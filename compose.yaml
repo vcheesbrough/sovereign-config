@@ -36,6 +36,7 @@ services:
     labels:
       traefik.enable: "true"
       traefik.http.routers.sovereign-config.rule: Host(`${SOVEREIGN_CONFIG_HOST:?Set SOVEREIGN_CONFIG_HOST}`)
+      traefik.http.routers.sovereign-config.middlewares: lan-vpn-only@docker,rate-limit@docker,crowdsec@docker,security-headers@docker
       traefik.http.services.sovereign-config.loadbalancer.server.port: "50051"
       traefik.http.services.sovereign-config.loadbalancer.server.scheme: h2c
       alloy.logs: "true"
