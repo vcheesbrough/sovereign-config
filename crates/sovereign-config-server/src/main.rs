@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
         .acquire_timeout(Duration::from_secs(5))
         .connect(&config.database_url)
         .await
-        .context("unable to connect to required PostgreSQL dependency")?;
+        .map_err(|_| anyhow::anyhow!("unable to connect to required PostgreSQL dependency"))?;
     sqlx::migrate!("./migrations")
         .run(&database)
         .await
