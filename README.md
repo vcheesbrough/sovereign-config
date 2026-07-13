@@ -6,7 +6,9 @@ Sovereign Config is a self-hosted, gRPC-first configuration service. This reposi
 
 The production Compose stack contains only PostgreSQL and Sovereign Config. It publishes no application, PostgreSQL, metrics, logging, or tracing ports. Traefik must provide the external `proxy-backend` network and is the only supported ingress. The PostgreSQL volume and all backup/staging storage must be encrypted by the operator.
 
-Create operator-owned secret files with mode `0600`. `POSTGRES_PASSWORD_FILE` contains only the PostgreSQL password. `DATABASE_URL_FILE` contains the complete private-network URL, for example `postgresql://sovereign_config:<password>@postgres:5432/sovereign_config`. Never commit either file.
+Create the secret files in an operator-controlled directory. The PostgreSQL password file is read by the PostgreSQL entrypoint and should be owned by `root:root` with mode `0400`. The database URL file is read by Sovereign Config's fixed UID `10001` and must be owned by `10001:10001` with mode `0400`. Compose preserves host ownership for these file-backed secrets.
+
+`POSTGRES_PASSWORD_SECRET_FILE` points to the file containing only the PostgreSQL password. `DATABASE_URL_FILE` points to the file containing the complete private-network URL, for example `postgresql://sovereign_config:<password>@postgres:5432/sovereign_config`. Never commit either file.
 
 Set the required deployment inputs and start the stack:
 
@@ -15,7 +17,7 @@ export SOVEREIGN_CONFIG_IMAGE_TAG='1.1.0'
 export SOVEREIGN_CONFIG_ENV='prod'
 export SOVEREIGN_CONFIG_HOST='config.example.internal'
 export SOVEREIGN_CONFIG_CONTAINER_NAME='sovereign-config-production'
-export POSTGRES_PASSWORD_FILE="$HOME/.config/sovereign-config/postgres-password"
+export POSTGRES_PASSWORD_SECRET_FILE="$HOME/.config/sovereign-config/postgres-password"
 export DATABASE_URL_FILE="$HOME/.config/sovereign-config/database-url"
 docker compose up -d
 ```
