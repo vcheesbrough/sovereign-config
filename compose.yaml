@@ -24,7 +24,8 @@ services:
     image: registry.desync.link/sovereign-config:${SOVEREIGN_CONFIG_IMAGE_TAG:-local}
     container_name: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}
     environment:
-      SOVEREIGN_CONFIG_DATABASE_URL_FILE: /run/secrets/database_url
+      SOVEREIGN_CONFIG_DATABASE_URL: ${SOVEREIGN_CONFIG_DATABASE_URL:-}
+      SOVEREIGN_CONFIG_DATABASE_URL_FILE: ${SOVEREIGN_CONFIG_DATABASE_URL_FILE-/run/secrets/database_url}
       SOVEREIGN_CONFIG_GRPC_ADDR: 0.0.0.0:50051
       SOVEREIGN_CONFIG_METRICS_ADDR: 0.0.0.0:9090
     secrets:
