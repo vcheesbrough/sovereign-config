@@ -41,7 +41,7 @@ This repository is being initialized directly on `main`. The initial commit that
 
 ## 2. CI after every push
 
-When this repository has CI configured and a commit is pushed, monitor the pipeline through completion for that commit. Do not report a pending status as the final result.
+When this repository has CI configured and a commit is pushed, monitor every pipeline triggered by that push through completion for that commit. Do not report a pending status as the final result. Fix any pipeline errors encountered, then commit, push, and monitor the replacement pipeline until it succeeds.
 
 1. Obtain the pushed SHA with `git rev-parse HEAD`.
 2. Check the GitHub commit status for `vcheesbrough/sovereign-config` using `gh api` and expect `success`.
