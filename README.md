@@ -11,14 +11,14 @@ Create operator-owned secret files with mode `0600`. `POSTGRES_PASSWORD_FILE` co
 Set the required deployment inputs and start the stack:
 
 ```sh
-export SOVEREIGN_CONFIG_IMAGE='zot.example.internal/sovereign-config/server@sha256:<published-digest>'
+export SOVEREIGN_CONFIG_IMAGE_TAG='1.1.0'
 export SOVEREIGN_CONFIG_HOST='config.example.internal'
 export POSTGRES_PASSWORD_FILE="$HOME/.config/sovereign-config/postgres-password"
 export DATABASE_URL_FILE="$HOME/.config/sovereign-config/database-url"
 docker compose up -d
 ```
 
-`SOVEREIGN_CONFIG_IMAGE` must be a digest reference. Tag-only images are unsupported. PostgreSQL is already pinned by digest. The service starts only after PostgreSQL reports healthy.
+`SOVEREIGN_CONFIG_IMAGE_TAG` selects the published Zot image; it defaults to `local` for local builds. PostgreSQL is pinned by digest. The service starts only after PostgreSQL reports healthy.
 
 Build release images only for linux/amd64 with `docker build --platform linux/amd64 --tag sovereign-config:local .`.
 

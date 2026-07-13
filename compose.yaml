@@ -20,7 +20,7 @@ services:
     restart: unless-stopped
 
   sovereign-config:
-    image: ${SOVEREIGN_CONFIG_IMAGE:?Set to a Zot image digest, for example zot.example.internal/sovereign-config/server@sha256:...}
+    image: registry.desync.link/sovereign-config:${SOVEREIGN_CONFIG_IMAGE_TAG:-local}
     environment:
       SOVEREIGN_CONFIG_DATABASE_URL_FILE: /run/secrets/database_url
       SOVEREIGN_CONFIG_GRPC_ADDR: 0.0.0.0:50051
