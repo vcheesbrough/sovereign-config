@@ -17,7 +17,6 @@ steps:
 
   verify-image:
     image: woodpeckerci/plugin-docker-buildx@sha256:93e8c7b4480899ecea64a5e023abd2ce0f5bd134d22455cb2354c3ed7d48af93
-    privileged: true
     settings:
       dry_run: true
       dockerfile: Dockerfile
