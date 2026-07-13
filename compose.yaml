@@ -51,7 +51,7 @@ secrets:
 
 volumes:
   postgres_data:
-    name: sovereign-config-postgres-data
+    name: ${POSTGRES_DATA_VOLUME:-sovereign-config-postgres-data}
 
 networks:
   sovereign_config_private:
