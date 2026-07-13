@@ -1,0 +1,76 @@
+services:
+  postgres:
+    image: docker.io/library/postgres@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4
+    container_name: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}-postgres
+    environment:
+      POSTGRES_DB: sovereign_config
+      POSTGRES_USER: sovereign_config
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_PASSWORD_FILE: ${POSTGRES_PASSWORD_FILE-/run/secrets/postgres_password}
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sovereign_config -d sovereign_config"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks:
+      - sovereign_config_private
+    restart: unless-stopped
+
+  sovereign-config:
+    image: registry.desync.link/sovereign-config:${SOVEREIGN_CONFIG_IMAGE_TAG:-local}
+    container_name: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}
+    environment:
+      SOVEREIGN_CONFIG_DATABASE_URL: ${SOVEREIGN_CONFIG_DATABASE_URL:-}
+      SOVEREIGN_CONFIG_DATABASE_URL_FILE: ${SOVEREIGN_CONFIG_DATABASE_URL_FILE-/run/secrets/database_url}
+      SOVEREIGN_CONFIG_GRPC_ADDR: 0.0.0.0:50051
+      SOVEREIGN_CONFIG_METRICS_ADDR: 0.0.0.0:9090
+    secrets:
+      - database_url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - sovereign_config_private
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy-backend"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.entrypoints=websecure"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.rule=Host(`${SOVEREIGN_CONFIG_HOST:?Set SOVEREIGN_CONFIG_HOST}`)"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.tls=true"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.tls.certresolver=myresolver"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.middlewares=lan-vpn-only@docker,rate-limit@docker,crowdsec@docker,security-headers@docker"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.service=${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}"
+      - "traefik.http.services.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.loadbalancer.server.port=50051"
+      - "traefik.http.services.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.loadbalancer.server.scheme=h2c"
+      - "observability.metrics.scrape=true"
+      - "observability.metrics.port=9090"
+      - "observability.metrics.path=/metrics"
+      - "observability.metrics.scheme=http"
+      - "observability.service=sovereign-config"
+      - "observability.env=${SOVEREIGN_CONFIG_ENV:-dev}"
+      - "observability.release=${SOVEREIGN_CONFIG_IMAGE_TAG:-local}"
+      - "observability.protocol=v1"
+    restart: unless-stopped
+
+secrets:
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_SECRET_FILE:-/dev/null}
+  database_url:
+    file: ${DATABASE_URL_FILE:-/dev/null}
+
+volumes:
+  postgres_data:
+    name: ${POSTGRES_DATA_VOLUME:-sovereign-config-postgres-data}
+
+networks:
+  sovereign_config_private:
+    internal: true
+  traefik:
+    external: true
+    name: proxy-backend

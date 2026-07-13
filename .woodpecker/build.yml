@@ -1,0 +1,110 @@
+# Step DAG: compute-version ∥ contract-validation ∥ compose-validation →
+# build-server → publish-dev-image → auto-deploy-dev → tag-release-auto-dev.
+when:
+  - event: [push, manual]
+
+steps:
+  compute-version:
+    depends_on: []
+    pull: true
+    image: &version-plugin ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.1.0@sha256:81a29c3a5785c146b5b3dfd7e0d8e7edb353b72e4e53bdbef4f7e13a88488c59
+    settings:
+      mode: compute
+      major_minor_source: cargo
+      github_token:
+        from_secret: github_token
+
+  contract-validation:
+    depends_on: []
+    image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
+    environment:
+      CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
+      SOVEREIGN_CONFIG_TEST_DATABASE_URL: postgresql://sovereign_config_test:sovereign_config_test@postgres-migrations:5432/sovereign_config_test
+    volumes:
+      - sovereign-config-cargo-registry:/usr/local/cargo/registry
+      - sovereign-config-cargo-git:/usr/local/cargo/git
+      - sovereign-config-contract-target:/woodpecker/cache/sovereign-config-target
+    commands:
+      - rustup component add clippy rustfmt
+      - cargo fmt --check
+      - cargo clippy --workspace --all-targets -- -D warnings
+      - cargo test --workspace
+      - cargo test --package sovereign-config-server --test migrations -- --ignored
+
+  compose-validation:
+    depends_on: []
+    image: docker.io/library/docker@sha256:862099ada15c669000bef53aa4cb9d821262829f45b0dda2159ccb276443043b
+    commands:
+      - SOVEREIGN_CONFIG_IMAGE_TAG=validation SOVEREIGN_CONFIG_HOST=config.example.internal SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-validation POSTGRES_PASSWORD_FILE=/dev/null DATABASE_URL_FILE=/dev/null docker compose config -q
+
+  build-server:
+    depends_on:
+      - compute-version
+      - contract-validation
+      - compose-validation
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - |
+        RELEASE_TAG=$$(cat .release-tag)
+        IMAGE=sovereign-config-ci:$$CI_COMMIT_SHA
+        docker build --platform linux/amd64 --build-arg RELEASE_VERSION="$$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
+        docker image inspect "$$IMAGE" >/dev/null
+
+  publish-dev-image:
+    depends_on:
+      - build-server
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      REGISTRY_USER:
+        from_secret: zot_ci_user
+      REGISTRY_PASSWORD:
+        from_secret: zot_ci_password
+    commands:
+      - |
+        RELEASE_TAG=$$(cat .release-tag)
+        IMAGE=registry.desync.link/sovereign-config:$$RELEASE_TAG
+        echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
+        docker tag sovereign-config-ci:$$CI_COMMIT_SHA "$$IMAGE"
+        docker push "$$IMAGE"
+
+  auto-deploy-dev:
+    depends_on:
+      - publish-dev-image
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      POSTGRES_PASSWORD:
+        from_secret: sovereign_config_dev_postgres_password
+    commands:
+      - |
+        ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
+        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" docker compose -p sovereign-config-dev up -d --wait --wait-timeout 90 || {
+          docker compose -p sovereign-config-dev logs --tail 200
+          exit 1
+        }
+
+  tag-release-auto-dev:
+    when:
+      - event: push
+    depends_on:
+      - auto-deploy-dev
+    pull: true
+    image: *version-plugin
+    settings:
+      mode: push-tag
+      major_minor_source: cargo
+      github_token:
+        from_secret: github_token
+
+services:
+  postgres-migrations:
+    image: docker.io/library/postgres@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4
+    environment:
+      POSTGRES_DB: sovereign_config_test
+      POSTGRES_USER: sovereign_config_test
+      POSTGRES_PASSWORD: sovereign_config_test

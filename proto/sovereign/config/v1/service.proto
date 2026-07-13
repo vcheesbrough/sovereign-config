@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package sovereign.config.v1;
+
+service System {
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+}
+
+message GetVersionRequest {
+  string protocol_version = 1;
+}
+
+message GetVersionResponse {
+  string application_version = 1;
+  string protocol_version = 2;
+}

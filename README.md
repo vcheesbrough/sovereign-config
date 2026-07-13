@@ -1,0 +1,50 @@
+# Sovereign Config
+
+Sovereign Config is a self-hosted, gRPC-first configuration service. This repository is a Cargo-workspace monorepo: the server, protocol crates, shared client libraries, Rust provider, WASM UI, and local MCP binary are released together from the same source tag.
+
+## Deployment
+
+The production Compose stack contains only PostgreSQL and Sovereign Config. It publishes no application, PostgreSQL, metrics, logging, or tracing ports. Traefik must provide the external `proxy-backend` network and is the only supported ingress. The PostgreSQL volume and all backup/staging storage must be encrypted by the operator.
+
+Create the secret files in an operator-controlled directory. The PostgreSQL password file is read by the PostgreSQL entrypoint and should be owned by `root:root` with mode `0400`. The database URL file is read by Sovereign Config's fixed UID `10001` and must be owned by `10001:10001` with mode `0400`. Compose preserves host ownership for these file-backed secrets.
+
+`POSTGRES_PASSWORD_SECRET_FILE` points to the file containing only the PostgreSQL password. `DATABASE_URL_FILE` points to the file containing the complete private-network URL, for example `postgresql://sovereign_config:<password>@postgres:5432/sovereign_config`. Never commit either file.
+
+Set the required deployment inputs and start the stack:
+
+```sh
+export SOVEREIGN_CONFIG_IMAGE_TAG='1.1.0'
+export SOVEREIGN_CONFIG_ENV='prod'
+export SOVEREIGN_CONFIG_HOST='config.example.internal'
+export SOVEREIGN_CONFIG_CONTAINER_NAME='sovereign-config-production'
+export POSTGRES_PASSWORD_SECRET_FILE="$HOME/.config/sovereign-config/postgres-password"
+export DATABASE_URL_FILE="$HOME/.config/sovereign-config/database-url"
+docker compose up -d
+```
+
+`SOVEREIGN_CONFIG_IMAGE_TAG` selects the published Zot image; it defaults to `local` for local builds. `SOVEREIGN_CONFIG_ENV` labels metrics and logs and defaults to `dev`. PostgreSQL is pinned by digest. The service starts only after PostgreSQL reports healthy.
+
+Cargo supplies the `major.minor` release line. After a successful development deployment, Woodpecker tags the deployed commit and the next deployment advances the patch version. The deployed `System.GetVersion` response reports that computed release version; local builds report the Cargo version.
+
+The development deployment is verified by calling `System.GetVersion` through the public gRPC endpoint after Woodpecker completes.
+
+Build release images only for linux/amd64 with `docker build --platform linux/amd64 --tag sovereign-config:local .`.
+Woodpecker reuses Cargo dependency and compilation caches across validation and server-image builds.
+
+## Upgrade
+
+1. Stop Sovereign Config traffic through Traefik.
+2. Verify a recoverable PostgreSQL backup from encrypted backup/staging storage.
+3. Set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new published tag and run `docker compose up -d`.
+4. The service applies its forward-only migrations before accepting requests.
+5. Validate native gRPC health/version and `/readyz` through the trusted internal network before restoring traffic.
+
+Downgrades after a migration are unsupported. Restore the verified PostgreSQL backup into a replacement deployment instead.
+
+## Observability
+
+The application writes structured redacted JSON logs to stdout. Internal Alloy discovers `/metrics` using the Docker labels in `compose.yaml`; that endpoint is not routed through Traefik. OTLP export and the Authentik dependency are introduced with their respective cards and will be required explicit boot configuration.
+
+## Release Gate
+
+Publish an image tag only after `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, unit and integration checks, PostgreSQL migration checks, gRPC/gRPC-Web end-to-end checks, and supported-browser UI checks pass. SBOM generation is out of scope for the MVP.
