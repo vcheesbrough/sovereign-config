@@ -1,0 +1,22 @@
+[package]
+name = "sovereign-config-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tonic-health.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sovereign-config-proto = { path = "../sovereign-config-proto" }
+
+[lints]
+workspace = true
