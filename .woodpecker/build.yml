@@ -75,4 +75,7 @@ steps:
         from_secret: sovereign_config_dev_postgres_password
     commands:
       - |
-        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link POSTGRES_DATA_VOLUME=sovereign-config-dev-db SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$POSTGRES_PASSWORD@postgres:5432/sovereign_config" docker compose -p sovereign-config-dev up -d
+        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link POSTGRES_DATA_VOLUME=sovereign-config-dev-db SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$POSTGRES_PASSWORD@postgres:5432/sovereign_config" docker compose -p sovereign-config-dev up -d || {
+          docker compose -p sovereign-config-dev logs --tail 200
+          exit 1
+        }
