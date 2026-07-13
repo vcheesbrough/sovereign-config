@@ -46,9 +46,9 @@ services:
 
 secrets:
   postgres_password:
-    file: ${POSTGRES_PASSWORD_FILE:?Set POSTGRES_PASSWORD_FILE to an operator-owned secret file}
+    file: ${POSTGRES_PASSWORD_FILE:-/dev/null}
   database_url:
-    file: ${DATABASE_URL_FILE:?Set DATABASE_URL_FILE to an operator-owned secret file}
+    file: ${DATABASE_URL_FILE:-/dev/null}
 
 volumes:
   postgres_data:
