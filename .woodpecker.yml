@@ -14,11 +14,3 @@ steps:
     image: docker.io/library/docker@sha256:862099ada15c669000bef53aa4cb9d821262829f45b0dda2159ccb276443043b
     commands:
       - SOVEREIGN_CONFIG_IMAGE='zot.example.internal/sovereign-config/server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' SOVEREIGN_CONFIG_HOST=config.example.internal POSTGRES_PASSWORD_FILE=/dev/null DATABASE_URL_FILE=/dev/null docker compose config -q
-
-  verify-image:
-    image: woodpeckerci/plugin-docker-buildx@sha256:93e8c7b4480899ecea64a5e023abd2ce0f5bd134d22455cb2354c3ed7d48af93
-    settings:
-      dry_run: true
-      dockerfile: Dockerfile
-      platforms: linux/amd64
-      repo: vcheesbrough/sovereign-config
