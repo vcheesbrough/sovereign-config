@@ -16,4 +16,6 @@ FROM docker.io/library/debian@sha256:60eac759739651111db372c07be67863818726f7548
 RUN useradd --system --uid 10001 --create-home sovereign-config
 USER sovereign-config
 COPY --from=builder /tmp/sovereign-config-server /usr/local/bin/sovereign-config-server
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=12 \
+    CMD ["/usr/local/bin/sovereign-config-server", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/sovereign-config-server"]
