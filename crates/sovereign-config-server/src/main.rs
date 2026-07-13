@@ -14,6 +14,14 @@ use sovereign_config_proto::sovereign::config::v1::{
 };
 
 const PROTOCOL_VERSION: &str = "v1";
+const APPLICATION_VERSION: &str = application_version(option_env!("SOVEREIGN_CONFIG_RELEASE"));
+
+const fn application_version(release_version: Option<&str>) -> &str {
+    match release_version {
+        Some(version) if !version.is_empty() => version,
+        _ => env!("CARGO_PKG_VERSION"),
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -89,7 +97,7 @@ impl System for SystemService {
         }
 
         Ok(Response::new(GetVersionResponse {
-            application_version: env!("CARGO_PKG_VERSION").to_owned(),
+            application_version: APPLICATION_VERSION.to_owned(),
             protocol_version: PROTOCOL_VERSION.to_owned(),
         }))
     }
@@ -172,13 +180,29 @@ async fn shutdown_signal() {
 mod tests {
     use tonic::Code;
 
-    use super::{PROTOCOL_VERSION, System, SystemService, required_env};
+    use super::{
+        APPLICATION_VERSION, PROTOCOL_VERSION, System, SystemService, application_version,
+        required_env,
+    };
     use sovereign_config_proto::sovereign::config::v1::GetVersionRequest;
     use tonic::Request;
 
     #[test]
     fn required_env_rejects_missing_values() {
         assert!(required_env("SOVEREIGN_CONFIG_TEST_UNSET_6F63A8D9").is_err());
+    }
+
+    #[test]
+    fn configured_release_version_overrides_cargo_version() {
+        assert_eq!(application_version(Some("1.1.42")), "1.1.42");
+        assert_eq!(application_version(None), env!("CARGO_PKG_VERSION"));
+        assert_eq!(application_version(Some("")), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn compiled_application_version_uses_the_build_release() {
+        let expected = option_env!("SOVEREIGN_CONFIG_RELEASE").unwrap_or(env!("CARGO_PKG_VERSION"));
+        assert_eq!(APPLICATION_VERSION, expected);
     }
 
     #[tokio::test]
@@ -204,6 +228,6 @@ mod tests {
             .into_inner();
 
         assert_eq!(response.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(response.application_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(response.application_version, APPLICATION_VERSION);
     }
 }
