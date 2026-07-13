@@ -79,11 +79,3 @@ steps:
           docker compose -p sovereign-config-dev logs --tail 200
           exit 1
         }
-        for attempt in $$(seq 1 30); do
-          if printf '\0\0\0\0\0' | docker run --rm -i --network proxy-backend docker.io/curlimages/curl:8.12.1@sha256:88a9abad9d958340e48564f9bdcdaa29916a2984be59314da709f8bbc0eef6f7 --silent --show-error --fail --http2 --connect-to sovereign-config-dev.desync.link:443:infra-traefik:443 --header 'content-type: application/grpc' --header 'te: trailers' --data-binary @- --dump-header - --output /dev/null https://sovereign-config-dev.desync.link/grpc.health.v1.Health/Check | grep -qi '^grpc-status: 0'; then
-            exit 0
-          fi
-          sleep 2
-        done
-        docker compose -p sovereign-config-dev logs --tail 200
-        exit 1
