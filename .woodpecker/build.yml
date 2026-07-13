@@ -82,7 +82,8 @@ steps:
         from_secret: sovereign_config_dev_postgres_password
     commands:
       - |
-        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$POSTGRES_PASSWORD@postgres:5432/sovereign_config" docker compose -p sovereign-config-dev up -d || {
+        ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
+        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" docker compose -p sovereign-config-dev up -d --wait --wait-timeout 90 || {
           docker compose -p sovereign-config-dev logs --tail 200
           exit 1
         }

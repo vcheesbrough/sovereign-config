@@ -4,7 +4,11 @@ use anyhow::{Context, Result, bail};
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::{net::TcpListener, signal};
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{
+    Request, Response, Status,
+    transport::{Endpoint, Server},
+};
+use tonic_health::pb::{HealthCheckRequest, health_check_response, health_client::HealthClient};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -14,6 +18,7 @@ use sovereign_config_proto::sovereign::config::v1::{
 };
 
 const PROTOCOL_VERSION: &str = "v1";
+const SYSTEM_SERVICE_NAME: &str = "sovereign.config.v1.System";
 const APPLICATION_VERSION: &str = application_version(option_env!("SOVEREIGN_CONFIG_RELEASE"));
 
 const fn application_version(release_version: Option<&str>) -> &str {
@@ -125,6 +130,10 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if env::args().nth(1).as_deref() == Some("healthcheck") {
+        return healthcheck().await;
+    }
+
     fmt()
         .json()
         .with_env_filter(
@@ -171,9 +180,56 @@ async fn main() -> Result<()> {
         .context("gRPC server terminated")
 }
 
+async fn healthcheck() -> Result<()> {
+    let mut address: SocketAddr = required_env("SOVEREIGN_CONFIG_GRPC_ADDR")?
+        .parse()
+        .context("SOVEREIGN_CONFIG_GRPC_ADDR must be a socket address")?;
+    if address.ip().is_unspecified() {
+        address.set_ip(if address.is_ipv4() {
+            "127.0.0.1".parse().expect("IPv4 loopback must parse")
+        } else {
+            "::1".parse().expect("IPv6 loopback must parse")
+        });
+    }
+
+    let channel = Endpoint::from_shared(format!("http://{address}"))
+        .context("unable to configure local gRPC health endpoint")?
+        .connect()
+        .await
+        .context("unable to connect to local gRPC health service")?;
+    let mut client = HealthClient::new(channel);
+    let response = client
+        .check(Request::new(HealthCheckRequest {
+            service: SYSTEM_SERVICE_NAME.to_owned(),
+        }))
+        .await
+        .context("local gRPC health check failed")?
+        .into_inner();
+
+    if response.status != health_check_response::ServingStatus::Serving as i32 {
+        bail!("local gRPC service is not serving");
+    }
+    Ok(())
+}
+
 async fn shutdown_signal() {
-    let _ = signal::ctrl_c().await;
-    info!("shutdown signal received");
+    #[cfg(unix)]
+    let received_signal = {
+        let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler must install");
+        tokio::select! {
+            _ = signal::ctrl_c() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+        }
+    };
+
+    #[cfg(not(unix))]
+    let received_signal = {
+        let _ = signal::ctrl_c().await;
+        "SIGINT"
+    };
+
+    info!(signal = received_signal, "shutdown signal received");
 }
 
 #[cfg(test)]
