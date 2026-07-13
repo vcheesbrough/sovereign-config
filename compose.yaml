@@ -58,4 +58,4 @@ networks:
     internal: true
   traefik:
     external: true
-    name: traefik
+    name: proxy-backend
