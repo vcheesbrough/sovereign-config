@@ -17,6 +17,12 @@ steps:
   contract-validation:
     depends_on: []
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
+    environment:
+      CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
+    volumes:
+      - sovereign-config-cargo-registry:/usr/local/cargo/registry
+      - sovereign-config-cargo-git:/usr/local/cargo/git
+      - sovereign-config-contract-target:/woodpecker/cache/sovereign-config-target
     commands:
       - rustup component add clippy rustfmt
       - cargo fmt --check
