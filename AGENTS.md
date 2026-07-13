@@ -29,6 +29,7 @@ When this project uses Kanban cards as the task queue:
 ### Bored MCP only
 
 - Use Bored MCP for all board, column, and card reads and writes.
+- The url to the board in bored is https://bored.desync.link/boards/sovereign-config
 - Do not use the Bored HTTP API, curl, scripts, or ad-hoc clients unless MCP is unavailable. State the failure once before using a minimal fallback.
 - Default board service: `https://bored.desync.link` with scope `bored:prod:access`, unless the user instructs otherwise.
 
@@ -76,6 +77,7 @@ Never force-push for review work. Leave threads open when the user chooses furth
 
 ## 5. Self-review for PRs opened by an agent
 
+Do not open reviews as draft initially, there is a background agent that observes public PR and starts posting review comments after a few minutes.
 After opening a PR, review the diff before treating it as complete. Check correctness, security, OWASP concerns, tests, versioning, and deployment behavior. Post the result as a PR review when the project review workflow is configured.
 
 Surface findings to the user and use the pull request comment loop for every resulting change decision.
