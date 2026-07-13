@@ -26,6 +26,7 @@ Cargo supplies the `major.minor` release line. After a successful development de
 The development deployment is verified by calling `System.GetVersion` through the public gRPC endpoint after Woodpecker completes.
 
 Build release images only for linux/amd64 with `docker build --platform linux/amd64 --tag sovereign-config:local .`.
+Woodpecker reuses Cargo dependency and compilation caches across validation and server-image builds.
 
 ## Upgrade
 
