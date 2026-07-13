@@ -1,0 +1,8 @@
+services:
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD from the development secret provider}
+      POSTGRES_PASSWORD_FILE: ""
+  sovereign-config:
+    environment:
+      SOVEREIGN_CONFIG_DATABASE_URL: ${SOVEREIGN_CONFIG_DATABASE_URL:?Set SOVEREIGN_CONFIG_DATABASE_URL from the development secret provider}

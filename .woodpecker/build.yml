@@ -76,8 +76,4 @@ steps:
         from_secret: sovereign_config_dev_postgres_password
     commands:
       - |
-        SECRET_DIR=$$(mktemp -d)
-        trap 'rm -rf "$$SECRET_DIR"' EXIT
-        printf %s "$$POSTGRES_PASSWORD" > "$$SECRET_DIR/postgres-password"
-        printf 'postgresql://sovereign_config:%s@postgres:5432/sovereign_config' "$$POSTGRES_PASSWORD" > "$$SECRET_DIR/database-url"
-        SOVEREIGN_CONFIG_IMAGE=$$(cat .sovereign-config-image) SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE="$$SECRET_DIR/postgres-password" DATABASE_URL_FILE="$$SECRET_DIR/database-url" docker compose -p sovereign-config-dev up -d
+        SOVEREIGN_CONFIG_IMAGE=$$(cat .sovereign-config-image) SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link POSTGRES_DATA_VOLUME=sovereign-config-dev-db SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$POSTGRES_PASSWORD@postgres:5432/sovereign_config" docker compose -f compose.yaml -f compose.dev.yaml -p sovereign-config-dev up -d
