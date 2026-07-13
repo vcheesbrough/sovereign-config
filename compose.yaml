@@ -37,7 +37,10 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=proxy-backend"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.entrypoints=websecure"
       - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.rule=Host(`${SOVEREIGN_CONFIG_HOST:?Set SOVEREIGN_CONFIG_HOST}`)"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.tls=true"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.tls.certresolver=myresolver"
       - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.middlewares=lan-vpn-only@docker,rate-limit@docker,crowdsec@docker,security-headers@docker"
       - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.service=${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}"
       - "traefik.http.services.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.loadbalancer.server.port=50051"
