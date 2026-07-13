@@ -48,9 +48,14 @@ services:
       - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.service=${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}"
       - "traefik.http.services.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.loadbalancer.server.port=50051"
       - "traefik.http.services.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.loadbalancer.server.scheme=h2c"
-      - "alloy.logs=true"
-      - "alloy.metrics.port=9090"
-      - "alloy.metrics.path=/metrics"
+      - "observability.metrics.scrape=true"
+      - "observability.metrics.port=9090"
+      - "observability.metrics.path=/metrics"
+      - "observability.metrics.scheme=http"
+      - "observability.service=sovereign-config"
+      - "observability.env=${SOVEREIGN_CONFIG_ENV:-dev}"
+      - "observability.release=${SOVEREIGN_CONFIG_IMAGE_TAG:-local}"
+      - "observability.protocol=v1"
     restart: unless-stopped
 
 secrets:
