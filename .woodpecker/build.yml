@@ -1,8 +1,11 @@
+# Verification DAG: Rust and Compose checks run in parallel; image verification
+# runs only after both complete. Release publishing is a separate future stage.
 when:
-  - event: [push, pull_request]
+  - event: [push, manual]
 
 steps:
   verify-rust:
+    depends_on: []
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
     commands:
       - rustup component add clippy rustfmt
@@ -11,6 +14,18 @@ steps:
       - cargo test --workspace
 
   verify-compose:
+    depends_on: []
     image: docker.io/library/docker@sha256:862099ada15c669000bef53aa4cb9d821262829f45b0dda2159ccb276443043b
     commands:
       - SOVEREIGN_CONFIG_IMAGE='zot.example.internal/sovereign-config/server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' SOVEREIGN_CONFIG_HOST=config.example.internal POSTGRES_PASSWORD_FILE=/dev/null DATABASE_URL_FILE=/dev/null docker compose config -q
+
+  verify-image:
+    depends_on:
+      - verify-rust
+      - verify-compose
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - docker build --platform linux/amd64 --tag sovereign-config-ci:$$CI_COMMIT_SHA .
+      - docker image inspect sovereign-config-ci:$$CI_COMMIT_SHA >/dev/null
