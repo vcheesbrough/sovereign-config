@@ -12,6 +12,7 @@ Set the required deployment inputs and start the stack:
 
 ```sh
 export SOVEREIGN_CONFIG_IMAGE_TAG='1.1.0'
+export SOVEREIGN_CONFIG_ENV='prod'
 export SOVEREIGN_CONFIG_HOST='config.example.internal'
 export SOVEREIGN_CONFIG_CONTAINER_NAME='sovereign-config-production'
 export POSTGRES_PASSWORD_FILE="$HOME/.config/sovereign-config/postgres-password"
@@ -19,7 +20,7 @@ export DATABASE_URL_FILE="$HOME/.config/sovereign-config/database-url"
 docker compose up -d
 ```
 
-`SOVEREIGN_CONFIG_IMAGE_TAG` selects the published Zot image; it defaults to `local` for local builds. PostgreSQL is pinned by digest. The service starts only after PostgreSQL reports healthy.
+`SOVEREIGN_CONFIG_IMAGE_TAG` selects the published Zot image; it defaults to `local` for local builds. `SOVEREIGN_CONFIG_ENV` labels metrics and logs and defaults to `dev`. PostgreSQL is pinned by digest. The service starts only after PostgreSQL reports healthy.
 
 Cargo supplies the `major.minor` release line. After a successful development deployment, Woodpecker tags the deployed commit and the next deployment advances the patch version. The deployed `System.GetVersion` response reports that computed release version; local builds report the Cargo version.
 
