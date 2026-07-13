@@ -21,6 +21,8 @@ docker compose up -d
 
 `SOVEREIGN_CONFIG_IMAGE_TAG` selects the published Zot image; it defaults to `local` for local builds. PostgreSQL is pinned by digest. The service starts only after PostgreSQL reports healthy.
 
+Cargo supplies the `major.minor` release line. After a successful development deployment, Woodpecker tags the deployed commit and the next deployment advances the patch version. The deployed `System.GetVersion` response reports that computed release version; local builds report the Cargo version.
+
 Build release images only for linux/amd64 with `docker build --platform linux/amd64 --tag sovereign-config:local .`.
 
 ## Upgrade
