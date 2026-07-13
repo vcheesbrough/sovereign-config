@@ -23,6 +23,8 @@ docker compose up -d
 
 Cargo supplies the `major.minor` release line. After a successful development deployment, Woodpecker tags the deployed commit and the next deployment advances the patch version. The deployed `System.GetVersion` response reports that computed release version; local builds report the Cargo version.
 
+The development deployment is verified by calling `System.GetVersion` through the public gRPC endpoint after Woodpecker completes.
+
 Build release images only for linux/amd64 with `docker build --platform linux/amd64 --tag sovereign-config:local .`.
 
 ## Upgrade
