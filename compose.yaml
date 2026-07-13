@@ -1,0 +1,61 @@
+services:
+  postgres:
+    image: docker.io/library/postgres@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4
+    environment:
+      POSTGRES_DB: sovereign_config
+      POSTGRES_USER: sovereign_config
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sovereign_config -d sovereign_config"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks:
+      - sovereign_config_private
+    restart: unless-stopped
+
+  sovereign-config:
+    image: ${SOVEREIGN_CONFIG_IMAGE:?Set to a Zot image digest, for example zot.example.internal/sovereign-config/server@sha256:...}
+    environment:
+      SOVEREIGN_CONFIG_DATABASE_URL_FILE: /run/secrets/database_url
+      SOVEREIGN_CONFIG_GRPC_ADDR: 0.0.0.0:50051
+      SOVEREIGN_CONFIG_METRICS_ADDR: 0.0.0.0:9090
+    secrets:
+      - database_url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - sovereign_config_private
+      - traefik
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.sovereign-config.rule: Host(`${SOVEREIGN_CONFIG_HOST:?Set SOVEREIGN_CONFIG_HOST}`)
+      traefik.http.services.sovereign-config.loadbalancer.server.port: "50051"
+      traefik.http.services.sovereign-config.loadbalancer.server.scheme: h2c
+      alloy.logs: "true"
+      alloy.metrics.port: "9090"
+      alloy.metrics.path: "/metrics"
+    restart: unless-stopped
+
+secrets:
+  postgres_password:
+    file: ${POSTGRES_PASSWORD_FILE:?Set POSTGRES_PASSWORD_FILE to an operator-owned secret file}
+  database_url:
+    file: ${DATABASE_URL_FILE:?Set DATABASE_URL_FILE to an operator-owned secret file}
+
+volumes:
+  postgres_data:
+    name: sovereign-config-postgres-data
+
+networks:
+  sovereign_config_private:
+    internal: true
+  traefik:
+    external: true
+    name: traefik

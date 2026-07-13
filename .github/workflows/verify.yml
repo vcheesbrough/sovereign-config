@@ -1,0 +1,25 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - feat/**
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: clippy,rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: docker build --platform linux/amd64 --tag sovereign-config:verify .
+      - run: SOVEREIGN_CONFIG_IMAGE='zot.example.internal/sovereign-config/server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' SOVEREIGN_CONFIG_HOST=config.example.internal POSTGRES_PASSWORD_FILE=/dev/null DATABASE_URL_FILE=/dev/null docker compose config -q
