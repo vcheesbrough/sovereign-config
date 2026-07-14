@@ -15,8 +15,24 @@ const APPLICATION_VERSION: &str = match option_env!("SOVEREIGN_CONFIG_RELEASE") 
 #[derive(Parser)]
 #[command(name = "sovereign-config", version = APPLICATION_VERSION, about)]
 struct Arguments {
-    #[arg(long, env = "SOVEREIGN_CONFIG_ENDPOINT")]
-    endpoint: String,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Login(IdentityProviderArguments),
+    Logout,
+    Status {
+        #[arg(long, env = "SOVEREIGN_CONFIG_ENDPOINT")]
+        endpoint: String,
+        #[command(flatten)]
+        identity_provider: IdentityProviderArguments,
+    },
+}
+
+#[derive(clap::Args)]
+struct IdentityProviderArguments {
     #[arg(long, env = "SOVEREIGN_CONFIG_OIDC_ISSUER")]
     issuer: String,
     #[arg(
@@ -25,15 +41,6 @@ struct Arguments {
         default_value = "sovereign-config-cli"
     )]
     client_id: String,
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    Login,
-    Logout,
-    Status,
 }
 
 struct InMemoryToken(Secret);
@@ -50,17 +57,27 @@ async fn main() -> Result<()> {
     let arguments = Arguments::parse();
     let credential_store = CredentialStore::new(default_credential_path()?)?;
     match arguments.command {
-        Command::Login => login(&arguments.issuer, arguments.client_id, &credential_store).await,
+        Command::Login(identity_provider) => {
+            login(
+                &identity_provider.issuer,
+                identity_provider.client_id,
+                &credential_store,
+            )
+            .await
+        }
         Command::Logout => {
             credential_store.delete()?;
             println!("Logged out");
             Ok(())
         }
-        Command::Status => {
+        Command::Status {
+            endpoint,
+            identity_provider,
+        } => {
             status(
-                arguments.endpoint,
-                &arguments.issuer,
-                arguments.client_id,
+                endpoint,
+                &identity_provider.issuer,
+                identity_provider.client_id,
                 &credential_store,
             )
             .await
