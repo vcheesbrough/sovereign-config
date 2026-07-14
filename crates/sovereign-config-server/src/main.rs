@@ -1,4 +1,8 @@
-use std::{env, fs, net::SocketAddr, time::Duration};
+mod auth;
+mod config;
+mod metrics;
+
+use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
@@ -12,6 +16,9 @@ use tonic_health::pb::{HealthCheckRequest, health_check_response, health_client:
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
+use auth::{AuthenticationLayer, Authenticator};
+use config::{Config, required_env};
+use metrics::AuthenticationMetrics;
 use sovereign_config_proto::sovereign::config::v1::{
     GetVersionRequest, GetVersionResponse,
     system_server::{System, SystemServer},
@@ -31,58 +38,7 @@ const fn application_version(release_version: Option<&str>) -> &str {
 #[derive(Clone)]
 struct AppState {
     database: PgPool,
-}
-
-#[derive(Clone)]
-struct Config {
-    database_url: String,
-    grpc_addr: SocketAddr,
-    metrics_addr: SocketAddr,
-}
-
-impl Config {
-    fn from_env() -> Result<Self> {
-        let database_url = required_secret("SOVEREIGN_CONFIG_DATABASE_URL")?;
-        let grpc_addr = required_env("SOVEREIGN_CONFIG_GRPC_ADDR")?
-            .parse()
-            .context("SOVEREIGN_CONFIG_GRPC_ADDR must be a socket address")?;
-        let metrics_addr = required_env("SOVEREIGN_CONFIG_METRICS_ADDR")?
-            .parse()
-            .context("SOVEREIGN_CONFIG_METRICS_ADDR must be a socket address")?;
-
-        if grpc_addr == metrics_addr {
-            bail!("gRPC and metrics listeners must use different addresses");
-        }
-
-        Ok(Self {
-            database_url,
-            grpc_addr,
-            metrics_addr,
-        })
-    }
-}
-
-fn required_env(name: &str) -> Result<String> {
-    match env::var(name) {
-        Ok(value) if !value.trim().is_empty() => Ok(value),
-        _ => bail!("required configuration {name} is missing or empty"),
-    }
-}
-
-fn required_secret(name: &str) -> Result<String> {
-    if let Ok(value) = env::var(name)
-        && !value.trim().is_empty()
-    {
-        return Ok(value);
-    }
-
-    let file_name = format!("{name}_FILE");
-    let path = required_env(&file_name)?;
-    let value = fs::read_to_string(&path).with_context(|| format!("unable to read {file_name}"))?;
-    if value.trim().is_empty() {
-        bail!("{file_name} points to an empty secret file");
-    }
-    Ok(value.trim().to_owned())
+    authentication_metrics: Arc<AuthenticationMetrics>,
 }
 
 #[derive(Clone, Default)]
@@ -110,10 +66,22 @@ impl System for SystemService {
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     match sqlx::query("SELECT 1").execute(&state.database).await {
-        Ok(_) => (StatusCode::OK, "sovereign_config_up 1\n"),
+        Ok(_) => (
+            StatusCode::OK,
+            format!(
+                "sovereign_config_up 1\n{}",
+                state.authentication_metrics.render()
+            ),
+        ),
         Err(error) => {
             error!(error = %error, "database health probe failed");
-            (StatusCode::SERVICE_UNAVAILABLE, "sovereign_config_up 0\n")
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "sovereign_config_up 0\n{}",
+                    state.authentication_metrics.render()
+                ),
+            )
         }
     }
 }
@@ -142,6 +110,8 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    let authenticator = Authenticator::new(config.authentication)?;
+    let authentication_metrics = Arc::new(AuthenticationMetrics::default());
     let database = PgPoolOptions::new()
         .acquire_timeout(Duration::from_secs(5))
         .connect(&config.database_url)
@@ -152,7 +122,10 @@ async fn main() -> Result<()> {
         .await
         .context("database migration failed")?;
 
-    let state = AppState { database };
+    let state = AppState {
+        database,
+        authentication_metrics: Arc::clone(&authentication_metrics),
+    };
     let metrics_app = Router::new()
         .route("/metrics", get(metrics))
         .route("/readyz", get(ready))
@@ -173,6 +146,10 @@ async fn main() -> Result<()> {
 
     info!(grpc_addr = %config.grpc_addr, metrics_addr = %config.metrics_addr, protocol_version = PROTOCOL_VERSION, "sovereign-config started");
     Server::builder()
+        .layer(AuthenticationLayer::new(
+            authenticator,
+            authentication_metrics,
+        ))
         .add_service(health_service)
         .add_service(SystemServer::new(SystemService))
         .serve_with_shutdown(config.grpc_addr, shutdown_signal())
@@ -238,19 +215,13 @@ mod tests {
 
     use super::{
         APPLICATION_VERSION, PROTOCOL_VERSION, System, SystemService, application_version,
-        required_env,
     };
     use sovereign_config_proto::sovereign::config::v1::GetVersionRequest;
     use tonic::Request;
 
     #[test]
-    fn required_env_rejects_missing_values() {
-        assert!(required_env("SOVEREIGN_CONFIG_TEST_UNSET_6F63A8D9").is_err());
-    }
-
-    #[test]
     fn configured_release_version_overrides_cargo_version() {
-        assert_eq!(application_version(Some("1.1.42")), "1.1.42");
+        assert_eq!(application_version(Some("1.2.42")), "1.2.42");
         assert_eq!(application_version(None), env!("CARGO_PKG_VERSION"));
         assert_eq!(application_version(Some("")), env!("CARGO_PKG_VERSION"));
     }
