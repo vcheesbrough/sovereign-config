@@ -86,7 +86,17 @@ Surface findings to the user and use the pull request comment loop for every res
 
 ---
 
-## 6. Repository safety
+## 6. Automated coverage for every iteration
+
+- Every iteration must add or update automated tests for all behavior it adds or changes wherever practical. Passing pre-existing tests is not sufficient when the changed behavior is not directly asserted.
+- Put coverage at the lowest responsible layer and add integration or end-to-end coverage when behavior crosses a process, protocol, authentication, persistence, deployment, browser, or other user-visible boundary.
+- Cover relevant success, rejection, failure, security, redaction, compatibility, and lifecycle paths introduced or changed by the iteration. Bug fixes require a regression test when the failure can be reproduced deterministically.
+- Deliver tests in the same iteration and pull request as the behavior. Do not defer ordinary coverage to a later card.
+- When automated coverage is genuinely impractical, record the exact uncovered behavior, the concrete reason, and the narrowest feasible manual or external validation in the active card and pull request. Never omit coverage silently.
+
+---
+
+## 7. Repository safety
 
 - Do not revert user changes or use destructive Git commands unless explicitly instructed.
 - Keep changes scoped to the active card and preserve unrelated worktree changes.
