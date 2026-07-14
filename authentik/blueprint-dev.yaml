@@ -1,0 +1,74 @@
+version: 1
+metadata:
+  name: sovereign-config development OIDC
+  labels:
+    blueprints.goauthentik.io/description: "Sovereign Config development OAuth2 providers, application, and grant scope"
+
+entries:
+  - model: authentik_providers_oauth2.scopemapping
+    state: present
+    identifiers:
+      name: sovereign-config grants
+    attrs:
+      name: sovereign-config grants
+      scope_name: sovereign-config
+      description: "Sovereign Config path grants"
+      expression: |
+        grants = []
+        attribute_sets = [request.user.attributes]
+        attribute_sets.extend(group.attributes for group in request.user.ak_groups.all())
+        for attributes in attribute_sets:
+            for grant in attributes.get("sovereign_config_grants", []):
+                if grant not in grants:
+                    grants.append(grant)
+        return {"sovereign_config_grants": grants}
+
+  - model: authentik_providers_oauth2.oauth2provider
+    state: present
+    identifiers:
+      name: sovereign-config-introspection-dev
+    attrs:
+      name: sovereign-config-introspection-dev
+      client_id: sovereign-config-introspection-dev
+      client_secret: ${AUTHENTIK_SOVEREIGN_CONFIG_DEV_INTROSPECTION_CLIENT_SECRET}
+      client_type: confidential
+      redirect_uris: []
+      signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      issuer_mode: per_provider
+      sub_mode: hashed_user_id
+
+  - model: authentik_providers_oauth2.oauth2provider
+    state: present
+    identifiers:
+      name: sovereign-config-dev
+    attrs:
+      name: sovereign-config-dev
+      client_id: sovereign-config-dev
+      client_type: public
+      redirect_uris:
+        - url: ${SOVEREIGN_CONFIG_DEV_OIDC_REDIRECT_URI}
+          matching_mode: strict
+      access_token_validity: minutes=5
+      refresh_token_validity: hours=8
+      signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      issuer_mode: per_provider
+      sub_mode: hashed_user_id
+      property_mappings:
+        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, openid]]
+        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, offline_access]]
+        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, sovereign-config]]
+      jwt_federation_providers:
+        - !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config-introspection-dev]]
+
+  - model: authentik_core.application
+    state: present
+    identifiers:
+      slug: sovereign-config-dev
+    attrs:
+      name: Sovereign Config (development)
+      slug: sovereign-config-dev
+      provider: !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config-dev]]
