@@ -22,6 +22,9 @@ use web_sys::{
 
 const STATE_KEY: &str = "sovereign-config.pkce-state";
 const VERIFIER_KEY: &str = "sovereign-config.pkce-verifier";
+const REFRESH_TOKEN_KEY: &str = "sovereign-config.refresh-token";
+const REFRESH_ENDPOINT_KEY: &str = "sovereign-config.refresh-endpoint";
+const REFRESH_EXPIRES_KEY: &str = "sovereign-config.refresh-expires-at";
 const REFRESH_LIFETIME_MS: f64 = 8.0 * 60.0 * 60.0 * 1000.0;
 
 thread_local! {
@@ -67,6 +70,7 @@ impl AccessTokenProvider for MemoryAuthentication {
         match refresh_tokens(&self.client_id, &tokens).await {
             Ok(refreshed) => {
                 let access_token = refreshed.access_token.clone();
+                persist_refresh_token(&refreshed);
                 TOKENS.with_borrow_mut(|slot| *slot = Some(refreshed));
                 Ok(Some(access_token))
             }
@@ -74,7 +78,10 @@ impl AccessTokenProvider for MemoryAuthentication {
                 TOKENS.with_borrow_mut(|slot| *slot = Some(tokens));
                 Err(error)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                clear_persisted_refresh_token();
+                Err(error)
+            }
         }
     }
 }
@@ -115,6 +122,7 @@ pub fn start() {
     spawn_local(async {
         match app_config() {
             Ok(config) => {
+                restore_tokens();
                 let callback_error =
                     if location_search().is_some_and(|search| search.contains("code=")) {
                         finish_login(&config).await.err()
@@ -170,6 +178,7 @@ fn install_actions() {
     if let Some(logout) = document.get_element_by_id("logout") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: web_sys::Event| {
             TOKENS.with_borrow_mut(|token| *token = None);
+            clear_persisted_refresh_token();
             set_text("auth-value", "Logged out");
             set_hidden("login", false);
             set_hidden("logout", true);
@@ -316,6 +325,11 @@ async fn finish_login(config: &AppConfig) -> Result<(), ClientError> {
     let refresh_token = string_property(&json, "refresh_token")?;
     let expires_in = expires_in(&json);
     let now = Date::now();
+    persist_refresh_token_from_parts(
+        &refresh_token,
+        &discovery.token_endpoint,
+        now + REFRESH_LIFETIME_MS,
+    );
     TOKENS.with_borrow_mut(|token| {
         *token = Some(MemoryTokens {
             access_token: Secret::new(access_token),
@@ -331,6 +345,60 @@ async fn finish_login(config: &AppConfig) -> Result<(), ClientError> {
         .map_err(|_| browser_error())?
         .replace_state_with_url(&JsValue::NULL, "", Some("/"))
         .map_err(|_| browser_error())
+}
+
+fn restore_tokens() {
+    let Ok(storage) = session_storage() else {
+        return;
+    };
+    let (Some(refresh_token), Some(token_endpoint), Some(expires_at)) = (
+        storage.get_item(REFRESH_TOKEN_KEY).ok().flatten(),
+        storage.get_item(REFRESH_ENDPOINT_KEY).ok().flatten(),
+        storage
+            .get_item(REFRESH_EXPIRES_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<f64>().ok()),
+    ) else {
+        return;
+    };
+    if Date::now() >= expires_at {
+        clear_persisted_refresh_token();
+        return;
+    }
+    TOKENS.with_borrow_mut(|slot| {
+        *slot = Some(MemoryTokens {
+            access_token: Secret::new(String::new()),
+            refresh_token: Secret::new(refresh_token),
+            access_expires_at_ms: 0.0,
+            refresh_expires_at_ms: expires_at,
+            token_endpoint,
+        });
+    });
+}
+
+fn persist_refresh_token(tokens: &MemoryTokens) {
+    persist_refresh_token_from_parts(
+        tokens.refresh_token.expose(),
+        &tokens.token_endpoint,
+        tokens.refresh_expires_at_ms,
+    );
+}
+
+fn persist_refresh_token_from_parts(token: &str, endpoint: &str, expires_at: f64) {
+    if let Ok(storage) = session_storage() {
+        let _ = storage.set_item(REFRESH_TOKEN_KEY, token);
+        let _ = storage.set_item(REFRESH_ENDPOINT_KEY, endpoint);
+        let _ = storage.set_item(REFRESH_EXPIRES_KEY, &expires_at.to_string());
+    }
+}
+
+fn clear_persisted_refresh_token() {
+    if let Ok(storage) = session_storage() {
+        let _ = storage.remove_item(REFRESH_TOKEN_KEY);
+        let _ = storage.remove_item(REFRESH_ENDPOINT_KEY);
+        let _ = storage.remove_item(REFRESH_EXPIRES_KEY);
+    }
 }
 
 async fn refresh_tokens(
