@@ -22,14 +22,18 @@ use web_sys::{
 
 const STATE_KEY: &str = "sovereign-config.pkce-state";
 const VERIFIER_KEY: &str = "sovereign-config.pkce-verifier";
+const REFRESH_LIFETIME_MS: f64 = 8.0 * 60.0 * 60.0 * 1000.0;
 
 thread_local! {
-    static ACCESS_TOKEN: RefCell<Option<MemoryToken>> = const { RefCell::new(None) };
+    static TOKENS: RefCell<Option<MemoryTokens>> = const { RefCell::new(None) };
 }
 
-struct MemoryToken {
-    token: Secret,
-    expires_at_ms: f64,
+struct MemoryTokens {
+    access_token: Secret,
+    refresh_token: Secret,
+    access_expires_at_ms: f64,
+    refresh_expires_at_ms: f64,
+    token_endpoint: String,
 }
 
 #[derive(Clone)]
@@ -41,20 +45,37 @@ struct AppConfig {
 #[derive(Clone, Copy)]
 struct BrowserTransport;
 
-struct MemoryAuthentication;
+struct MemoryAuthentication {
+    client_id: String,
+}
 
 #[async_trait(?Send)]
 impl AccessTokenProvider for MemoryAuthentication {
     async fn access_token(&self) -> Result<Option<Secret>, ClientError> {
-        ACCESS_TOKEN.with_borrow_mut(|token| {
-            if token
-                .as_ref()
-                .is_some_and(|token| Date::now() >= token.expires_at_ms)
-            {
-                *token = None;
+        let Some(tokens) = TOKENS.with_borrow_mut(Option::take) else {
+            return Ok(None);
+        };
+        let now = Date::now();
+        if now < tokens.access_expires_at_ms {
+            let access_token = tokens.access_token.clone();
+            TOKENS.with_borrow_mut(|slot| *slot = Some(tokens));
+            return Ok(Some(access_token));
+        }
+        if now >= tokens.refresh_expires_at_ms {
+            return Ok(None);
+        }
+        match refresh_tokens(&self.client_id, &tokens).await {
+            Ok(refreshed) => {
+                let access_token = refreshed.access_token.clone();
+                TOKENS.with_borrow_mut(|slot| *slot = Some(refreshed));
+                Ok(Some(access_token))
             }
-            Ok(token.as_ref().map(|token| token.token.clone()))
-        })
+            Err(error) if error.kind == ErrorKind::Unavailable => {
+                TOKENS.with_borrow_mut(|slot| *slot = Some(tokens));
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -94,12 +115,16 @@ pub fn start() {
     spawn_local(async {
         match app_config() {
             Ok(config) => {
-                if location_search().is_some_and(|search| search.contains("code="))
-                    && let Err(error) = finish_login(&config).await
-                {
+                let callback_error =
+                    if location_search().is_some_and(|search| search.contains("code=")) {
+                        finish_login(&config).await.err()
+                    } else {
+                        None
+                    };
+                refresh_status(&config).await;
+                if let Some(error) = callback_error {
                     show_error(error.message());
                 }
-                refresh_status(&config).await;
             }
             Err(error) => show_error(error.message()),
         }
@@ -128,7 +153,7 @@ fn install_actions() {
     }
     if let Some(logout) = document.get_element_by_id("logout") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: web_sys::Event| {
-            ACCESS_TOKEN.with_borrow_mut(|token| *token = None);
+            TOKENS.with_borrow_mut(|token| *token = None);
             set_text("auth-value", "Logged out");
             set_hidden("login", false);
             set_hidden("logout", true);
@@ -139,9 +164,14 @@ fn install_actions() {
     }
 }
 
-async fn refresh_status(_: &AppConfig) {
+async fn refresh_status(config: &AppConfig) {
     clear_error();
-    let client = Client::new(BrowserTransport, MemoryAuthentication);
+    let client = Client::new(
+        BrowserTransport,
+        MemoryAuthentication {
+            client_id: config.client_id.clone(),
+        },
+    );
     match client.service_status().await {
         Ok(status) => {
             set_text("service-value", "Available");
@@ -160,10 +190,22 @@ async fn refresh_status(_: &AppConfig) {
             set_hidden("logout", false);
             focus("auth-heading");
         }
-        Ok(_) | Err(_) => {
+        Ok(_) => {
             set_text("auth-value", "Logged out");
             set_hidden("login", false);
             set_hidden("logout", true);
+        }
+        Err(error) if error.kind == ErrorKind::Unauthenticated => {
+            set_text("auth-value", "Logged out");
+            set_hidden("login", false);
+            set_hidden("logout", true);
+            show_error(error.message());
+        }
+        Err(error) => {
+            set_text("auth-value", "Unavailable");
+            set_hidden("login", true);
+            set_hidden("logout", false);
+            show_error(error.message());
         }
     }
 }
@@ -187,7 +229,7 @@ async fn begin_login(config: &AppConfig) -> Result<(), ClientError> {
         ("response_type", "code"),
         ("client_id", config.client_id.as_str()),
         ("redirect_uri", redirect_uri.as_str()),
-        ("scope", "openid sovereign-config"),
+        ("scope", "openid sovereign-config offline_access"),
         ("state", state.as_str()),
         ("code_challenge", challenge.as_str()),
         ("code_challenge_method", "S256"),
@@ -255,14 +297,16 @@ async fn finish_login(config: &AppConfig) -> Result<(), ClientError> {
         .await
         .map_err(|_| oidc_error())?;
     let access_token = string_property(&json, "access_token")?;
-    let expires_in = Reflect::get(&json, &JsValue::from_str("expires_in"))
-        .ok()
-        .and_then(|value| value.as_f64())
-        .unwrap_or(300.0);
-    ACCESS_TOKEN.with_borrow_mut(|token| {
-        *token = Some(MemoryToken {
-            token: Secret::new(access_token),
-            expires_at_ms: Date::now() + expires_in * 1000.0,
+    let refresh_token = string_property(&json, "refresh_token")?;
+    let expires_in = expires_in(&json);
+    let now = Date::now();
+    TOKENS.with_borrow_mut(|token| {
+        *token = Some(MemoryTokens {
+            access_token: Secret::new(access_token),
+            refresh_token: Secret::new(refresh_token),
+            access_expires_at_ms: now + expires_in * 1000.0,
+            refresh_expires_at_ms: now + REFRESH_LIFETIME_MS,
+            token_endpoint: discovery.token_endpoint,
         });
     });
     let window = window().ok_or_else(browser_error)?;
@@ -271,6 +315,54 @@ async fn finish_login(config: &AppConfig) -> Result<(), ClientError> {
         .map_err(|_| browser_error())?
         .replace_state_with_url(&JsValue::NULL, "", Some("/"))
         .map_err(|_| browser_error())
+}
+
+async fn refresh_tokens(
+    client_id: &str,
+    current: &MemoryTokens,
+) -> Result<MemoryTokens, ClientError> {
+    let form = UrlSearchParams::new().map_err(|_| browser_error())?;
+    for (name, value) in [
+        ("grant_type", "refresh_token"),
+        ("client_id", client_id),
+        ("refresh_token", current.refresh_token.expose()),
+    ] {
+        form.append(name, value);
+    }
+    let response = fetch(
+        &current.token_endpoint,
+        "POST",
+        Some(form.to_string().into()),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await?;
+    if !response.ok() {
+        return Err(ClientError::new(
+            ErrorKind::Unauthenticated,
+            "login has expired",
+        ));
+    }
+    let json = JsFuture::from(response.json().map_err(|_| oidc_error())?)
+        .await
+        .map_err(|_| oidc_error())?;
+    let access_token = string_property(&json, "access_token")?;
+    let refresh_token = string_property(&json, "refresh_token")?;
+    Ok(MemoryTokens {
+        access_token: Secret::new(access_token),
+        refresh_token: Secret::new(refresh_token),
+        access_expires_at_ms: Date::now() + expires_in(&json) * 1000.0,
+        refresh_expires_at_ms: current.refresh_expires_at_ms,
+        token_endpoint: current.token_endpoint.clone(),
+    })
+}
+
+fn expires_in(json: &JsValue) -> f64 {
+    Reflect::get(json, &JsValue::from_str("expires_in"))
+        .ok()
+        .and_then(|value| value.as_f64())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(300.0)
+        .min(300.0)
 }
 
 struct Discovery {

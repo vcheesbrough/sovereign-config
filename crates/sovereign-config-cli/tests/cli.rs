@@ -265,7 +265,7 @@ async fn device_authorization(
     State(state): State<Arc<OidcState>>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    if form.get("client_id").map(String::as_str) != Some("sovereign-config-cli")
+    if form.get("client_id").map(String::as_str) != Some("sovereign-config")
         || form.get("scope").map(String::as_str) != Some("openid sovereign-config offline_access")
     {
         return (
