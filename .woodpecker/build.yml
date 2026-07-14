@@ -78,8 +78,7 @@ steps:
     pull: true
     image: ghcr.io/vcheesbrough/woodpecker-plugin-authentik-blueprint:v0.2.0@sha256:9f262c4390205b5629e9af7560f4e492f0155395a429153703ba351206d9d975
     settings:
-      api_url:
-        from_secret: authentik_api_url
+      api_url: https://auth.desync.link
       api_token:
         from_secret: authentik_api_token
       file: authentik/blueprint-dev.yaml
