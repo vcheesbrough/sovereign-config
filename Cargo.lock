@@ -2659,6 +2659,7 @@ dependencies = [
  "sovereign-config-core",
  "sovereign-config-proto",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 

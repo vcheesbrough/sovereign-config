@@ -22,6 +22,7 @@ tonic = { workspace = true, features = ["tls", "transport"] }
 
 [dev-dependencies]
 axum.workspace = true
+tokio-stream = { version = "0.1.18", features = ["net"] }
 
 [lints]
 workspace = true

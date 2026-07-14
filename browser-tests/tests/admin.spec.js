@@ -1,6 +1,7 @@
 const { test, expect } = require('@playwright/test');
 const AxeBuilder = require('@axe-core/playwright').default;
 const path = require('node:path');
+const transportContract = require('../../test-contracts/transport.json');
 
 const configScript = 'globalThis.SOVEREIGN_CONFIG={issuer:"https://auth.example.test/application/o/sovereign-config/",clientId:"sovereign-config"};';
 const tokenEndpoint = 'https://auth.example.test/application/o/token/';
@@ -46,11 +47,27 @@ async function mockDiscovery(page) {
   }));
 }
 
-async function openCallback(page, refreshResult = 'success', state = 'expected-state') {
-  await page.addInitScript(() => {
+async function openCallback(
+  page,
+  refreshResult = 'success',
+  state = 'expected-state',
+  identityStatus = 0,
+  expireRefresh = false
+) {
+  await page.addInitScript(({ expireRefresh }) => {
     sessionStorage.setItem('sovereign-config.pkce-state', 'expected-state');
     sessionStorage.setItem('sovereign-config.pkce-verifier', 'test-verifier');
-  });
+    if (expireRefresh) {
+      let now = Date.now();
+      Date.now = () => now;
+      const replaceState = history.replaceState.bind(history);
+      history.replaceState = (...args) => {
+        const result = replaceState(...args);
+        now += 8 * 60 * 60 * 1000 + 1;
+        return result;
+      };
+    }
+  }, { expireRefresh });
   await mockDiscovery(page);
   await page.route('**/auth/callback?*', route => route.fulfill({
     contentType: 'text/html',
@@ -94,10 +111,11 @@ async function openCallback(page, refreshResult = 'success', state = 'expected-s
   });
   await page.route('**/sovereign.config.v1.System/GetIdentity', route => {
     const authorized = route.request().headers().authorization === 'Bearer access-token-two';
+    const status = authorized ? identityStatus : 16;
     return route.fulfill({
       status: 200,
       headers: { 'content-type': 'application/grpc-web+proto' },
-      body: grpcFrame(authorized ? Buffer.from([0x08, 0x01]) : Buffer.alloc(0), authorized ? 0 : 16)
+      body: grpcFrame(status === 0 ? Buffer.from([0x08, 0x01]) : Buffer.alloc(0), status)
     });
   });
   await page.goto(`/auth/callback?code=test-code&state=${state}`);
@@ -173,6 +191,15 @@ test('refresh outage does not reuse an expired access token', async ({ page }) =
   await expect(page.getByRole('button', { name: 'Log out' })).toBeVisible();
 });
 
+test('absolute refresh expiry clears the browser session without a token request', async ({ page }) => {
+  const requests = await openCallback(page, 'success', 'expected-state', 0, true);
+  await expect(page.getByText('Logged out')).toBeVisible();
+  await expect(page.getByText('authentication required')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Log in' })).toBeVisible();
+  expect(requests).toHaveLength(1);
+  expect(requests[0].grant_type).toBe('authorization_code');
+});
+
 test('keyboard logout clears the in-memory session and restores focus', async ({ page }) => {
   await openCallback(page);
   const logout = page.getByRole('button', { name: 'Log out' });
@@ -196,3 +223,16 @@ test('reload starts logged out without recovering either token', async ({ page }
   await page.reload();
   await expect(page.getByText('Logged out')).toBeVisible();
 });
+
+for (const contract of transportContract) {
+  test(`browser transport maps gRPC status ${contract.grpc_status}`, async ({ page }) => {
+    await openCallback(page, 'success', 'expected-state', contract.grpc_status);
+    if (contract.grpc_status === 0) {
+      await expect(page.getByText('Logged in')).toBeVisible();
+      return;
+    }
+    await expect(page.getByText(contract.message, { exact: true })).toBeVisible();
+    const authentication = contract.grpc_status === 16 ? 'Logged out' : 'Unavailable';
+    await expect(page.getByText(authentication, { exact: true })).toBeVisible();
+  });
+}
