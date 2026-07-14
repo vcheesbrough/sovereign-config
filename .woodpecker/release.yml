@@ -31,7 +31,7 @@ steps:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     commands:
-      - docker run --rm --platform linux/amd64 -v "$$CI_WORKSPACE/dist:/dist:ro" docker.io/library/debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df /dist/sovereign-config-linux-amd64 --version
+      - docker run --rm --platform linux/amd64 -i docker.io/library/debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df sh -c 'cat > /tmp/sovereign-config && chmod +x /tmp/sovereign-config && /tmp/sovereign-config --version' < dist/sovereign-config-linux-amd64
 
   publish-cli-release:
     depends_on:
