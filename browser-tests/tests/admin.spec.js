@@ -224,11 +224,12 @@ test('callback rejects a mismatched state without exchanging the code', async ({
   expect(requests).toHaveLength(0);
 });
 
-test('reload starts logged out without recovering either token', async ({ page }) => {
+test('reload restores the session with a rotated refresh token', async ({ page }) => {
   await openCallback(page);
   await expect(page.getByText('Logged in')).toBeVisible();
+  await page.evaluate(() => sessionStorage.setItem('sovereign-config.refresh-token', 'refresh-token-two'));
   await page.reload();
-  await expect(page.getByText('Logged out')).toBeVisible();
+  await expect(page.getByText('Logged in')).toBeVisible();
 });
 
 for (const contract of transportContract) {
