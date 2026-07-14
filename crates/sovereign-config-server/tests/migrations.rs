@@ -49,7 +49,25 @@ async fn migrations_are_repeatable_against_postgresql() {
         .fetch_one(&pool)
         .await
         .expect("migrated schema must be readable");
+    let authorization_tables: i64 = sqlx::query_scalar(
+        r"
+        SELECT COUNT(*)
+        FROM information_schema.tables
+        WHERE table_schema = current_schema()
+          AND (
+            table_name LIKE '%acl%'
+            OR table_name LIKE '%grant%'
+            OR table_name LIKE '%token%'
+            OR table_name LIKE '%session%'
+            OR table_name LIKE '%audit%'
+          )
+        ",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("authorization table inventory must be readable");
 
     assert_eq!(applied_migrations, 1);
     assert_eq!(metadata_rows, 1);
+    assert_eq!(authorization_tables, 0);
 }
