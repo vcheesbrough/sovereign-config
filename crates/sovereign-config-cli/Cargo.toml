@@ -21,5 +21,13 @@ sovereign-config-core = { path = "../sovereign-config-core" }
 sovereign-config-native = { path = "../sovereign-config-native" }
 tokio.workspace = true
 
+[dev-dependencies]
+axum.workspace = true
+serde_json.workspace = true
+sovereign-config-proto = { path = "../sovereign-config-proto" }
+tempfile = "3.27.0"
+tonic = { version = "0.12.3", features = ["transport"] }
+tokio-stream = { version = "0.1.18", features = ["net"] }
+
 [lints]
 workspace = true
