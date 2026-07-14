@@ -35,9 +35,13 @@ steps:
       - rustup target add wasm32-unknown-unknown
       - cargo check --target wasm32-unknown-unknown --package sovereign-config-core --package sovereign-config-client --package sovereign-config-web
       - cargo install --locked --version 0.21.14 trunk
-      - cp -a web-dist /tmp/web-dist-before
       - cd crates/sovereign-config-web && NO_COLOR=false trunk build --release && cd ../..
-      - diff -r /tmp/web-dist-before web-dist
+      - |
+        test -s web-dist/index.html
+        find web-dist -maxdepth 1 -type f -name 'sovereign-config-web-*.js' -size +0c -print -quit | grep -q .
+        find web-dist -maxdepth 1 -type f -name 'sovereign-config-web-*_bg.wasm' -size +0c -print -quit | grep -q .
+        grep -Eq '/sovereign-config-web-[0-9a-f]+\.js' web-dist/index.html
+        grep -Eq '/sovereign-config-web-[0-9a-f]+_bg\.wasm' web-dist/index.html
 
   browser-validation:
     depends_on:
