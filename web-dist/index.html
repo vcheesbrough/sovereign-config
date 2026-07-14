@@ -9,8 +9,8 @@
     <script src="/app-config.js"></script>
     
 <script type="module">
-import init, * as bindings from '/sovereign-config-web-81ecc6cc61cfb45d.js';
-const wasm = await init({ module_or_path: '/sovereign-config-web-81ecc6cc61cfb45d_bg.wasm' });
+import init, * as bindings from '/sovereign-config-web-ee2be8d9fd59e264.js';
+const wasm = await init({ module_or_path: '/sovereign-config-web-ee2be8d9fd59e264_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -19,17 +19,17 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-  <link rel="modulepreload" href="/sovereign-config-web-81ecc6cc61cfb45d.js" crossorigin="anonymous" integrity="sha384-KG6LlYhak7dmo9EP3sItfqmPksxd0KZHBV11sZ+jszQo8wCHwlReFs+pTgFm61+n"><link rel="preload" href="/sovereign-config-web-81ecc6cc61cfb45d_bg.wasm" crossorigin="anonymous" integrity="sha384-t2QHMsdND3B2LPD2qSkXHtNUeGrKLZ89EYnvSPeMNV0G3NUZbgboAGnaL24vnzOf" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/sovereign-config-web-ee2be8d9fd59e264.js" crossorigin="anonymous" integrity="sha384-t4gnSoaksQ4vxBihUTAIU8UC43MHJfwQtv8dmmMxdKY69WnExKfzvRNU+HMM8nh2"><link rel="preload" href="/sovereign-config-web-ee2be8d9fd59e264_bg.wasm" crossorigin="anonymous" integrity="sha384-0tc4sI+xrPocAr4Y75G9O87aHsfADvV+Gvt/nLSwGuVDOhQvNRLAOUzuKuAngpuS" as="fetch" type="application/wasm"></head>
   <body>
     <header>
-      <a class="brand" href="/" aria-label="Sovereign Config home">
+      <a id="brand-link" class="brand" href="/" aria-label="Sovereign Config home">
         <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
         <span>Sovereign Config</span>
       </a>
     </header>
     <div class="layout">
       <nav aria-label="Administration">
-        <a class="active" href="/">System status</a>
+        <a id="system-status-link" class="active" href="/">System status</a>
       </nav>
       <main id="main">
         <div class="page-heading">
