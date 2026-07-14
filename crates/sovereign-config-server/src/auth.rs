@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use http::{HeaderMap, Request, Response, header::AUTHORIZATION};
+use http::{HeaderMap, Method, Request, Response, header::AUTHORIZATION};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use sovereign_config_core::ConfigPath;
@@ -341,6 +341,10 @@ fn is_operational_rpc(path: &str) -> bool {
     OPERATIONAL_RPCS.contains(&path)
 }
 
+fn is_web_asset_request(method: &Method, path: &str) -> bool {
+    matches!(*method, Method::GET | Method::HEAD) && !is_operational_rpc(path)
+}
+
 #[derive(Clone)]
 pub(crate) struct AuthenticationLayer {
     authenticator: Authenticator,
@@ -393,7 +397,9 @@ where
     fn call(&mut self, mut request: Request<B>) -> Self::Future {
         let replacement = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, replacement);
-        if is_operational_rpc(request.uri().path()) {
+        if is_web_asset_request(request.method(), request.uri().path())
+            || is_operational_rpc(request.uri().path())
+        {
             return Box::pin(async move { inner.call(request).await });
         }
 
@@ -445,7 +451,7 @@ mod tests {
         Engine as _,
         engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     };
-    use http::{HeaderMap, HeaderValue, Request, Response, header::AUTHORIZATION};
+    use http::{HeaderMap, HeaderValue, Method, Request, Response, header::AUTHORIZATION};
     use reqwest::Url;
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, task::JoinHandle, time::sleep};
@@ -454,8 +460,8 @@ mod tests {
 
     use super::{
         AuthenticatedPrincipal, AuthenticationLayer, Authenticator, IntrospectionResponse,
-        Permission, bearer_token, is_canonical_prefix, is_operational_rpc, require_rs256,
-        validate_introspection,
+        Permission, bearer_token, is_canonical_prefix, is_operational_rpc, is_web_asset_request,
+        require_rs256, validate_introspection,
     };
     use crate::{config::AuthenticationConfig, metrics::AuthenticationMetrics};
 
@@ -771,6 +777,20 @@ mod tests {
         assert!(!is_operational_rpc("/grpc.health.v1.Health/Unknown"));
         assert!(!is_operational_rpc(
             "/sovereign.config.v1.Configuration/GetValue"
+        ));
+    }
+
+    #[test]
+    fn browser_asset_requests_do_not_require_authentication() {
+        assert!(is_web_asset_request(&Method::GET, "/"));
+        assert!(is_web_asset_request(&Method::HEAD, "/app-config.js"));
+        assert!(!is_web_asset_request(
+            &Method::POST,
+            "/sovereign.config.v1.System/GetIdentity"
+        ));
+        assert!(!is_web_asset_request(
+            &Method::GET,
+            "/sovereign.config.v1.System/GetVersion"
         ));
     }
 
