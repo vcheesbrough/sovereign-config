@@ -877,6 +877,7 @@ mod tests {
         assert_eq!(server.state.calls.load(Ordering::Relaxed), 0);
 
         let mut protected = Request::builder()
+            .method(Method::POST)
             .uri("/protected.Service/Call")
             .body(())
             .unwrap();
@@ -886,6 +887,7 @@ mod tests {
         assert_eq!(server.state.calls.load(Ordering::Relaxed), 1);
 
         let unknown = Request::builder()
+            .method(Method::POST)
             .uri("/grpc.health.v1.Health/Unknown")
             .body(())
             .unwrap();
