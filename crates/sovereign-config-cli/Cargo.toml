@@ -1,0 +1,25 @@
+[package]
+name = "sovereign-config-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "First-party Sovereign Config command-line client"
+build = "build.rs"
+
+[[bin]]
+name = "sovereign-config"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+sovereign-config-client = { path = "../sovereign-config-client" }
+sovereign-config-core = { path = "../sovereign-config-core" }
+sovereign-config-native = { path = "../sovereign-config-native" }
+tokio.workspace = true
+
+[lints]
+workspace = true

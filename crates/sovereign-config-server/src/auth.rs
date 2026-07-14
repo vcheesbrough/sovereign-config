@@ -11,12 +11,13 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{HeaderMap, Request, Response, header::AUTHORIZATION};
 use reqwest::{Client, Url};
 use serde::Deserialize;
+use sovereign_config_core::ConfigPath;
 use tonic::{Status, body::BoxBody};
 use tower::{Layer, Service};
 use tracing::{info, warn};
 
 use crate::{
-    config::AuthenticationConfig,
+    config::{AcceptedIdentity, AuthenticationConfig},
     metrics::{AuthenticationMetrics, AuthenticationResult},
 };
 
@@ -32,8 +33,7 @@ const OPERATIONAL_RPCS: [&str; 3] = [
 pub(crate) struct Authenticator {
     client: Client,
     introspection_url: Url,
-    issuer: String,
-    audience: String,
+    accepted_identities: Vec<AcceptedIdentity>,
     introspection_client_id: String,
     introspection_client_secret: String,
 }
@@ -115,8 +115,7 @@ impl Authenticator {
         Ok(Self {
             client,
             introspection_url: config.introspection_url,
-            issuer: config.issuer,
-            audience: config.audience,
+            accepted_identities: config.accepted_identities,
             introspection_client_id: config.introspection_client_id,
             introspection_client_secret: config.introspection_client_secret,
         })
@@ -147,7 +146,7 @@ impl Authenticator {
         let response = read_bounded_response(response).await?;
         let response: IntrospectionResponse =
             serde_json::from_slice(&response).map_err(|_| AuthenticationFailure::unavailable())?;
-        validate_introspection(response, &self.issuer, &self.audience)
+        validate_introspection_for_any(response, &self.accepted_identities)
     }
 }
 
@@ -236,22 +235,38 @@ fn require_rs256(token: &str) -> Result<(), AuthenticationFailure> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_introspection(
     response: IntrospectionResponse,
     expected_issuer: &str,
     expected_audience: &str,
+) -> Result<AuthenticatedPrincipal, AuthenticationFailure> {
+    validate_introspection_for_any(
+        response,
+        &[AcceptedIdentity {
+            issuer: expected_issuer.to_owned(),
+            audience: expected_audience.to_owned(),
+        }],
+    )
+}
+
+fn validate_introspection_for_any(
+    response: IntrospectionResponse,
+    accepted_identities: &[AcceptedIdentity],
 ) -> Result<AuthenticatedPrincipal, AuthenticationFailure> {
     if !response.active {
         return Err(AuthenticationFailure::unauthenticated(
             AuthenticationResult::Inactive,
         ));
     }
-    let valid_claims = response.iss.as_ref().and_then(serde_json::Value::as_str)
-        == Some(expected_issuer)
-        && response
-            .aud
-            .as_ref()
-            .is_some_and(|audience| audience_contains(audience, expected_audience))
+    let valid_identity = accepted_identities.iter().any(|identity| {
+        response.iss.as_ref().and_then(serde_json::Value::as_str) == Some(&identity.issuer)
+            && response
+                .aud
+                .as_ref()
+                .is_some_and(|audience| audience_contains(audience, &identity.audience))
+    });
+    let valid_claims = valid_identity
         && response
             .scope
             .as_ref()
@@ -319,13 +334,7 @@ fn validate_grants(raw_grants: Vec<RawGrant>) -> Result<Vec<Grant>, Authenticati
 }
 
 fn is_canonical_prefix(prefix: &str) -> bool {
-    prefix.is_empty()
-        || prefix.split('/').all(|segment| {
-            !segment.is_empty()
-                && segment
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        })
+    ConfigPath::parse(prefix).is_ok()
 }
 
 fn is_operational_rpc(path: &str) -> bool {
@@ -538,8 +547,10 @@ mod tests {
     fn authenticator(url: Url, timeout: Duration) -> Authenticator {
         Authenticator::new(AuthenticationConfig {
             introspection_url: url,
-            issuer: "https://issuer.example/application/o/sovereign-config/".to_owned(),
-            audience: "sovereign-config".to_owned(),
+            accepted_identities: vec![crate::config::AcceptedIdentity {
+                issuer: "https://issuer.example/application/o/sovereign-config/".to_owned(),
+                audience: "sovereign-config".to_owned(),
+            }],
             introspection_client_id: TEST_CLIENT_ID.to_owned(),
             introspection_client_secret: TEST_CLIENT_SECRET.to_owned(),
             timeout,

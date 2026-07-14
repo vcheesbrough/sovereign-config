@@ -1,5 +1,6 @@
 # Step DAG: compute-version ∥ contract-validation ∥ compose-validation →
-# build-server → publish-dev-image → apply-authentik-blueprint-auto-dev →
+# browser-validation ∥ build-server → publish-dev-image →
+# validate-authentik-version → apply-authentik-blueprint-auto-dev →
 # auto-deploy-dev → tag-release-auto-dev.
 when:
   - event: [push, manual]
@@ -31,17 +32,31 @@ steps:
       - cargo clippy --workspace --all-targets -- -D warnings
       - cargo test --workspace
       - cargo test --package sovereign-config-server --test migrations -- --ignored
+      - cargo check --target wasm32-unknown-unknown --package sovereign-config-core --package sovereign-config-client --package sovereign-config-web
+      - cargo install --locked --version 0.21.14 trunk
+      - cd crates/sovereign-config-web && NO_COLOR=false trunk build --release && cd ../..
+      - git diff --exit-code -- web-dist
+
+  browser-validation:
+    depends_on:
+      - contract-validation
+    image: mcr.microsoft.com/playwright:v1.61.1-noble@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48
+    commands:
+      - cd browser-tests
+      - npm ci --ignore-scripts
+      - PLAYWRIGHT_STATIC=1 npm test
 
   compose-validation:
     depends_on: []
     image: docker.io/library/docker@sha256:862099ada15c669000bef53aa4cb9d821262829f45b0dda2159ccb276443043b
     commands:
-      - SOVEREIGN_CONFIG_IMAGE_TAG=validation SOVEREIGN_CONFIG_HOST=config.example.internal SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-validation SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL=https://auth.example.internal/application/o/introspect/ SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.example.internal/application/o/sovereign-config-dev/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection-dev POSTGRES_PASSWORD_FILE=/dev/null DATABASE_URL_FILE=/dev/null OIDC_INTROSPECTION_CLIENT_SECRET_FILE=/dev/null docker compose config -q
+      - SOVEREIGN_CONFIG_IMAGE_TAG=validation SOVEREIGN_CONFIG_HOST=config.example.internal SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-validation SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL=https://auth.example.internal/application/o/introspect/ SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.example.internal/application/o/sovereign-config-browser-dev/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-browser-dev SOVEREIGN_CONFIG_OIDC_BROWSER_CLIENT_ID=sovereign-config-browser-dev SOVEREIGN_CONFIG_OIDC_CLI_ISSUER=https://auth.example.internal/application/o/sovereign-config-cli-dev/ SOVEREIGN_CONFIG_OIDC_CLI_AUDIENCE=sovereign-config-cli-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection-dev POSTGRES_PASSWORD_FILE=/dev/null DATABASE_URL_FILE=/dev/null OIDC_INTROSPECTION_CLIENT_SECRET_FILE=/dev/null docker compose config -q
 
   build-server:
     depends_on:
       - compute-version
       - contract-validation
+      - browser-validation
       - compose-validation
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
@@ -74,7 +89,7 @@ steps:
 
   apply-authentik-blueprint-auto-dev:
     depends_on:
-      - publish-dev-image
+      - validate-authentik-version
     pull: true
     image: ghcr.io/vcheesbrough/woodpecker-plugin-authentik-blueprint:v0.2.0@sha256:9f262c4390205b5629e9af7560f4e492f0155395a429153703ba351206d9d975
     settings:
@@ -87,7 +102,25 @@ steps:
       vars:
         AUTHENTIK_SOVEREIGN_CONFIG_DEV_INTROSPECTION_CLIENT_SECRET:
           from_secret: sovereign_config_dev_oidc_introspection_client_secret
-        SOVEREIGN_CONFIG_DEV_OIDC_REDIRECT_URI: https://sovereign-config-dev.desync.link/auth/callback
+        SOVEREIGN_CONFIG_DEV_BROWSER_REDIRECT_URI: https://sovereign-config-dev.desync.link/auth/callback
+        AUTHENTIK_DEV_BRAND_DOMAIN: auth.desync.link
+
+  validate-authentik-version:
+    depends_on:
+      - publish-dev-image
+    image: docker.io/curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
+    environment:
+      AUTHENTIK_API_TOKEN:
+        from_secret: authentik_api_token
+    commands:
+      - |
+        umask 077
+        printf 'header = "Authorization: Bearer %s"\n' "$$AUTHENTIK_API_TOKEN" > /tmp/authentik-curl.conf
+        VERSION=$$(curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/admin/version/ | sed -n 's/.*"version_current":"\([^"]*\)".*/\1/p')
+        test -n "$$VERSION"
+        awk -v version="$$VERSION" 'BEGIN { split(version, part, "."); if (part[1] > 2026 || (part[1] == 2026 && part[2] > 5) || (part[1] == 2026 && part[2] == 5 && part[3] >= 2)) exit 0; exit 1 }'
+        curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/schema/ | grep -q 'grant_types'
+        echo "Validated compatible Authentik $$VERSION"
 
   auto-deploy-dev:
     depends_on:
@@ -105,7 +138,7 @@ steps:
     commands:
       - |
         ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
-        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL="$$OIDC_INTROSPECTION_URL" SOVEREIGN_CONFIG_OIDC_ISSUER="$$OIDC_ISSUER" SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET_FILE= SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET="$$OIDC_INTROSPECTION_CLIENT_SECRET" docker compose -p sovereign-config-dev up -d --wait --wait-timeout 90 || {
+        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL="$$OIDC_INTROSPECTION_URL" SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config-browser-dev/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-browser-dev SOVEREIGN_CONFIG_OIDC_BROWSER_CLIENT_ID=sovereign-config-browser-dev SOVEREIGN_CONFIG_OIDC_CLI_ISSUER=https://auth.desync.link/application/o/sovereign-config-cli-dev/ SOVEREIGN_CONFIG_OIDC_CLI_AUDIENCE=sovereign-config-cli-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET_FILE= SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET="$$OIDC_INTROSPECTION_CLIENT_SECRET" docker compose -p sovereign-config-dev up -d --wait --wait-timeout 90 || {
           docker compose -p sovereign-config-dev logs --tail 200
           exit 1
         }

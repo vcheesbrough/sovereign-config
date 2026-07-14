@@ -10,15 +10,26 @@ pub(crate) struct Config {
     pub(crate) grpc_addr: SocketAddr,
     pub(crate) metrics_addr: SocketAddr,
     pub(crate) authentication: AuthenticationConfig,
+    pub(crate) web: WebConfig,
+}
+
+pub(crate) struct WebConfig {
+    pub(crate) issuer: String,
+    pub(crate) client_id: String,
 }
 
 pub(crate) struct AuthenticationConfig {
     pub(crate) introspection_url: Url,
-    pub(crate) issuer: String,
-    pub(crate) audience: String,
+    pub(crate) accepted_identities: Vec<AcceptedIdentity>,
     pub(crate) introspection_client_id: String,
     pub(crate) introspection_client_secret: String,
     pub(crate) timeout: Duration,
+}
+
+#[derive(Clone)]
+pub(crate) struct AcceptedIdentity {
+    pub(crate) issuer: String,
+    pub(crate) audience: String,
 }
 
 impl Config {
@@ -45,6 +56,13 @@ impl Config {
             .context("SOVEREIGN_CONFIG_OIDC_ISSUER must be a valid URL")?;
         validate_issuer_url(&issuer_url)?;
         let audience = required_identifier("SOVEREIGN_CONFIG_OIDC_AUDIENCE")?;
+        let cli_issuer = required_env("SOVEREIGN_CONFIG_OIDC_CLI_ISSUER")?;
+        validate_issuer_url(
+            &cli_issuer
+                .parse::<Url>()
+                .context("SOVEREIGN_CONFIG_OIDC_CLI_ISSUER must be a valid URL")?,
+        )?;
+        let cli_audience = required_identifier("SOVEREIGN_CONFIG_OIDC_CLI_AUDIENCE")?;
         let introspection_client_id =
             required_identifier("SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID")?;
 
@@ -54,13 +72,25 @@ impl Config {
             metrics_addr,
             authentication: AuthenticationConfig {
                 introspection_url,
-                issuer,
-                audience,
+                accepted_identities: vec![
+                    AcceptedIdentity {
+                        issuer: issuer.clone(),
+                        audience,
+                    },
+                    AcceptedIdentity {
+                        issuer: cli_issuer,
+                        audience: cli_audience,
+                    },
+                ],
                 introspection_client_id,
                 introspection_client_secret: required_secret(
                     "SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET",
                 )?,
                 timeout: INTROSPECTION_TIMEOUT,
+            },
+            web: WebConfig {
+                issuer,
+                client_id: required_identifier("SOVEREIGN_CONFIG_OIDC_BROWSER_CLIENT_ID")?,
             },
         })
     }

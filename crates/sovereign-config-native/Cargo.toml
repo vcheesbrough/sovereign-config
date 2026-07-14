@@ -1,0 +1,27 @@
+[package]
+name = "sovereign-config-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+http.workspace = true
+keyring = { version = "3.6.3", default-features = false, features = ["crypto-rust", "linux-native-sync-persistent", "vendored"] }
+reqwest = { workspace = true, features = ["json"] }
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sovereign-config-client = { path = "../sovereign-config-client" }
+sovereign-config-core = { path = "../sovereign-config-core" }
+sovereign-config-proto = { path = "../sovereign-config-proto" }
+tokio.workspace = true
+tonic = { workspace = true, features = ["tls", "transport"] }
+
+[dev-dependencies]
+axum.workspace = true
+
+[lints]
+workspace = true

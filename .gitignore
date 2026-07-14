@@ -1,4 +1,6 @@
 /target/
+/browser-tests/node_modules/
+/browser-tests/test-results/
 .env
 .env.*
 !.env.example
