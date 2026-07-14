@@ -3,14 +3,14 @@
 FROM docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2 AS builder
 WORKDIR /src
 ARG RELEASE_VERSION
-COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
-COPY proto ./proto
-COPY web-dist ./web-dist
 RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=sovereign-config-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=sovereign-config-cargo-target,target=/src/target \
     cargo install --locked --version 0.21.14 trunk
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY proto ./proto
+COPY web-dist ./web-dist
 RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=sovereign-config-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=sovereign-config-cargo-target,target=/src/target \
