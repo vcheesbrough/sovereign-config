@@ -21,8 +21,11 @@ export POSTGRES_PASSWORD_SECRET_FILE="$HOME/.config/sovereign-config/postgres-pa
 export DATABASE_URL_FILE="$HOME/.config/sovereign-config/database-url"
 export OIDC_INTROSPECTION_CLIENT_SECRET_FILE="$HOME/.config/sovereign-config/oidc-introspection-client-secret"
 export SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL='https://<authentik-host>/application/o/introspect/'
-export SOVEREIGN_CONFIG_OIDC_ISSUER='https://<authentik-host>/application/o/sovereign-config/'
-export SOVEREIGN_CONFIG_OIDC_AUDIENCE='sovereign-config'
+export SOVEREIGN_CONFIG_OIDC_ISSUER='https://<authentik-host>/application/o/sovereign-config-browser/'
+export SOVEREIGN_CONFIG_OIDC_AUDIENCE='sovereign-config-browser'
+export SOVEREIGN_CONFIG_OIDC_BROWSER_CLIENT_ID='sovereign-config-browser'
+export SOVEREIGN_CONFIG_OIDC_CLI_ISSUER='https://<authentik-host>/application/o/sovereign-config-cli/'
+export SOVEREIGN_CONFIG_OIDC_CLI_AUDIENCE='sovereign-config-cli'
 export SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID='sovereign-config-introspection'
 docker compose up -d
 ```
@@ -36,18 +39,55 @@ The development deployment is verified by calling `System.GetVersion` through th
 Build release images only for linux/amd64 with `docker build --platform linux/amd64 --tag sovereign-config:local .`.
 Woodpecker reuses Cargo dependency and compilation caches across validation and server-image builds.
 
+The server embeds the fingerprinted Rust WASM administration application and serves it with gRPC-Web on the native gRPC listener. Browser assets, runtime OIDC configuration, and gRPC-Web use the service origin; the server sends no cross-origin API permission. The browser retains an access token only in WASM memory. Reload and expiry require a new PKCE login.
+
+## CLI
+
+The supported prebuilt CLI target is 64-bit Linux on Debian 12 or a distribution with glibc 2.36 or newer. Release CI records the ELF dependencies and rejects anything outside `libc`, `libgcc_s`, `libm`, `libdl`, `libpthread`, the ELF loader, and the virtual DSO. The Secret Service dependency is statically vendored. The CLI first uses the desktop credential store and falls back to `$XDG_CONFIG_HOME/sovereign-config/refresh-token` (or `~/.config/sovereign-config/refresh-token`) with user ownership and mode `0600`.
+
+Download the binary and checksum file from the matching GitHub release, then verify before installation:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+install -m 0755 sovereign-config-linux-amd64 "$HOME/.local/bin/sovereign-config"
+```
+
+Configure non-secret connection details and use device login:
+
+```sh
+export SOVEREIGN_CONFIG_ENDPOINT='https://config.example.internal'
+export SOVEREIGN_CONFIG_OIDC_ISSUER='https://auth.example.internal/application/o/sovereign-config-cli/'
+export SOVEREIGN_CONFIG_OIDC_CLI_CLIENT_ID='sovereign-config-cli'
+sovereign-config status
+sovereign-config login
+sovereign-config status
+sovereign-config logout
+```
+
+The CLI prints only the device verification URI and user code during login. Access tokens remain in process memory; refresh credentials never appear in arguments or command output. Each status operation refreshes credentials and performs fresh RPCs without response caching or automatic retry.
+
+The locked source-build fallback requires the Rust toolchain:
+
+```sh
+cargo install --locked --git https://github.com/vcheesbrough/sovereign-config --tag <version> sovereign-config-cli
+```
+
 ## Authentik
 
 The repository owns two isolated Authentik blueprints:
 
 | Environment | Blueprint | Application and issuer provider | Introspection provider | Audience |
 | --- | --- | --- | --- | --- |
-| Production | `authentik/blueprint.yaml` | `sovereign-config` | `sovereign-config-introspection` | `sovereign-config` |
-| Development | `authentik/blueprint-dev.yaml` | `sovereign-config-dev` | `sovereign-config-introspection-dev` | `sovereign-config-dev` |
+| Production | `authentik/blueprint.yaml` | `sovereign-config-browser`, `sovereign-config-cli` | `sovereign-config-introspection` | matching client ID |
+| Development | `authentik/blueprint-dev.yaml` | `sovereign-config-browser-dev`, `sovereign-config-cli-dev` | `sovereign-config-introspection-dev` | matching client ID |
 
-Each issuing provider has its own per-provider issuer and permits introspection only by its same-environment confidential provider. Tokens and introspection credentials must never cross environments. Each blueprint requires its exact same-origin callback URI through `SOVEREIGN_CONFIG_OIDC_REDIRECT_URI` or `SOVEREIGN_CONFIG_DEV_OIDC_REDIRECT_URI`; wildcard and first-use redirect registration are not allowed. Woodpecker applies the development blueprint before automatic development deployment. Production deployment must apply only the production blueprint before starting the production stack.
+Each issuing provider has its own per-provider issuer and permits introspection only by its same-environment confidential provider. Tokens and introspection credentials must never cross environments. Browser providers allow only the authorization-code grant, omit `offline_access`, and require the exact same-origin callback through `SOVEREIGN_CONFIG_BROWSER_REDIRECT_URI` or `SOVEREIGN_CONFIG_DEV_BROWSER_REDIRECT_URI`. CLI providers allow only device-code and refresh grants and have no redirect URI. Wildcard and first-use registration are not allowed.
 
-The issuing providers use the selected Authentik signing certificate, five-minute access tokens, and eight-hour refresh tokens. Human clients request `openid sovereign-config`; clients that retain a refresh token must also request `offline_access`. Use authorization code with PKCE or device flow and keep access tokens out of shell history, logs, and persistent application storage.
+Both blueprints own the authenticated `sovereign-config-device-code` Stage Configuration flow and assign it to the exact brand selected by `AUTHENTIK_BRAND_DOMAIN` or `AUTHENTIK_DEV_BRAND_DOMAIN`. Supply the domain of the brand active for the Authentik public hostname; do not point this at a different tenant or create a second active brand accidentally. Woodpecker applies the development blueprint before automatic development deployment. Production deployment must apply only the production blueprint before starting the production stack.
+
+Authentik 2026.5.2 or newer is required. That version includes configurable grant allowlists along with the cross-provider introspection and device-authorization scope clipping fixes needed by this design. Woodpecker checks the development deployment's authenticated version endpoint and schema before applying its blueprint; verify production the same way before applying its blueprint.
+
+The issuing providers use the selected Authentik signing certificate and five-minute access tokens; CLI refresh tokens last eight hours. Browser clients request `openid sovereign-config`. The CLI also requests `offline_access`. Use authorization code with PKCE or device flow and keep access tokens out of shell history, logs, and persistent application storage.
 
 ### Bootstrap administrator
 
@@ -66,7 +106,7 @@ The empty prefix is the global root. The `sovereign-config` scope mapping combin
 
 ### Request authentication
 
-Every non-operational RPC requires exactly one Bearer token. Sovereign Config requires an `RS256` JOSE header, then performs a fresh Authentik introspection request using HTTP Basic client authentication. It accepts only an active response with the configured issuer and audience, the exact `sovereign-config` scope, a non-empty subject, and valid `sovereign_config_grants`.
+Every non-operational RPC requires exactly one Bearer token. Sovereign Config requires an `RS256` JOSE header, then performs a fresh Authentik introspection request using HTTP Basic client authentication. It accepts only an active response matching either the configured browser issuer/audience pair or CLI issuer/audience pair, the exact `sovereign-config` scope, a non-empty subject, and valid `sovereign_config_grants`. Issuers and audiences are evaluated as pairs to prevent cross-client claim substitution.
 
 The introspection endpoint must use HTTPS and cannot contain credentials, a query, or a fragment. Tokens, claims, subjects, grants, credentials, and provider URLs are not logged. There is no JWT, JWKS, token, or claim cache and no automatic retry. Invalid tokens return gRPC `UNAUTHENTICATED`; Authentik timeouts, outages, non-success responses, and malformed responses return `UNAVAILABLE`.
 
@@ -90,4 +130,4 @@ The application writes structured redacted JSON logs to stdout. Authentication e
 
 ## Release Gate
 
-Publish an image tag only after `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, unit and integration checks, PostgreSQL migration checks, gRPC/gRPC-Web end-to-end checks, and supported-browser UI checks pass. SBOM generation is out of scope for the MVP.
+Publish an image tag only after `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, native and WASM checks, unit and integration checks, PostgreSQL migration checks, gRPC/gRPC-Web checks, and Chromium/Firefox UI checks pass. The tag pipeline builds the CLI from that tagged commit, verifies its reported release, records and allowlists its ELF dependencies, executes it in clean Debian 12, generates `SHA256SUMS`, and publishes those artifacts. SBOM generation is out of scope for the MVP.

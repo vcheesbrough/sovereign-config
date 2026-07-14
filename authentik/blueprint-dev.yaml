@@ -42,14 +42,41 @@ entries:
   - model: authentik_providers_oauth2.oauth2provider
     state: present
     identifiers:
-      name: sovereign-config-dev
+      name: sovereign-config-browser-dev
     attrs:
-      name: sovereign-config-dev
-      client_id: sovereign-config-dev
+      name: sovereign-config-browser-dev
+      client_id: sovereign-config-browser-dev
       client_type: public
+      grant_types:
+        - authorization_code
       redirect_uris:
-        - url: ${SOVEREIGN_CONFIG_DEV_OIDC_REDIRECT_URI}
+        - url: ${SOVEREIGN_CONFIG_DEV_BROWSER_REDIRECT_URI}
           matching_mode: strict
+      access_token_validity: minutes=5
+      refresh_token_validity: hours=8
+      signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      issuer_mode: per_provider
+      sub_mode: hashed_user_id
+      property_mappings:
+        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, openid]]
+        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, sovereign-config]]
+      jwt_federation_providers:
+        - !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config-introspection-dev]]
+
+  - model: authentik_providers_oauth2.oauth2provider
+    state: present
+    identifiers:
+      name: sovereign-config-cli-dev
+    attrs:
+      name: sovereign-config-cli-dev
+      client_id: sovereign-config-cli-dev
+      client_type: public
+      grant_types:
+        - urn:ietf:params:oauth:grant-type:device_code
+        - refresh_token
+      redirect_uris: []
       access_token_validity: minutes=5
       refresh_token_validity: hours=8
       signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
@@ -71,4 +98,30 @@ entries:
     attrs:
       name: Sovereign Config (development)
       slug: sovereign-config-dev
-      provider: !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config-dev]]
+      provider: !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config-browser-dev]]
+
+  - model: authentik_core.application
+    state: present
+    identifiers:
+      slug: sovereign-config-cli-dev
+    attrs:
+      name: Sovereign Config CLI (development)
+      slug: sovereign-config-cli-dev
+      provider: !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config-cli-dev]]
+
+  - model: authentik_flows.flow
+    state: present
+    identifiers:
+      slug: sovereign-config-device-code
+    attrs:
+      name: Sovereign Config device code
+      title: Authorize Sovereign Config CLI
+      designation: stage_configuration
+      authentication: require_authenticated
+
+  - model: authentik_brands.brand
+    state: present
+    identifiers:
+      domain: ${AUTHENTIK_DEV_BRAND_DOMAIN}
+    attrs:
+      flow_device_code: !Find [authentik_flows.flow, [slug, sovereign-config-device-code]]
