@@ -87,8 +87,7 @@ steps:
       vars:
         AUTHENTIK_SOVEREIGN_CONFIG_DEV_INTROSPECTION_CLIENT_SECRET:
           from_secret: sovereign_config_dev_oidc_introspection_client_secret
-        SOVEREIGN_CONFIG_DEV_OIDC_REDIRECT_URI:
-          from_secret: sovereign_config_dev_oidc_redirect_uri
+        SOVEREIGN_CONFIG_DEV_OIDC_REDIRECT_URI: https://sovereign-config-dev.desync.link/auth/callback
 
   auto-deploy-dev:
     depends_on:
@@ -99,10 +98,8 @@ steps:
     environment:
       POSTGRES_PASSWORD:
         from_secret: sovereign_config_dev_postgres_password
-      OIDC_INTROSPECTION_URL:
-        from_secret: sovereign_config_dev_oidc_introspection_url
-      OIDC_ISSUER:
-        from_secret: sovereign_config_dev_oidc_issuer
+      OIDC_INTROSPECTION_URL: https://auth.desync.link/application/o/introspect/
+      OIDC_ISSUER: https://auth.desync.link/application/o/sovereign-config-dev/
       OIDC_INTROSPECTION_CLIENT_SECRET:
         from_secret: sovereign_config_dev_oidc_introspection_client_secret
     commands:
