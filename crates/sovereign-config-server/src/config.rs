@@ -56,13 +56,6 @@ impl Config {
             .context("SOVEREIGN_CONFIG_OIDC_ISSUER must be a valid URL")?;
         validate_issuer_url(&issuer_url)?;
         let audience = required_identifier("SOVEREIGN_CONFIG_OIDC_AUDIENCE")?;
-        let cli_issuer = required_env("SOVEREIGN_CONFIG_OIDC_CLI_ISSUER")?;
-        validate_issuer_url(
-            &cli_issuer
-                .parse::<Url>()
-                .context("SOVEREIGN_CONFIG_OIDC_CLI_ISSUER must be a valid URL")?,
-        )?;
-        let cli_audience = required_identifier("SOVEREIGN_CONFIG_OIDC_CLI_AUDIENCE")?;
         let introspection_client_id =
             required_identifier("SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID")?;
 
@@ -72,16 +65,10 @@ impl Config {
             metrics_addr,
             authentication: AuthenticationConfig {
                 introspection_url,
-                accepted_identities: vec![
-                    AcceptedIdentity {
-                        issuer: issuer.clone(),
-                        audience,
-                    },
-                    AcceptedIdentity {
-                        issuer: cli_issuer,
-                        audience: cli_audience,
-                    },
-                ],
+                accepted_identities: vec![AcceptedIdentity {
+                    issuer: issuer.clone(),
+                    audience: audience.clone(),
+                }],
                 introspection_client_id,
                 introspection_client_secret: required_secret(
                     "SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET",
@@ -90,7 +77,7 @@ impl Config {
             },
             web: WebConfig {
                 issuer,
-                client_id: required_identifier("SOVEREIGN_CONFIG_OIDC_BROWSER_CLIENT_ID")?,
+                client_id: audience,
             },
         })
     }

@@ -34,7 +34,7 @@ fn database_url() -> String {
     format!("postgresql://sovereign_config:{SECRET}@127.0.0.1:1/sovereign_config")
 }
 
-fn authentication_environment() -> [(&'static str, String); 8] {
+fn authentication_environment() -> [(&'static str, String); 5] {
     [
         (
             "SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL",
@@ -47,18 +47,6 @@ fn authentication_environment() -> [(&'static str, String); 8] {
         (
             "SOVEREIGN_CONFIG_OIDC_AUDIENCE",
             "sovereign-config".to_owned(),
-        ),
-        (
-            "SOVEREIGN_CONFIG_OIDC_BROWSER_CLIENT_ID",
-            "sovereign-config-browser".to_owned(),
-        ),
-        (
-            "SOVEREIGN_CONFIG_OIDC_CLI_ISSUER",
-            "https://auth.example.test/application/o/sovereign-config-cli/".to_owned(),
-        ),
-        (
-            "SOVEREIGN_CONFIG_OIDC_CLI_AUDIENCE",
-            "sovereign-config-cli".to_owned(),
         ),
         (
             "SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID",

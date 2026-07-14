@@ -38,7 +38,7 @@ struct IdentityProviderArguments {
     #[arg(
         long,
         env = "SOVEREIGN_CONFIG_OIDC_CLI_CLIENT_ID",
-        default_value = "sovereign-config-cli"
+        default_value = "sovereign-config"
     )]
     client_id: String,
 }

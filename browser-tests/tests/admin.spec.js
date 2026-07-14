@@ -1,12 +1,14 @@
 const { test, expect } = require('@playwright/test');
 const AxeBuilder = require('@axe-core/playwright').default;
+const path = require('node:path');
 
-const configScript = 'globalThis.SOVEREIGN_CONFIG={issuer:"https://auth.example.test/application/o/browser/",clientId:"browser"};';
+const configScript = 'globalThis.SOVEREIGN_CONFIG={issuer:"https://auth.example.test/application/o/sovereign-config/",clientId:"sovereign-config"};';
+const tokenEndpoint = 'https://auth.example.test/application/o/token/';
 
-function grpcFrame(payload) {
+function grpcFrame(payload, status = 0) {
   const dataHeader = Buffer.alloc(5);
   dataHeader.writeUInt32BE(payload.length, 1);
-  const trailer = Buffer.from('grpc-status: 0\r\n');
+  const trailer = Buffer.from(`grpc-status: ${status}\r\n`);
   const trailerHeader = Buffer.alloc(5);
   trailerHeader[0] = 0x80;
   trailerHeader.writeUInt32BE(trailer.length, 1);
@@ -33,6 +35,75 @@ async function mockApplication(page) {
   });
 }
 
+async function mockDiscovery(page) {
+  await page.route('**/.well-known/openid-configuration', route => route.fulfill({
+    contentType: 'application/json',
+    headers: { 'access-control-allow-origin': '*' },
+    body: JSON.stringify({
+      authorization_endpoint: 'https://auth.example.test/application/o/authorize/',
+      token_endpoint: tokenEndpoint
+    })
+  }));
+}
+
+async function openCallback(page, refreshResult = 'success', state = 'expected-state') {
+  await page.addInitScript(() => {
+    sessionStorage.setItem('sovereign-config.pkce-state', 'expected-state');
+    sessionStorage.setItem('sovereign-config.pkce-verifier', 'test-verifier');
+  });
+  await mockDiscovery(page);
+  await page.route('**/auth/callback?*', route => route.fulfill({
+    contentType: 'text/html',
+    path: path.resolve(__dirname, '../../web-dist/index.html')
+  }));
+  const tokenRequests = [];
+  await page.route(tokenEndpoint, async route => {
+    const form = new URLSearchParams(route.request().postData());
+    tokenRequests.push(Object.fromEntries(form));
+    if (form.get('grant_type') === 'authorization_code') {
+      return route.fulfill({
+        contentType: 'application/json',
+        headers: { 'access-control-allow-origin': '*' },
+        body: JSON.stringify({
+          access_token: 'access-token-one',
+          refresh_token: 'refresh-token-one',
+          expires_in: 0.000001
+        })
+      });
+    }
+    if (refreshResult === 'rejected') {
+      return route.fulfill({
+        status: 400,
+        contentType: 'application/json',
+        headers: { 'access-control-allow-origin': '*' },
+        body: JSON.stringify({ error: 'invalid_grant' })
+      });
+    }
+    if (refreshResult === 'unavailable') {
+      return route.abort('connectionrefused');
+    }
+    return route.fulfill({
+      contentType: 'application/json',
+      headers: { 'access-control-allow-origin': '*' },
+      body: JSON.stringify({
+        access_token: 'access-token-two',
+        refresh_token: 'refresh-token-two',
+        expires_in: 300
+      })
+    });
+  });
+  await page.route('**/sovereign.config.v1.System/GetIdentity', route => {
+    const authorized = route.request().headers().authorization === 'Bearer access-token-two';
+    return route.fulfill({
+      status: 200,
+      headers: { 'content-type': 'application/grpc-web+proto' },
+      body: grpcFrame(authorized ? Buffer.from([0x08, 0x01]) : Buffer.alloc(0), authorized ? 0 : 16)
+    });
+  });
+  await page.goto(`/auth/callback?code=test-code&state=${state}`);
+  return tokenRequests;
+}
+
 test.beforeEach(async ({ page }) => {
   await mockApplication(page);
 });
@@ -51,14 +122,8 @@ test('reports service and logged-out state accessibly', async ({ page }, testInf
   });
 });
 
-test('keyboard login creates an S256 request without exposing a verifier', async ({ page }) => {
-  await page.route('**/.well-known/openid-configuration', route => route.fulfill({
-    contentType: 'application/json',
-    body: JSON.stringify({
-      authorization_endpoint: 'https://auth.example.test/application/o/authorize/',
-      token_endpoint: 'https://auth.example.test/application/o/token/'
-    })
-  }));
+test('keyboard login creates an S256 offline request without exposing a verifier', async ({ page }) => {
+  await mockDiscovery(page);
   const authorization = page.waitForRequest('https://auth.example.test/application/o/authorize/**');
   await page.route('https://auth.example.test/application/o/authorize/**', route => route.fulfill({
     contentType: 'text/html',
@@ -75,12 +140,59 @@ test('keyboard login creates an S256 request without exposing a verifier', async
   expect(url.searchParams.get('code_challenge_method')).toBe('S256');
   expect(url.searchParams.get('code_challenge')).toBeTruthy();
   expect(url.searchParams.get('state')).toBeTruthy();
+  expect(url.searchParams.get('scope')).toBe('openid sovereign-config offline_access');
   expect(url.searchParams.has('code_verifier')).toBe(false);
 });
 
-test('reload starts logged out without recovering an access token', async ({ page }) => {
-  await page.goto('/');
+test('callback refreshes an expired access token and rotates the refresh token', async ({ page }) => {
+  const requests = await openCallback(page);
+  await expect(page.getByText('Logged in')).toBeVisible();
+  expect(requests).toHaveLength(2);
+  expect(requests[0]).toMatchObject({
+    grant_type: 'authorization_code',
+    code: 'test-code',
+    code_verifier: 'test-verifier'
+  });
+  expect(requests[1]).toMatchObject({
+    grant_type: 'refresh_token',
+    refresh_token: 'refresh-token-one'
+  });
+});
+
+test('refresh rejection clears the browser session', async ({ page }) => {
+  await openCallback(page, 'rejected');
   await expect(page.getByText('Logged out')).toBeVisible();
+  await expect(page.getByText('login has expired')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Log in' })).toBeVisible();
+});
+
+test('refresh outage does not reuse an expired access token', async ({ page }) => {
+  await openCallback(page, 'unavailable');
+  await expect(page.getByText('Unavailable', { exact: true })).toBeVisible();
+  await expect(page.getByText('service is unavailable')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Log out' })).toBeVisible();
+});
+
+test('keyboard logout clears the in-memory session and restores focus', async ({ page }) => {
+  await openCallback(page);
+  const logout = page.getByRole('button', { name: 'Log out' });
+  await expect(logout).toBeVisible();
+  await logout.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByText('Logged out')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Log in' })).toBeFocused();
+});
+
+test('callback rejects a mismatched state without exchanging the code', async ({ page }) => {
+  const requests = await openCallback(page, 'success', 'wrong-state');
+  await expect(page.getByText('Logged out')).toBeVisible();
+  await expect(page.getByText('login response did not match this browser')).toBeVisible();
+  expect(requests).toHaveLength(0);
+});
+
+test('reload starts logged out without recovering either token', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in')).toBeVisible();
   await page.reload();
   await expect(page.getByText('Logged out')).toBeVisible();
 });
