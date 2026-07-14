@@ -177,6 +177,13 @@ test('callback refreshes an expired access token and rotates the refresh token',
   });
 });
 
+test('same-page navigation does not discard the in-memory login session', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in')).toBeVisible();
+  await page.getByRole('link', { name: 'System status' }).click();
+  await expect(page.getByText('Logged in')).toBeVisible();
+});
+
 test('refresh rejection clears the browser session', async ({ page }) => {
   await openCallback(page, 'rejected');
   await expect(page.getByText('Logged out')).toBeVisible();

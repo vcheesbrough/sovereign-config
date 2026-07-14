@@ -17,7 +17,7 @@ use sovereign_config_proto::sovereign::config::v1::{
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    Headers, Request, RequestCache, RequestInit, Response, Url, UrlSearchParams, window,
+    Event, Headers, Request, RequestCache, RequestInit, Response, Url, UrlSearchParams, window,
 };
 
 const STATE_KEY: &str = "sovereign-config.pkce-state";
@@ -135,6 +135,22 @@ fn install_actions() {
     let Some(document) = window().and_then(|window| window.document()) else {
         return;
     };
+    for id in ["brand-link", "system-status-link"] {
+        if let Some(link) = document.get_element_by_id(id) {
+            let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
+                if window()
+                    .and_then(|window| window.location().pathname().ok())
+                    .as_deref()
+                    == Some("/")
+                {
+                    event.prevent_default();
+                }
+            });
+            let _ =
+                link.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+            callback.forget();
+        }
+    }
     if let Some(login) = document.get_element_by_id("login") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: web_sys::Event| {
             spawn_local(async {
