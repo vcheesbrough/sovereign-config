@@ -8,6 +8,7 @@ RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/carg
     cargo install --locked --version 0.21.14 trunk
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY test-consumers ./test-consumers
 COPY proto ./proto
 COPY web-dist ./web-dist
 RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/cargo/registry \

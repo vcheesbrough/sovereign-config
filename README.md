@@ -58,6 +58,16 @@ sovereign-config logout
 
 Use `sovereign-config profile update <name>` to replace a URL and `sovereign-config profile default <name>` to change the default. A URL can instead be supplied as exactly one line on standard input. Profile URLs are never accepted as process arguments. Operational commands accept a global override, for example `sovereign-config --profile prod status`.
 
+Read, create or replace, and permanently delete one exact plain-text value with the selected profile. Paths are relative to the profile root and ASCII case-insensitive; the service stores one lowercase canonical path. Put content is read from standard input so it does not appear in process arguments. Interactive deletion requires typing `delete`; automation must pass `--yes` explicitly.
+
+```sh
+sovereign-config get apps/api/settings
+printf '%s' 'enabled=true' | sovereign-config put apps/api/settings
+sovereign-config delete apps/api/settings --yes
+```
+
+Get prints the exact stored text. Put and delete print only fixed success summaries and never echo the value. Read, write, and manage grants are independent: get requires `read`, put requires `write`, and delete requires `manage` on the exact path or an ancestor prefix.
+
 The version-1 URL origin is the native gRPC endpoint, its path is the canonical configuration root, and its fragment contains the OIDC issuer and client ID. Without `client_secret`, login uses device flow. With `client_secret`, the value is unpadded Base64URL-encoded `service-account-username:app-password`; the CLI obtains a fresh client-credentials access token for each operation and does not support login or logout for that profile. The entire managed URL is a secret even though its credential is encoded.
 
 Profiles are stored in `$XDG_CONFIG_HOME/sovereign-config/config.toml`, defaulting to `~/.config/sovereign-config/config.toml`. The directory is mode `0700` and the file is mode `0600`; because managed profiles contain credentials, protect the entire file. Human refresh credentials are stored in environment-bound mode-`0600` files under `$XDG_STATE_HOME/sovereign-config/credentials/`, defaulting to `~/.local/state/sovereign-config/credentials/`. Keep these paths in the WSL Linux filesystem rather than `/mnt/c` so Unix ownership and modes are enforced.
@@ -115,6 +125,8 @@ Authentik supports one client secret per introspection provider, so rotation has
 5. Validate native gRPC health/version and `/readyz` through the trusted internal network before restoring traffic.
 
 Downgrades after a migration are unsupported. Restore the verified PostgreSQL backup into a replacement deployment instead.
+
+Configuration values are stored in PostgreSQL as canonical paths, plain text, and service-generated UTC creation/update timestamps. Updates are last-write-wins and preserve the original creation timestamp. Deletion is a hard delete with no tombstone, rollback record, or retained value history. PostgreSQL volume and backup encryption remain operator responsibilities.
 
 ## Observability
 

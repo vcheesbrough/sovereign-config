@@ -2,10 +2,16 @@ use std::{net::IpAddr, time::Duration};
 
 use async_trait::async_trait;
 use http::Uri;
-use sovereign_config_client::{RpcCode, Transport, VersionReply, map_rpc_status};
-use sovereign_config_core::{AuthenticationStatus, ClientError, Secret};
+use sovereign_config_client::{
+    RpcCode, Transport, ValueTransport, VersionReply, map_rpc_status, timestamp,
+};
+use sovereign_config_core::{
+    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ExactValue, PlainValue,
+    PutMetadata, Secret,
+};
 use sovereign_config_proto::sovereign::config::v1::{
-    GetIdentityRequest, GetVersionRequest, system_client::SystemClient,
+    DeleteValueRequest, GetIdentityRequest, GetValueRequest, GetVersionRequest, PutValueRequest,
+    configuration_client::ConfigurationClient, system_client::SystemClient,
 };
 use tonic::{
     Code, Request,
@@ -19,6 +25,96 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 pub struct TonicTransport {
     channel: Channel,
+}
+
+#[async_trait(?Send)]
+impl ValueTransport for TonicTransport {
+    async fn get_value(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ExactValue, ClientError> {
+        let mut client = ConfigurationClient::new(self.channel.clone());
+        let response = client
+            .get_value(authenticated_request(
+                GetValueRequest {
+                    path: path.as_str().to_owned(),
+                },
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        let created_at = response.created_at.ok_or_else(invalid_response)?;
+        let updated_at = response.updated_at.ok_or_else(invalid_response)?;
+        Ok(ExactValue {
+            value: PlainValue::new(response.value),
+            created_at: timestamp(created_at.seconds, created_at.nanos)?,
+            updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
+        })
+    }
+
+    async fn put_value(
+        &self,
+        path: &ConfigPath,
+        value: &PlainValue,
+        bearer: &Secret,
+    ) -> Result<PutMetadata, ClientError> {
+        let mut client = ConfigurationClient::new(self.channel.clone());
+        let response = client
+            .put_value(authenticated_request(
+                PutValueRequest {
+                    path: path.as_str().to_owned(),
+                    value: value.expose().to_owned(),
+                },
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        let created_at = response.created_at.ok_or_else(invalid_response)?;
+        let updated_at = response.updated_at.ok_or_else(invalid_response)?;
+        Ok(PutMetadata {
+            created_at: timestamp(created_at.seconds, created_at.nanos)?,
+            updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
+        })
+    }
+
+    async fn delete_value(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<DeleteMetadata, ClientError> {
+        let mut client = ConfigurationClient::new(self.channel.clone());
+        let response = client
+            .delete_value(authenticated_request(
+                DeleteValueRequest {
+                    path: path.as_str().to_owned(),
+                },
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        let deleted_at = response.deleted_at.ok_or_else(invalid_response)?;
+        Ok(DeleteMetadata {
+            deleted_at: timestamp(deleted_at.seconds, deleted_at.nanos)?,
+        })
+    }
+}
+
+fn authenticated_request<T>(message: T, bearer: &Secret) -> Result<Request<T>, ClientError> {
+    let mut request = Request::new(message);
+    let authorization = MetadataValue::try_from(format!("Bearer {}", bearer.expose()))
+        .map_err(|_| map_rpc_status(RpcCode::InvalidArgument))?;
+    request
+        .metadata_mut()
+        .insert("authorization", authorization);
+    Ok(request)
+}
+
+fn invalid_response() -> ClientError {
+    map_rpc_status(RpcCode::Other)
 }
 
 impl TonicTransport {
@@ -86,14 +182,8 @@ impl Transport for TonicTransport {
 
     async fn get_identity(&self, bearer: &Secret) -> Result<AuthenticationStatus, ClientError> {
         let mut client = SystemClient::new(self.channel.clone());
-        let mut request = Request::new(GetIdentityRequest {});
-        let authorization = MetadataValue::try_from(format!("Bearer {}", bearer.expose()))
-            .map_err(|_| map_rpc_status(RpcCode::InvalidArgument))?;
-        request
-            .metadata_mut()
-            .insert("authorization", authorization);
         let response = client
-            .get_identity(request)
+            .get_identity(authenticated_request(GetIdentityRequest {}, bearer)?)
             .await
             .map_err(|status| map_status(&status))?
             .into_inner();
@@ -109,6 +199,7 @@ fn map_status(status: &tonic::Status) -> ClientError {
         Code::PermissionDenied => RpcCode::PermissionDenied,
         Code::FailedPrecondition => RpcCode::FailedPrecondition,
         Code::InvalidArgument => RpcCode::InvalidArgument,
+        Code::NotFound => RpcCode::NotFound,
         Code::Cancelled | Code::DeadlineExceeded | Code::Unavailable => RpcCode::Unavailable,
         _ => RpcCode::Other,
     })

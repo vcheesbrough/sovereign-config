@@ -8,16 +8,23 @@ use js_sys::{Date, Reflect, Uint8Array};
 use prost::Message;
 use sha2::{Digest, Sha256};
 use sovereign_config_client::{
-    AccessTokenProvider, Client, RpcCode, Transport, VersionReply, map_rpc_status,
+    AccessTokenProvider, Client, RpcCode, Transport, ValueTransport, VersionReply, map_rpc_status,
+    timestamp,
 };
-use sovereign_config_core::{AuthenticationStatus, ClientError, ErrorKind, Secret};
+use sovereign_config_core::{
+    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, ExactValue,
+    PlainValue, PutMetadata, Secret, Timestamp,
+};
 use sovereign_config_proto::sovereign::config::v1::{
-    GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
+    DeleteValueRequest, DeleteValueResponse, GetIdentityRequest, GetIdentityResponse,
+    GetValueRequest, GetValueResponse, GetVersionRequest, GetVersionResponse, PutValueRequest,
+    PutValueResponse,
 };
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    Event, Headers, Request, RequestCache, RequestInit, Response, Url, UrlSearchParams, window,
+    Event, Headers, HtmlButtonElement, HtmlDialogElement, HtmlInputElement, HtmlTextAreaElement,
+    Request, RequestCache, RequestInit, Response, Url, UrlSearchParams, window,
 };
 
 const STATE_KEY: &str = "sovereign-config.pkce-state";
@@ -117,6 +124,73 @@ impl Transport for BrowserTransport {
     }
 }
 
+#[async_trait(?Send)]
+impl ValueTransport for BrowserTransport {
+    async fn get_value(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ExactValue, ClientError> {
+        let response: GetValueResponse = grpc_unary(
+            "/sovereign.config.v1.Configuration/GetValue",
+            &GetValueRequest {
+                path: path.as_str().to_owned(),
+            },
+            Some(bearer),
+        )
+        .await?;
+        Ok(ExactValue {
+            value: PlainValue::new(response.value),
+            created_at: proto_timestamp(response.created_at)?,
+            updated_at: proto_timestamp(response.updated_at)?,
+        })
+    }
+
+    async fn put_value(
+        &self,
+        path: &ConfigPath,
+        value: &PlainValue,
+        bearer: &Secret,
+    ) -> Result<PutMetadata, ClientError> {
+        let response: PutValueResponse = grpc_unary(
+            "/sovereign.config.v1.Configuration/PutValue",
+            &PutValueRequest {
+                path: path.as_str().to_owned(),
+                value: value.expose().to_owned(),
+            },
+            Some(bearer),
+        )
+        .await?;
+        Ok(PutMetadata {
+            created_at: proto_timestamp(response.created_at)?,
+            updated_at: proto_timestamp(response.updated_at)?,
+        })
+    }
+
+    async fn delete_value(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<DeleteMetadata, ClientError> {
+        let response: DeleteValueResponse = grpc_unary(
+            "/sovereign.config.v1.Configuration/DeleteValue",
+            &DeleteValueRequest {
+                path: path.as_str().to_owned(),
+            },
+            Some(bearer),
+        )
+        .await?;
+        Ok(DeleteMetadata {
+            deleted_at: proto_timestamp(response.deleted_at)?,
+        })
+    }
+}
+
+fn proto_timestamp(value: Option<prost_types::Timestamp>) -> Result<Timestamp, ClientError> {
+    let value = value.ok_or_else(browser_error)?;
+    timestamp(value.seconds, value.nanos)
+}
+
 #[wasm_bindgen(start)]
 pub fn start() {
     install_actions();
@@ -186,6 +260,150 @@ fn install_actions() {
         });
         let _ = logout.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
         callback.forget();
+    }
+    install_value_actions(&document);
+}
+
+fn install_value_actions(document: &web_sys::Document) {
+    if let Some(form) = document.get_element_by_id("value-form") {
+        let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
+            event.prevent_default();
+            spawn_local(async { load_value().await });
+        });
+        let _ = form.add_event_listener_with_callback("submit", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(save) = document.get_element_by_id("save-value") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            spawn_local(async { save_value().await });
+        });
+        let _ = save.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(remove) = document.get_element_by_id("delete-value") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            if let Some(dialog) = element::<HtmlDialogElement>("delete-dialog") {
+                let _ = dialog.show_modal();
+                focus("cancel-delete");
+            }
+        });
+        let _ = remove.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(cancel) = document.get_element_by_id("cancel-delete") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            close_delete_dialog();
+            focus("delete-value");
+        });
+        let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(confirm) = document.get_element_by_id("confirm-delete") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            spawn_local(async { delete_value().await });
+        });
+        let _ =
+            confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+}
+
+fn value_client(config: &AppConfig) -> Client<BrowserTransport, MemoryAuthentication> {
+    Client::new(
+        BrowserTransport,
+        MemoryAuthentication {
+            client_id: config.client_id.clone(),
+        },
+    )
+}
+
+fn selected_path() -> Result<ConfigPath, ClientError> {
+    let input = element::<HtmlInputElement>("value-path").ok_or_else(browser_error)?;
+    ConfigPath::parse_operation(input.value())
+        .map_err(|_| ClientError::new(ErrorKind::InvalidRequest, "configuration path is invalid"))
+}
+
+async fn load_value() {
+    clear_error();
+    let result = async {
+        let config = app_config()?;
+        value_client(&config).get_value(&selected_path()?).await
+    }
+    .await;
+    match result {
+        Ok(value) => {
+            set_textarea("value-content", value.value.expose());
+            set_timestamp("created-value", value.created_at);
+            set_timestamp("updated-value", value.updated_at);
+            set_text("value-state", "Loaded");
+            set_button_disabled("delete-value", false);
+            focus("value-content");
+        }
+        Err(error) if error.kind == ErrorKind::NotFound => {
+            set_textarea("value-content", "");
+            set_text("created-value", "-");
+            set_text("updated-value", "-");
+            set_text("value-state", "New value");
+            set_button_disabled("delete-value", true);
+            focus("value-content");
+        }
+        Err(error) => show_error(error.message()),
+    }
+}
+
+async fn save_value() {
+    clear_error();
+    let result = async {
+        let config = app_config()?;
+        let path = selected_path()?;
+        let value = element::<HtmlTextAreaElement>("value-content")
+            .ok_or_else(browser_error)?
+            .value();
+        value_client(&config)
+            .put_value(&path, &PlainValue::new(value))
+            .await
+    }
+    .await;
+    match result {
+        Ok(metadata) => {
+            set_timestamp("created-value", metadata.created_at);
+            set_timestamp("updated-value", metadata.updated_at);
+            set_text("value-state", "Saved");
+            set_button_disabled("delete-value", false);
+            focus("value-heading");
+        }
+        Err(error) => show_error(error.message()),
+    }
+}
+
+async fn delete_value() {
+    clear_error();
+    let result = async {
+        let config = app_config()?;
+        value_client(&config).delete_value(&selected_path()?).await
+    }
+    .await;
+    match result {
+        Ok(_) => {
+            close_delete_dialog();
+            set_textarea("value-content", "");
+            set_text("created-value", "-");
+            set_text("updated-value", "-");
+            set_text("value-state", "Deleted");
+            set_button_disabled("delete-value", true);
+            focus("value-path");
+        }
+        Err(error) => {
+            close_delete_dialog();
+            show_error(error.message());
+            focus("delete-value");
+        }
+    }
+}
+
+fn close_delete_dialog() {
+    if let Some(dialog) = element::<HtmlDialogElement>("delete-dialog") {
+        dialog.close();
     }
 }
 
@@ -565,6 +783,7 @@ fn decode_grpc_web<R: Message + Default>(bytes: &[u8]) -> Result<R, ClientError>
     if status != 0 {
         return Err(map_rpc_status(match status {
             3 => RpcCode::InvalidArgument,
+            5 => RpcCode::NotFound,
             7 => RpcCode::PermissionDenied,
             9 => RpcCode::FailedPrecondition,
             14 => RpcCode::Unavailable,
@@ -665,6 +884,34 @@ fn set_text(id: &str, text: &str) {
     {
         element.set_text_content(Some(text));
     }
+}
+
+fn element<T: JsCast>(id: &str) -> Option<T> {
+    window()?
+        .document()?
+        .get_element_by_id(id)?
+        .dyn_into::<T>()
+        .ok()
+}
+
+fn set_textarea(id: &str, value: &str) {
+    if let Some(element) = element::<HtmlTextAreaElement>(id) {
+        element.set_value(value);
+    }
+}
+
+fn set_button_disabled(id: &str, disabled: bool) {
+    if let Some(element) = element::<HtmlButtonElement>(id) {
+        element.set_disabled(disabled);
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn set_timestamp(id: &str, timestamp: Timestamp) {
+    let milliseconds = timestamp.seconds as f64 * 1000.0 + f64::from(timestamp.nanos) / 1_000_000.0;
+    let date = Date::new(&JsValue::from_f64(milliseconds));
+    let formatted = date.to_locale_string("en-GB", &JsValue::UNDEFINED);
+    set_text(id, &String::from(formatted));
 }
 
 fn set_hidden(id: &str, hidden: bool) {

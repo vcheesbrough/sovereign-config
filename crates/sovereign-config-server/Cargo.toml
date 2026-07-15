@@ -15,12 +15,14 @@ bytes.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 mime_guess.workspace = true
+prost-types.workspace = true
 reqwest.workspace = true
 rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
+time.workspace = true
 tokio.workspace = true
 tonic = { workspace = true, features = ["tls", "transport"] }
 tonic-health.workspace = true

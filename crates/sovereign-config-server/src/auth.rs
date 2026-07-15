@@ -95,6 +95,20 @@ impl AuthenticationFailure {
     }
 }
 
+impl AuthenticatedPrincipal {
+    pub(crate) fn allows(&self, path: &ConfigPath, permission: Permission) -> bool {
+        self.grants.iter().any(|grant| {
+            grant.permissions.contains(&permission)
+                && (grant.prefix.is_empty()
+                    || path.as_str() == grant.prefix
+                    || path
+                        .as_str()
+                        .strip_prefix(&grant.prefix)
+                        .is_some_and(|suffix| suffix.starts_with('/')))
+        })
+    }
+}
+
 #[derive(Deserialize)]
 struct JoseHeader {
     alg: String,
@@ -496,12 +510,13 @@ mod tests {
     use http_body_util::BodyExt as _;
     use reqwest::Url;
     use serde_json::{Value, json};
+    use sovereign_config_core::ConfigPath;
     use tokio::{net::TcpListener, task::JoinHandle, time::sleep};
     use tonic::body::{BoxBody, empty_body};
     use tower::{Layer, ServiceExt, service_fn};
 
     use super::{
-        AuthenticatedPrincipal, AuthenticationLayer, Authenticator, IntrospectionResponse,
+        AuthenticatedPrincipal, AuthenticationLayer, Authenticator, Grant, IntrospectionResponse,
         Permission, bearer_token, grpc_authentication_layer, is_canonical_prefix,
         is_operational_rpc, is_web_asset_request, require_rs256, validate_introspection,
     };
@@ -509,6 +524,34 @@ mod tests {
 
     const TEST_CLIENT_ID: &str = "introspection-client";
     const TEST_CLIENT_SECRET: &str = "introspection-secret-sentinel";
+
+    #[test]
+    fn permissions_are_independent_and_prefixes_stop_at_segment_boundaries() {
+        let principal = AuthenticatedPrincipal {
+            subject: "principal".into(),
+            grants: vec![
+                Grant {
+                    prefix: "apps/api".into(),
+                    permissions: BTreeSet::from([Permission::Write]),
+                },
+                Grant {
+                    prefix: "apps/api/private".into(),
+                    permissions: BTreeSet::from([Permission::Manage]),
+                },
+            ],
+        };
+        let api = ConfigPath::parse("apps/api").unwrap();
+        let child = ConfigPath::parse("apps/api/settings").unwrap();
+        let attack = ConfigPath::parse("apps/apix").unwrap();
+        let private = ConfigPath::parse("apps/api/private/key").unwrap();
+
+        assert!(principal.allows(&api, Permission::Write));
+        assert!(principal.allows(&child, Permission::Write));
+        assert!(!principal.allows(&child, Permission::Read));
+        assert!(!principal.allows(&attack, Permission::Write));
+        assert!(principal.allows(&private, Permission::Manage));
+        assert!(!principal.allows(&private, Permission::Read));
+    }
 
     #[derive(Clone)]
     struct FakeIntrospectionState {

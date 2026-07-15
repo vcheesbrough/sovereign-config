@@ -35,9 +35,12 @@ h2 { margin: 0; font-size: 17px; letter-spacing: 0; }
 .actions { display: flex; gap: 8px; }
 button { min-height: 40px; padding: 0 16px; color: #fff; background: #17634c; border: 1px solid #124d3c; border-radius: 4px; font: inherit; font-weight: 700; cursor: pointer; }
 button.secondary { color: #24312c; background: #fff; border-color: #8d9a94; }
+button.danger { background: #9b2c35; border-color: #762029; }
 button:hover { background: #104c3a; }
 button.secondary:hover { background: #edf1ef; }
-a:focus-visible, button:focus-visible, h2:focus-visible { outline: 3px solid #b66800; outline-offset: 3px; }
+button.danger:hover { background: #762029; }
+button:disabled { cursor: not-allowed; opacity: .55; }
+a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible, h2:focus-visible { outline: 3px solid #b66800; outline-offset: 3px; }
 section { padding: 24px 0; border-top: 1px solid #cbd3cf; }
 section:last-child { border-bottom: 1px solid #cbd3cf; }
 dl { margin: 18px 0 0; }
@@ -45,6 +48,20 @@ dl div { display: grid; grid-template-columns: minmax(180px, 1fr) 2fr; gap: 24px
 dt { color: #58655f; }
 dd { margin: 0; font-weight: 650; overflow-wrap: anywhere; }
 .error { padding: 12px 14px; color: #721c24; background: #f8d7da; border-left: 4px solid #a52934; }
+.section-heading { display: flex; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
+.status-text { margin: 6px 0 0; color: #58655f; }
+.path-form { margin-bottom: 20px; }
+label { display: block; margin-bottom: 7px; font-weight: 700; }
+.field-command { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+input, textarea { width: 100%; color: #18201d; background: #fff; border: 1px solid #8d9a94; border-radius: 4px; font: inherit; }
+input { min-height: 40px; padding: 8px 10px; }
+textarea { min-height: 220px; padding: 12px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; line-height: 1.45; }
+.value-metadata { margin-top: 20px; }
+.value-actions { justify-content: flex-end; margin-top: 20px; }
+dialog { width: min(440px, calc(100% - 32px)); padding: 24px; color: #18201d; background: #fff; border: 1px solid #8d9a94; border-radius: 6px; }
+dialog::backdrop { background: rgb(16 33 27 / 55%); }
+dialog p { margin: 12px 0 24px; }
+dialog .actions { justify-content: flex-end; }
 [hidden] { display: none !important; }
 
 @media (max-width: 720px) {

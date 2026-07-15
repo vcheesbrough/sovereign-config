@@ -19,6 +19,7 @@
     <div class="layout">
       <nav aria-label="Administration">
         <a id="system-status-link" class="active" href="/">System status</a>
+        <a href="#configuration-values">Configuration values</a>
       </nav>
       <main id="main">
         <div class="page-heading">
@@ -44,7 +45,40 @@
           <h2 id="auth-heading" tabindex="-1">Authentication</h2>
           <dl><div><dt>Session</dt><dd id="auth-value">Checking</dd></div></dl>
         </section>
+        <section id="configuration-values" aria-labelledby="value-heading">
+          <div class="section-heading">
+            <div>
+              <h2 id="value-heading" tabindex="-1">Configuration value</h2>
+              <p id="value-state" class="status-text" aria-live="polite">Enter an exact path</p>
+            </div>
+          </div>
+          <form id="value-form" class="path-form">
+            <label for="value-path">Path</label>
+            <div class="field-command">
+              <input id="value-path" name="path" type="text" autocomplete="off" spellcheck="false" required placeholder="apps/api/settings">
+              <button type="submit">Load</button>
+            </div>
+          </form>
+          <label for="value-content">Plain text value</label>
+          <textarea id="value-content" rows="12" spellcheck="false"></textarea>
+          <dl class="value-metadata">
+            <div><dt>Created</dt><dd id="created-value">-</dd></div>
+            <div><dt>Updated</dt><dd id="updated-value">-</dd></div>
+          </dl>
+          <div class="actions value-actions">
+            <button id="save-value" type="button">Save</button>
+            <button id="delete-value" class="danger" type="button" disabled>Delete</button>
+          </div>
+        </section>
       </main>
     </div>
+    <dialog id="delete-dialog" aria-labelledby="delete-title">
+      <h2 id="delete-title">Permanently delete this value?</h2>
+      <p>This operation cannot be undone.</p>
+      <div class="actions">
+        <button id="cancel-delete" class="secondary" type="button">Cancel</button>
+        <button id="confirm-delete" class="danger" type="button">Delete</button>
+      </div>
+    </dialog>
   </body>
 </html>
