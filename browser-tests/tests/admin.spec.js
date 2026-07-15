@@ -173,7 +173,12 @@ async function mockValues(page, initial = {}) {
       body: grpcFrame(field(1, timestamp(1700000001)))
     });
   });
-  return requests;
+  return {
+    requests,
+    setValue(path, value) {
+      stored.set(path, value);
+    }
+  };
 }
 
 async function mockApplication(page) {
@@ -453,6 +458,26 @@ test('configuration path is deep-linked, selectable, and restored by browser his
   await expect(page.getByRole('row', { name: /feature-flag/ })).toBeVisible();
 });
 
+test('path selector refreshes external paths and Enter opens the selected path', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  const values = await mockValues(page, {
+    'apps/api/feature-flag': 'enabled'
+  });
+  await page.goto('/configuration/apps/api');
+  const pathInput = page.getByLabel('Selected path');
+  await expect(page.locator('#existing-paths option[value="/services/worker"]')).toHaveCount(0);
+
+  values.setValue('services/worker/concurrency', '4');
+  await pathInput.focus();
+  await expect(page.locator('#existing-paths option[value="/services/worker"]')).toHaveCount(1);
+
+  await pathInput.fill('/services/worker');
+  await pathInput.press('Enter');
+  await expect(page).toHaveURL(/\/configuration\/services\/worker$/);
+  await expect(page.getByRole('row', { name: /concurrency/ })).toBeVisible();
+});
+
 test('configuration grid is accessible and contained on desktop and mobile', async ({ page }, testInfo) => {
   await openCallback(page);
   await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
@@ -527,7 +552,7 @@ test('path and new-value fields validate on every keystroke', async ({ page }) =
 test('grid adds, edits, and permanently deletes individual values', async ({ page }) => {
   await openCallback(page);
   await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
-  const requests = await mockValues(page);
+  const { requests } = await mockValues(page);
   await page.goto('/configuration/apps/api');
   await expect(page.getByText('No values at this path.')).toBeVisible();
 

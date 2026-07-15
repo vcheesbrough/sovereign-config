@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-use std::{cell::RefCell, collections::BTreeSet};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeSet,
+};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -24,8 +27,8 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     Document, Element, Event, Headers, HtmlButtonElement, HtmlDialogElement, HtmlInputElement,
-    HtmlTextAreaElement, Request, RequestCache, RequestInit, Response, Url, UrlSearchParams,
-    window,
+    HtmlTextAreaElement, KeyboardEvent, Request, RequestCache, RequestInit, Response, Url,
+    UrlSearchParams, window,
 };
 
 const STATE_KEY: &str = "sovereign-config.pkce-state";
@@ -39,6 +42,7 @@ const REFRESH_LIFETIME_MS: f64 = 8.0 * 60.0 * 60.0 * 1000.0;
 thread_local! {
     static TOKENS: RefCell<Option<MemoryTokens>> = const { RefCell::new(None) };
     static DELETE_TARGET: RefCell<Option<DeleteTarget>> = const { RefCell::new(None) };
+    static PATH_OPTIONS_REFRESHING: Cell<bool> = const { Cell::new(false) };
 }
 
 struct DeleteTarget {
@@ -332,11 +336,7 @@ fn install_configuration_actions(document: &Document) {
     if let Some(form) = document.get_element_by_id("path-form") {
         let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
             event.prevent_default();
-            if let Ok(path) = selected_namespace() {
-                navigate(&Route::Configuration(path));
-            } else {
-                validate_path_field();
-            }
+            open_selected_path();
         });
         let _ = form.add_event_listener_with_callback("submit", callback.as_ref().unchecked_ref());
         callback.forget();
@@ -346,6 +346,23 @@ fn install_configuration_actions(document: &Document) {
             validate_path_field();
         });
         let _ = path.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
+        callback.forget();
+
+        for event_name in ["focus", "pointerdown"] {
+            let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+                spawn_local(async { refresh_path_options().await });
+            });
+            let _ = path
+                .add_event_listener_with_callback(event_name, callback.as_ref().unchecked_ref());
+            callback.forget();
+        }
+
+        let callback = Closure::<dyn FnMut(_)>::new(|event: KeyboardEvent| {
+            if event.key() == "Enter" {
+                open_selected_path_if_changed();
+            }
+        });
+        let _ = path.add_event_listener_with_callback("keyup", callback.as_ref().unchecked_ref());
         callback.forget();
     }
     if let Some(add) = document.get_element_by_id("add-value") {
@@ -398,6 +415,26 @@ fn install_configuration_actions(document: &Document) {
         let _ =
             confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
         callback.forget();
+    }
+}
+
+fn open_selected_path() {
+    if let Ok(path) = selected_namespace() {
+        navigate(&Route::Configuration(path));
+    } else {
+        validate_path_field();
+    }
+}
+
+fn open_selected_path_if_changed() {
+    let Ok(path) = selected_namespace() else {
+        validate_path_field();
+        return;
+    };
+    let route = Route::Configuration(path);
+    let current_path = window().and_then(|window| window.location().pathname().ok());
+    if current_path.as_deref() != Some(route_url(&route).as_str()) {
+        navigate(&route);
     }
 }
 
@@ -536,6 +573,30 @@ async fn load_current_configuration() {
             }
             set_text("value-state", "Loaded");
         }
+        Err(error) => show_error(error.message()),
+    }
+}
+
+async fn refresh_path_options() {
+    if PATH_OPTIONS_REFRESHING.replace(true) {
+        return;
+    }
+    let result = async {
+        let Route::Configuration(path) = route_from_location() else {
+            return Ok(None);
+        };
+        let config = app_config()?;
+        value_client(&config).list_values(&path).await.map(Some)
+    }
+    .await;
+    PATH_OPTIONS_REFRESHING.set(false);
+    match result {
+        Ok(Some(listing)) => {
+            if let Err(error) = render_path_options(&listing) {
+                show_error(error.message());
+            }
+        }
+        Ok(None) => {}
         Err(error) => show_error(error.message()),
     }
 }
