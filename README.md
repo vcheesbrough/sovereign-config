@@ -40,13 +40,10 @@ The server embeds the fingerprinted Rust WASM administration application and ser
 
 ## CLI
 
-The supported prebuilt CLI target is 64-bit Linux on Debian 12 or a distribution with glibc 2.36 or newer. Release CI records the ELF dependencies and rejects anything outside `libc`, `libgcc_s`, `libm`, `libdl`, `libpthread`, the ELF loader, and the virtual DSO.
-
-Download the binary and checksum file from the matching GitHub release, then verify before installation:
+Install the CLI from the matching tagged source with a Rust toolchain:
 
 ```sh
-sha256sum --check --ignore-missing SHA256SUMS
-install -m 0755 sovereign-config-linux-amd64 "$HOME/.local/bin/sovereign-config"
+cargo install --locked --git https://github.com/vcheesbrough/sovereign-config --tag <version> sovereign-config-cli
 ```
 
 Add a named development profile by entering its self-contained connection URL at the hidden prompt. The first profile becomes the default:
@@ -66,12 +63,6 @@ The version-1 URL origin is the native gRPC endpoint, its path is the canonical 
 Profiles are stored in `$XDG_CONFIG_HOME/sovereign-config/config.toml`, defaulting to `~/.config/sovereign-config/config.toml`. The directory is mode `0700` and the file is mode `0600`; because managed profiles contain credentials, protect the entire file. Human refresh credentials are stored in environment-bound mode-`0600` files under `$XDG_STATE_HOME/sovereign-config/credentials/`, defaulting to `~/.local/state/sovereign-config/credentials/`. Keep these paths in the WSL Linux filesystem rather than `/mnt/c` so Unix ownership and modes are enforced.
 
 The CLI prints only the device verification URI and user code during login. Access tokens remain in process memory; refresh credentials and managed credentials never appear in arguments or command output. Each status operation acquires a fresh access token and performs fresh RPCs without response caching or automatic retry. A definitive refresh rejection deletes the unusable human credential; a temporary Authentik outage retains it for a later attempt.
-
-The locked source-build fallback requires the Rust toolchain:
-
-```sh
-cargo install --locked --git https://github.com/vcheesbrough/sovereign-config --tag <version> sovereign-config-cli
-```
 
 ## Authentik
 
@@ -131,4 +122,4 @@ The application writes structured redacted JSON logs to stdout. Authentication e
 
 ## Release Gate
 
-Publish an image tag only after `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, native and WASM checks, unit and integration checks, PostgreSQL migration checks, gRPC/gRPC-Web checks, and Chromium/Firefox UI checks pass. The tag pipeline builds the CLI from that tagged commit, verifies its reported release, records and allowlists its ELF dependencies, executes it in clean Debian 12, generates `SHA256SUMS`, and publishes those artifacts. SBOM generation is out of scope for the MVP.
+Publish an image tag only after `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, native and WASM checks, unit and integration checks, PostgreSQL migration checks, gRPC/gRPC-Web checks, and Chromium/Firefox UI checks pass. The tagged source supplies the protocol-matched CLI installed with `cargo install --locked`. SBOM generation is out of scope for the MVP.
