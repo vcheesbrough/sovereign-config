@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#10211b">
+    <title>Sovereign Config</title>
+    <link rel="stylesheet" href="/style-83117033b18a7a91.css" integrity="sha384-B0RfmFBbbV/Uga+01y4fza4AOY2jwSbohcgxo+SGeujXl1v3h6SjmsnT3yX6k1Lm"/>
+    <script src="/app-config.js"></script>
+    
+<script type="module">
+import init, * as bindings from '/sovereign-config-web-d3c4bed55a14b833.js';
+const wasm = await init({ module_or_path: '/sovereign-config-web-d3c4bed55a14b833_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+  <link rel="modulepreload" href="/sovereign-config-web-d3c4bed55a14b833.js" crossorigin="anonymous" integrity="sha384-lYdcKFrvq8gNsN9oUJp9GKgGBX8hK8VvoJj8zCPDjcPnthXuE1MQWFWHK1XSW78Z"><link rel="preload" href="/sovereign-config-web-d3c4bed55a14b833_bg.wasm" crossorigin="anonymous" integrity="sha384-NAzjtX2TwqpjGLAsjnsP/ezjpImzjy9wh0fkvx3AiqLlJ6JpMLoRj26FT3cMXbM+" as="fetch" type="application/wasm"></head>
+  <body>
+    <header>
+      <a id="brand-link" class="brand" href="/" aria-label="Sovereign Config home">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span>Sovereign Config</span>
+      </a>
+    </header>
+    <div class="layout">
+      <nav aria-label="Administration">
+        <a id="system-status-link" class="active" href="/">System status</a>
+      </nav>
+      <main id="main">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">Administration</p>
+            <h1>System status</h1>
+          </div>
+          <div class="actions">
+            <button id="login" type="button">Log in</button>
+            <button id="logout" class="secondary" type="button" hidden>Log out</button>
+          </div>
+        </div>
+        <p id="error" class="error" role="alert" hidden></p>
+        <section aria-labelledby="service-heading">
+          <h2 id="service-heading">Service</h2>
+          <dl>
+            <div><dt>Connection</dt><dd id="service-value">Checking</dd></div>
+            <div><dt>Application version</dt><dd id="version-value">-</dd></div>
+            <div><dt>Protocol version</dt><dd id="protocol-value">-</dd></div>
+          </dl>
+        </section>
+        <section aria-labelledby="auth-heading">
+          <h2 id="auth-heading" tabindex="-1">Authentication</h2>
+          <dl><div><dt>Session</dt><dd id="auth-value">Checking</dd></div></dl>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

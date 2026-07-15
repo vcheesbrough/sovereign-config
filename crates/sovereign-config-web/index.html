@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#10211b">
+    <title>Sovereign Config</title>
+    <link data-trunk rel="css" href="style.css">
+    <script src="/app-config.js"></script>
+    <link data-trunk rel="rust">
+  </head>
+  <body>
+    <header>
+      <a id="brand-link" class="brand" href="/" aria-label="Sovereign Config home">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span>Sovereign Config</span>
+      </a>
+    </header>
+    <div class="layout">
+      <nav aria-label="Administration">
+        <a id="system-status-link" class="active" href="/">System status</a>
+      </nav>
+      <main id="main">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">Administration</p>
+            <h1>System status</h1>
+          </div>
+          <div class="actions">
+            <button id="login" type="button">Log in</button>
+            <button id="logout" class="secondary" type="button" hidden>Log out</button>
+          </div>
+        </div>
+        <p id="error" class="error" role="alert" hidden></p>
+        <section aria-labelledby="service-heading">
+          <h2 id="service-heading">Service</h2>
+          <dl>
+            <div><dt>Connection</dt><dd id="service-value">Checking</dd></div>
+            <div><dt>Application version</dt><dd id="version-value">-</dd></div>
+            <div><dt>Protocol version</dt><dd id="protocol-value">-</dd></div>
+          </dl>
+        </section>
+        <section aria-labelledby="auth-heading">
+          <h2 id="auth-heading" tabindex="-1">Authentication</h2>
+          <dl><div><dt>Session</dt><dd id="auth-value">Checking</dd></div></dl>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

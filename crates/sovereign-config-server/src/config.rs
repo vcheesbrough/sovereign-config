@@ -10,15 +10,26 @@ pub(crate) struct Config {
     pub(crate) grpc_addr: SocketAddr,
     pub(crate) metrics_addr: SocketAddr,
     pub(crate) authentication: AuthenticationConfig,
+    pub(crate) web: WebConfig,
+}
+
+pub(crate) struct WebConfig {
+    pub(crate) issuer: String,
+    pub(crate) client_id: String,
 }
 
 pub(crate) struct AuthenticationConfig {
     pub(crate) introspection_url: Url,
-    pub(crate) issuer: String,
-    pub(crate) audience: String,
+    pub(crate) accepted_identities: Vec<AcceptedIdentity>,
     pub(crate) introspection_client_id: String,
     pub(crate) introspection_client_secret: String,
     pub(crate) timeout: Duration,
+}
+
+#[derive(Clone)]
+pub(crate) struct AcceptedIdentity {
+    pub(crate) issuer: String,
+    pub(crate) audience: String,
 }
 
 impl Config {
@@ -54,13 +65,19 @@ impl Config {
             metrics_addr,
             authentication: AuthenticationConfig {
                 introspection_url,
-                issuer,
-                audience,
+                accepted_identities: vec![AcceptedIdentity {
+                    issuer: issuer.clone(),
+                    audience: audience.clone(),
+                }],
                 introspection_client_id,
                 introspection_client_secret: required_secret(
                     "SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET",
                 )?,
                 timeout: INTROSPECTION_TIMEOUT,
+            },
+            web: WebConfig {
+                issuer,
+                client_id: audience,
             },
         })
     }

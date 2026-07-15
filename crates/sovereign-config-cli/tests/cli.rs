@@ -1,0 +1,830 @@
+use std::{
+    collections::HashMap,
+    fs,
+    io::Write,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
+
+use axum::{
+    Form, Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use base64::{Engine, engine::general_purpose};
+use serde_json::json;
+use sovereign_config_proto::sovereign::config::v1::{
+    GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
+    system_server::{System, SystemServer},
+};
+use tempfile::TempDir;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::{Request, Status, transport::Server};
+use url::form_urlencoded;
+
+const DEVICE_SECRET: &str = "device-secret-sentinel";
+const ACCESS_SECRET: &str = "access-secret-sentinel";
+const REFRESH_SECRET: &str = "refresh-secret-sentinel";
+const ROTATED_REFRESH_SECRET: &str = "rotated-refresh-secret-sentinel";
+const MANAGED_CREDENTIAL: &str = "pipeline:app-password-sentinel";
+
+#[derive(Clone, Copy)]
+enum DeviceResult {
+    Success,
+    PendingThenSuccess,
+    SlowDownThenSuccess,
+    Denied,
+    Expired,
+    Rejected,
+    Unavailable,
+}
+
+struct OidcState {
+    issuer: String,
+    device_result: DeviceResult,
+    poll_count: AtomicUsize,
+    refresh_count: AtomicUsize,
+    managed_count: AtomicUsize,
+    reject_refresh: AtomicBool,
+    reject_managed: AtomicBool,
+    unavailable: AtomicBool,
+    omit_device_endpoint: AtomicBool,
+    unsafe_token_endpoint: AtomicBool,
+}
+
+struct TestServices {
+    issuer: String,
+    endpoint: String,
+    oidc_state: Arc<OidcState>,
+    oidc_task: tokio::task::JoinHandle<()>,
+    grpc_task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+}
+
+impl Drop for TestServices {
+    fn drop(&mut self) {
+        self.oidc_task.abort();
+        self.grpc_task.abort();
+    }
+}
+
+#[derive(Default)]
+struct MockSystem;
+
+#[tonic::async_trait]
+impl System for MockSystem {
+    async fn get_version(
+        &self,
+        request: Request<GetVersionRequest>,
+    ) -> Result<tonic::Response<GetVersionResponse>, Status> {
+        if request.into_inner().protocol_version != "v1" {
+            return Err(Status::failed_precondition("protocol mismatch"));
+        }
+        Ok(tonic::Response::new(GetVersionResponse {
+            application_version: "1.3.0-test".to_owned(),
+            protocol_version: "v1".to_owned(),
+        }))
+    }
+
+    async fn get_identity(
+        &self,
+        request: Request<GetIdentityRequest>,
+    ) -> Result<tonic::Response<GetIdentityResponse>, Status> {
+        let authorization = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        if authorization != Some("Bearer access-secret-sentinel") {
+            return Err(Status::unauthenticated("authentication required"));
+        }
+        Ok(tonic::Response::new(GetIdentityResponse {
+            authenticated: true,
+        }))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_status_logout_flow_is_authenticated_private_and_secret_safe() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    add_profile(home.path(), &services, "dev", false).await;
+
+    let login = run_cli(home.path(), &["login"]).await;
+    assert_success(&login);
+    let login_output = combined(&login);
+    assert!(login_output.contains("Code: TEST-CODE"));
+    assert!(login_output.contains("Logged in"));
+    assert_secrets_absent(&login_output);
+
+    let [credential] = credential_files(home.path()).try_into().unwrap();
+    assert_eq!(fs::read_to_string(&credential).unwrap(), REFRESH_SECRET);
+    assert_eq!(
+        fs::metadata(&credential).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let status = run_cli(home.path(), &["status"]).await;
+    assert_success(&status);
+    let status_output = combined(&status);
+    assert!(status_output.contains("Service 1.3.0-test (protocol v1)"));
+    assert!(status_output.contains("Authentication: logged in"));
+    assert_secrets_absent(&status_output);
+    assert_eq!(
+        fs::read_to_string(&credential).unwrap(),
+        ROTATED_REFRESH_SECRET
+    );
+
+    let logout = run_cli(home.path(), &["logout"]).await;
+    assert_success(&logout);
+    assert_eq!(String::from_utf8_lossy(&logout.stdout).trim(), "Logged out");
+    assert!(!credential.exists());
+
+    let logged_out = run_cli(home.path(), &["status"]).await;
+    assert_success(&logged_out);
+    assert!(combined(&logged_out).contains("Authentication: logged out"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn profiles_support_defaults_updates_and_global_overrides_without_revealing_secrets() {
+    let development = start_services(DeviceResult::Success).await;
+    let production = start_services(DeviceResult::Success).await;
+    let replacement = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+
+    add_profile(home.path(), &development, "dev", false).await;
+    let managed_add = add_profile(home.path(), &production, "pipeline", true).await;
+    assert_secrets_absent(&combined(&managed_add));
+
+    let config = home.path().join("sovereign-config/config.toml");
+    assert_eq!(
+        fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(config.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .contains(&general_purpose::URL_SAFE_NO_PAD.encode(MANAGED_CREDENTIAL))
+    );
+
+    let default_status = run_cli(home.path(), &["status"]).await;
+    assert_success(&default_status);
+    assert!(combined(&default_status).contains("Authentication: logged out"));
+
+    let override_status = run_cli(home.path(), &["--profile", "pipeline", "status"]).await;
+    assert_success(&override_status);
+    assert!(combined(&override_status).contains("Authentication: logged in"));
+    assert_eq!(
+        production.oidc_state.managed_count.load(Ordering::SeqCst),
+        1
+    );
+    assert!(credential_files(home.path()).is_empty());
+
+    let set_default = run_cli(home.path(), &["profile", "default", "pipeline"]).await;
+    assert_success(&set_default);
+    let unchanged =
+        run_cli_with_input(home.path(), &["profile", "update", "pipeline"], Some("\n")).await;
+    assert_success(&unchanged);
+    assert!(combined(&unchanged).contains("Profile unchanged"));
+
+    let replacement_url = connection_url(&replacement, true, "");
+    let update = run_cli_with_input(
+        home.path(),
+        &["profile", "update", "pipeline"],
+        Some(&format!("{replacement_url}\n")),
+    )
+    .await;
+    assert_success(&update);
+    assert_secrets_absent(&combined(&update));
+    let replaced_status = run_cli(home.path(), &["status"]).await;
+    assert_success(&replaced_status);
+    assert_eq!(
+        replacement.oidc_state.managed_count.load(Ordering::SeqCst),
+        1
+    );
+
+    for unsupported in ["list", "show", "remove"] {
+        let output = run_cli(home.path(), &["profile", unsupported]).await;
+        assert!(!output.status.success());
+        assert_secrets_absent(&combined(&output));
+    }
+    let irrelevant_override = run_cli(
+        home.path(),
+        &["--profile", "dev", "profile", "default", "dev"],
+    )
+    .await;
+    assert!(!irrelevant_override.status.success());
+    assert!(
+        combined(&irrelevant_override).contains("--profile applies only to operational commands")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn profile_input_is_one_bounded_redacted_line() {
+    let home = TempDir::new().unwrap();
+    for input in [
+        "not-a-url\nsecond-line\n".to_owned(),
+        format!("{}\n", "a".repeat(16 * 1024 + 1)),
+        format!("https://example.test/#client_secret={MANAGED_CREDENTIAL}\n"),
+    ] {
+        let output =
+            run_cli_with_input(home.path(), &["profile", "add", "invalid"], Some(&input)).await;
+        assert!(!output.status.success());
+        let output = combined(&output);
+        assert!(output.contains("connection URL is invalid"));
+        assert_secrets_absent(&output);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn home_fallback_uses_standard_config_and_state_directories() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let url = connection_url(&services, false, "");
+    let add = run_cli_environment(
+        home.path(),
+        &["profile", "add", "dev"],
+        Some(&format!("{url}\n")),
+        false,
+    )
+    .await;
+    assert_success(&add);
+    assert!(
+        home.path()
+            .join(".config/sovereign-config/config.toml")
+            .is_file()
+    );
+
+    let login = run_cli_environment(home.path(), &["login"], None, false).await;
+    assert_success(&login);
+    assert_eq!(
+        fs::read_dir(
+            home.path()
+                .join(".local/state/sovereign-config/credentials")
+        )
+        .unwrap()
+        .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn human_credentials_are_isolated_by_endpoint_and_selected_profile() {
+    let development = start_services(DeviceResult::Success).await;
+    let production = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    add_profile(home.path(), &development, "dev", false).await;
+    add_profile(home.path(), &production, "prod", false).await;
+
+    assert_success(&run_cli(home.path(), &["login"]).await);
+    assert_eq!(credential_files(home.path()).len(), 1);
+
+    let production_status = run_cli(home.path(), &["--profile", "prod", "status"]).await;
+    assert_success(&production_status);
+    assert!(combined(&production_status).contains("Authentication: logged out"));
+    assert_eq!(
+        production.oidc_state.refresh_count.load(Ordering::SeqCst),
+        0
+    );
+
+    assert_success(&run_cli(home.path(), &["--profile", "prod", "login"]).await);
+    assert_eq!(credential_files(home.path()).len(), 2);
+    assert_success(&run_cli(home.path(), &["--profile", "prod", "logout"]).await);
+    assert_eq!(credential_files(home.path()).len(), 1);
+
+    let development_status = run_cli(home.path(), &["status"]).await;
+    assert_success(&development_status);
+    assert!(combined(&development_status).contains("Authentication: logged in"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn profile_updates_preserve_shared_human_state_and_remove_the_last_reference() {
+    let development = start_services(DeviceResult::Success).await;
+    let replacement = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    add_profile(home.path(), &development, "dev", false).await;
+    let alias_url = connection_url(&development, false, "apps/example");
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["profile", "add", "alias"],
+            Some(&format!("{alias_url}\n")),
+        )
+        .await,
+    );
+    assert_success(&run_cli(home.path(), &["login"]).await);
+    assert_eq!(credential_files(home.path()).len(), 1);
+
+    let replacement_url = connection_url(&replacement, false, "");
+    let update = run_cli_with_input(
+        home.path(),
+        &["profile", "update", "dev"],
+        Some(&format!("{replacement_url}\n")),
+    )
+    .await;
+    assert_success(&update);
+    assert_eq!(credential_files(home.path()).len(), 1);
+    assert_success(&run_cli(home.path(), &["--profile", "alias", "status"]).await);
+
+    let final_update = run_cli_with_input(
+        home.path(),
+        &["profile", "update", "alias"],
+        Some(&format!("{replacement_url}\n")),
+    )
+    .await;
+    assert_success(&final_update);
+    assert!(credential_files(home.path()).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changing_a_human_profile_to_managed_removes_its_refresh_credential() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    add_profile(home.path(), &services, "connection", false).await;
+    assert_success(&run_cli(home.path(), &["login"]).await);
+    assert_eq!(credential_files(home.path()).len(), 1);
+
+    let managed_url = connection_url(&services, true, "");
+    let update = run_cli_with_input(
+        home.path(),
+        &["profile", "update", "connection"],
+        Some(&format!("{managed_url}\n")),
+    )
+    .await;
+    assert_success(&update);
+    assert!(credential_files(home.path()).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn definitive_refresh_rejection_deletes_the_human_credential() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    add_profile(home.path(), &services, "dev", false).await;
+    assert_success(&run_cli(home.path(), &["login"]).await);
+    services
+        .oidc_state
+        .reject_refresh
+        .store(true, Ordering::SeqCst);
+
+    let status = run_cli(home.path(), &["status"]).await;
+    assert!(!status.status.success());
+    assert!(combined(&status).contains("login has expired"));
+    assert!(credential_files(home.path()).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn temporary_provider_failure_retains_the_human_credential() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    add_profile(home.path(), &services, "dev", false).await;
+    assert_success(&run_cli(home.path(), &["login"]).await);
+    services
+        .oidc_state
+        .unavailable
+        .store(true, Ordering::SeqCst);
+
+    let status = run_cli(home.path(), &["status"]).await;
+    assert!(!status.status.success());
+    assert!(combined(&status).contains("authentication service is unavailable"));
+    assert_eq!(credential_files(home.path()).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_authentication_rejection_is_bounded_and_never_creates_token_state() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    add_profile(home.path(), &services, "pipeline", true).await;
+    services
+        .oidc_state
+        .reject_managed
+        .store(true, Ordering::SeqCst);
+    services
+        .oidc_state
+        .omit_device_endpoint
+        .store(true, Ordering::SeqCst);
+
+    let status = run_cli(home.path(), &["status"]).await;
+    assert!(!status.status.success());
+    let output = combined(&status);
+    assert!(output.contains("managed authentication failed"));
+    assert_secrets_absent(&output);
+    assert!(credential_files(home.path()).is_empty());
+    for command in ["login", "logout"] {
+        let output = run_cli(home.path(), &[command]).await;
+        assert!(!output.status.success());
+        assert!(combined(&output).contains("profile uses managed authentication"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn denied_device_login_fails_without_exposing_credentials() {
+    assert_login_failure(DeviceResult::Denied, "device login denied").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_device_login_polls_until_authorized() {
+    assert_eventual_login(DeviceResult::PendingThenSuccess).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_down_device_login_honors_the_provider_response() {
+    assert_eventual_login(DeviceResult::SlowDownThenSuccess).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_device_login_returns_a_bounded_error() {
+    assert_login_failure(DeviceResult::Expired, "device login expired").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_device_authorization_returns_a_bounded_error() {
+    assert_login_failure(
+        DeviceResult::Rejected,
+        "authentication service is unavailable",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unavailable_identity_provider_returns_a_bounded_error() {
+    assert_login_failure(
+        DeviceResult::Unavailable,
+        "authentication service is unavailable",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn credentialed_discovery_endpoint_is_rejected_without_disclosure() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    add_profile(home.path(), &services, "dev", false).await;
+    services
+        .oidc_state
+        .unsafe_token_endpoint
+        .store(true, Ordering::SeqCst);
+
+    let output = run_cli(home.path(), &["login"]).await;
+    assert!(!output.status.success());
+    let output = combined(&output);
+    assert!(output.contains("OIDC configuration is invalid"));
+    assert!(!output.contains("discovery-user"));
+    assert!(!output.contains("discovery-password"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unavailable_service_returns_a_bounded_error_without_retrying() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let unavailable = TestServices {
+        issuer: services.issuer.clone(),
+        endpoint: "http://127.0.0.1:1".to_owned(),
+        oidc_state: services.oidc_state.clone(),
+        oidc_task: tokio::spawn(async {}),
+        grpc_task: tokio::spawn(async { Ok(()) }),
+    };
+    add_profile(home.path(), &unavailable, "dev", false).await;
+
+    let output = run_cli(home.path(), &["status"]).await;
+    assert!(!output.status.success());
+    assert!(combined(&output).contains("service is unavailable"));
+    assert_secrets_absent(&combined(&output));
+}
+
+#[test]
+fn version_does_not_require_profile_configuration() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sovereign-config"))
+        .arg("--version")
+        .env_clear()
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "sovereign-config 1.3.0"
+    );
+}
+
+async fn start_services(device_result: DeviceResult) -> TestServices {
+    let oidc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let oidc_address = oidc_listener.local_addr().unwrap();
+    let issuer = format!("http://{oidc_address}/");
+    let oidc_state = Arc::new(OidcState {
+        issuer: issuer.clone(),
+        device_result,
+        poll_count: AtomicUsize::new(0),
+        refresh_count: AtomicUsize::new(0),
+        managed_count: AtomicUsize::new(0),
+        reject_refresh: AtomicBool::new(false),
+        reject_managed: AtomicBool::new(false),
+        unavailable: AtomicBool::new(false),
+        omit_device_endpoint: AtomicBool::new(false),
+        unsafe_token_endpoint: AtomicBool::new(false),
+    });
+    let oidc = Router::new()
+        .route("/.well-known/openid-configuration", get(discovery))
+        .route("/device", post(device_authorization))
+        .route("/token", post(token))
+        .with_state(oidc_state.clone());
+    let oidc_task = tokio::spawn(async move {
+        axum::serve(oidc_listener, oidc).await.unwrap();
+    });
+
+    let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_address = grpc_listener.local_addr().unwrap();
+    let grpc_task = tokio::spawn(
+        Server::builder()
+            .add_service(SystemServer::new(MockSystem))
+            .serve_with_incoming(TcpListenerStream::new(grpc_listener)),
+    );
+
+    TestServices {
+        issuer,
+        endpoint: format!("http://{grpc_address}"),
+        oidc_state,
+        oidc_task,
+        grpc_task,
+    }
+}
+
+async fn discovery(State(state): State<Arc<OidcState>>) -> Response {
+    if matches!(state.device_result, DeviceResult::Unavailable)
+        || state.unavailable.load(Ordering::SeqCst)
+    {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let token_endpoint = if state.unsafe_token_endpoint.load(Ordering::SeqCst) {
+        format!(
+            "{}token",
+            state
+                .issuer
+                .replacen("http://", "http://discovery-user:discovery-password@", 1)
+        )
+    } else {
+        format!("{}token", state.issuer)
+    };
+    let mut document = json!({"token_endpoint": token_endpoint});
+    if !state.omit_device_endpoint.load(Ordering::SeqCst) {
+        document["device_authorization_endpoint"] = json!(format!("{}device", state.issuer));
+    }
+    Json(document).into_response()
+}
+
+async fn device_authorization(
+    State(state): State<Arc<OidcState>>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    if form.get("client_id").map(String::as_str) != Some("sovereign-config")
+        || form.get("scope").map(String::as_str) != Some("openid sovereign-config offline_access")
+    {
+        return oauth_error("invalid_request");
+    }
+    if matches!(state.device_result, DeviceResult::Rejected) {
+        return oauth_error("invalid_request");
+    }
+    Json(json!({
+        "device_code": DEVICE_SECRET,
+        "user_code": "TEST-CODE",
+        "verification_uri": "https://auth.example.test/device",
+        "verification_uri_complete": "https://auth.example.test/device?code=TEST-CODE",
+        "expires_in": 30,
+        "interval": 1,
+    }))
+    .into_response()
+}
+
+async fn token(
+    State(state): State<Arc<OidcState>>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    match form.get("grant_type").map(String::as_str) {
+        Some("urn:ietf:params:oauth:grant-type:device_code") => {
+            if form.get("device_code").map(String::as_str) != Some(DEVICE_SECRET) {
+                return oauth_error("invalid_grant");
+            }
+            match state.device_result {
+                DeviceResult::Success => token_response(true),
+                DeviceResult::PendingThenSuccess
+                    if state.poll_count.fetch_add(1, Ordering::SeqCst) == 0 =>
+                {
+                    oauth_error("authorization_pending")
+                }
+                DeviceResult::SlowDownThenSuccess
+                    if state.poll_count.fetch_add(1, Ordering::SeqCst) == 0 =>
+                {
+                    oauth_error("slow_down")
+                }
+                DeviceResult::PendingThenSuccess | DeviceResult::SlowDownThenSuccess => {
+                    token_response(true)
+                }
+                DeviceResult::Denied => oauth_error("access_denied"),
+                DeviceResult::Expired => oauth_error("expired_token"),
+                DeviceResult::Rejected | DeviceResult::Unavailable => unreachable!(),
+            }
+        }
+        Some("refresh_token") => {
+            state.refresh_count.fetch_add(1, Ordering::SeqCst);
+            if state.reject_refresh.load(Ordering::SeqCst)
+                || form.get("refresh_token").map(String::as_str) != Some(REFRESH_SECRET)
+            {
+                return oauth_error("invalid_grant");
+            }
+            Json(json!({
+                "access_token": ACCESS_SECRET,
+                "refresh_token": ROTATED_REFRESH_SECRET,
+            }))
+            .into_response()
+        }
+        Some("client_credentials") => {
+            state.managed_count.fetch_add(1, Ordering::SeqCst);
+            let expected = general_purpose::STANDARD.encode(MANAGED_CREDENTIAL);
+            let valid = form.get("client_secret").map(String::as_str) == Some(expected.as_str())
+                && form.get("client_id").map(String::as_str) == Some("sovereign-config")
+                && form.get("scope").map(String::as_str) == Some("sovereign-config");
+            if !valid || state.reject_managed.load(Ordering::SeqCst) {
+                return oauth_error("invalid_client");
+            }
+            token_response(false)
+        }
+        _ => oauth_error("unsupported_grant_type"),
+    }
+}
+
+fn token_response(refresh: bool) -> Response {
+    if refresh {
+        Json(json!({
+            "access_token": ACCESS_SECRET,
+            "refresh_token": REFRESH_SECRET,
+        }))
+        .into_response()
+    } else {
+        Json(json!({"access_token": ACCESS_SECRET})).into_response()
+    }
+}
+
+fn oauth_error(error: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({"error": error}))).into_response()
+}
+
+async fn assert_eventual_login(result: DeviceResult) {
+    let services = start_services(result).await;
+    let home = TempDir::new().unwrap();
+    add_profile(home.path(), &services, "dev", false).await;
+    let output = run_cli(home.path(), &["login"]).await;
+    assert_success(&output);
+    assert!(combined(&output).contains("Logged in"));
+    assert_secrets_absent(&combined(&output));
+    let [credential] = credential_files(home.path()).try_into().unwrap();
+    assert_eq!(fs::read_to_string(credential).unwrap(), REFRESH_SECRET);
+}
+
+async fn assert_login_failure(result: DeviceResult, expected: &str) {
+    let services = start_services(result).await;
+    let home = TempDir::new().unwrap();
+    add_profile(home.path(), &services, "dev", false).await;
+    let output = run_cli(home.path(), &["login"]).await;
+    assert!(!output.status.success());
+    let output = combined(&output);
+    assert!(
+        output.contains(expected),
+        "unexpected command output: {output}"
+    );
+    assert_secrets_absent(&output);
+    assert!(credential_files(home.path()).is_empty());
+}
+
+async fn add_profile(home: &Path, services: &TestServices, name: &str, managed: bool) -> Output {
+    let url = connection_url(services, managed, "");
+    let output =
+        run_cli_with_input(home, &["profile", "add", name], Some(&format!("{url}\n"))).await;
+    assert_success(&output);
+    output
+}
+
+fn connection_url(services: &TestServices, managed: bool, root: &str) -> String {
+    let mut fragment = form_urlencoded::Serializer::new(String::new());
+    fragment
+        .append_pair("v", "1")
+        .append_pair("issuer", &services.issuer)
+        .append_pair("client_id", "sovereign-config");
+    if managed {
+        fragment.append_pair(
+            "client_secret",
+            &general_purpose::URL_SAFE_NO_PAD.encode(MANAGED_CREDENTIAL),
+        );
+    }
+    format!("{}/{root}#{}", services.endpoint, fragment.finish())
+}
+
+fn credential_files(home: &Path) -> Vec<PathBuf> {
+    let directory = home.join("sovereign-config/credentials");
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut paths = entries
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+async fn run_cli(home: &Path, arguments: &[&str]) -> Output {
+    run_cli_with_input(home, arguments, None).await
+}
+
+async fn run_cli_with_input(home: &Path, arguments: &[&str], input: Option<&str>) -> Output {
+    run_cli_environment(home, arguments, input, true).await
+}
+
+async fn run_cli_environment(
+    home: &Path,
+    arguments: &[&str],
+    input: Option<&str>,
+    use_xdg: bool,
+) -> Output {
+    let binary = env!("CARGO_BIN_EXE_sovereign-config");
+    let home = home.to_owned();
+    let arguments = arguments
+        .iter()
+        .map(|argument| (*argument).to_owned())
+        .collect::<Vec<_>>();
+    let input = input.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        let mut command = Command::new(binary);
+        command
+            .args(arguments)
+            .env_clear()
+            .env("HOME", &home)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if use_xdg {
+            command
+                .env("XDG_CONFIG_HOME", &home)
+                .env("XDG_STATE_HOME", &home);
+        }
+        let mut child = command.spawn().unwrap();
+        if let Some(input) = input {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+        }
+        child.wait_with_output().unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "command failed: {}",
+        combined(output)
+    );
+}
+
+fn combined(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn assert_secrets_absent(output: &str) {
+    for secret in [
+        DEVICE_SECRET,
+        ACCESS_SECRET,
+        REFRESH_SECRET,
+        ROTATED_REFRESH_SECRET,
+        MANAGED_CREDENTIAL,
+        "app-password-sentinel",
+        &general_purpose::URL_SAFE_NO_PAD.encode(MANAGED_CREDENTIAL),
+        &general_purpose::STANDARD.encode(MANAGED_CREDENTIAL),
+    ] {
+        assert!(
+            !output.contains(secret),
+            "secret appeared in command output"
+        );
+    }
+}

@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod metrics;
+mod web;
 
 use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -16,15 +17,16 @@ use tonic_health::pb::{HealthCheckRequest, health_check_response, health_client:
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use auth::{AuthenticationLayer, Authenticator};
+use auth::{Authenticator, grpc_authentication_layer};
 use config::{Config, required_env};
 use metrics::AuthenticationMetrics;
+use sovereign_config_core::PROTOCOL_VERSION;
 use sovereign_config_proto::sovereign::config::v1::{
-    GetVersionRequest, GetVersionResponse,
+    GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
     system_server::{System, SystemServer},
 };
+use web::WebAssetsLayer;
 
-const PROTOCOL_VERSION: &str = "v1";
 const SYSTEM_SERVICE_NAME: &str = "sovereign.config.v1.System";
 const APPLICATION_VERSION: &str = application_version(option_env!("SOVEREIGN_CONFIG_RELEASE"));
 
@@ -60,6 +62,22 @@ impl System for SystemService {
         Ok(Response::new(GetVersionResponse {
             application_version: APPLICATION_VERSION.to_owned(),
             protocol_version: PROTOCOL_VERSION.to_owned(),
+        }))
+    }
+
+    async fn get_identity(
+        &self,
+        request: Request<GetIdentityRequest>,
+    ) -> Result<Response<GetIdentityResponse>, Status> {
+        if request
+            .extensions()
+            .get::<auth::AuthenticatedPrincipal>()
+            .is_none()
+        {
+            return Err(Status::unauthenticated("authentication required"));
+        }
+        Ok(Response::new(GetIdentityResponse {
+            authenticated: true,
         }))
     }
 }
@@ -110,6 +128,7 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    let web_assets = WebAssetsLayer::new(&config.web);
     let authenticator = Authenticator::new(config.authentication)?;
     let authentication_metrics = Arc::new(AuthenticationMetrics::default());
     let database = PgPoolOptions::new()
@@ -146,10 +165,12 @@ async fn main() -> Result<()> {
 
     info!(grpc_addr = %config.grpc_addr, metrics_addr = %config.metrics_addr, protocol_version = PROTOCOL_VERSION, "sovereign-config started");
     Server::builder()
-        .layer(AuthenticationLayer::new(
+        .accept_http1(true)
+        .layer(grpc_authentication_layer(
             authenticator,
             authentication_metrics,
         ))
+        .layer(web_assets)
         .add_service(health_service)
         .add_service(SystemServer::new(SystemService))
         .serve_with_shutdown(config.grpc_addr, shutdown_signal())
@@ -221,7 +242,7 @@ mod tests {
 
     #[test]
     fn configured_release_version_overrides_cargo_version() {
-        assert_eq!(application_version(Some("1.2.42")), "1.2.42");
+        assert_eq!(application_version(Some("1.3.42")), "1.3.42");
         assert_eq!(application_version(None), env!("CARGO_PKG_VERSION"));
         assert_eq!(application_version(Some("")), env!("CARGO_PKG_VERSION"));
     }

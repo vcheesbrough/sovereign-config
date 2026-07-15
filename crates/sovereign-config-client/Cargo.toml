@@ -1,0 +1,17 @@
+[package]
+name = "sovereign-config-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+sovereign-config-core = { path = "../sovereign-config-core" }
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
