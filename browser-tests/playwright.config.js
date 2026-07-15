@@ -1,5 +1,7 @@
 const { defineConfig, devices } = require('@playwright/test');
 
+const staticDir = process.env.PLAYWRIGHT_STATIC_DIR || '../web-dist';
+
 module.exports = defineConfig({
   testDir: './tests',
   outputDir: './test-results',
@@ -16,7 +18,7 @@ module.exports = defineConfig({
   ],
   webServer: {
     command: process.env.PLAYWRIGHT_STATIC
-      ? 'npx http-server ../web-dist -a 127.0.0.1 -p 8088 -c-1'
+      ? `npx http-server ${JSON.stringify(staticDir)} -a 127.0.0.1 -p 8088 -c-1`
       : 'NO_COLOR=false trunk serve --address 127.0.0.1 --port 8088',
     cwd: process.env.PLAYWRIGHT_STATIC ? '.' : '../crates/sovereign-config-web',
     url: 'http://127.0.0.1:8088',
