@@ -36,6 +36,7 @@ features = [
   "HtmlElement",
   "HtmlInputElement",
   "HtmlTextAreaElement",
+  "KeyboardEvent",
   "Location",
   "Request",
   "RequestCache",
