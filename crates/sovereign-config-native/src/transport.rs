@@ -1,10 +1,17 @@
+use std::net::IpAddr;
+
 use async_trait::async_trait;
+use http::Uri;
 use sovereign_config_client::{RpcCode, Transport, VersionReply, map_rpc_status};
 use sovereign_config_core::{AuthenticationStatus, ClientError, Secret};
 use sovereign_config_proto::sovereign::config::v1::{
     GetIdentityRequest, GetVersionRequest, system_client::SystemClient,
 };
-use tonic::{Code, Request, metadata::MetadataValue, transport::Channel};
+use tonic::{
+    Code, Request,
+    metadata::MetadataValue,
+    transport::{Channel, Endpoint},
+};
 
 #[derive(Clone)]
 pub struct TonicTransport {
@@ -18,13 +25,32 @@ impl TonicTransport {
     ///
     /// Returns a bounded invalid-request or unavailable error.
     pub async fn connect(endpoint: String) -> Result<Self, ClientError> {
-        let channel = Channel::from_shared(endpoint)
+        validate_service_endpoint(&endpoint)?;
+        let channel = Endpoint::new(endpoint)
             .map_err(|_| map_rpc_status(RpcCode::InvalidArgument))?
             .connect()
             .await
             .map_err(|_| map_rpc_status(RpcCode::Unavailable))?;
         Ok(Self { channel })
     }
+}
+
+fn validate_service_endpoint(endpoint: &str) -> Result<(), ClientError> {
+    let uri = endpoint
+        .parse::<Uri>()
+        .map_err(|_| map_rpc_status(RpcCode::InvalidArgument))?;
+    let valid = match (uri.scheme_str(), uri.host()) {
+        (Some("https"), Some(_)) => true,
+        (Some("http"), Some(host)) => host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback()),
+        _ => false,
+    };
+    if !valid {
+        return Err(map_rpc_status(RpcCode::InvalidArgument));
+    }
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -72,4 +98,19 @@ fn map_status(status: &tonic::Status) -> ClientError {
         Code::Unavailable => RpcCode::Unavailable,
         _ => RpcCode::Other,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_service_endpoint;
+
+    #[test]
+    fn service_endpoints_require_https_except_for_loopback() {
+        assert!(validate_service_endpoint("https://config.example.test").is_ok());
+        assert!(validate_service_endpoint("http://127.0.0.1:50051").is_ok());
+        assert!(validate_service_endpoint("http://[::1]:50051").is_ok());
+        assert!(validate_service_endpoint("http://config.example.test").is_err());
+        assert!(validate_service_endpoint("ftp://config.example.test").is_err());
+        assert!(validate_service_endpoint("not-a-url").is_err());
+    }
 }

@@ -18,7 +18,7 @@ sovereign-config-client = { path = "../sovereign-config-client" }
 sovereign-config-core = { path = "../sovereign-config-core" }
 sovereign-config-proto = { path = "../sovereign-config-proto" }
 tokio.workspace = true
-tonic = { workspace = true, features = ["tls", "transport"] }
+tonic = { workspace = true, features = ["tls-native-roots", "transport"] }
 
 [dev-dependencies]
 axum.workspace = true
