@@ -97,6 +97,12 @@ async fn migrations_are_repeatable_against_postgresql() {
         .run(&pool)
         .await
         .expect("upgrade from the prior release must succeed");
+    let values_after_rooted_upgrade: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM configuration_values")
+            .fetch_one(&pool)
+            .await
+            .expect("upgraded configuration value inventory must be readable");
+    assert_eq!(values_after_rooted_upgrade, 0);
 
     reset_schema(&pool, "after upgrade validation").await;
 
