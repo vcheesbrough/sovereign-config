@@ -51,7 +51,7 @@ fn assert_environment(environment: &Environment<'_>) {
     let grants = sequence(field(attributes, environment.source_attribute));
     assert_eq!(grants.len(), 1);
     let grant = mapping(&grants[0]);
-    assert_eq!(string(field(grant, "prefix")), "");
+    assert_eq!(string(field(grant, "prefix")), "/");
     let permissions = sequence(field(grant, "permissions"))
         .iter()
         .map(string)

@@ -132,12 +132,12 @@ mod tests {
             },
             ConsumerAuthentication,
         );
-        let path = ConfigPath::parse_operation("Apps/API/Feature").unwrap();
+        let path = ConfigPath::parse_operation("/Apps/API/Feature").unwrap();
         let value = PlainValue::new("consumer-value-sentinel");
 
         client.put_value(&path, &value).await.unwrap();
         let listing = client
-            .list_values(&ConfigPath::parse("apps/api").unwrap())
+            .list_values(&ConfigPath::parse("/apps/api").unwrap())
             .await
             .unwrap();
         assert_eq!(listing.values.len(), 1);

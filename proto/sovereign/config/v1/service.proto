@@ -17,10 +17,12 @@ service Configuration {
 }
 
 message ListValuesRequest {
+  // Canonical absolute configuration namespace path. `/` selects the tree root.
   string path = 1;
 }
 
 message ListedValue {
+  // Canonical absolute configuration value path.
   string path = 1;
   string value = 2;
   google.protobuf.Timestamp created_at = 3;
@@ -33,6 +35,7 @@ message ListValuesResponse {
 }
 
 message GetValueRequest {
+  // Canonical absolute configuration value path.
   string path = 1;
 }
 
@@ -43,6 +46,7 @@ message GetValueResponse {
 }
 
 message PutValueRequest {
+  // Canonical absolute configuration value path.
   string path = 1;
   string value = 2;
 }
@@ -53,6 +57,7 @@ message PutValueResponse {
 }
 
 message DeleteValueRequest {
+  // Canonical absolute configuration value path.
   string path = 1;
 }
 

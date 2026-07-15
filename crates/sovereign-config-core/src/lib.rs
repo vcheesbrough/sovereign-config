@@ -26,22 +26,26 @@ pub struct ConfigPath(String);
 impl ConfigPath {
     #[must_use]
     pub fn root() -> Self {
-        Self(String::new())
+        Self("/".into())
     }
 
-    /// Parses an empty root path or a slash-separated lowercase path.
+    /// Parses a rooted lowercase path, including the `/` root path.
     ///
     /// # Errors
     ///
-    /// Returns [`PathError::NonCanonical`] when a segment is empty or contains
-    /// characters outside lowercase ASCII letters, digits, and `-`.
+    /// Returns [`PathError::NonCanonical`] when the path is not rooted, a segment
+    /// is empty, or it contains characters outside lowercase ASCII letters,
+    /// digits, and `-`.
     pub fn parse(value: impl Into<String>) -> Result<Self, PathError> {
         let value = value.into();
-        if value.is_empty()
-            || value.split('/').all(|segment| {
-                !segment.is_empty()
-                    && segment.bytes().all(|byte| {
-                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+        if value == "/"
+            || value.strip_prefix('/').is_some_and(|relative| {
+                !relative.is_empty()
+                    && relative.split('/').all(|segment| {
+                        !segment.is_empty()
+                            && segment.bytes().all(|byte| {
+                                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                            })
                     })
             })
         {
@@ -51,17 +55,20 @@ impl ConfigPath {
         }
     }
 
-    /// Parses a non-root operation path and normalizes ASCII letters to lowercase.
+    /// Parses a non-root absolute operation path and normalizes ASCII letters to lowercase.
     ///
     /// # Errors
     ///
-    /// Returns [`PathError::NonCanonical`] for empty paths, empty segments,
-    /// non-ASCII text, percent encoding, or characters other than ASCII letters,
-    /// digits, and `-`.
+    /// Returns [`PathError::NonCanonical`] for root or unrooted paths, empty
+    /// segments, non-ASCII text, percent encoding, or characters other than
+    /// ASCII letters, digits, and `-`.
     pub fn parse_operation(value: impl AsRef<str>) -> Result<Self, PathError> {
         let value = value.as_ref();
-        if value.is_empty()
-            || !value.split('/').all(|segment| {
+        let Some(relative) = value.strip_prefix('/') else {
+            return Err(PathError::NonCanonical);
+        };
+        if relative.is_empty()
+            || !relative.split('/').all(|segment| {
                 !segment.is_empty()
                     && segment.bytes().all(|byte| {
                         byte.is_ascii_alphabetic() || byte.is_ascii_digit() || byte == b'-'
@@ -73,18 +80,26 @@ impl ConfigPath {
         Self::parse(value.to_ascii_lowercase())
     }
 
-    /// Joins a canonical root with a relative operation path.
+    /// Appends one value name to a canonical rooted namespace.
     ///
     /// # Errors
     ///
-    /// Returns [`PathError::NonCanonical`] when `relative` is not a valid
-    /// operation path.
-    pub fn join_operation(&self, relative: impl AsRef<str>) -> Result<Self, PathError> {
-        let relative = Self::parse_operation(relative)?;
-        if self.0.is_empty() {
-            Ok(relative)
+    /// Returns [`PathError::NonCanonical`] when `name` is not one valid path
+    /// segment.
+    pub fn join_name(&self, name: impl AsRef<str>) -> Result<Self, PathError> {
+        let name = name.as_ref();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphabetic() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(PathError::NonCanonical);
+        }
+        let name = name.to_ascii_lowercase();
+        if self.0 == "/" {
+            Self::parse(format!("/{name}"))
         } else {
-            Self::parse(format!("{}/{}", self.0, relative.0))
+            Self::parse(format!("{}/{name}", self.0))
         }
     }
 
@@ -328,23 +343,24 @@ mod tests {
 
     #[test]
     fn paths_are_canonical_and_root_is_explicit() {
-        assert_eq!(ConfigPath::root().as_str(), "");
-        assert!(ConfigPath::parse("apps/api-v2").is_ok());
-        for invalid in ["/apps", "apps/", "apps//api", "Apps", "apps_api"] {
+        assert_eq!(ConfigPath::root().as_str(), "/");
+        assert!(ConfigPath::parse("/apps/api-v2").is_ok());
+        for invalid in ["", "apps", "/apps/", "/apps//api", "/Apps", "/apps_api"] {
             assert!(ConfigPath::parse(invalid).is_err(), "accepted {invalid:?}");
         }
     }
 
     #[test]
     fn operation_paths_normalize_ascii_case_and_join_to_roots() {
-        let root = ConfigPath::parse("teams/platform").unwrap();
+        let root = ConfigPath::parse("/teams/platform").unwrap();
         assert_eq!(
-            root.join_operation("Apps/API-V2").unwrap().as_str(),
-            "teams/platform/apps/api-v2"
+            root.join_name("Apps-API-V2").unwrap().as_str(),
+            "/teams/platform/apps-api-v2"
         );
         for invalid in [
             "",
-            "/apps",
+            "/",
+            "apps",
             "apps/",
             "apps//api",
             ".",
@@ -357,6 +373,7 @@ mod tests {
                 "accepted {invalid:?}"
             );
         }
+        assert!(root.join_name("apps/api").is_err());
     }
 
     #[test]

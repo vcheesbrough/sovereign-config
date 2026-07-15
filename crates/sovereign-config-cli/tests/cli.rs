@@ -261,7 +261,7 @@ async fn exact_value_commands_use_absolute_paths_within_profile_root_and_hard_de
 
     let relative = run_cli(home.path(), &["get", "team/service/feature/flag"]).await;
     assert!(!relative.status.success());
-    assert!(combined(&relative).contains("path must begin with /"));
+    assert!(combined(&relative).contains("path must name a configuration value"));
 
     let outside_root = run_cli(home.path(), &["get", "/other/feature-flag"]).await;
     assert!(!outside_root.status.success());

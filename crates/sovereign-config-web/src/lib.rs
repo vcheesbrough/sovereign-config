@@ -703,7 +703,7 @@ fn route_from_path(path: &str) -> Route {
         return Route::Configuration(ConfigPath::root());
     }
     if let Some(relative) = path.strip_prefix("/configuration/")
-        && let Ok(path) = ConfigPath::parse_operation(relative)
+        && let Ok(path) = ConfigPath::parse_operation(format!("/{relative}"))
     {
         return Route::Configuration(path);
     }
@@ -713,17 +713,13 @@ fn route_from_path(path: &str) -> Route {
 fn route_url(route: &Route) -> String {
     match route {
         Route::System => "/".into(),
-        Route::Configuration(path) if path.as_str().is_empty() => "/configuration/".into(),
-        Route::Configuration(path) => format!("/configuration/{}", path.as_str()),
+        Route::Configuration(path) if path.as_str() == "/" => "/configuration/".into(),
+        Route::Configuration(path) => format!("/configuration{}", path.as_str()),
     }
 }
 
 fn absolute_path(path: &ConfigPath) -> String {
-    if path.as_str().is_empty() {
-        "/".into()
-    } else {
-        format!("/{}", path.as_str())
-    }
+    path.as_str().to_owned()
 }
 
 fn selected_namespace() -> Result<ConfigPath, ClientError> {
@@ -737,11 +733,7 @@ fn parse_absolute_path(value: &str) -> Result<ConfigPath, ClientError> {
     if value == "/" {
         return Ok(ConfigPath::root());
     }
-    let relative = value.strip_prefix('/').ok_or_else(invalid_path)?;
-    if relative.ends_with('/') {
-        return Err(invalid_path());
-    }
-    ConfigPath::parse_operation(relative).map_err(|_| invalid_path())
+    ConfigPath::parse_operation(value).map_err(|_| invalid_path())
 }
 
 fn invalid_path() -> ClientError {
@@ -818,7 +810,7 @@ async fn save_new_value() {
         let name = element::<HtmlInputElement>("new-value-name")
             .ok_or_else(browser_error)?
             .value();
-        let path = namespace.join_operation(name).map_err(|_| invalid_path())?;
+        let path = namespace.join_name(name).map_err(|_| invalid_path())?;
         let value = element::<HtmlTextAreaElement>("new-value-content")
             .ok_or_else(browser_error)?
             .value();
@@ -1196,12 +1188,11 @@ fn validate_name_field() -> bool {
     let Some(input) = element::<HtmlInputElement>("new-value-name") else {
         return false;
     };
-    let message =
-        if ConfigPath::parse_operation(input.value()).is_ok() && !input.value().contains('/') {
-            None
-        } else {
-            Some("Name must contain only letters, numbers, and hyphens")
-        };
+    let message = if ConfigPath::root().join_name(input.value()).is_ok() {
+        None
+    } else {
+        Some("Name must contain only letters, numbers, and hyphens")
+    };
     set_validation("new-value-name", "new-name-error", message);
     message.is_none()
 }
@@ -1838,10 +1829,10 @@ mod tests {
 
     #[test]
     fn absolute_configuration_paths_drive_canonical_routes() {
-        assert_eq!(parse_absolute_path("/").unwrap().as_str(), "");
+        assert_eq!(parse_absolute_path("/").unwrap().as_str(), "/");
         assert_eq!(
             parse_absolute_path("/Apps/API").unwrap().as_str(),
-            "apps/api"
+            "/apps/api"
         );
         for invalid in ["", "apps/api", "/apps/", "/apps/bad_name", "//apps"] {
             assert!(

@@ -106,20 +106,20 @@ function stringFields(frame) {
 
 function parentPath(path) {
   const split = path.lastIndexOf('/');
-  return split === -1 ? '' : path.slice(0, split);
+  return split <= 0 ? '/' : path.slice(0, split);
 }
 
 function existingPaths(values) {
   const paths = new Set();
   for (const path of values.keys()) {
     const parent = parentPath(path);
-    if (parent === '') {
-      paths.add('');
+    if (parent === '/') {
+      paths.add('/');
       continue;
     }
-    const segments = parent.split('/');
+    const segments = parent.slice(1).split('/');
     for (let index = 1; index <= segments.length; index++) {
-      paths.add(segments.slice(0, index).join('/'));
+      paths.add(`/${segments.slice(0, index).join('/')}`);
     }
   }
   return [...paths].sort();
@@ -142,7 +142,7 @@ async function mockValues(page, initial = {}) {
       });
     }
     if (method === 'ListValues') {
-      const selected = fields.get(1) || '';
+      const selected = fields.get(1) || '/';
       const values = [...stored].filter(([path]) => parentPath(path) === selected);
       return route.fulfill({
         status: 200,
@@ -437,8 +437,8 @@ test('configuration path is deep-linked, selectable, and restored by browser his
   await openCallback(page);
   await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
   await mockValues(page, {
-    'apps/api/feature-flag': 'enabled',
-    'apps/worker/concurrency': '4'
+    '/apps/api/feature-flag': 'enabled',
+    '/apps/worker/concurrency': '4'
   });
   await page.goto('/configuration/apps/api');
   const pathInput = page.getByLabel('Selected path');
@@ -462,13 +462,13 @@ test('path selector refreshes external paths and Enter opens the selected path',
   await openCallback(page);
   await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
   const values = await mockValues(page, {
-    'apps/api/feature-flag': 'enabled'
+    '/apps/api/feature-flag': 'enabled'
   });
   await page.goto('/configuration/apps/api');
   const pathInput = page.getByLabel('Selected path');
   await expect(page.locator('#existing-paths [role="option"][data-path="/services/worker"]')).toHaveCount(0);
 
-  values.setValue('services/worker/concurrency', '4');
+  values.setValue('/services/worker/concurrency', '4');
   await pathInput.focus();
   const workerPath = page.locator('#existing-paths [role="option"][data-path="/services/worker"]');
   await expect(workerPath).toHaveCount(1);
@@ -485,7 +485,7 @@ test('path selector popup uses the available viewport height', async ({ page }) 
   await openCallback(page);
   await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
   const initial = Object.fromEntries(
-    Array.from({ length: 40 }, (_, index) => [`services/service-${index + 1}/enabled`, 'true'])
+    Array.from({ length: 40 }, (_, index) => [`/services/service-${index + 1}/enabled`, 'true'])
   );
   await mockValues(page, initial);
   await page.goto('/configuration/services/service-1');
@@ -512,8 +512,8 @@ test('configuration grid is accessible and contained on desktop and mobile', asy
   await openCallback(page);
   await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
   await mockValues(page, {
-    'apps/api/feature-flag': 'enabled',
-    'apps/api/retry-limit': '5'
+    '/apps/api/feature-flag': 'enabled',
+    '/apps/api/retry-limit': '5'
   });
   await page.goto('/configuration/apps/api');
   await expect(page.getByRole('row', { name: /feature-flag/ })).toBeVisible();
@@ -593,7 +593,7 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
   const editor = page.getByLabel('Value for feature-flag');
   await expect(editor).toHaveValue('plain-value-sentinel');
-  expect(requests.at(-2).fields.get(1)).toBe('apps/api/feature-flag');
+  expect(requests.at(-2).fields.get(1)).toBe('/apps/api/feature-flag');
   expect(requests.at(-2).fields.get(2)).toBe('plain-value-sentinel');
 
   await editor.fill('updated-value-sentinel');
