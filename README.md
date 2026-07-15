@@ -58,12 +58,12 @@ sovereign-config logout
 
 Use `sovereign-config profile update <name>` to replace a URL and `sovereign-config profile default <name>` to change the default. A URL can instead be supplied as exactly one line on standard input. Profile URLs are never accepted as process arguments. Operational commands accept a global override, for example `sovereign-config --profile prod status`.
 
-Read, create or replace, and permanently delete one exact plain-text value with the selected profile. Paths are relative to the profile root and ASCII case-insensitive; the service stores one lowercase canonical path. Put content is read from standard input so it does not appear in process arguments. Interactive deletion requires typing `delete`; automation must pass `--yes` explicitly.
+Read, create or replace, and permanently delete one exact plain-text value with the selected profile. Every command path is absolute, begins with `/`, and is ASCII case-insensitive; the service stores one lowercase canonical path. A profile with a configured root accepts only absolute paths within that subtree. Put content is read from standard input so it does not appear in process arguments. Interactive deletion requires typing `delete`; automation must pass `--yes` explicitly.
 
 ```sh
-sovereign-config get apps/api/settings
-printf '%s' 'enabled=true' | sovereign-config put apps/api/settings
-sovereign-config delete apps/api/settings --yes
+sovereign-config get /apps/api/settings
+printf '%s' 'enabled=true' | sovereign-config put /apps/api/settings
+sovereign-config delete /apps/api/settings --yes
 ```
 
 Get prints the exact stored text. Put and delete print only fixed success summaries and never echo the value. Read, write, and manage grants are independent: get requires `read`, put requires `write`, and delete requires `manage` on the exact path or an ancestor prefix.
