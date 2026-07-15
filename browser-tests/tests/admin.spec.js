@@ -27,6 +27,79 @@ function grpcFrame(payload, status = 0) {
   return Buffer.concat([dataHeader, payload, trailerHeader, trailer]);
 }
 
+function varint(value) {
+  const bytes = [];
+  let current = BigInt(value);
+  while (current >= 0x80n) {
+    bytes.push(Number((current & 0x7fn) | 0x80n));
+    current >>= 7n;
+  }
+  bytes.push(Number(current));
+  return Buffer.from(bytes);
+}
+
+function field(number, payload) {
+  return Buffer.concat([Buffer.from([(number << 3) | 2]), varint(payload.length), payload]);
+}
+
+function timestamp(seconds) {
+  return Buffer.concat([Buffer.from([0x08]), varint(seconds)]);
+}
+
+function valueReply(value) {
+  const instant = timestamp(1700000000);
+  return Buffer.concat([
+    field(1, Buffer.from(value)),
+    field(2, instant),
+    field(3, instant)
+  ]);
+}
+
+function mutationReply() {
+  const instant = timestamp(1700000000);
+  return Buffer.concat([field(1, instant), field(2, instant)]);
+}
+
+async function mockValues(page) {
+  let stored = null;
+  const requests = [];
+  await page.route('**/sovereign.config.v1.Configuration/*', route => {
+    const method = route.request().url().split('/').pop();
+    const body = route.request().postDataBuffer();
+    requests.push({ method, body });
+    const authorized = route.request().headers().authorization === 'Bearer access-token-two';
+    if (!authorized) {
+      return route.fulfill({
+        status: 200,
+        headers: { 'content-type': 'application/grpc-web+proto' },
+        body: grpcFrame(Buffer.alloc(0), 16)
+      });
+    }
+    if (method === 'GetValue') {
+      return route.fulfill({
+        status: 200,
+        headers: { 'content-type': 'application/grpc-web+proto' },
+        body: stored === null ? grpcFrame(Buffer.alloc(0), 5) : grpcFrame(valueReply(stored))
+      });
+    }
+    if (method === 'PutValue') {
+      stored = 'plain-value-sentinel';
+      return route.fulfill({
+        status: 200,
+        headers: { 'content-type': 'application/grpc-web+proto' },
+        body: grpcFrame(mutationReply())
+      });
+    }
+    stored = null;
+    return route.fulfill({
+      status: 200,
+      headers: { 'content-type': 'application/grpc-web+proto' },
+      body: grpcFrame(field(1, timestamp(1700000001)))
+    });
+  });
+  return requests;
+}
+
 async function mockApplication(page) {
   await page.route('**/app-config.js', route => route.fulfill({
     contentType: 'text/javascript',
@@ -268,6 +341,49 @@ test('reload restores the session with a rotated refresh token', async ({ page }
     grant_type: 'refresh_token',
     refresh_token: 'refresh-token-two'
   });
+});
+
+test('exact value lifecycle is accessible, case-insensitive, and permanently deletes', async ({ page }) => {
+  await openCallback(page);
+  const requests = await mockValues(page);
+  const pathInput = page.getByLabel('Path');
+  const editor = page.getByLabel('Plain text value');
+
+  await pathInput.fill('Apps/API/Feature-Flag');
+  await page.getByRole('button', { name: 'Load' }).click();
+  await expect(page.getByText('New value')).toBeVisible();
+  await expect(editor).toBeFocused();
+
+  await editor.fill('plain-value-sentinel');
+  await page.getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByText('Saved')).toBeVisible();
+  await expect(page.locator('#created-value')).not.toHaveText('-');
+  expect(requests.at(-1).body.includes(Buffer.from('apps/api/feature-flag'))).toBe(true);
+  expect(requests.at(-1).body.includes(Buffer.from('plain-value-sentinel'))).toBe(true);
+
+  await editor.fill('discarded-local-edit');
+  await pathInput.fill('APPS/api/FEATURE-FLAG');
+  await page.getByRole('button', { name: 'Load' }).click();
+  await expect(editor).toHaveValue('plain-value-sentinel');
+
+  const remove = page.getByRole('button', { name: 'Delete', exact: true }).first();
+  await remove.click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Cancel' })).toBeFocused();
+  await page.getByRole('button', { name: 'Cancel' }).click();
+  await expect(remove).toBeFocused();
+
+  await remove.click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Delete' }).click();
+  await expect(page.getByText('Deleted')).toBeVisible();
+  await expect(pathInput).toBeFocused();
+  await expect(editor).toHaveValue('');
+
+  await page.getByRole('button', { name: 'Load' }).click();
+  await expect(page.getByText('New value')).toBeVisible();
+  expect(requests.map(request => request.method)).toEqual([
+    'GetValue', 'PutValue', 'GetValue', 'DeleteValue', 'GetValue'
+  ]);
 });
 
 for (const contract of transportContract) {

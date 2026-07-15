@@ -100,6 +100,7 @@ fn assert_contract_result(
 fn expected_kind(kind: &str) -> ErrorKind {
     match kind {
         "InvalidRequest" => ErrorKind::InvalidRequest,
+        "NotFound" => ErrorKind::NotFound,
         "PermissionDenied" => ErrorKind::PermissionDenied,
         "IncompatibleProtocol" => ErrorKind::IncompatibleProtocol,
         "Unavailable" => ErrorKind::Unavailable,
@@ -113,6 +114,7 @@ fn contract_code(status: u16) -> Code {
     match status {
         2 => Code::Unknown,
         3 => Code::InvalidArgument,
+        5 => Code::NotFound,
         7 => Code::PermissionDenied,
         9 => Code::FailedPrecondition,
         14 => Code::Unavailable,
