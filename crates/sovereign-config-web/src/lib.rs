@@ -427,10 +427,7 @@ async fn refresh_tokens(
     )
     .await?;
     if !response.ok() {
-        return Err(ClientError::new(
-            ErrorKind::Unauthenticated,
-            "login has expired",
-        ));
+        return Err(refresh_error(&response).await);
     }
     let json = JsFuture::from(response.json().map_err(|_| oidc_error())?)
         .await
@@ -444,6 +441,25 @@ async fn refresh_tokens(
         refresh_expires_at_ms: current.refresh_expires_at_ms,
         token_endpoint: current.token_endpoint.clone(),
     })
+}
+
+async fn refresh_error(response: &Response) -> ClientError {
+    let oauth_error = match response.json() {
+        Ok(json) => JsFuture::from(json)
+            .await
+            .ok()
+            .and_then(|json| optional_string_property(&json, "error")),
+        Err(_) => None,
+    };
+    classify_refresh_error(response.status(), oauth_error.as_deref())
+}
+
+fn classify_refresh_error(status: u16, oauth_error: Option<&str>) -> ClientError {
+    if status == 400 && oauth_error == Some("invalid_grant") {
+        ClientError::new(ErrorKind::Unauthenticated, "login has expired")
+    } else {
+        oidc_error()
+    }
 }
 
 fn expires_in(json: &JsValue) -> f64 {
@@ -601,11 +617,14 @@ fn app_config() -> Result<AppConfig, ClientError> {
 }
 
 fn string_property(value: &JsValue, name: &str) -> Result<String, ClientError> {
+    optional_string_property(value, name).ok_or_else(oidc_error)
+}
+
+fn optional_string_property(value: &JsValue, name: &str) -> Option<String> {
     Reflect::get(value, &JsValue::from_str(name))
         .ok()
         .and_then(|value| value.as_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(oidc_error)
 }
 
 fn random_urlsafe() -> Result<String, ClientError> {
@@ -697,7 +716,30 @@ mod tests {
     use sovereign_config_core::ErrorKind;
     use sovereign_config_proto::sovereign::config::v1::GetIdentityResponse;
 
-    use super::decode_grpc_web;
+    use super::{classify_refresh_error, decode_grpc_web};
+
+    #[test]
+    fn refresh_error_rejects_only_invalid_grant() {
+        let error = classify_refresh_error(400, Some("invalid_grant"));
+
+        assert_eq!(error.kind, ErrorKind::Unauthenticated);
+        assert_eq!(error.message(), "login has expired");
+    }
+
+    #[test]
+    fn refresh_error_preserves_sessions_for_provider_failures() {
+        for (status, oauth_error) in [
+            (429, Some("slow_down")),
+            (500, Some("server_error")),
+            (503, None),
+            (400, Some("invalid_request")),
+            (400, None),
+        ] {
+            let error = classify_refresh_error(status, oauth_error);
+            assert_eq!(error.kind, ErrorKind::Unavailable);
+            assert_eq!(error.message(), "identity provider is unavailable");
+        }
+    }
 
     #[test]
     fn grpc_web_decoder_reads_data_and_success_trailer() {
