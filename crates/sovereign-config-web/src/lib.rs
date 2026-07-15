@@ -178,8 +178,7 @@ fn install_actions() {
     }
     if let Some(logout) = document.get_element_by_id("logout") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: web_sys::Event| {
-            TOKENS.with_borrow_mut(|token| *token = None);
-            clear_persisted_refresh_token();
+            clear_browser_session();
             set_text("auth-value", "Logged out");
             set_hidden("login", false);
             set_hidden("logout", true);
@@ -222,6 +221,7 @@ async fn refresh_status(config: &AppConfig) {
             set_hidden("logout", true);
         }
         Err(error) if error.kind == ErrorKind::Unauthenticated => {
+            clear_browser_session();
             set_text("auth-value", "Logged out");
             set_hidden("login", false);
             set_hidden("logout", true);
@@ -400,6 +400,11 @@ fn clear_persisted_refresh_token() {
         let _ = storage.remove_item(REFRESH_ENDPOINT_KEY);
         let _ = storage.remove_item(REFRESH_EXPIRES_KEY);
     }
+}
+
+fn clear_browser_session() {
+    TOKENS.with_borrow_mut(|token| *token = None);
+    clear_persisted_refresh_token();
 }
 
 async fn refresh_tokens(
