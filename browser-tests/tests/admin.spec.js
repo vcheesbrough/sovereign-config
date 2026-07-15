@@ -110,6 +110,14 @@ async function openCallback(
     if (refreshResult === 'unavailable') {
       return route.abort('connectionrefused');
     }
+    if (refreshResult === 'transient') {
+      return route.fulfill({
+        status: 503,
+        contentType: 'application/json',
+        headers: { 'access-control-allow-origin': '*' },
+        body: JSON.stringify({ error: 'server_error' })
+      });
+    }
     return route.fulfill({
       contentType: 'application/json',
       headers: { 'access-control-allow-origin': '*' },
@@ -200,6 +208,8 @@ test('refresh rejection clears the browser session', async ({ page }) => {
   await expect(page.getByText('Logged out')).toBeVisible();
   await expect(page.getByText('login has expired')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Log in' })).toBeVisible();
+  await expect.poll(() => storedRefreshState(page))
+    .toEqual({ token: null, endpoint: null, expiry: null });
 });
 
 test('refresh outage does not reuse an expired access token', async ({ page }) => {
@@ -207,6 +217,17 @@ test('refresh outage does not reuse an expired access token', async ({ page }) =
   await expect(page.getByText('Unavailable', { exact: true })).toBeVisible();
   await expect(page.getByText('service is unavailable')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Log out' })).toBeVisible();
+});
+
+test('transient refresh HTTP failure preserves the browser session', async ({ page }) => {
+  await openCallback(page, 'transient');
+  await expect(page.getByText('Unavailable', { exact: true })).toBeVisible();
+  await expect(page.getByText('identity provider is unavailable')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Log out' })).toBeVisible();
+  await expect.poll(() => storedRefreshState(page)).toMatchObject({
+    token: 'refresh-token-one',
+    endpoint: tokenEndpoint
+  });
 });
 
 test('absolute refresh expiry clears the browser session without a token request', async ({ page }) => {
