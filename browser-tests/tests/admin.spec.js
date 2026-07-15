@@ -9,6 +9,14 @@ const staticDir = process.env.PLAYWRIGHT_STATIC_DIR
   : path.resolve(__dirname, '../../web-dist');
 const tokenEndpoint = 'https://auth.example.test/application/o/token/';
 
+async function storedRefreshState(page) {
+  return page.evaluate(() => ({
+    token: sessionStorage.getItem('sovereign-config.refresh-token'),
+    endpoint: sessionStorage.getItem('sovereign-config.refresh-endpoint'),
+    expiry: sessionStorage.getItem('sovereign-config.refresh-expires-at')
+  }));
+}
+
 function grpcFrame(payload, status = 0) {
   const dataHeader = Buffer.alloc(5);
   dataHeader.writeUInt32BE(payload.length, 1);
@@ -206,11 +214,8 @@ test('absolute refresh expiry clears the browser session without a token request
   await expect(page.getByText('Logged out')).toBeVisible();
   await expect(page.getByText('authentication required')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Log in' })).toBeVisible();
-  await expect.poll(() => page.evaluate(() => ({
-    token: sessionStorage.getItem('sovereign-config.refresh-token'),
-    endpoint: sessionStorage.getItem('sovereign-config.refresh-endpoint'),
-    expiry: sessionStorage.getItem('sovereign-config.refresh-expires-at')
-  }))).toEqual({ token: null, endpoint: null, expiry: null });
+  await expect.poll(() => storedRefreshState(page))
+    .toEqual({ token: null, endpoint: null, expiry: null });
   expect(requests).toHaveLength(1);
   expect(requests[0].grant_type).toBe('authorization_code');
 });
@@ -246,7 +251,7 @@ test('reload restores the session with a rotated refresh token', async ({ page }
 
 for (const contract of transportContract) {
   test(`browser transport maps gRPC status ${contract.grpc_status}`, async ({ page }) => {
-    await openCallback(page, 'success', 'expected-state', contract.grpc_status);
+    const requests = await openCallback(page, 'success', 'expected-state', contract.grpc_status);
     if (contract.grpc_status === 0) {
       await expect(page.getByText('Logged in')).toBeVisible();
       return;
@@ -254,5 +259,12 @@ for (const contract of transportContract) {
     await expect(page.getByText(contract.message, { exact: true })).toBeVisible();
     const authentication = contract.grpc_status === 16 ? 'Logged out' : 'Unavailable';
     await expect(page.getByText(authentication, { exact: true })).toBeVisible();
+    if (contract.grpc_status === 16) {
+      await expect.poll(() => storedRefreshState(page))
+        .toEqual({ token: null, endpoint: null, expiry: null });
+      await page.reload();
+      await expect(page.getByText('Logged out')).toBeVisible();
+      expect(requests).toHaveLength(2);
+    }
   });
 }
