@@ -545,13 +545,14 @@ fn decode_grpc_web<R: Message + Default>(bytes: &[u8]) -> Result<R, ClientError>
         }
         offset += length;
     }
-    if status.unwrap_or(0) != 0 {
+    let status = status.ok_or_else(|| map_rpc_status(RpcCode::Other))?;
+    if status != 0 {
         return Err(map_rpc_status(match status {
-            Some(3) => RpcCode::InvalidArgument,
-            Some(7) => RpcCode::PermissionDenied,
-            Some(9) => RpcCode::FailedPrecondition,
-            Some(14) => RpcCode::Unavailable,
-            Some(16) => RpcCode::Unauthenticated,
+            3 => RpcCode::InvalidArgument,
+            7 => RpcCode::PermissionDenied,
+            9 => RpcCode::FailedPrecondition,
+            14 => RpcCode::Unavailable,
+            16 => RpcCode::Unauthenticated,
             _ => RpcCode::Other,
         }));
     }
@@ -693,6 +694,7 @@ fn oidc_error() -> ClientError {
 #[cfg(test)]
 mod tests {
     use prost::Message;
+    use sovereign_config_core::ErrorKind;
     use sovereign_config_proto::sovereign::config::v1::GetIdentityResponse;
 
     use super::decode_grpc_web;
@@ -712,5 +714,28 @@ mod tests {
         response.extend_from_slice(trailer);
         let decoded: GetIdentityResponse = decode_grpc_web(&response).unwrap();
         assert!(decoded.authenticated);
+    }
+
+    #[test]
+    fn grpc_web_decoder_rejects_responses_without_a_status_trailer() {
+        let message = GetIdentityResponse {
+            authenticated: true,
+        }
+        .encode_to_vec();
+        let mut data_only = vec![0];
+        data_only.extend_from_slice(&u32::try_from(message.len()).unwrap().to_be_bytes());
+        data_only.extend_from_slice(&message);
+
+        let mut missing_status = data_only.clone();
+        let trailer = b"grpc-message: missing status\r\n";
+        missing_status.push(0x80);
+        missing_status.extend_from_slice(&u32::try_from(trailer.len()).unwrap().to_be_bytes());
+        missing_status.extend_from_slice(trailer);
+
+        for response in [data_only, missing_status] {
+            let error = decode_grpc_web::<GetIdentityResponse>(&response).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Internal);
+            assert_eq!(error.message(), "request failed");
+        }
     }
 }
