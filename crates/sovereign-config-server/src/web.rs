@@ -39,7 +39,7 @@ impl WebAssetsLayer {
             .into_bytes()
             .into(),
             content_security_policy: HeaderValue::from_str(&format!(
-                "default-src 'self'; connect-src 'self' https:; img-src 'self'; style-src 'self'; script-src 'self' 'sha256-{loader_hash}'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+                "default-src 'self'; connect-src 'self' https:; img-src 'self'; style-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-{loader_hash}'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
             ))
             .expect("generated content security policy must be valid"),
         }
@@ -177,7 +177,10 @@ fn not_found() -> Response<BoxBody> {
 mod tests {
     use std::convert::Infallible;
 
-    use http::{Request, Response, header::ACCESS_CONTROL_ALLOW_ORIGIN};
+    use http::{
+        Request, Response,
+        header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_SECURITY_POLICY},
+    };
     use tonic::body::{BoxBody, empty_body};
     use tower::{Layer, ServiceExt, service_fn};
 
@@ -204,5 +207,26 @@ mod tests {
                 .get(ACCESS_CONTROL_ALLOW_ORIGIN)
                 .is_none()
         );
+        let policy = response
+            .headers()
+            .get(CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(policy.contains("script-src 'self' 'wasm-unsafe-eval' 'sha256-"));
+        assert!(
+            !policy
+                .split_ascii_whitespace()
+                .any(|source| source == "'unsafe-eval'")
+        );
+        for directive in [
+            "default-src 'self'",
+            "connect-src 'self' https:",
+            "object-src 'none'",
+            "base-uri 'none'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(policy.contains(directive));
+        }
     }
 }
