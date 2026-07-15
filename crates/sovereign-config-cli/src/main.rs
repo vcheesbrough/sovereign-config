@@ -37,12 +37,24 @@ enum Command {
     Logout,
     Status,
     Get {
+        #[arg(
+            value_name = "ABSOLUTE_PATH",
+            help = "Absolute configuration value path, beginning with /"
+        )]
         path: String,
     },
     Put {
+        #[arg(
+            value_name = "ABSOLUTE_PATH",
+            help = "Absolute configuration value path, beginning with /"
+        )]
         path: String,
     },
     Delete {
+        #[arg(
+            value_name = "ABSOLUTE_PATH",
+            help = "Absolute configuration value path, beginning with /"
+        )]
         path: String,
         #[arg(long)]
         yes: bool,
@@ -265,7 +277,19 @@ async fn operational_client(
 }
 
 fn operation_path(connection: &ConnectionUrl, path: &str) -> Result<ConfigPath> {
-    Ok(connection.root().join_operation(path)?)
+    let relative = path.strip_prefix('/').context("path must begin with /")?;
+    let path =
+        ConfigPath::parse_operation(relative).context("path must name a configuration value")?;
+    let root = connection.root().as_str();
+    if !root.is_empty()
+        && !path
+            .as_str()
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    {
+        bail!("path is outside the selected profile root");
+    }
+    Ok(path)
 }
 
 async fn get_value(connection: &ConnectionUrl, path: &str) -> Result<()> {

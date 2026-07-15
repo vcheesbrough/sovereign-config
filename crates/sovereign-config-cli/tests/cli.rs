@@ -218,7 +218,7 @@ fn require_access_token<T>(request: &Request<T>) -> Result<(), Status> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn exact_value_commands_use_profile_root_stdin_and_hard_delete() {
+async fn exact_value_commands_use_absolute_paths_within_profile_root_and_hard_delete() {
     let services = start_services(DeviceResult::Success).await;
     let home = TempDir::new().unwrap();
     let connection = connection_url(&services, true, "team/service");
@@ -232,7 +232,7 @@ async fn exact_value_commands_use_profile_root_stdin_and_hard_delete() {
 
     let put = run_cli_with_input(
         home.path(),
-        &["put", "Feature/Flag"],
+        &["put", "/team/service/Feature/Flag"],
         Some("value-sentinel\nsecond-line"),
     )
     .await;
@@ -240,20 +240,32 @@ async fn exact_value_commands_use_profile_root_stdin_and_hard_delete() {
     assert_eq!(String::from_utf8_lossy(&put.stdout), "Value stored\n");
     assert!(!combined(&put).contains("value-sentinel"));
 
-    let get = run_cli(home.path(), &["get", "FEATURE/FLAG"]).await;
+    let get = run_cli(home.path(), &["get", "/TEAM/SERVICE/FEATURE/FLAG"]).await;
     assert_success(&get);
     assert_eq!(
         String::from_utf8_lossy(&get.stdout),
         "value-sentinel\nsecond-line"
     );
 
-    let delete = run_cli(home.path(), &["delete", "feature/flag", "--yes"]).await;
+    let delete = run_cli(
+        home.path(),
+        &["delete", "/team/service/feature/flag", "--yes"],
+    )
+    .await;
     assert_success(&delete);
     assert_eq!(String::from_utf8_lossy(&delete.stdout), "Value deleted\n");
 
-    let missing = run_cli(home.path(), &["get", "feature/flag"]).await;
+    let missing = run_cli(home.path(), &["get", "/team/service/feature/flag"]).await;
     assert!(!missing.status.success());
     assert!(combined(&missing).contains("configuration value not found"));
+
+    let relative = run_cli(home.path(), &["get", "team/service/feature/flag"]).await;
+    assert!(!relative.status.success());
+    assert!(combined(&relative).contains("path must begin with /"));
+
+    let outside_root = run_cli(home.path(), &["get", "/other/feature-flag"]).await;
+    assert!(!outside_root.status.success());
+    assert!(combined(&outside_root).contains("path is outside the selected profile root"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
