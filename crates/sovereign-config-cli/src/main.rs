@@ -1,46 +1,46 @@
-use anyhow::{Context, Result, bail};
+use std::io::{self, IsTerminal, Read};
+
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use sovereign_config_client::{AccessTokenProvider, Client};
-use sovereign_config_core::{ClientError, Secret};
+use sovereign_config_core::{ClientError, ConnectionUrl, ErrorKind, Secret};
 use sovereign_config_native::{
-    CredentialStore, DeviceFlowClient, TonicTransport, default_credential_directory,
+    CredentialStore, DeviceFlowClient, ProfileStore, TonicTransport, default_credential_directory,
+    default_profile_path,
 };
 
 const APPLICATION_VERSION: &str = match option_env!("SOVEREIGN_CONFIG_RELEASE") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
 };
+const MAX_CONNECTION_URL_BYTES: u64 = 16 * 1024;
 
 #[derive(Parser)]
 #[command(name = "sovereign-config", version = APPLICATION_VERSION, about)]
 struct Arguments {
+    #[arg(long, global = true)]
+    profile: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    Login(IdentityProviderArguments),
-    Logout(IdentityProviderArguments),
-    Status {
-        #[arg(long, env = "SOVEREIGN_CONFIG_ENDPOINT")]
-        endpoint: String,
-        #[command(flatten)]
-        identity_provider: IdentityProviderArguments,
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
     },
+    Login,
+    Logout,
+    Status,
 }
 
-#[derive(clap::Args)]
-struct IdentityProviderArguments {
-    #[arg(long, env = "SOVEREIGN_CONFIG_OIDC_ISSUER")]
-    issuer: String,
-    #[arg(
-        long,
-        env = "SOVEREIGN_CONFIG_OIDC_CLI_CLIENT_ID",
-        default_value = "sovereign-config"
-    )]
-    client_id: String,
+#[derive(Subcommand)]
+enum ProfileCommand {
+    Add { name: String },
+    Update { name: String },
+    Default { name: String },
 }
 
 struct InMemoryToken(Secret);
@@ -55,48 +55,102 @@ impl AccessTokenProvider for InMemoryToken {
 #[tokio::main]
 async fn main() -> Result<()> {
     let arguments = Arguments::parse();
+    let profiles = ProfileStore::new(default_profile_path()?);
     match arguments.command {
-        Command::Login(identity_provider) => {
-            let credential_store = credential_store(&identity_provider)?;
-            login(
-                &identity_provider.issuer,
-                identity_provider.client_id,
-                &credential_store,
-            )
-            .await
+        Command::Profile { command } => {
+            if arguments.profile.is_some() {
+                bail!("--profile applies only to operational commands");
+            }
+            manage_profile(command, &profiles)
         }
-        Command::Logout(identity_provider) => {
-            let credential_store = credential_store(&identity_provider)?;
-            credential_store.delete()?;
-            println!("Logged out");
-            Ok(())
-        }
-        Command::Status {
-            endpoint,
-            identity_provider,
-        } => {
-            let credential_store = credential_store(&identity_provider)?;
-            status(
-                endpoint,
-                &identity_provider.issuer,
-                identity_provider.client_id,
-                &credential_store,
-            )
-            .await
+        command => {
+            let connection = profiles.connection(arguments.profile.as_deref())?;
+            match command {
+                Command::Login => login(&connection).await,
+                Command::Logout => logout(&connection),
+                Command::Status => status(&connection).await,
+                Command::Profile { .. } => unreachable!(),
+            }
         }
     }
 }
 
-fn credential_store(identity_provider: &IdentityProviderArguments) -> Result<CredentialStore> {
-    Ok(CredentialStore::new(
-        &default_credential_directory()?,
-        &identity_provider.issuer,
-        &identity_provider.client_id,
-    )?)
+fn manage_profile(command: ProfileCommand, profiles: &ProfileStore) -> Result<()> {
+    match command {
+        ProfileCommand::Add { name } => {
+            let connection = read_connection(None, false)?.context("connection URL is required")?;
+            profiles.add(&name, &connection)?;
+            println!("Profile added");
+        }
+        ProfileCommand::Update { name } => {
+            let current = profiles.connection(Some(&name))?;
+            let Some(connection) = read_connection(Some(&current.redacted()), true)? else {
+                println!("Profile unchanged");
+                return Ok(());
+            };
+            if current.client_authentication().is_none()
+                && !same_human_authentication_identity(&current, &connection)
+                && !profiles.contains_other_human_identity(&name, &current)?
+            {
+                credential_store(&current)?.delete()?;
+            }
+            profiles.update(&name, &connection)?;
+            println!("Profile updated");
+        }
+        ProfileCommand::Default { name } => {
+            profiles.set_default(&name)?;
+            println!("Default profile updated");
+        }
+    }
+    Ok(())
 }
 
-async fn login(issuer: &str, client_id: String, store: &CredentialStore) -> Result<()> {
-    let oidc = DeviceFlowClient::discover(issuer, client_id).await?;
+fn same_human_authentication_identity(first: &ConnectionUrl, second: &ConnectionUrl) -> bool {
+    second.client_authentication().is_none()
+        && first.endpoint() == second.endpoint()
+        && first.issuer() == second.issuer()
+        && first.client_id() == second.client_id()
+}
+
+fn read_connection(
+    current: Option<&str>,
+    empty_is_unchanged: bool,
+) -> Result<Option<ConnectionUrl>> {
+    let value = if io::stdin().is_terminal() {
+        if let Some(current) = current {
+            println!("Current URL: {current}");
+        }
+        rpassword::prompt_password("New URL: ")
+            .map_err(|_| anyhow!("profile input is unavailable"))?
+    } else {
+        let mut value = String::new();
+        io::stdin()
+            .take(MAX_CONNECTION_URL_BYTES + 1)
+            .read_to_string(&mut value)
+            .map_err(|_| anyhow!("profile input is unavailable"))?;
+        if value.len() as u64 > MAX_CONNECTION_URL_BYTES {
+            bail!("connection URL is invalid");
+        }
+        let value = value.strip_suffix('\n').unwrap_or(&value);
+        let value = value.strip_suffix('\r').unwrap_or(value);
+        if value.bytes().any(|byte| matches!(byte, b'\n' | b'\r')) {
+            bail!("connection URL is invalid");
+        }
+        value.to_owned()
+    };
+    if value.is_empty() && empty_is_unchanged {
+        return Ok(None);
+    }
+    Ok(Some(ConnectionUrl::parse(&value)?))
+}
+
+async fn login(connection: &ConnectionUrl) -> Result<()> {
+    if connection.client_authentication().is_some() {
+        bail!("profile uses managed authentication");
+    }
+    let store = credential_store(connection)?;
+    let oidc =
+        DeviceFlowClient::discover(connection.issuer(), connection.client_id().to_owned()).await?;
     let authorization = oidc.begin().await?;
     println!("Open: {}", authorization.verification_uri);
     println!("Code: {}", authorization.user_code);
@@ -112,13 +166,17 @@ async fn login(issuer: &str, client_id: String, store: &CredentialStore) -> Resu
     Ok(())
 }
 
-async fn status(
-    endpoint: String,
-    issuer: &str,
-    client_id: String,
-    store: &CredentialStore,
-) -> Result<()> {
-    let transport = TonicTransport::connect(endpoint).await?;
+fn logout(connection: &ConnectionUrl) -> Result<()> {
+    if connection.client_authentication().is_some() {
+        bail!("profile uses managed authentication");
+    }
+    credential_store(connection)?.delete()?;
+    println!("Logged out");
+    Ok(())
+}
+
+async fn status(connection: &ConnectionUrl) -> Result<()> {
+    let transport = TonicTransport::connect(connection.endpoint().to_owned()).await?;
     let public_client = Client::new(transport.clone(), MissingToken);
     let service = public_client.service_status().await?;
     println!(
@@ -126,22 +184,49 @@ async fn status(
         service.application_version, service.protocol_version
     );
 
-    let Some(refresh) = store.load()? else {
-        println!("Authentication: logged out");
-        return Ok(());
+    let access_token = if let Some(authentication) = connection.client_authentication() {
+        DeviceFlowClient::discover(connection.issuer(), connection.client_id().to_owned())
+            .await?
+            .client_credentials(authentication)
+            .await?
+            .access_token
+    } else {
+        let store = credential_store(connection)?;
+        let Some(refresh) = store.load()? else {
+            println!("Authentication: logged out");
+            return Ok(());
+        };
+        let oidc =
+            DeviceFlowClient::discover(connection.issuer(), connection.client_id().to_owned())
+                .await?;
+        let tokens = match oidc.refresh(&refresh).await {
+            Ok(tokens) => tokens,
+            Err(error) if error.kind == ErrorKind::Unauthenticated => {
+                store.delete()?;
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(rotated) = &tokens.refresh_token {
+            store.store(rotated)?;
+        }
+        tokens.access_token
     };
-    let oidc = DeviceFlowClient::discover(issuer, client_id).await?;
-    let tokens = oidc.refresh(&refresh).await?;
-    if let Some(rotated) = &tokens.refresh_token {
-        store.store(rotated)?;
-    }
-    let client = Client::new(transport, InMemoryToken(tokens.access_token));
+
+    let client = Client::new(transport, InMemoryToken(access_token));
     let authentication = client.authentication_status().await?;
     if !authentication.authenticated {
         bail!("service returned an invalid authentication status");
     }
     println!("Authentication: logged in");
     Ok(())
+}
+
+fn credential_store(connection: &ConnectionUrl) -> Result<CredentialStore> {
+    Ok(CredentialStore::new(
+        &default_credential_directory()?,
+        connection,
+    ))
 }
 
 struct MissingToken;

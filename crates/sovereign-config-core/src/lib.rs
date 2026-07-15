@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod connection;
+
 use core::fmt;
 use std::collections::BTreeMap;
 
@@ -7,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const PROTOCOL_VERSION: &str = "v1";
+
+pub use connection::{ConnectionUrl, ConnectionUrlError};
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum PathError {

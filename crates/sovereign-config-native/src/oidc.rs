@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 
 use reqwest::{Client, Response, Url};
 use serde::Deserialize;
@@ -13,7 +13,7 @@ const SCOPE: &str = "openid sovereign-config offline_access";
 pub struct DeviceFlowClient {
     http: Client,
     client_id: String,
-    device_endpoint: Url,
+    device_endpoint: Option<Url>,
     token_endpoint: Url,
 }
 
@@ -33,7 +33,7 @@ pub struct TokenSet {
 
 #[derive(Deserialize)]
 struct Discovery {
-    device_authorization_endpoint: String,
+    device_authorization_endpoint: Option<String>,
     token_endpoint: String,
 }
 
@@ -66,7 +66,12 @@ impl DeviceFlowClient {
     /// Returns a bounded configuration or availability error.
     pub async fn discover(issuer: &str, client_id: String) -> Result<Self, ClientError> {
         let issuer = Url::parse(issuer).map_err(|_| invalid())?;
-        if issuer.scheme() != "https" && issuer.host_str() != Some("127.0.0.1") {
+        let loopback_http = issuer.scheme() == "http"
+            && issuer
+                .host_str()
+                .and_then(|host| host.parse::<IpAddr>().ok())
+                .is_some_and(|address| address.is_loopback());
+        if issuer.scheme() != "https" && !loopback_http {
             return Err(invalid());
         }
         let discovery_url = issuer
@@ -83,12 +88,18 @@ impl DeviceFlowClient {
                 .map_err(|_| unavailable())?,
         )?)
         .await?;
-        let device_endpoint =
-            Url::parse(&discovery.device_authorization_endpoint).map_err(|_| invalid())?;
+        let device_endpoint = discovery
+            .device_authorization_endpoint
+            .map(|endpoint| Url::parse(&endpoint).map_err(|_| invalid()))
+            .transpose()?;
         let token_endpoint = Url::parse(&discovery.token_endpoint).map_err(|_| invalid())?;
         let issuer_origin = issuer.origin().ascii_serialization();
-        for endpoint in [&device_endpoint, &token_endpoint] {
-            if endpoint.origin().ascii_serialization() != issuer_origin {
+        for endpoint in device_endpoint.iter().chain([&token_endpoint]) {
+            if endpoint.origin().ascii_serialization() != issuer_origin
+                || !endpoint.username().is_empty()
+                || endpoint.password().is_some()
+                || endpoint.fragment().is_some()
+            {
                 return Err(invalid());
             }
         }
@@ -106,9 +117,10 @@ impl DeviceFlowClient {
     ///
     /// Returns an availability error for rejected or malformed provider responses.
     pub async fn begin(&self) -> Result<DeviceAuthorization, ClientError> {
+        let device_endpoint = self.device_endpoint.clone().ok_or_else(invalid)?;
         let response = self
             .http
-            .post(self.device_endpoint.clone())
+            .post(device_endpoint)
             .form(&[("client_id", self.client_id.as_str()), ("scope", SCOPE)])
             .send()
             .await
@@ -206,10 +218,7 @@ impl DeviceFlowClient {
             .await
             .map_err(|_| unavailable())?;
         if !response.status().is_success() {
-            return Err(ClientError::new(
-                ErrorKind::Unauthenticated,
-                "login has expired",
-            ));
+            return Err(authentication_error(response, "login has expired").await);
         }
         let response: TokenResponse = decode(response).await?;
         if response.access_token.is_empty() {
@@ -219,6 +228,52 @@ impl DeviceFlowClient {
             access_token: Secret::new(response.access_token),
             refresh_token: response.refresh_token.map(Secret::new),
         })
+    }
+
+    /// Acquires one short-lived access token using an Authentik M2M credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication or availability error.
+    pub async fn client_credentials(
+        &self,
+        authentication: &Secret,
+    ) -> Result<TokenSet, ClientError> {
+        let response = self
+            .http
+            .post(self.token_endpoint.clone())
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("scope", "sovereign-config"),
+                ("client_id", self.client_id.as_str()),
+                ("client_secret", authentication.expose()),
+            ])
+            .send()
+            .await
+            .map_err(|_| unavailable())?;
+        if !response.status().is_success() {
+            return Err(authentication_error(response, "managed authentication failed").await);
+        }
+        let response: TokenResponse = decode(response).await?;
+        if response.access_token.is_empty() || response.refresh_token.is_some() {
+            return Err(unavailable());
+        }
+        Ok(TokenSet {
+            access_token: Secret::new(response.access_token),
+            refresh_token: None,
+        })
+    }
+}
+
+async fn authentication_error(response: Response, message: &'static str) -> ClientError {
+    if response.status().is_client_error()
+        && decode::<OAuthError>(response)
+            .await
+            .is_ok_and(|error| matches!(error.error.as_str(), "invalid_grant" | "invalid_client"))
+    {
+        ClientError::new(ErrorKind::Unauthenticated, message)
+    } else {
+        unavailable()
     }
 }
 
