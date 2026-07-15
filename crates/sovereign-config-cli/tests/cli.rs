@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     os::unix::fs::PermissionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output},
     sync::{
         Arc,
@@ -46,11 +46,13 @@ struct OidcState {
     issuer: String,
     device_result: DeviceResult,
     poll_count: AtomicUsize,
+    refresh_count: AtomicUsize,
 }
 
 struct TestServices {
     issuer: String,
     endpoint: String,
+    oidc_state: Arc<OidcState>,
     oidc_task: tokio::task::JoinHandle<()>,
     grpc_task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 }
@@ -109,7 +111,7 @@ async fn login_status_logout_flow_is_authenticated_private_and_secret_safe() {
     assert!(login_output.contains("Logged in"));
     assert_secrets_absent(&login_output);
 
-    let credential = home.path().join("sovereign-config/refresh-token");
+    let [credential] = credential_files(home.path()).try_into().unwrap();
     assert_eq!(fs::read_to_string(&credential).unwrap(), REFRESH_SECRET);
     assert_eq!(
         fs::metadata(&credential).unwrap().permissions().mode() & 0o777,
@@ -140,6 +142,39 @@ async fn login_status_logout_flow_is_authenticated_private_and_secret_safe() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn credentials_are_isolated_by_issuer_and_client() {
+    let development = start_services(DeviceResult::Success).await;
+    let production = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+
+    assert_success(&run_cli(home.path(), &development, &["login"]).await);
+    assert_eq!(credential_files(home.path()).len(), 1);
+
+    let production_status = run_cli(home.path(), &production, &["status"]).await;
+    assert_success(&production_status);
+    assert!(combined(&production_status).contains("Authentication: logged out"));
+    assert_eq!(
+        production.oidc_state.refresh_count.load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(credential_files(home.path()).len(), 1);
+
+    assert_success(&run_cli(home.path(), &production, &["login"]).await);
+    assert_eq!(credential_files(home.path()).len(), 2);
+
+    assert_success(&run_cli(home.path(), &production, &["logout"]).await);
+    assert_eq!(credential_files(home.path()).len(), 1);
+
+    let development_status = run_cli(home.path(), &development, &["status"]).await;
+    assert_success(&development_status);
+    assert!(combined(&development_status).contains("Authentication: logged in"));
+    assert_eq!(
+        development.oidc_state.refresh_count.load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn denied_device_login_fails_without_exposing_credentials() {
     let services = start_services(DeviceResult::Denied).await;
     let home = TempDir::new().unwrap();
@@ -149,7 +184,7 @@ async fn denied_device_login_fails_without_exposing_credentials() {
     let output = combined(&output);
     assert!(output.contains("device login denied"));
     assert_secrets_absent(&output);
-    assert!(!home.path().join("sovereign-config/refresh-token").exists());
+    assert!(credential_files(home.path()).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -192,6 +227,7 @@ async fn unavailable_service_returns_a_bounded_error_without_retrying() {
     let unavailable = TestServices {
         issuer: services.issuer.clone(),
         endpoint: "http://127.0.0.1:1".to_owned(),
+        oidc_state: services.oidc_state.clone(),
         oidc_task: tokio::spawn(async {}),
         grpc_task: tokio::spawn(async { Ok(()) }),
     };
@@ -221,15 +257,17 @@ async fn start_services(device_result: DeviceResult) -> TestServices {
     let oidc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let oidc_address = oidc_listener.local_addr().unwrap();
     let issuer = format!("http://{oidc_address}/");
+    let oidc_state = Arc::new(OidcState {
+        issuer: issuer.clone(),
+        device_result,
+        poll_count: AtomicUsize::new(0),
+        refresh_count: AtomicUsize::new(0),
+    });
     let oidc = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
         .route("/device", post(device_authorization))
         .route("/token", post(token))
-        .with_state(Arc::new(OidcState {
-            issuer: issuer.clone(),
-            device_result,
-            poll_count: AtomicUsize::new(0),
-        }));
+        .with_state(oidc_state.clone());
     let oidc_task = tokio::spawn(async move {
         axum::serve(oidc_listener, oidc).await.unwrap();
     });
@@ -245,6 +283,7 @@ async fn start_services(device_result: DeviceResult) -> TestServices {
     TestServices {
         issuer,
         endpoint: format!("http://{grpc_address}"),
+        oidc_state,
         oidc_task,
         grpc_task,
     }
@@ -346,6 +385,7 @@ async fn token(
             }
         }
         Some("refresh_token") => {
+            state.refresh_count.fetch_add(1, Ordering::SeqCst);
             if form.get("refresh_token").map(String::as_str) != Some(REFRESH_SECRET) {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -375,10 +415,8 @@ async fn assert_eventual_login(result: DeviceResult) {
     let output = combined(&output);
     assert!(output.contains("Logged in"));
     assert_secrets_absent(&output);
-    assert_eq!(
-        fs::read_to_string(home.path().join("sovereign-config/refresh-token")).unwrap(),
-        REFRESH_SECRET
-    );
+    let [credential] = credential_files(home.path()).try_into().unwrap();
+    assert_eq!(fs::read_to_string(credential).unwrap(), REFRESH_SECRET);
 }
 
 async fn assert_login_failure(result: DeviceResult, expected: &str) {
@@ -392,7 +430,19 @@ async fn assert_login_failure(result: DeviceResult, expected: &str) {
         "unexpected command output: {output}"
     );
     assert_secrets_absent(&output);
-    assert!(!home.path().join("sovereign-config/refresh-token").exists());
+    assert!(credential_files(home.path()).is_empty());
+}
+
+fn credential_files(home: &Path) -> Vec<PathBuf> {
+    let directory = home.join("sovereign-config/credentials");
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut paths = entries
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
 }
 
 async fn run_cli(home: &Path, services: &TestServices, arguments: &[&str]) -> Output {

@@ -40,7 +40,7 @@ The server embeds the fingerprinted Rust WASM administration application and ser
 
 ## CLI
 
-The supported prebuilt CLI target is 64-bit Linux on Debian 12 or a distribution with glibc 2.36 or newer. Release CI records the ELF dependencies and rejects anything outside `libc`, `libgcc_s`, `libm`, `libdl`, `libpthread`, the ELF loader, and the virtual DSO. The Secret Service dependency is statically vendored. The CLI first uses the desktop credential store and falls back to `$XDG_CONFIG_HOME/sovereign-config/refresh-token` (or `~/.config/sovereign-config/refresh-token`) with user ownership and mode `0600`.
+The supported prebuilt CLI target is 64-bit Linux on Debian 12 or a distribution with glibc 2.36 or newer. Release CI records the ELF dependencies and rejects anything outside `libc`, `libgcc_s`, `libm`, `libdl`, `libpthread`, the ELF loader, and the virtual DSO. The Secret Service dependency is statically vendored. The CLI first uses the desktop credential store and falls back to an environment-scoped file under `$XDG_CONFIG_HOME/sovereign-config/credentials/` (or `~/.config/sovereign-config/credentials/`) with user ownership and mode `0600`. Credential identity is derived from the canonical OIDC issuer and client ID so credentials cannot cross environments.
 
 Download the binary and checksum file from the matching GitHub release, then verify before installation:
 

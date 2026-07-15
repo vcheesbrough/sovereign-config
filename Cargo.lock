@@ -2721,6 +2721,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sovereign-config-client",
  "sovereign-config-core",
  "sovereign-config-proto",

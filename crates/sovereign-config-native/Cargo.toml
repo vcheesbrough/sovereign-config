@@ -14,6 +14,7 @@ reqwest = { workspace = true, features = ["json"] }
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sovereign-config-client = { path = "../sovereign-config-client" }
 sovereign-config-core = { path = "../sovereign-config-core" }
 sovereign-config-proto = { path = "../sovereign-config-proto" }
