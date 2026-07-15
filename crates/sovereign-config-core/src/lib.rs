@@ -126,8 +126,26 @@ impl ClientError {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(transparent)]
+/// An authentication or connection credential that requires explicit exposure.
+///
+/// Secrets deliberately do not implement Serde's serialization traits.
+///
+/// ```compile_fail
+/// use serde::Serialize;
+/// use sovereign_config_core::Secret;
+///
+/// fn assert_serializable<T: Serialize>() {}
+/// assert_serializable::<Secret>();
+/// ```
+///
+/// ```compile_fail
+/// use serde::Deserialize;
+/// use sovereign_config_core::Secret;
+///
+/// fn assert_deserializable<T: for<'de> Deserialize<'de>>() {}
+/// assert_deserializable::<Secret>();
+/// ```
+#[derive(Clone)]
 pub struct Secret(String);
 
 impl Secret {
