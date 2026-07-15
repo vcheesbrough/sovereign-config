@@ -206,6 +206,11 @@ test('absolute refresh expiry clears the browser session without a token request
   await expect(page.getByText('Logged out')).toBeVisible();
   await expect(page.getByText('authentication required')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Log in' })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => ({
+    token: sessionStorage.getItem('sovereign-config.refresh-token'),
+    endpoint: sessionStorage.getItem('sovereign-config.refresh-endpoint'),
+    expiry: sessionStorage.getItem('sovereign-config.refresh-expires-at')
+  }))).toEqual({ token: null, endpoint: null, expiry: null });
   expect(requests).toHaveLength(1);
   expect(requests[0].grant_type).toBe('authorization_code');
 });
@@ -228,11 +233,15 @@ test('callback rejects a mismatched state without exchanging the code', async ({
 });
 
 test('reload restores the session with a rotated refresh token', async ({ page }) => {
-  await openCallback(page);
+  const requests = await openCallback(page);
   await expect(page.getByText('Logged in')).toBeVisible();
-  await page.evaluate(() => sessionStorage.setItem('sovereign-config.refresh-token', 'refresh-token-two'));
   await page.reload();
   await expect(page.getByText('Logged in')).toBeVisible();
+  expect(requests).toHaveLength(3);
+  expect(requests[2]).toMatchObject({
+    grant_type: 'refresh_token',
+    refresh_token: 'refresh-token-two'
+  });
 });
 
 for (const contract of transportContract) {

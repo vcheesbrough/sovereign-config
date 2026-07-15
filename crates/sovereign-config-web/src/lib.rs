@@ -65,6 +65,7 @@ impl AccessTokenProvider for MemoryAuthentication {
             return Ok(Some(access_token));
         }
         if now >= tokens.refresh_expires_at_ms {
+            clear_persisted_refresh_token();
             return Ok(None);
         }
         match refresh_tokens(&self.client_id, &tokens).await {
