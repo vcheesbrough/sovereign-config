@@ -40,7 +40,7 @@ The server embeds the fingerprinted Rust WASM administration application and ser
 
 ## CLI
 
-The supported prebuilt CLI target is 64-bit Linux on Debian 12 or a distribution with glibc 2.36 or newer. Release CI records the ELF dependencies and rejects anything outside `libc`, `libgcc_s`, `libm`, `libdl`, `libpthread`, the ELF loader, and the virtual DSO. The Secret Service dependency is statically vendored. The CLI first uses the desktop credential store and falls back to an environment-scoped file under `$XDG_CONFIG_HOME/sovereign-config/credentials/` (or `~/.config/sovereign-config/credentials/`) with user ownership and mode `0600`. Credential identity is derived from the canonical OIDC issuer and client ID so credentials cannot cross environments.
+The supported prebuilt CLI target is 64-bit Linux on Debian 12 or a distribution with glibc 2.36 or newer. Release CI records the ELF dependencies and rejects anything outside `libc`, `libgcc_s`, `libm`, `libdl`, `libpthread`, the ELF loader, and the virtual DSO.
 
 Download the binary and checksum file from the matching GitHub release, then verify before installation:
 
@@ -49,20 +49,23 @@ sha256sum --check --ignore-missing SHA256SUMS
 install -m 0755 sovereign-config-linux-amd64 "$HOME/.local/bin/sovereign-config"
 ```
 
-Configure the development connection and use device login. For another deployment, replace the
-service URL, issuer, and client ID with that environment's matching values:
+Add a named development profile by entering its self-contained connection URL at the hidden prompt. The first profile becomes the default:
 
 ```sh
-export SOVEREIGN_CONFIG_ENDPOINT='https://sovereign-config-dev.desync.link'
-export SOVEREIGN_CONFIG_OIDC_ISSUER='https://auth.desync.link/application/o/sovereign-config-dev/'
-export SOVEREIGN_CONFIG_OIDC_CLI_CLIENT_ID='sovereign-config-dev'
-sovereign-config status
+sovereign-config profile add dev
+# New URL: https://sovereign-config-dev.desync.link/#v=1&issuer=https%3A%2F%2Fauth.desync.link%2Fapplication%2Fo%2Fsovereign-config-dev%2F&client_id=sovereign-config-dev
 sovereign-config login
 sovereign-config status
 sovereign-config logout
 ```
 
-The CLI prints only the device verification URI and user code during login. Access tokens remain in process memory; refresh credentials never appear in arguments or command output. Each status operation refreshes credentials and performs fresh RPCs without response caching or automatic retry.
+Use `sovereign-config profile update <name>` to replace a URL and `sovereign-config profile default <name>` to change the default. A URL can instead be supplied as exactly one line on standard input. Profile URLs are never accepted as process arguments. Operational commands accept a global override, for example `sovereign-config --profile prod status`.
+
+The version-1 URL origin is the native gRPC endpoint, its path is the canonical configuration root, and its fragment contains the OIDC issuer and client ID. Without `client_secret`, login uses device flow. With `client_secret`, the value is unpadded Base64URL-encoded `service-account-username:app-password`; the CLI obtains a fresh client-credentials access token for each operation and does not support login or logout for that profile. The entire managed URL is a secret even though its credential is encoded.
+
+Profiles are stored in `$XDG_CONFIG_HOME/sovereign-config/config.toml`, defaulting to `~/.config/sovereign-config/config.toml`. The directory is mode `0700` and the file is mode `0600`; because managed profiles contain credentials, protect the entire file. Human refresh credentials are stored in environment-bound mode-`0600` files under `$XDG_STATE_HOME/sovereign-config/credentials/`, defaulting to `~/.local/state/sovereign-config/credentials/`. Keep these paths in the WSL Linux filesystem rather than `/mnt/c` so Unix ownership and modes are enforced.
+
+The CLI prints only the device verification URI and user code during login. Access tokens remain in process memory; refresh credentials and managed credentials never appear in arguments or command output. Each status operation acquires a fresh access token and performs fresh RPCs without response caching or automatic retry. A definitive refresh rejection deletes the unusable human credential; a temporary Authentik outage retains it for a later attempt.
 
 The locked source-build fallback requires the Rust toolchain:
 
