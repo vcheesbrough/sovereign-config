@@ -1,6 +1,6 @@
 use std::{net::IpAddr, time::Duration};
 
-use reqwest::{Client, Response, Url};
+use reqwest::{Client, Response, Url, redirect::Policy};
 use serde::Deserialize;
 use sovereign_config_core::{ClientError, ErrorKind, Secret};
 use tokio::time::{Instant, sleep};
@@ -78,6 +78,7 @@ impl DeviceFlowClient {
             .join(".well-known/openid-configuration")
             .map_err(|_| invalid())?;
         let http = Client::builder()
+            .redirect(Policy::none())
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|_| unavailable())?;
@@ -308,4 +309,98 @@ fn unavailable() -> ClientError {
         ErrorKind::Unavailable,
         "authentication service is unavailable",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        routing::{get, post},
+    };
+    use serde_json::json;
+
+    use super::{DeviceFlowClient, ErrorKind, Secret};
+
+    struct RedirectState {
+        issuer: String,
+        target: String,
+        status: StatusCode,
+        token_requests: AtomicUsize,
+    }
+
+    #[tokio::test]
+    async fn token_credentials_are_not_forwarded_through_redirects() {
+        for status in [
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            assert_redirect_not_followed(status).await;
+        }
+    }
+
+    async fn assert_redirect_not_followed(status: StatusCode) {
+        let captures = Arc::new(AtomicUsize::new(0));
+        let capture_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let capture_address = capture_listener.local_addr().unwrap();
+        let capture_app = Router::new()
+            .route("/capture", post(capture))
+            .with_state(captures.clone());
+        let capture_task = tokio::spawn(async move {
+            axum::serve(capture_listener, capture_app).await.unwrap();
+        });
+
+        let issuer_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer_address = issuer_listener.local_addr().unwrap();
+        let state = Arc::new(RedirectState {
+            issuer: format!("http://{issuer_address}/"),
+            target: format!("http://{capture_address}/capture"),
+            status,
+            token_requests: AtomicUsize::new(0),
+        });
+        let issuer_app = Router::new()
+            .route("/.well-known/openid-configuration", get(discovery))
+            .route("/token", post(redirect_token))
+            .with_state(state.clone());
+        let issuer_task = tokio::spawn(async move {
+            axum::serve(issuer_listener, issuer_app).await.unwrap();
+        });
+
+        let client = DeviceFlowClient::discover(&state.issuer, "client".to_owned())
+            .await
+            .unwrap();
+        let Err(error) = client
+            .client_credentials(&Secret::new("credential-sentinel"))
+            .await
+        else {
+            panic!("redirected token request unexpectedly succeeded");
+        };
+
+        assert_eq!(error.kind, ErrorKind::Unavailable);
+        assert_eq!(state.token_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(captures.load(Ordering::SeqCst), 0);
+        issuer_task.abort();
+        capture_task.abort();
+    }
+
+    async fn discovery(State(state): State<Arc<RedirectState>>) -> Json<serde_json::Value> {
+        Json(json!({"token_endpoint": format!("{}token", state.issuer)}))
+    }
+
+    async fn redirect_token(State(state): State<Arc<RedirectState>>) -> Response {
+        state.token_requests.fetch_add(1, Ordering::SeqCst);
+        (state.status, [("location", state.target.as_str())]).into_response()
+    }
+
+    async fn capture(State(captures): State<Arc<AtomicUsize>>) -> StatusCode {
+        captures.fetch_add(1, Ordering::SeqCst);
+        StatusCode::NO_CONTENT
+    }
 }
