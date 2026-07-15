@@ -106,12 +106,12 @@ For narrower access, place grants in the environment-specific direct grant attri
 
 ```yaml
 sovereign_config_dev_grants:
-  - prefix: apps/example
+  - prefix: /apps/example
     permissions:
       - read
 ```
 
-Use `sovereign_config_prod_grants` for the equivalent production assignment. The empty prefix is the global root. Each environment's `sovereign-config` scope mapping combines and deduplicates only its own direct and group grants before emitting the common granular claim, so the same principal can have different development and production permissions. An existing access token retains its grants until it is replaced; log out and sign in again to apply a change immediately. Sovereign Config rejects malformed, non-canonical, or unknown grants. It never seeds users or authorization state and PostgreSQL contains no ACL, grant, token, session, or audit records.
+Use `sovereign_config_prod_grants` for the equivalent production assignment. The `/` prefix is the global root. Every direct grant prefix must be absolute, for example `/apps/example`; after changing grants, obtain a new access token. Each environment's `sovereign-config` scope mapping combines and deduplicates only its own direct and group grants before emitting the common granular claim, so the same principal can have different development and production permissions. Sovereign Config rejects malformed, non-canonical, or unknown grants. It never seeds users or authorization state and PostgreSQL contains no ACL, grant, token, session, or audit records.
 
 When upgrading from the shared `sovereign-config grants` scope mapping, apply both environment blueprints before deleting that legacy mapping manually. Neither blueprint deletes it because development and production can be migrated at different times.
 
@@ -133,9 +133,9 @@ Authentik supports one client secret per introspection provider, so rotation has
 4. The service applies its forward-only migrations before accepting requests.
 5. Validate native gRPC health/version and `/readyz` through the trusted internal network before restoring traffic.
 
-Downgrades after a migration are unsupported. Restore the verified PostgreSQL backup into a replacement deployment instead.
+Downgrades after a migration are unsupported. Restore the verified PostgreSQL backup into a replacement deployment instead. The rooted-path migration deletes every existing configuration value because prior releases stored unrooted paths; recreate required values at their absolute paths after deployment.
 
-Configuration values are stored in PostgreSQL as canonical paths, plain text, and service-generated UTC creation/update timestamps. Updates are last-write-wins and preserve the original creation timestamp. Deletion is a hard delete with no tombstone, rollback record, or retained value history. PostgreSQL volume and backup encryption remain operator responsibilities.
+Configuration values are stored in PostgreSQL as canonical absolute paths beginning with `/`, plain text, and service-generated UTC creation/update timestamps. Updates are last-write-wins and preserve the original creation timestamp. Deletion is a hard delete with no tombstone, rollback record, or retained value history. PostgreSQL volume and backup encryption remain operator responsibilities.
 
 The browser exposes system status and configuration values as separate client-side pages. Configuration URLs use `/configuration/<path>` and display absolute paths beginning with `/`; the final segment of each stored path is the value name. The path selector offers namespaces containing readable values and also accepts a valid namespace that does not exist yet. Listing filters every returned value through server-side `read` permission, while row saves and deletes continue to require independent `write` and `manage` permissions.
 

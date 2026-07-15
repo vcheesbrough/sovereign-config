@@ -277,11 +277,9 @@ async fn operational_client(
 }
 
 fn operation_path(connection: &ConnectionUrl, path: &str) -> Result<ConfigPath> {
-    let relative = path.strip_prefix('/').context("path must begin with /")?;
-    let path =
-        ConfigPath::parse_operation(relative).context("path must name a configuration value")?;
+    let path = ConfigPath::parse_operation(path).context("path must name a configuration value")?;
     let root = connection.root().as_str();
-    if !root.is_empty()
+    if root != "/"
         && !path
             .as_str()
             .strip_prefix(root)

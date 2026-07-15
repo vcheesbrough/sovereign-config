@@ -192,8 +192,7 @@ fn valid_secure_origin(url: &Url) -> bool {
 }
 
 fn parse_root(path: &str) -> Result<ConfigPath, ConnectionUrlError> {
-    let root = path.strip_prefix('/').ok_or(ConnectionUrlError)?;
-    ConfigPath::parse(root).map_err(|_| ConnectionUrlError)
+    ConfigPath::parse(path).map_err(|_| ConnectionUrlError)
 }
 
 fn parse_client_authentication(value: &str) -> Result<Secret, ConnectionUrlError> {
@@ -233,8 +232,7 @@ fn serialize(
     if let Some(client_secret) = client_secret.filter(|_| !redacted) {
         fragment.append_pair("client_secret", client_secret);
     }
-    let root = root.as_str();
-    let mut serialized = format!("{endpoint}/{root}#{}", fragment.finish());
+    let mut serialized = format!("{endpoint}{}#{}", root.as_str(), fragment.finish());
     if redacted {
         serialized.push_str("&client_secret=*");
     }
@@ -255,7 +253,7 @@ mod tests {
     fn parses_canonical_device_connection() {
         let connection = ConnectionUrl::parse(device_url()).unwrap();
         assert_eq!(connection.endpoint(), "https://config.example.test");
-        assert_eq!(connection.root().as_str(), "apps/api");
+        assert_eq!(connection.root().as_str(), "/apps/api");
         assert_eq!(
             connection.issuer(),
             "https://auth.example.test/application/o/config/"

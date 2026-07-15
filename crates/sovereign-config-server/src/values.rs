@@ -228,22 +228,21 @@ impl ValueRequest for DeleteValueRequest {
 }
 
 fn parent_path(path: &ConfigPath) -> &str {
-    path.as_str()
-        .rsplit_once('/')
-        .map_or("", |(parent, _)| parent)
+    path.as_str().rsplit_once('/').map_or(
+        "/",
+        |(parent, _)| if parent.is_empty() { "/" } else { parent },
+    )
 }
 
 fn add_parent_paths(paths: &mut BTreeSet<String>, path: &ConfigPath) {
     let parent = parent_path(path);
-    if parent.is_empty() {
-        paths.insert(String::new());
+    paths.insert("/".into());
+    if parent == "/" {
         return;
     }
     let mut prefix = String::new();
-    for segment in parent.split('/') {
-        if !prefix.is_empty() {
-            prefix.push('/');
-        }
+    for segment in parent.trim_start_matches('/').split('/') {
+        prefix.push('/');
         prefix.push_str(segment);
         paths.insert(prefix.clone());
     }
@@ -281,7 +280,7 @@ mod tests {
     use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
 
     fn request<T>(message: T, permissions: &[Permission]) -> Request<T> {
-        request_for_prefix(message, "tests/exact", permissions)
+        request_for_prefix(message, "/tests/exact", permissions)
     }
 
     fn request_for_prefix<T>(message: T, prefix: &str, permissions: &[Permission]) -> Request<T> {
@@ -304,7 +303,7 @@ mod tests {
             .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        sqlx::query("DELETE FROM configuration_values WHERE path LIKE 'tests/exact/%'")
+        sqlx::query("DELETE FROM configuration_values WHERE path LIKE '/tests/exact/%'")
             .execute(&pool)
             .await
             .unwrap();
@@ -313,17 +312,27 @@ mod tests {
         let invalid_list = service
             .list_values(request(
                 ListValuesRequest {
-                    path: "tests//exact".into(),
+                    path: "/tests//exact".into(),
                 },
                 &[Permission::Read],
             ))
             .await
             .unwrap_err();
         assert_eq!(invalid_list.code(), Code::InvalidArgument);
+        let unrooted_value = service
+            .get_value(request(
+                GetValueRequest {
+                    path: "tests/exact/key".into(),
+                },
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(unrooted_value.code(), Code::InvalidArgument);
         let invalid_value = service
             .put_value(request(
                 PutValueRequest {
-                    path: "tests/exact/invalid".into(),
+                    path: "/tests/exact/invalid".into(),
                     value: "invalid\0value".into(),
                 },
                 &[Permission::Write],
@@ -335,7 +344,7 @@ mod tests {
         let first = service
             .put_value(request(
                 PutValueRequest {
-                    path: "Tests/Exact/Key".into(),
+                    path: "/Tests/Exact/Key".into(),
                     value: "value-sentinel-one".into(),
                 },
                 &[Permission::Write],
@@ -346,7 +355,7 @@ mod tests {
         service
             .put_value(request(
                 PutValueRequest {
-                    path: "tests/exact/nested/child".into(),
+                    path: "/tests/exact/nested/child".into(),
                     value: "nested-value-sentinel".into(),
                 },
                 &[Permission::Write],
@@ -356,7 +365,7 @@ mod tests {
         let listing = service
             .list_values(request(
                 ListValuesRequest {
-                    path: "tests/exact".into(),
+                    path: "/tests/exact".into(),
                 },
                 &[Permission::Read],
             ))
@@ -364,17 +373,17 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(listing.values.len(), 1);
-        assert_eq!(listing.values[0].path, "tests/exact/key");
+        assert_eq!(listing.values[0].path, "/tests/exact/key");
         assert_eq!(
             listing.paths,
-            ["tests", "tests/exact", "tests/exact/nested"]
+            ["/", "/tests", "/tests/exact", "/tests/exact/nested"]
         );
         let nested_only = service
             .list_values(request_for_prefix(
                 ListValuesRequest {
-                    path: "tests/exact".into(),
+                    path: "/tests/exact".into(),
                 },
-                "tests/exact/nested",
+                "/tests/exact/nested",
                 &[Permission::Read],
             ))
             .await
@@ -383,12 +392,12 @@ mod tests {
         assert!(nested_only.values.is_empty());
         assert_eq!(
             nested_only.paths,
-            ["tests", "tests/exact", "tests/exact/nested"]
+            ["/", "/tests", "/tests/exact", "/tests/exact/nested"]
         );
         let write_only = service
             .list_values(request(
                 ListValuesRequest {
-                    path: "tests/exact".into(),
+                    path: "/tests/exact".into(),
                 },
                 &[Permission::Write],
             ))
@@ -400,7 +409,7 @@ mod tests {
         let denied = service
             .get_value(request(
                 GetValueRequest {
-                    path: "tests/exact/key".into(),
+                    path: "/tests/exact/key".into(),
                 },
                 &[Permission::Write],
             ))
@@ -412,7 +421,7 @@ mod tests {
         let stored = service
             .get_value(request(
                 GetValueRequest {
-                    path: "TESTS/EXACT/KEY".into(),
+                    path: "/TESTS/EXACT/KEY".into(),
                 },
                 &[Permission::Read],
             ))
@@ -425,7 +434,7 @@ mod tests {
         let second = service
             .put_value(request(
                 PutValueRequest {
-                    path: "tests/exact/key".into(),
+                    path: "/tests/exact/key".into(),
                     value: "value-sentinel-two".into(),
                 },
                 &[Permission::Write],
@@ -444,7 +453,7 @@ mod tests {
         let boundary = service
             .get_value(request(
                 GetValueRequest {
-                    path: "tests/exactly/key".into(),
+                    path: "/tests/exactly/key".into(),
                 },
                 &[Permission::Read],
             ))
@@ -455,7 +464,7 @@ mod tests {
         service
             .delete_value(request(
                 DeleteValueRequest {
-                    path: "tests/exact/key".into(),
+                    path: "/tests/exact/key".into(),
                 },
                 &[Permission::Manage],
             ))
@@ -464,7 +473,7 @@ mod tests {
         let missing = service
             .get_value(request(
                 GetValueRequest {
-                    path: "tests/exact/key".into(),
+                    path: "/tests/exact/key".into(),
                 },
                 &[Permission::Read],
             ))
@@ -476,7 +485,7 @@ mod tests {
         let unavailable = service
             .get_value(request(
                 GetValueRequest {
-                    path: "tests/exact/key".into(),
+                    path: "/tests/exact/key".into(),
                 },
                 &[Permission::Read],
             ))

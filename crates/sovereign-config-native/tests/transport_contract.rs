@@ -36,7 +36,7 @@ impl Configuration for ContractConfiguration {
         }
         Ok(tonic::Response::new(ListValuesResponse {
             values: vec![ListedValue {
-                path: "apps/api/feature".into(),
+                path: "/apps/api/feature".into(),
                 value: "contract-value-sentinel".into(),
                 created_at: Some(prost_types::Timestamp {
                     seconds: 1_700_000_000,
@@ -125,13 +125,13 @@ async fn tonic_transport_satisfies_shared_contract() {
 
     let listing = transport
         .list_values(
-            &ConfigPath::parse("apps/api").unwrap(),
+            &ConfigPath::parse("/apps/api").unwrap(),
             &Secret::new("contract-token-sentinel"),
         )
         .await
         .unwrap();
-    assert_eq!(listing.paths, [ConfigPath::parse("apps/api").unwrap()]);
-    assert_eq!(listing.values[0].path.as_str(), "apps/api/feature");
+    assert_eq!(listing.paths, [ConfigPath::parse("/apps/api").unwrap()]);
+    assert_eq!(listing.values[0].path.as_str(), "/apps/api/feature");
     assert_eq!(listing.values[0].value.expose(), "contract-value-sentinel");
 
     for case in contract() {

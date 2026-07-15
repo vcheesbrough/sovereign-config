@@ -99,7 +99,7 @@ impl AuthenticatedPrincipal {
     pub(crate) fn allows(&self, path: &ConfigPath, permission: Permission) -> bool {
         self.grants.iter().any(|grant| {
             grant.permissions.contains(&permission)
-                && (grant.prefix.is_empty()
+                && (grant.prefix == "/"
                     || path.as_str() == grant.prefix
                     || path
                         .as_str()
@@ -531,19 +531,19 @@ mod tests {
             subject: "principal".into(),
             grants: vec![
                 Grant {
-                    prefix: "apps/api".into(),
+                    prefix: "/apps/api".into(),
                     permissions: BTreeSet::from([Permission::Write]),
                 },
                 Grant {
-                    prefix: "apps/api/private".into(),
+                    prefix: "/apps/api/private".into(),
                     permissions: BTreeSet::from([Permission::Manage]),
                 },
             ],
         };
-        let api = ConfigPath::parse("apps/api").unwrap();
-        let child = ConfigPath::parse("apps/api/settings").unwrap();
-        let attack = ConfigPath::parse("apps/apix").unwrap();
-        let private = ConfigPath::parse("apps/api/private/key").unwrap();
+        let api = ConfigPath::parse("/apps/api").unwrap();
+        let child = ConfigPath::parse("/apps/api/settings").unwrap();
+        let attack = ConfigPath::parse("/apps/apix").unwrap();
+        let private = ConfigPath::parse("/apps/api/private/key").unwrap();
 
         assert!(principal.allows(&api, Permission::Write));
         assert!(principal.allows(&child, Permission::Write));
@@ -551,6 +551,15 @@ mod tests {
         assert!(!principal.allows(&attack, Permission::Write));
         assert!(principal.allows(&private, Permission::Manage));
         assert!(!principal.allows(&private, Permission::Read));
+
+        let global = AuthenticatedPrincipal {
+            subject: "global-principal".into(),
+            grants: vec![Grant {
+                prefix: "/".into(),
+                permissions: BTreeSet::from([Permission::Read]),
+            }],
+        };
+        assert!(global.allows(&private, Permission::Read));
     }
 
     #[derive(Clone)]
@@ -657,7 +666,7 @@ mod tests {
             "sub": "principal-id",
             "scope": "openid sovereign-config",
             "sovereign_config_grants": [
-                {"prefix": "", "permissions": ["read", "write", "manage"]}
+                {"prefix": "/", "permissions": ["read", "write", "manage"]}
             ]
         })
     }
@@ -684,9 +693,9 @@ mod tests {
             "sub": "principal-id",
             "scope": "openid sovereign-config",
             "sovereign_config_grants": [
-                {"prefix": "", "permissions": ["read", "write", "manage"]},
-                {"prefix": "apps/api", "permissions": ["read"]},
-                {"prefix": "apps/api", "permissions": ["write"]}
+                {"prefix": "/", "permissions": ["read", "write", "manage"]},
+                {"prefix": "/apps/api", "permissions": ["read"]},
+                {"prefix": "/apps/api", "permissions": ["write"]}
             ]
         }))
         .unwrap()
@@ -816,16 +825,16 @@ mod tests {
 
     #[test]
     fn grants_require_canonical_prefixes_and_known_permissions() {
-        for prefix in ["", "apps", "apps/my-api", "a1/b-2"] {
+        for prefix in ["/", "/apps", "/apps/my-api", "/a1/b-2"] {
             assert!(is_canonical_prefix(prefix));
         }
-        for prefix in ["/apps", "apps/", "apps//api", "Apps/api", "apps/."] {
+        for prefix in ["", "apps", "/apps/", "/apps//api", "/Apps/api", "/apps/."] {
             assert!(!is_canonical_prefix(prefix));
         }
 
         let mut response = valid_response();
         response.sovereign_config_grants =
-            Some(json!([{"prefix": "Apps/api", "permissions": ["read"]}]));
+            Some(json!([{"prefix": "/Apps/api", "permissions": ["read"]}]));
         assert_eq!(
             validate_introspection(
                 response,
@@ -840,7 +849,7 @@ mod tests {
 
         let mut response = valid_response();
         response.sovereign_config_grants =
-            Some(json!([{"prefix": "apps/api", "permissions": ["owner"]}]));
+            Some(json!([{"prefix": "/apps/api", "permissions": ["owner"]}]));
         assert_eq!(
             validate_introspection(
                 response,

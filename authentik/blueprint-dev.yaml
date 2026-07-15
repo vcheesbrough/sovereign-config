@@ -31,7 +31,7 @@ entries:
       is_superuser: false
       attributes:
         sovereign_config_dev_grants:
-          - prefix: ""
+          - prefix: "/"
             permissions:
               - read
               - write
