@@ -2280,6 +2280,7 @@ dependencies = [
  "async-trait",
  "axum 0.8.9",
  "http",
+ "prost-types",
  "reqwest",
  "rustix",
  "serde",

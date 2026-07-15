@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::BTreeSet};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -13,18 +13,19 @@ use sovereign_config_client::{
 };
 use sovereign_config_core::{
     AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, ExactValue,
-    PlainValue, PutMetadata, Secret, Timestamp,
+    ListedValue, PlainValue, PutMetadata, Secret, Timestamp, ValueListing,
 };
 use sovereign_config_proto::sovereign::config::v1::{
     DeleteValueRequest, DeleteValueResponse, GetIdentityRequest, GetIdentityResponse,
-    GetValueRequest, GetValueResponse, GetVersionRequest, GetVersionResponse, PutValueRequest,
-    PutValueResponse,
+    GetValueRequest, GetValueResponse, GetVersionRequest, GetVersionResponse, ListValuesRequest,
+    ListValuesResponse, PutValueRequest, PutValueResponse,
 };
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    Event, Headers, HtmlButtonElement, HtmlDialogElement, HtmlInputElement, HtmlTextAreaElement,
-    Request, RequestCache, RequestInit, Response, Url, UrlSearchParams, window,
+    Document, Element, Event, Headers, HtmlButtonElement, HtmlDialogElement, HtmlInputElement,
+    HtmlTextAreaElement, Request, RequestCache, RequestInit, Response, Url, UrlSearchParams,
+    window,
 };
 
 const STATE_KEY: &str = "sovereign-config.pkce-state";
@@ -32,10 +33,23 @@ const VERIFIER_KEY: &str = "sovereign-config.pkce-verifier";
 const REFRESH_TOKEN_KEY: &str = "sovereign-config.refresh-token";
 const REFRESH_ENDPOINT_KEY: &str = "sovereign-config.refresh-endpoint";
 const REFRESH_EXPIRES_KEY: &str = "sovereign-config.refresh-expires-at";
+const RETURN_PATH_KEY: &str = "sovereign-config.return-path";
 const REFRESH_LIFETIME_MS: f64 = 8.0 * 60.0 * 60.0 * 1000.0;
 
 thread_local! {
     static TOKENS: RefCell<Option<MemoryTokens>> = const { RefCell::new(None) };
+    static DELETE_TARGET: RefCell<Option<DeleteTarget>> = const { RefCell::new(None) };
+}
+
+struct DeleteTarget {
+    path: ConfigPath,
+    return_focus: String,
+}
+
+#[derive(Clone)]
+enum Route {
+    System,
+    Configuration(ConfigPath),
 }
 
 struct MemoryTokens {
@@ -126,6 +140,39 @@ impl Transport for BrowserTransport {
 
 #[async_trait(?Send)]
 impl ValueTransport for BrowserTransport {
+    async fn list_values(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ValueListing, ClientError> {
+        let response: ListValuesResponse = grpc_unary(
+            "/sovereign.config.v1.Configuration/ListValues",
+            &ListValuesRequest {
+                path: path.as_str().to_owned(),
+            },
+            Some(bearer),
+        )
+        .await?;
+        let values = response
+            .values
+            .into_iter()
+            .map(|value| {
+                Ok(ListedValue {
+                    path: ConfigPath::parse(value.path).map_err(|_| browser_error())?,
+                    value: PlainValue::new(value.value),
+                    created_at: proto_timestamp(value.created_at)?,
+                    updated_at: proto_timestamp(value.updated_at)?,
+                })
+            })
+            .collect::<Result<Vec<_>, ClientError>>()?;
+        let paths = response
+            .paths
+            .into_iter()
+            .map(|path| ConfigPath::parse(path).map_err(|_| browser_error()))
+            .collect::<Result<Vec<_>, ClientError>>()?;
+        Ok(ValueListing { values, paths })
+    }
+
     async fn get_value(
         &self,
         path: &ConfigPath,
@@ -194,6 +241,7 @@ fn proto_timestamp(value: Option<prost_types::Timestamp>) -> Result<Timestamp, C
 #[wasm_bindgen(start)]
 pub fn start() {
     install_actions();
+    render_route(&route_from_location());
     spawn_local(async {
         match app_config() {
             Ok(config) => {
@@ -204,9 +252,12 @@ pub fn start() {
                     } else {
                         None
                     };
-                refresh_status(&config).await;
+                render_route(&route_from_location());
+                let authenticated = refresh_status(&config).await;
                 if let Some(error) = callback_error {
                     show_error(error.message());
+                } else if authenticated {
+                    load_current_configuration().await;
                 }
             }
             Err(error) => show_error(error.message()),
@@ -218,21 +269,21 @@ fn install_actions() {
     let Some(document) = window().and_then(|window| window.document()) else {
         return;
     };
-    for id in ["brand-link", "system-status-link"] {
-        if let Some(link) = document.get_element_by_id(id) {
-            let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
-                if window()
-                    .and_then(|window| window.location().pathname().ok())
-                    .as_deref()
-                    == Some("/")
-                {
-                    event.prevent_default();
-                }
-            });
-            let _ =
-                link.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-            callback.forget();
-        }
+    install_route_link(&document, "brand-link", Route::System);
+    install_route_link(&document, "system-status-link", Route::System);
+    install_route_link(
+        &document,
+        "configuration-values-link",
+        Route::Configuration(ConfigPath::root()),
+    );
+    if let Some(window) = window() {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            render_route(&route_from_location());
+            spawn_local(async { load_current_configuration().await });
+        });
+        let _ =
+            window.add_event_listener_with_callback("popstate", callback.as_ref().unchecked_ref());
+        callback.forget();
     }
     if let Some(login) = document.get_element_by_id("login") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: web_sys::Event| {
@@ -256,56 +307,205 @@ fn install_actions() {
             set_text("auth-value", "Logged out");
             set_hidden("login", false);
             set_hidden("logout", true);
+            set_text("value-state", "Log in to view values");
+            clear_value_rows();
             focus("login");
         });
         let _ = logout.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
         callback.forget();
     }
-    install_value_actions(&document);
+    install_configuration_actions(&document);
 }
 
-fn install_value_actions(document: &web_sys::Document) {
-    if let Some(form) = document.get_element_by_id("value-form") {
+fn install_route_link(document: &Document, id: &str, route: Route) {
+    if let Some(link) = document.get_element_by_id(id) {
+        let callback = Closure::<dyn FnMut(_)>::new(move |event: Event| {
+            event.prevent_default();
+            navigate(&route);
+        });
+        let _ = link.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+}
+
+fn install_configuration_actions(document: &Document) {
+    if let Some(form) = document.get_element_by_id("path-form") {
         let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
             event.prevent_default();
-            spawn_local(async { load_value().await });
+            if let Ok(path) = selected_namespace() {
+                navigate(&Route::Configuration(path));
+            } else {
+                validate_path_field();
+            }
         });
         let _ = form.add_event_listener_with_callback("submit", callback.as_ref().unchecked_ref());
         callback.forget();
     }
-    if let Some(save) = document.get_element_by_id("save-value") {
+    if let Some(path) = document.get_element_by_id("selected-path") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            spawn_local(async { save_value().await });
+            validate_path_field();
+        });
+        let _ = path.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(add) = document.get_element_by_id("add-value") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            show_new_value_row();
+        });
+        let _ = add.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(cancel) = document.get_element_by_id("cancel-new-value") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            hide_new_value_row();
+            focus("add-value");
+        });
+        let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(save) = document.get_element_by_id("save-new-value") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            spawn_local(async { save_new_value().await });
         });
         let _ = save.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
         callback.forget();
     }
-    if let Some(remove) = document.get_element_by_id("delete-value") {
+    if let Some(name) = document.get_element_by_id("new-value-name") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            if let Some(dialog) = element::<HtmlDialogElement>("delete-dialog") {
-                let _ = dialog.show_modal();
-                focus("cancel-delete");
-            }
+            validate_name_field();
+            update_new_save_state();
         });
-        let _ = remove.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        let _ = name.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(value) = document.get_element_by_id("new-value-content") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            validate_value_field("new-value-content", "new-value-error");
+            update_new_save_state();
+        });
+        let _ = value.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
         callback.forget();
     }
     if let Some(cancel) = document.get_element_by_id("cancel-delete") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            close_delete_dialog();
-            focus("delete-value");
-        });
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| cancel_delete());
         let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
         callback.forget();
     }
     if let Some(confirm) = document.get_element_by_id("confirm-delete") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            spawn_local(async { delete_value().await });
+            spawn_local(async { delete_selected_value().await });
         });
         let _ =
             confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
         callback.forget();
     }
+}
+
+fn navigate(route: &Route) {
+    let url = route_url(route);
+    if let Some(window) = window()
+        && let Ok(history) = window.history()
+    {
+        let _ = history.push_state_with_url(&JsValue::NULL, "", Some(&url));
+    }
+    render_route(route);
+    spawn_local(async { load_current_configuration().await });
+}
+
+fn render_route(route: &Route) {
+    let configuration = matches!(route, Route::Configuration(_));
+    set_hidden("system-page", configuration);
+    set_hidden("configuration-page", !configuration);
+    set_active("system-status-link", !configuration);
+    set_active("configuration-values-link", configuration);
+    if let Route::Configuration(path) = route {
+        let canonical_url = route_url(route);
+        if let Some(window) = window()
+            && window.location().pathname().ok().as_deref() != Some(canonical_url.as_str())
+            && let Ok(history) = window.history()
+        {
+            let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&canonical_url));
+        }
+        if let Some(input) = element::<HtmlInputElement>("selected-path") {
+            input.set_value(&absolute_path(path));
+        }
+        validate_path_field();
+    }
+}
+
+fn set_active(id: &str, active: bool) {
+    if let Some(element) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id(id))
+    {
+        if active {
+            element.set_class_name("active");
+            let _ = element.set_attribute("aria-current", "page");
+        } else {
+            element.set_class_name("");
+            let _ = element.remove_attribute("aria-current");
+        }
+    }
+}
+
+fn route_from_location() -> Route {
+    let path = window()
+        .and_then(|window| window.location().pathname().ok())
+        .unwrap_or_else(|| "/".into());
+    route_from_path(&path)
+}
+
+fn route_from_path(path: &str) -> Route {
+    if path == "/configuration" || path == "/configuration/" {
+        return Route::Configuration(ConfigPath::root());
+    }
+    if let Some(relative) = path.strip_prefix("/configuration/")
+        && let Ok(path) = ConfigPath::parse_operation(relative)
+    {
+        return Route::Configuration(path);
+    }
+    Route::System
+}
+
+fn route_url(route: &Route) -> String {
+    match route {
+        Route::System => "/".into(),
+        Route::Configuration(path) if path.as_str().is_empty() => "/configuration/".into(),
+        Route::Configuration(path) => format!("/configuration/{}", path.as_str()),
+    }
+}
+
+fn absolute_path(path: &ConfigPath) -> String {
+    if path.as_str().is_empty() {
+        "/".into()
+    } else {
+        format!("/{}", path.as_str())
+    }
+}
+
+fn selected_namespace() -> Result<ConfigPath, ClientError> {
+    let value = element::<HtmlInputElement>("selected-path")
+        .ok_or_else(browser_error)?
+        .value();
+    parse_absolute_path(&value)
+}
+
+fn parse_absolute_path(value: &str) -> Result<ConfigPath, ClientError> {
+    if value == "/" {
+        return Ok(ConfigPath::root());
+    }
+    let relative = value.strip_prefix('/').ok_or_else(invalid_path)?;
+    if relative.ends_with('/') {
+        return Err(invalid_path());
+    }
+    ConfigPath::parse_operation(relative).map_err(|_| invalid_path())
+}
+
+fn invalid_path() -> ClientError {
+    ClientError::new(
+        ErrorKind::InvalidRequest,
+        "path must begin with / and contain only letters, numbers, and hyphens",
+    )
 }
 
 fn value_client(config: &AppConfig) -> Client<BrowserTransport, MemoryAuthentication> {
@@ -317,46 +517,42 @@ fn value_client(config: &AppConfig) -> Client<BrowserTransport, MemoryAuthentica
     )
 }
 
-fn selected_path() -> Result<ConfigPath, ClientError> {
-    let input = element::<HtmlInputElement>("value-path").ok_or_else(browser_error)?;
-    ConfigPath::parse_operation(input.value())
-        .map_err(|_| ClientError::new(ErrorKind::InvalidRequest, "configuration path is invalid"))
-}
-
-async fn load_value() {
+async fn load_current_configuration() {
+    let Route::Configuration(path) = route_from_location() else {
+        return;
+    };
     clear_error();
+    set_text("value-state", "Loading");
     let result = async {
         let config = app_config()?;
-        value_client(&config).get_value(&selected_path()?).await
+        value_client(&config).list_values(&path).await
     }
     .await;
     match result {
-        Ok(value) => {
-            set_textarea("value-content", value.value.expose());
-            set_timestamp("created-value", value.created_at);
-            set_timestamp("updated-value", value.updated_at);
+        Ok(listing) => {
+            if let Err(error) = render_listing(&listing) {
+                show_error(error.message());
+                return;
+            }
             set_text("value-state", "Loaded");
-            set_button_disabled("delete-value", false);
-            focus("value-content");
-        }
-        Err(error) if error.kind == ErrorKind::NotFound => {
-            set_textarea("value-content", "");
-            set_text("created-value", "-");
-            set_text("updated-value", "-");
-            set_text("value-state", "New value");
-            set_button_disabled("delete-value", true);
-            focus("value-content");
         }
         Err(error) => show_error(error.message()),
     }
 }
 
-async fn save_value() {
+async fn save_new_value() {
+    if !validate_name_field() || !validate_value_field("new-value-content", "new-value-error") {
+        return;
+    }
     clear_error();
     let result = async {
         let config = app_config()?;
-        let path = selected_path()?;
-        let value = element::<HtmlTextAreaElement>("value-content")
+        let namespace = selected_namespace()?;
+        let name = element::<HtmlInputElement>("new-value-name")
+            .ok_or_else(browser_error)?
+            .value();
+        let path = namespace.join_operation(name).map_err(|_| invalid_path())?;
+        let value = element::<HtmlTextAreaElement>("new-value-content")
             .ok_or_else(browser_error)?
             .value();
         value_client(&config)
@@ -365,38 +561,83 @@ async fn save_value() {
     }
     .await;
     match result {
-        Ok(metadata) => {
-            set_timestamp("created-value", metadata.created_at);
-            set_timestamp("updated-value", metadata.updated_at);
+        Ok(_) => {
+            hide_new_value_row();
+            load_current_configuration().await;
             set_text("value-state", "Saved");
-            set_button_disabled("delete-value", false);
-            focus("value-heading");
+            focus("add-value");
         }
         Err(error) => show_error(error.message()),
     }
 }
 
-async fn delete_value() {
+async fn save_existing_value(path: ConfigPath, input_id: String) {
+    let error_id = format!("{input_id}-error");
+    if !validate_value_field(&input_id, &error_id) {
+        return;
+    }
     clear_error();
     let result = async {
         let config = app_config()?;
-        value_client(&config).delete_value(&selected_path()?).await
+        let value = element::<HtmlTextAreaElement>(&input_id)
+            .ok_or_else(browser_error)?
+            .value();
+        value_client(&config)
+            .put_value(&path, &PlainValue::new(value))
+            .await
     }
     .await;
     match result {
         Ok(_) => {
-            close_delete_dialog();
-            set_textarea("value-content", "");
-            set_text("created-value", "-");
-            set_text("updated-value", "-");
+            load_current_configuration().await;
+            set_text("value-state", "Saved");
+            focus("values-heading");
+        }
+        Err(error) => show_error(error.message()),
+    }
+}
+
+fn open_delete(path: ConfigPath, return_focus: String) {
+    set_text("delete-path", &absolute_path(&path));
+    DELETE_TARGET.with_borrow_mut(|target| {
+        *target = Some(DeleteTarget { path, return_focus });
+    });
+    if let Some(dialog) = element::<HtmlDialogElement>("delete-dialog") {
+        let _ = dialog.show_modal();
+        focus("cancel-delete");
+    }
+}
+
+fn cancel_delete() {
+    let return_focus = DELETE_TARGET
+        .with_borrow_mut(Option::take)
+        .map(|target| target.return_focus);
+    close_delete_dialog();
+    if let Some(return_focus) = return_focus {
+        focus(&return_focus);
+    }
+}
+
+async fn delete_selected_value() {
+    let Some(target) = DELETE_TARGET.with_borrow_mut(Option::take) else {
+        return;
+    };
+    clear_error();
+    let result = async {
+        let config = app_config()?;
+        value_client(&config).delete_value(&target.path).await
+    }
+    .await;
+    close_delete_dialog();
+    match result {
+        Ok(_) => {
+            load_current_configuration().await;
             set_text("value-state", "Deleted");
-            set_button_disabled("delete-value", true);
-            focus("value-path");
+            focus("add-value");
         }
         Err(error) => {
-            close_delete_dialog();
             show_error(error.message());
-            focus("delete-value");
+            focus(&target.return_focus);
         }
     }
 }
@@ -407,7 +648,315 @@ fn close_delete_dialog() {
     }
 }
 
-async fn refresh_status(config: &AppConfig) {
+fn render_listing(listing: &ValueListing) -> Result<(), ClientError> {
+    clear_value_rows();
+    hide_new_value_row();
+    render_path_options(listing)?;
+    let document = window()
+        .and_then(|window| window.document())
+        .ok_or_else(browser_error)?;
+    let body = document
+        .get_element_by_id("values-body")
+        .ok_or_else(browser_error)?;
+    for (index, value) in listing.values.iter().enumerate() {
+        let row = render_value_row(&document, value, index)?;
+        append(&body, &row)?;
+    }
+    let count = listing.values.len();
+    set_text(
+        "value-count",
+        &format!("{count} {}", if count == 1 { "value" } else { "values" }),
+    );
+    set_hidden("empty-values", count != 0);
+    Ok(())
+}
+
+fn render_path_options(listing: &ValueListing) -> Result<(), ClientError> {
+    let document = window()
+        .and_then(|window| window.document())
+        .ok_or_else(browser_error)?;
+    let options = document
+        .get_element_by_id("existing-paths")
+        .ok_or_else(browser_error)?;
+    options.set_text_content(None);
+    let mut paths = listing
+        .paths
+        .iter()
+        .map(absolute_path)
+        .collect::<BTreeSet<_>>();
+    paths.insert("/".into());
+    if let Ok(selected) = selected_namespace() {
+        paths.insert(absolute_path(&selected));
+    }
+    for path in paths {
+        let option = document
+            .create_element("option")
+            .map_err(|_| browser_error())?;
+        option
+            .set_attribute("value", &path)
+            .map_err(|_| browser_error())?;
+        options.append_child(&option).map_err(|_| browser_error())?;
+    }
+    Ok(())
+}
+
+fn render_value_row(
+    document: &Document,
+    value: &ListedValue,
+    index: usize,
+) -> Result<Element, ClientError> {
+    let row = create_element(document, "tr", None)?;
+    row.set_attribute("data-value-row", "")
+        .map_err(|_| browser_error())?;
+
+    let name_cell = create_element(document, "th", None)?;
+    name_cell
+        .set_attribute("scope", "row")
+        .map_err(|_| browser_error())?;
+    let name = value
+        .path
+        .as_str()
+        .rsplit_once('/')
+        .map_or(value.path.as_str(), |(_, name)| name);
+    let name_text = create_element(document, "span", Some("value-name"))?;
+    name_text.set_text_content(Some(name));
+    let full_path = create_element(document, "span", Some("full-path"))?;
+    full_path.set_text_content(Some(&absolute_path(&value.path)));
+    append(&name_cell, &name_text)?;
+    append(&name_cell, &full_path)?;
+
+    let value_cell = create_element(document, "td", None)?;
+    let input_id = format!("listed-value-{index}");
+    let error_id = format!("{input_id}-error");
+    let editor = create_element(document, "textarea", None)?;
+    editor
+        .set_attribute("id", &input_id)
+        .map_err(|_| browser_error())?;
+    editor
+        .set_attribute("rows", "2")
+        .map_err(|_| browser_error())?;
+    editor
+        .set_attribute("spellcheck", "false")
+        .map_err(|_| browser_error())?;
+    editor
+        .set_attribute("aria-label", &format!("Value for {name}"))
+        .map_err(|_| browser_error())?;
+    editor
+        .set_attribute("aria-describedby", &error_id)
+        .map_err(|_| browser_error())?;
+    editor
+        .clone()
+        .dyn_into::<HtmlTextAreaElement>()
+        .map_err(|_| browser_error())?
+        .set_value(value.value.expose());
+    let field_error = create_element(document, "p", Some("field-error"))?;
+    field_error
+        .set_attribute("id", &error_id)
+        .map_err(|_| browser_error())?;
+    field_error
+        .set_attribute("hidden", "")
+        .map_err(|_| browser_error())?;
+    field_error
+        .set_attribute("aria-live", "polite")
+        .map_err(|_| browser_error())?;
+    append(&value_cell, &editor)?;
+    append(&value_cell, &field_error)?;
+
+    let updated = create_element(document, "td", Some("updated-time"))?;
+    updated.set_text_content(Some(&format_timestamp(value.updated_at)));
+
+    let actions_cell = create_element(document, "td", None)?;
+    let actions = create_element(document, "div", Some("row-actions"))?;
+    let save_id = format!("save-listed-value-{index}");
+    let save = create_button(document, &save_id, "Save", None)?;
+    let remove_id = format!("delete-listed-value-{index}");
+    let remove = create_button(document, &remove_id, "Delete", Some("danger"))?;
+    append(&actions, &save)?;
+    append(&actions, &remove)?;
+    append(&actions_cell, &actions)?;
+
+    let save_path = value.path.clone();
+    let save_input = input_id.clone();
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        let path = save_path.clone();
+        let input = save_input.clone();
+        spawn_local(async move { save_existing_value(path, input).await });
+    });
+    save.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
+
+    let validation_input = input_id.clone();
+    let validation_error = error_id.clone();
+    let validation_save = save_id.clone();
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        let valid = validate_value_field(&validation_input, &validation_error);
+        set_button_disabled(&validation_save, !valid);
+    });
+    editor
+        .add_event_listener_with_callback("input", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
+
+    let delete_path = value.path.clone();
+    let delete_focus = remove_id;
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        open_delete(delete_path.clone(), delete_focus.clone());
+    });
+    remove
+        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
+
+    append(&row, &name_cell)?;
+    append(&row, &value_cell)?;
+    append(&row, &updated)?;
+    append(&row, &actions_cell)?;
+    Ok(row)
+}
+
+fn create_element(
+    document: &Document,
+    tag: &str,
+    class_name: Option<&str>,
+) -> Result<Element, ClientError> {
+    let element = document.create_element(tag).map_err(|_| browser_error())?;
+    if let Some(class_name) = class_name {
+        element.set_class_name(class_name);
+    }
+    Ok(element)
+}
+
+fn create_button(
+    document: &Document,
+    id: &str,
+    label: &str,
+    class_name: Option<&str>,
+) -> Result<Element, ClientError> {
+    let button = create_element(document, "button", class_name)?;
+    button
+        .set_attribute("id", id)
+        .map_err(|_| browser_error())?;
+    button
+        .set_attribute("type", "button")
+        .map_err(|_| browser_error())?;
+    button.set_text_content(Some(label));
+    Ok(button)
+}
+
+fn append(parent: &Element, child: &Element) -> Result<(), ClientError> {
+    parent
+        .append_child(child)
+        .map(|_| ())
+        .map_err(|_| browser_error())
+}
+
+fn clear_value_rows() {
+    let Some(body) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("values-body"))
+    else {
+        return;
+    };
+    while let Some(row) = body.last_element_child() {
+        if row.id() == "new-value-row" {
+            break;
+        }
+        row.remove();
+    }
+    set_text("value-count", "0 values");
+    set_hidden("empty-values", false);
+}
+
+fn show_new_value_row() {
+    set_textarea("new-value-content", "");
+    if let Some(name) = element::<HtmlInputElement>("new-value-name") {
+        name.set_value("");
+    }
+    set_hidden("new-value-row", false);
+    validate_name_field();
+    validate_value_field("new-value-content", "new-value-error");
+    update_new_save_state();
+    focus("new-value-name");
+}
+
+fn hide_new_value_row() {
+    set_hidden("new-value-row", true);
+    set_validation("new-value-name", "new-name-error", None);
+    set_validation("new-value-content", "new-value-error", None);
+}
+
+fn validate_path_field() -> bool {
+    let Some(input) = element::<HtmlInputElement>("selected-path") else {
+        return false;
+    };
+    let message = parse_absolute_path(&input.value())
+        .err()
+        .map(|error| error.message());
+    set_validation("selected-path", "path-error", message);
+    message.is_none()
+}
+
+fn validate_name_field() -> bool {
+    let Some(input) = element::<HtmlInputElement>("new-value-name") else {
+        return false;
+    };
+    let message =
+        if ConfigPath::parse_operation(input.value()).is_ok() && !input.value().contains('/') {
+            None
+        } else {
+            Some("Name must contain only letters, numbers, and hyphens")
+        };
+    set_validation("new-value-name", "new-name-error", message);
+    message.is_none()
+}
+
+fn validate_value_field(input_id: &str, error_id: &str) -> bool {
+    let Some(input) = element::<HtmlTextAreaElement>(input_id) else {
+        return false;
+    };
+    let message = input
+        .value()
+        .contains('\0')
+        .then_some("Value cannot contain a null character");
+    set_validation(input_id, error_id, message);
+    message.is_none()
+}
+
+fn set_validation(input_id: &str, error_id: &str, message: Option<&str>) {
+    if let Some(input) = element::<HtmlInputElement>(input_id) {
+        input.set_custom_validity(message.unwrap_or_default());
+        let _ = input.set_attribute(
+            "aria-invalid",
+            if message.is_some() { "true" } else { "false" },
+        );
+    } else if let Some(input) = element::<HtmlTextAreaElement>(input_id) {
+        input.set_custom_validity(message.unwrap_or_default());
+        let _ = input.set_attribute(
+            "aria-invalid",
+            if message.is_some() { "true" } else { "false" },
+        );
+    }
+    set_text(error_id, message.unwrap_or_default());
+    set_hidden(error_id, message.is_none());
+}
+
+fn update_new_save_state() {
+    let name_valid = element::<HtmlInputElement>("new-value-name")
+        .is_some_and(|input| !input.value().is_empty() && input.check_validity());
+    let value_valid = element::<HtmlTextAreaElement>("new-value-content")
+        .is_some_and(|input| input.check_validity());
+    set_button_disabled("save-new-value", !(name_valid && value_valid));
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn format_timestamp(timestamp: Timestamp) -> String {
+    let milliseconds = timestamp.seconds as f64 * 1000.0 + f64::from(timestamp.nanos) / 1_000_000.0;
+    let date = Date::new(&JsValue::from_f64(milliseconds));
+    String::from(date.to_locale_string("en-GB", &JsValue::UNDEFINED))
+}
+
+async fn refresh_status(config: &AppConfig) -> bool {
     clear_error();
     let client = Client::new(
         BrowserTransport,
@@ -431,12 +980,13 @@ async fn refresh_status(config: &AppConfig) {
             set_text("auth-value", "Logged in");
             set_hidden("login", true);
             set_hidden("logout", false);
-            focus("auth-heading");
+            true
         }
         Ok(_) => {
             set_text("auth-value", "Logged out");
             set_hidden("login", false);
             set_hidden("logout", true);
+            false
         }
         Err(error) if error.kind == ErrorKind::Unauthenticated => {
             clear_browser_session();
@@ -444,12 +994,14 @@ async fn refresh_status(config: &AppConfig) {
             set_hidden("login", false);
             set_hidden("logout", true);
             show_error(error.message());
+            false
         }
         Err(error) => {
             set_text("auth-value", "Unavailable");
             set_hidden("login", true);
             set_hidden("logout", false);
             show_error(error.message());
+            false
         }
     }
 }
@@ -465,6 +1017,9 @@ async fn begin_login(config: &AppConfig) -> Result<(), ClientError> {
         .map_err(|_| browser_error())?;
     storage
         .set_item(VERIFIER_KEY, &verifier)
+        .map_err(|_| browser_error())?;
+    storage
+        .set_item(RETURN_PATH_KEY, &route_url(&route_from_location()))
         .map_err(|_| browser_error())?;
     let redirect_uri = redirect_uri()?;
     let url = Url::new(&discovery.authorization_endpoint).map_err(|_| oidc_error())?;
@@ -501,11 +1056,18 @@ async fn finish_login(config: &AppConfig) -> Result<(), ClientError> {
         .get_item(VERIFIER_KEY)
         .map_err(|_| browser_error())?
         .ok_or_else(oidc_error)?;
+    let return_path = storage
+        .get_item(RETURN_PATH_KEY)
+        .map_err(|_| browser_error())?
+        .map_or_else(|| "/".into(), |path| route_url(&route_from_path(&path)));
     storage
         .remove_item(STATE_KEY)
         .map_err(|_| browser_error())?;
     storage
         .remove_item(VERIFIER_KEY)
+        .map_err(|_| browser_error())?;
+    storage
+        .remove_item(RETURN_PATH_KEY)
         .map_err(|_| browser_error())?;
     if received_state != expected_state {
         return Err(ClientError::new(
@@ -562,7 +1124,7 @@ async fn finish_login(config: &AppConfig) -> Result<(), ClientError> {
     window
         .history()
         .map_err(|_| browser_error())?
-        .replace_state_with_url(&JsValue::NULL, "", Some("/"))
+        .replace_state_with_url(&JsValue::NULL, "", Some(&return_path))
         .map_err(|_| browser_error())
 }
 
@@ -926,21 +1488,12 @@ fn set_button_disabled(id: &str, disabled: bool) {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
-fn set_timestamp(id: &str, timestamp: Timestamp) {
-    let milliseconds = timestamp.seconds as f64 * 1000.0 + f64::from(timestamp.nanos) / 1_000_000.0;
-    let date = Date::new(&JsValue::from_f64(milliseconds));
-    let formatted = date.to_locale_string("en-GB", &JsValue::UNDEFINED);
-    set_text(id, &String::from(formatted));
-}
-
 fn set_hidden(id: &str, hidden: bool) {
     if let Some(element) = window()
         .and_then(|window| window.document())
         .and_then(|document| document.get_element_by_id(id))
     {
         let _ = element.set_attribute("aria-hidden", if hidden { "true" } else { "false" });
-        let _ = element.set_attribute("tabindex", if hidden { "-1" } else { "0" });
         if hidden {
             let _ = element.set_attribute("hidden", "");
         } else {
@@ -983,7 +1536,28 @@ mod tests {
     use sovereign_config_core::ErrorKind;
     use sovereign_config_proto::sovereign::config::v1::GetIdentityResponse;
 
-    use super::{classify_refresh_error, decode_grpc_web, decode_grpc_web_response};
+    use super::{
+        Route, classify_refresh_error, decode_grpc_web, decode_grpc_web_response,
+        parse_absolute_path, route_from_path, route_url,
+    };
+
+    #[test]
+    fn absolute_configuration_paths_drive_canonical_routes() {
+        assert_eq!(parse_absolute_path("/").unwrap().as_str(), "");
+        assert_eq!(
+            parse_absolute_path("/Apps/API").unwrap().as_str(),
+            "apps/api"
+        );
+        for invalid in ["", "apps/api", "/apps/", "/apps/bad_name", "//apps"] {
+            assert!(
+                parse_absolute_path(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        let route = route_from_path("/configuration/Apps/API");
+        assert_eq!(route_url(&route), "/configuration/apps/api");
+        assert!(matches!(route_from_path("/unknown"), Route::System));
+    }
 
     #[test]
     fn refresh_error_rejects_only_invalid_grant() {

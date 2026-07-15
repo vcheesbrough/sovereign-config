@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use sovereign_config_core::{
     AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, ExactValue,
-    PROTOCOL_VERSION, PlainValue, PutMetadata, Secret, ServiceStatus, Timestamp,
+    PROTOCOL_VERSION, PlainValue, PutMetadata, Secret, ServiceStatus, Timestamp, ValueListing,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +53,12 @@ pub trait Transport {
 
 #[async_trait(?Send)]
 pub trait ValueTransport: Transport {
+    async fn list_values(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ValueListing, ClientError>;
+
     async fn get_value(
         &self,
         path: &ConfigPath,
@@ -81,6 +87,16 @@ where
     T: ValueTransport,
     A: AccessTokenProvider,
 {
+    /// Lists readable values directly below a namespace and its existing readable paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, validation, or dependency error.
+    pub async fn list_values(&self, path: &ConfigPath) -> Result<ValueListing, ClientError> {
+        let token = self.required_token().await?;
+        self.transport.list_values(path, &token).await
+    }
+
     /// Reads one exact configuration value without caching or retrying.
     ///
     /// # Errors

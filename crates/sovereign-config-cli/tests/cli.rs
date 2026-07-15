@@ -22,8 +22,8 @@ use base64::{Engine, engine::general_purpose};
 use serde_json::json;
 use sovereign_config_proto::sovereign::config::v1::{
     DeleteValueRequest, DeleteValueResponse, GetIdentityRequest, GetIdentityResponse,
-    GetValueRequest, GetValueResponse, GetVersionRequest, GetVersionResponse, PutValueRequest,
-    PutValueResponse,
+    GetValueRequest, GetValueResponse, GetVersionRequest, GetVersionResponse, ListValuesRequest,
+    ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
     configuration_server::{Configuration, ConfigurationServer},
     system_server::{System, SystemServer},
 };
@@ -119,6 +119,29 @@ struct MockConfiguration {
 
 #[tonic::async_trait]
 impl Configuration for MockConfiguration {
+    async fn list_values(
+        &self,
+        request: Request<ListValuesRequest>,
+    ) -> Result<tonic::Response<ListValuesResponse>, Status> {
+        require_access_token(&request)?;
+        let selected = request.into_inner().path;
+        let values = self.values.lock().unwrap();
+        let values = values
+            .iter()
+            .filter(|(path, _)| path.rsplit_once('/').map_or("", |(parent, _)| parent) == selected)
+            .map(|(path, (value, created_at))| ListedValue {
+                path: path.clone(),
+                value: value.clone(),
+                created_at: Some(*created_at),
+                updated_at: Some(*created_at),
+            })
+            .collect();
+        Ok(tonic::Response::new(ListValuesResponse {
+            values,
+            paths: vec![selected],
+        }))
+    }
+
     async fn get_value(
         &self,
         request: Request<GetValueRequest>,

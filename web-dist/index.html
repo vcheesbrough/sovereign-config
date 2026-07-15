@@ -5,12 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#10211b">
     <title>Sovereign Config</title>
-    <link rel="stylesheet" href="/style-2c0640bc5cba7ffa.css" integrity="sha384-jKC8892uQHhetkI6ugYn1n1iB/loGRNHBethT2Op1SC9V02d3106edX8AbrODMu/"/>
+    <link rel="stylesheet" href="/style-eea1c9c832cba5db.css" integrity="sha384-8/jwvOELbLZO2VkddR2iBRdUNP2qaLvIcP/kvy8dRHQjVhutyFN3BxT0BnQTBzod"/>
     <script src="/app-config.js"></script>
     
 <script type="module">
-import init, * as bindings from '/sovereign-config-web-a47a072c77ecca7f.js';
-const wasm = await init({ module_or_path: '/sovereign-config-web-a47a072c77ecca7f_bg.wasm' });
+import init, * as bindings from '/sovereign-config-web-11b7ad97a1e2d6f8.js';
+const wasm = await init({ module_or_path: '/sovereign-config-web-11b7ad97a1e2d6f8_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -19,73 +19,114 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-  <link rel="modulepreload" href="/sovereign-config-web-a47a072c77ecca7f.js" crossorigin="anonymous" integrity="sha384-kvJa+hx951Q/BDqpW3Ch1fGLwHIMianwIRIUurq34I2Ny//GqGV8LpEdVf1lc+vZ"><link rel="preload" href="/sovereign-config-web-a47a072c77ecca7f_bg.wasm" crossorigin="anonymous" integrity="sha384-/jo7c/2UU0Df1xHYJilOmUVOWXyz9XRIaxUiRi8lqiCpnP079aETePgmFw6YJ4ot" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/sovereign-config-web-11b7ad97a1e2d6f8.js" crossorigin="anonymous" integrity="sha384-S1FMRUe5v1r91Bg6Uy4qZtOobNxxlwomfV9XKYTDi0F0Zg2PUzcDXBCqh4FLHG4J"><link rel="preload" href="/sovereign-config-web-11b7ad97a1e2d6f8_bg.wasm" crossorigin="anonymous" integrity="sha384-z9aWQP85E/g3l7SLk/DG5KsgtNlB4Wh8hLcPChQ++3XIuj8cF1b3+DSE+lpBaxhu" as="fetch" type="application/wasm"></head>
   <body>
     <header>
       <a id="brand-link" class="brand" href="/" aria-label="Sovereign Config home">
         <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
         <span>Sovereign Config</span>
       </a>
+      <div class="session-actions">
+        <button id="login" type="button">Log in</button>
+        <button id="logout" class="secondary inverse" type="button" hidden>Log out</button>
+      </div>
     </header>
     <div class="layout">
       <nav aria-label="Administration">
-        <a id="system-status-link" class="active" href="/">System status</a>
-        <a href="#configuration-values">Configuration values</a>
+        <a id="system-status-link" href="/">System status</a>
+        <a id="configuration-values-link" href="/configuration/">Configuration values</a>
       </nav>
       <main id="main">
-        <div class="page-heading">
-          <div>
-            <p class="eyebrow">Administration</p>
-            <h1>System status</h1>
-          </div>
-          <div class="actions">
-            <button id="login" type="button">Log in</button>
-            <button id="logout" class="secondary" type="button" hidden>Log out</button>
-          </div>
-        </div>
         <p id="error" class="error" role="alert" hidden></p>
-        <section aria-labelledby="service-heading">
-          <h2 id="service-heading">Service</h2>
-          <dl>
-            <div><dt>Connection</dt><dd id="service-value">Checking</dd></div>
-            <div><dt>Application version</dt><dd id="version-value">-</dd></div>
-            <div><dt>Protocol version</dt><dd id="protocol-value">-</dd></div>
-          </dl>
-        </section>
-        <section aria-labelledby="auth-heading">
-          <h2 id="auth-heading" tabindex="-1">Authentication</h2>
-          <dl><div><dt>Session</dt><dd id="auth-value">Checking</dd></div></dl>
-        </section>
-        <section id="configuration-values" aria-labelledby="value-heading">
-          <div class="section-heading">
+
+        <div id="system-page" class="page" hidden>
+          <div class="page-heading">
             <div>
-              <h2 id="value-heading" tabindex="-1">Configuration value</h2>
-              <p id="value-state" class="status-text" aria-live="polite">Enter an exact path</p>
+              <p class="eyebrow">Administration</p>
+              <h1>System status</h1>
             </div>
           </div>
-          <form id="value-form" class="path-form">
-            <label for="value-path">Path</label>
+          <section aria-labelledby="service-heading">
+            <h2 id="service-heading">Service</h2>
+            <dl>
+              <div><dt>Connection</dt><dd id="service-value">Checking</dd></div>
+              <div><dt>Application version</dt><dd id="version-value">-</dd></div>
+              <div><dt>Protocol version</dt><dd id="protocol-value">-</dd></div>
+            </dl>
+          </section>
+          <section aria-labelledby="auth-heading">
+            <h2 id="auth-heading" tabindex="-1">Authentication</h2>
+            <dl><div><dt>Session</dt><dd id="auth-value">Checking</dd></div></dl>
+          </section>
+        </div>
+
+        <div id="configuration-page" class="page" hidden>
+          <div class="page-heading configuration-heading">
+            <div>
+              <p class="eyebrow">Configuration</p>
+              <h1>Configuration values</h1>
+            </div>
+            <p id="value-state" class="status-text" aria-live="polite">Loading</p>
+          </div>
+
+          <form id="path-form" class="path-form" novalidate>
+            <label for="selected-path">Selected path</label>
             <div class="field-command">
-              <input id="value-path" name="path" type="text" autocomplete="off" spellcheck="false" required placeholder="apps/api/settings">
-              <button type="submit">Load</button>
+              <input id="selected-path" name="path" type="text" list="existing-paths" autocomplete="off" spellcheck="false" required value="/" aria-describedby="path-error">
+              <datalist id="existing-paths"></datalist>
+              <button id="open-path" type="submit">Open</button>
             </div>
+            <p id="path-error" class="field-error" aria-live="polite" hidden></p>
           </form>
-          <label for="value-content">Plain text value</label>
-          <textarea id="value-content" rows="12" spellcheck="false"></textarea>
-          <dl class="value-metadata">
-            <div><dt>Created</dt><dd id="created-value">-</dd></div>
-            <div><dt>Updated</dt><dd id="updated-value">-</dd></div>
-          </dl>
-          <div class="actions value-actions">
-            <button id="save-value" type="button">Save</button>
-            <button id="delete-value" class="danger" type="button" disabled>Delete</button>
+
+          <div class="grid-toolbar">
+            <div>
+              <h2 id="values-heading">Values</h2>
+              <p id="value-count" class="status-text">0 values</p>
+            </div>
+            <button id="add-value" type="button">Add value</button>
           </div>
-        </section>
+
+          <div class="table-scroll">
+            <table aria-labelledby="values-heading">
+              <thead>
+                <tr>
+                  <th scope="col">Name</th>
+                  <th scope="col">Value</th>
+                  <th scope="col">Updated</th>
+                  <th scope="col"><span class="visually-hidden">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="values-body">
+                <tr id="new-value-row" class="edit-row" hidden>
+                  <th scope="row">
+                    <label class="visually-hidden" for="new-value-name">Name</label>
+                    <input id="new-value-name" type="text" autocomplete="off" spellcheck="false" placeholder="value-name" aria-describedby="new-name-error">
+                    <p id="new-name-error" class="field-error" aria-live="polite" hidden></p>
+                  </th>
+                  <td>
+                    <label class="visually-hidden" for="new-value-content">Value</label>
+                    <textarea id="new-value-content" rows="2" spellcheck="false" aria-describedby="new-value-error"></textarea>
+                    <p id="new-value-error" class="field-error" aria-live="polite" hidden></p>
+                  </td>
+                  <td class="muted">New</td>
+                  <td>
+                    <div class="row-actions">
+                      <button id="save-new-value" type="button">Save</button>
+                      <button id="cancel-new-value" class="secondary" type="button">Cancel</button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p id="empty-values" class="empty-state" hidden>No values at this path.</p>
+        </div>
       </main>
     </div>
     <dialog id="delete-dialog" aria-labelledby="delete-title">
       <h2 id="delete-title">Permanently delete this value?</h2>
-      <p>This operation cannot be undone.</p>
+      <p><code id="delete-path"></code> will be removed immediately. This operation cannot be undone.</p>
       <div class="actions">
         <button id="cancel-delete" class="secondary" type="button">Cancel</button>
         <button id="confirm-delete" class="danger" type="button">Delete</button>

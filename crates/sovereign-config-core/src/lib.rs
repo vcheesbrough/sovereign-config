@@ -181,6 +181,20 @@ pub struct ExactValue {
     pub updated_at: Timestamp,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListedValue {
+    pub path: ConfigPath,
+    pub value: PlainValue,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValueListing {
+    pub values: Vec<ListedValue>,
+    pub paths: Vec<ConfigPath>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PutMetadata {
     pub created_at: Timestamp,

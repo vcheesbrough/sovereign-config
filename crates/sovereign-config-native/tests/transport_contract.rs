@@ -1,9 +1,12 @@
 use serde::Deserialize;
-use sovereign_config_client::Transport;
-use sovereign_config_core::{ClientError, ErrorKind, Secret};
+use sovereign_config_client::{Transport, ValueTransport};
+use sovereign_config_core::{ClientError, ConfigPath, ErrorKind, Secret};
 use sovereign_config_native::TonicTransport;
 use sovereign_config_proto::sovereign::config::v1::{
-    GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
+    DeleteValueRequest, DeleteValueResponse, GetIdentityRequest, GetIdentityResponse,
+    GetValueRequest, GetValueResponse, GetVersionRequest, GetVersionResponse, ListValuesRequest,
+    ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
+    configuration_server::{Configuration, ConfigurationServer},
     system_server::{System, SystemServer},
 };
 use tokio_stream::wrappers::TcpListenerStream;
@@ -18,6 +21,57 @@ struct ContractCase {
 
 #[derive(Default)]
 struct ContractSystem;
+
+#[derive(Default)]
+struct ContractConfiguration;
+
+#[tonic::async_trait]
+impl Configuration for ContractConfiguration {
+    async fn list_values(
+        &self,
+        request: Request<ListValuesRequest>,
+    ) -> Result<tonic::Response<ListValuesResponse>, Status> {
+        if request.metadata().get("authorization").is_none() {
+            return Err(Status::unauthenticated("missing bearer"));
+        }
+        Ok(tonic::Response::new(ListValuesResponse {
+            values: vec![ListedValue {
+                path: "apps/api/feature".into(),
+                value: "contract-value-sentinel".into(),
+                created_at: Some(prost_types::Timestamp {
+                    seconds: 1_700_000_000,
+                    nanos: 0,
+                }),
+                updated_at: Some(prost_types::Timestamp {
+                    seconds: 1_700_000_001,
+                    nanos: 0,
+                }),
+            }],
+            paths: vec![request.into_inner().path],
+        }))
+    }
+
+    async fn get_value(
+        &self,
+        _: Request<GetValueRequest>,
+    ) -> Result<tonic::Response<GetValueResponse>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
+
+    async fn put_value(
+        &self,
+        _: Request<PutValueRequest>,
+    ) -> Result<tonic::Response<PutValueResponse>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
+
+    async fn delete_value(
+        &self,
+        _: Request<DeleteValueRequest>,
+    ) -> Result<tonic::Response<DeleteValueResponse>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
+}
 
 #[tonic::async_trait]
 impl System for ContractSystem {
@@ -58,6 +112,7 @@ async fn tonic_transport_satisfies_shared_contract() {
     let server = tokio::spawn(
         Server::builder()
             .add_service(SystemServer::new(ContractSystem))
+            .add_service(ConfigurationServer::new(ContractConfiguration))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
     let transport = TonicTransport::connect(format!("http://{address}"))
@@ -67,6 +122,17 @@ async fn tonic_transport_satisfies_shared_contract() {
     let version = transport.get_version("v1").await.unwrap();
     assert_eq!(version.application_version, "contract-version");
     assert_eq!(version.protocol_version, "v1");
+
+    let listing = transport
+        .list_values(
+            &ConfigPath::parse("apps/api").unwrap(),
+            &Secret::new("contract-token-sentinel"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listing.paths, [ConfigPath::parse("apps/api").unwrap()]);
+    assert_eq!(listing.values[0].path.as_str(), "apps/api/feature");
+    assert_eq!(listing.values[0].value.expose(), "contract-value-sentinel");
 
     for case in contract() {
         let result = transport
