@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-FROM docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2 AS builder
+FROM docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2 AS web-builder
 WORKDIR /src
-ARG RELEASE_VERSION
 RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=sovereign-config-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=sovereign-config-cargo-target,target=/src/target \
@@ -17,6 +16,12 @@ RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/carg
     rustup target add wasm32-unknown-unknown \
     && cd crates/sovereign-config-web \
     && NO_COLOR=false trunk build --release
+
+FROM scratch AS web-dist-artifact
+COPY --from=web-builder /src/web-dist /
+
+FROM web-builder AS builder
+ARG RELEASE_VERSION
 RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=sovereign-config-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=sovereign-config-cargo-target,target=/src/target \

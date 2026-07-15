@@ -4,6 +4,9 @@ const path = require('node:path');
 const transportContract = require('../../test-contracts/transport.json');
 
 const configScript = 'globalThis.SOVEREIGN_CONFIG={issuer:"https://auth.example.test/application/o/sovereign-config/",clientId:"sovereign-config"};';
+const staticDir = process.env.PLAYWRIGHT_STATIC_DIR
+  ? path.resolve(process.env.PLAYWRIGHT_STATIC_DIR)
+  : path.resolve(__dirname, '../../web-dist');
 const tokenEndpoint = 'https://auth.example.test/application/o/token/';
 
 function grpcFrame(payload, status = 0) {
@@ -71,7 +74,7 @@ async function openCallback(
   await mockDiscovery(page);
   await page.route('**/auth/callback?*', route => route.fulfill({
     contentType: 'text/html',
-    path: path.resolve(__dirname, '../../web-dist/index.html')
+    path: path.join(staticDir, 'index.html')
   }));
   const tokenRequests = [];
   await page.route(tokenEndpoint, async route => {
