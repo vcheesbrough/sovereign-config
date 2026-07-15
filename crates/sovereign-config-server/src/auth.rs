@@ -8,12 +8,23 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use http::{HeaderMap, Method, Request, Response, header::AUTHORIZATION};
+use http::{
+    HeaderMap, HeaderValue, Method, Request, Response,
+    header::{AUTHORIZATION, CONTENT_TYPE},
+};
+use http_body_util::BodyExt;
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use sovereign_config_core::ConfigPath;
-use tonic::{Status, body::BoxBody};
-use tower::{Layer, Service};
+use tonic::{
+    Status,
+    body::{BoxBody, empty_body},
+};
+use tonic_web::GrpcWebLayer;
+use tower::{
+    Layer, Service,
+    layer::util::{Identity, Stack},
+};
 use tracing::{info, warn};
 
 use crate::{
@@ -360,6 +371,18 @@ impl AuthenticationLayer {
     }
 }
 
+pub(crate) type GrpcAuthenticationLayer = Stack<AuthenticationLayer, Stack<GrpcWebLayer, Identity>>;
+
+pub(crate) fn grpc_authentication_layer(
+    authenticator: Authenticator,
+    metrics: Arc<AuthenticationMetrics>,
+) -> GrpcAuthenticationLayer {
+    Stack::new(
+        AuthenticationLayer::new(authenticator, metrics),
+        Stack::new(GrpcWebLayer::new(), Identity::new()),
+    )
+}
+
 impl<S> Layer<S> for AuthenticationLayer {
     type Service = AuthenticationService<S>;
 
@@ -427,11 +450,26 @@ where
                         reason = failure.result.reason(),
                         "gRPC authentication failed"
                     );
-                    Ok(failure.status().into_http())
+                    Ok(status_response(&failure.status()))
                 }
             }
         })
     }
+}
+
+fn status_response(status: &Status) -> Response<BoxBody> {
+    let mut trailers = HeaderMap::new();
+    status
+        .add_header(&mut trailers)
+        .expect("bounded authentication status must produce valid trailers");
+    let body = empty_body()
+        .with_trailers(async move { Some(Ok(trailers)) })
+        .boxed_unsync();
+    let mut response = Response::new(body);
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+    response
 }
 
 #[cfg(test)]
@@ -451,17 +489,21 @@ mod tests {
         Engine as _,
         engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     };
-    use http::{HeaderMap, HeaderValue, Method, Request, Response, header::AUTHORIZATION};
+    use http::{
+        HeaderMap, HeaderValue, Method, Request, Response,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    };
+    use http_body_util::BodyExt as _;
     use reqwest::Url;
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, task::JoinHandle, time::sleep};
-    use tonic::body::empty_body;
+    use tonic::body::{BoxBody, empty_body};
     use tower::{Layer, ServiceExt, service_fn};
 
     use super::{
         AuthenticatedPrincipal, AuthenticationLayer, Authenticator, IntrospectionResponse,
-        Permission, bearer_token, is_canonical_prefix, is_operational_rpc, is_web_asset_request,
-        require_rs256, validate_introspection,
+        Permission, bearer_token, grpc_authentication_layer, is_canonical_prefix,
+        is_operational_rpc, is_web_asset_request, require_rs256, validate_introspection,
     };
     use crate::{config::AuthenticationConfig, metrics::AuthenticationMetrics};
 
@@ -846,6 +888,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grpc_web_authentication_failures_are_framed() {
+        let server = fake_server(StatusCode::SERVICE_UNAVAILABLE, "{}", Duration::ZERO).await;
+
+        let unauthenticated = grpc_web_status(
+            authenticator(server.url.clone(), Duration::from_secs(1)),
+            HeaderMap::new(),
+        )
+        .await;
+        let unavailable = grpc_web_status(
+            authenticator(server.url.clone(), Duration::from_secs(1)),
+            authenticated_headers(),
+        )
+        .await;
+
+        assert_eq!(unauthenticated, 16);
+        assert_eq!(unavailable, 14);
+        assert_eq!(server.state.calls.load(Ordering::Relaxed), 1);
+    }
+
+    async fn grpc_web_status(authenticator: Authenticator, headers: HeaderMap) -> u16 {
+        let layer =
+            grpc_authentication_layer(authenticator, Arc::new(AuthenticationMetrics::default()));
+        let inner = service_fn(|_: Request<BoxBody>| async {
+            Ok::<_, Infallible>(Response::new(empty_body()))
+        });
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/sovereign.config.v1.System/GetIdentity")
+            .header(CONTENT_TYPE, "application/grpc-web+proto")
+            .body(empty_body())
+            .unwrap();
+        request.headers_mut().extend(headers);
+        let response = layer.layer(inner).oneshot(request).await.unwrap();
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/grpc-web+proto"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.first(), Some(&0x80));
+        let length = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+        assert_eq!(length, body.len() - 5);
+        std::str::from_utf8(&body[5..])
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("grpc-status:")
+                    .and_then(|value| value.trim().parse().ok())
+            })
+            .expect("gRPC-Web response must contain a status trailer")
+    }
+
+    #[tokio::test]
     async fn middleware_bypasses_only_operational_rpcs_and_propagates_principal() {
         let server = fake_server(
             StatusCode::OK,
@@ -892,7 +986,11 @@ mod tests {
             .body(())
             .unwrap();
         let response = layer.layer(inner).oneshot(unknown).await.unwrap();
-        assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
+        let collected = response.into_body().collect().await.unwrap();
+        assert_eq!(
+            collected.trailers().unwrap().get("grpc-status").unwrap(),
+            "16"
+        );
         assert_eq!(server.state.calls.load(Ordering::Relaxed), 1);
     }
 }

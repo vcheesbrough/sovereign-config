@@ -17,7 +17,7 @@ use tonic_health::pb::{HealthCheckRequest, health_check_response, health_client:
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use auth::{AuthenticationLayer, Authenticator};
+use auth::{Authenticator, grpc_authentication_layer};
 use config::{Config, required_env};
 use metrics::AuthenticationMetrics;
 use sovereign_config_core::PROTOCOL_VERSION;
@@ -166,11 +166,10 @@ async fn main() -> Result<()> {
     info!(grpc_addr = %config.grpc_addr, metrics_addr = %config.metrics_addr, protocol_version = PROTOCOL_VERSION, "sovereign-config started");
     Server::builder()
         .accept_http1(true)
-        .layer(AuthenticationLayer::new(
+        .layer(grpc_authentication_layer(
             authenticator,
             authentication_metrics,
         ))
-        .layer(tonic_web::GrpcWebLayer::new())
         .layer(web_assets)
         .add_service(health_service)
         .add_service(SystemServer::new(SystemService))
