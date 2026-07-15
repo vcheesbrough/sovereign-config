@@ -47,8 +47,13 @@ entries:
       name: sovereign-config
       client_id: sovereign-config
       client_type: public
+      grant_types:
+        - authorization_code
+        - urn:ietf:params:oauth:grant-type:device_code
+        - refresh_token
+        - client_credentials
       redirect_uris:
-        - url: ${SOVEREIGN_CONFIG_OIDC_REDIRECT_URI}
+        - url: ${SOVEREIGN_CONFIG_BROWSER_REDIRECT_URI}
           matching_mode: strict
       access_token_validity: minutes=5
       refresh_token_validity: hours=8
@@ -72,3 +77,35 @@ entries:
       name: Sovereign Config
       slug: sovereign-config
       provider: !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config]]
+
+  - model: authentik_core.application
+    state: absent
+    identifiers:
+      slug: sovereign-config-cli
+
+  - model: authentik_providers_oauth2.oauth2provider
+    state: absent
+    identifiers:
+      name: sovereign-config-browser
+
+  - model: authentik_providers_oauth2.oauth2provider
+    state: absent
+    identifiers:
+      name: sovereign-config-cli
+
+  - model: authentik_flows.flow
+    state: present
+    identifiers:
+      slug: sovereign-config-device-code
+    attrs:
+      name: Sovereign Config device code
+      title: Authorize Sovereign Config CLI
+      designation: stage_configuration
+      authentication: require_authenticated
+
+  - model: authentik_brands.brand
+    state: present
+    identifiers:
+      domain: ${AUTHENTIK_BRAND_DOMAIN}
+    attrs:
+      flow_device_code: !Find [authentik_flows.flow, [slug, sovereign-config-device-code]]

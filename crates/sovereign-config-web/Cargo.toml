@@ -1,0 +1,46 @@
+[package]
+name = "sovereign-config-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+js-sys.workspace = true
+prost.workspace = true
+sha2.workspace = true
+sovereign-config-client = { path = "../sovereign-config-client" }
+sovereign-config-core = { path = "../sovereign-config-core" }
+sovereign-config-proto = { path = "../sovereign-config-proto" }
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+
+[dependencies.web-sys]
+workspace = true
+features = [
+  "Crypto",
+  "Document",
+  "Element",
+  "Event",
+  "Headers",
+  "History",
+  "HtmlElement",
+  "Location",
+  "Request",
+  "RequestCache",
+  "RequestInit",
+  "Response",
+  "Storage",
+  "Url",
+  "UrlSearchParams",
+  "Window",
+]
+
+[lints]
+workspace = true

@@ -8,15 +8,27 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use http::{HeaderMap, Request, Response, header::AUTHORIZATION};
+use http::{
+    HeaderMap, HeaderValue, Method, Request, Response,
+    header::{AUTHORIZATION, CONTENT_TYPE},
+};
+use http_body_util::BodyExt;
 use reqwest::{Client, Url};
 use serde::Deserialize;
-use tonic::{Status, body::BoxBody};
-use tower::{Layer, Service};
+use sovereign_config_core::ConfigPath;
+use tonic::{
+    Status,
+    body::{BoxBody, empty_body},
+};
+use tonic_web::GrpcWebLayer;
+use tower::{
+    Layer, Service,
+    layer::util::{Identity, Stack},
+};
 use tracing::{info, warn};
 
 use crate::{
-    config::AuthenticationConfig,
+    config::{AcceptedIdentity, AuthenticationConfig},
     metrics::{AuthenticationMetrics, AuthenticationResult},
 };
 
@@ -32,8 +44,7 @@ const OPERATIONAL_RPCS: [&str; 3] = [
 pub(crate) struct Authenticator {
     client: Client,
     introspection_url: Url,
-    issuer: String,
-    audience: String,
+    accepted_identities: Vec<AcceptedIdentity>,
     introspection_client_id: String,
     introspection_client_secret: String,
 }
@@ -115,8 +126,7 @@ impl Authenticator {
         Ok(Self {
             client,
             introspection_url: config.introspection_url,
-            issuer: config.issuer,
-            audience: config.audience,
+            accepted_identities: config.accepted_identities,
             introspection_client_id: config.introspection_client_id,
             introspection_client_secret: config.introspection_client_secret,
         })
@@ -147,7 +157,7 @@ impl Authenticator {
         let response = read_bounded_response(response).await?;
         let response: IntrospectionResponse =
             serde_json::from_slice(&response).map_err(|_| AuthenticationFailure::unavailable())?;
-        validate_introspection(response, &self.issuer, &self.audience)
+        validate_introspection_for_any(response, &self.accepted_identities)
     }
 }
 
@@ -236,22 +246,38 @@ fn require_rs256(token: &str) -> Result<(), AuthenticationFailure> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_introspection(
     response: IntrospectionResponse,
     expected_issuer: &str,
     expected_audience: &str,
+) -> Result<AuthenticatedPrincipal, AuthenticationFailure> {
+    validate_introspection_for_any(
+        response,
+        &[AcceptedIdentity {
+            issuer: expected_issuer.to_owned(),
+            audience: expected_audience.to_owned(),
+        }],
+    )
+}
+
+fn validate_introspection_for_any(
+    response: IntrospectionResponse,
+    accepted_identities: &[AcceptedIdentity],
 ) -> Result<AuthenticatedPrincipal, AuthenticationFailure> {
     if !response.active {
         return Err(AuthenticationFailure::unauthenticated(
             AuthenticationResult::Inactive,
         ));
     }
-    let valid_claims = response.iss.as_ref().and_then(serde_json::Value::as_str)
-        == Some(expected_issuer)
-        && response
-            .aud
-            .as_ref()
-            .is_some_and(|audience| audience_contains(audience, expected_audience))
+    let valid_identity = accepted_identities.iter().any(|identity| {
+        response.iss.as_ref().and_then(serde_json::Value::as_str) == Some(&identity.issuer)
+            && response
+                .aud
+                .as_ref()
+                .is_some_and(|audience| audience_contains(audience, &identity.audience))
+    });
+    let valid_claims = valid_identity
         && response
             .scope
             .as_ref()
@@ -319,17 +345,15 @@ fn validate_grants(raw_grants: Vec<RawGrant>) -> Result<Vec<Grant>, Authenticati
 }
 
 fn is_canonical_prefix(prefix: &str) -> bool {
-    prefix.is_empty()
-        || prefix.split('/').all(|segment| {
-            !segment.is_empty()
-                && segment
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        })
+    ConfigPath::parse(prefix).is_ok()
 }
 
 fn is_operational_rpc(path: &str) -> bool {
     OPERATIONAL_RPCS.contains(&path)
+}
+
+fn is_web_asset_request(method: &Method, path: &str) -> bool {
+    matches!(*method, Method::GET | Method::HEAD) && !is_operational_rpc(path)
 }
 
 #[derive(Clone)]
@@ -345,6 +369,18 @@ impl AuthenticationLayer {
             metrics,
         }
     }
+}
+
+pub(crate) type GrpcAuthenticationLayer = Stack<AuthenticationLayer, Stack<GrpcWebLayer, Identity>>;
+
+pub(crate) fn grpc_authentication_layer(
+    authenticator: Authenticator,
+    metrics: Arc<AuthenticationMetrics>,
+) -> GrpcAuthenticationLayer {
+    Stack::new(
+        AuthenticationLayer::new(authenticator, metrics),
+        Stack::new(GrpcWebLayer::new(), Identity::new()),
+    )
 }
 
 impl<S> Layer<S> for AuthenticationLayer {
@@ -384,7 +420,9 @@ where
     fn call(&mut self, mut request: Request<B>) -> Self::Future {
         let replacement = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, replacement);
-        if is_operational_rpc(request.uri().path()) {
+        if is_web_asset_request(request.method(), request.uri().path())
+            || is_operational_rpc(request.uri().path())
+        {
             return Box::pin(async move { inner.call(request).await });
         }
 
@@ -412,11 +450,26 @@ where
                         reason = failure.result.reason(),
                         "gRPC authentication failed"
                     );
-                    Ok(failure.status().into_http())
+                    Ok(status_response(&failure.status()))
                 }
             }
         })
     }
+}
+
+fn status_response(status: &Status) -> Response<BoxBody> {
+    let mut trailers = HeaderMap::new();
+    status
+        .add_header(&mut trailers)
+        .expect("bounded authentication status must produce valid trailers");
+    let body = empty_body()
+        .with_trailers(async move { Some(Ok(trailers)) })
+        .boxed_unsync();
+    let mut response = Response::new(body);
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+    response
 }
 
 #[cfg(test)]
@@ -436,17 +489,21 @@ mod tests {
         Engine as _,
         engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     };
-    use http::{HeaderMap, HeaderValue, Request, Response, header::AUTHORIZATION};
+    use http::{
+        HeaderMap, HeaderValue, Method, Request, Response,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    };
+    use http_body_util::BodyExt as _;
     use reqwest::Url;
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, task::JoinHandle, time::sleep};
-    use tonic::body::empty_body;
+    use tonic::body::{BoxBody, empty_body};
     use tower::{Layer, ServiceExt, service_fn};
 
     use super::{
         AuthenticatedPrincipal, AuthenticationLayer, Authenticator, IntrospectionResponse,
-        Permission, bearer_token, is_canonical_prefix, is_operational_rpc, require_rs256,
-        validate_introspection,
+        Permission, bearer_token, grpc_authentication_layer, is_canonical_prefix,
+        is_operational_rpc, is_web_asset_request, require_rs256, validate_introspection,
     };
     use crate::{config::AuthenticationConfig, metrics::AuthenticationMetrics};
 
@@ -538,8 +595,10 @@ mod tests {
     fn authenticator(url: Url, timeout: Duration) -> Authenticator {
         Authenticator::new(AuthenticationConfig {
             introspection_url: url,
-            issuer: "https://issuer.example/application/o/sovereign-config/".to_owned(),
-            audience: "sovereign-config".to_owned(),
+            accepted_identities: vec![crate::config::AcceptedIdentity {
+                issuer: "https://issuer.example/application/o/sovereign-config/".to_owned(),
+                audience: "sovereign-config".to_owned(),
+            }],
             introspection_client_id: TEST_CLIENT_ID.to_owned(),
             introspection_client_secret: TEST_CLIENT_SECRET.to_owned(),
             timeout,
@@ -763,6 +822,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn browser_asset_requests_do_not_require_authentication() {
+        assert!(is_web_asset_request(&Method::GET, "/"));
+        assert!(is_web_asset_request(&Method::HEAD, "/app-config.js"));
+        assert!(!is_web_asset_request(
+            &Method::POST,
+            "/sovereign.config.v1.System/GetIdentity"
+        ));
+        assert!(!is_web_asset_request(
+            &Method::GET,
+            "/sovereign.config.v1.System/GetVersion"
+        ));
+    }
+
     #[tokio::test]
     async fn live_introspection_uses_basic_auth_for_every_request() {
         let server = fake_server(
@@ -815,6 +888,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grpc_web_authentication_failures_are_framed() {
+        let server = fake_server(StatusCode::SERVICE_UNAVAILABLE, "{}", Duration::ZERO).await;
+
+        let unauthenticated = grpc_web_status(
+            authenticator(server.url.clone(), Duration::from_secs(1)),
+            HeaderMap::new(),
+        )
+        .await;
+        let unavailable = grpc_web_status(
+            authenticator(server.url.clone(), Duration::from_secs(1)),
+            authenticated_headers(),
+        )
+        .await;
+
+        assert_eq!(unauthenticated, 16);
+        assert_eq!(unavailable, 14);
+        assert_eq!(server.state.calls.load(Ordering::Relaxed), 1);
+    }
+
+    async fn grpc_web_status(authenticator: Authenticator, headers: HeaderMap) -> u16 {
+        let layer =
+            grpc_authentication_layer(authenticator, Arc::new(AuthenticationMetrics::default()));
+        let inner = service_fn(|_: Request<BoxBody>| async {
+            Ok::<_, Infallible>(Response::new(empty_body()))
+        });
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/sovereign.config.v1.System/GetIdentity")
+            .header(CONTENT_TYPE, "application/grpc-web+proto")
+            .body(empty_body())
+            .unwrap();
+        request.headers_mut().extend(headers);
+        let response = layer.layer(inner).oneshot(request).await.unwrap();
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/grpc-web+proto"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.first(), Some(&0x80));
+        let length = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+        assert_eq!(length, body.len() - 5);
+        std::str::from_utf8(&body[5..])
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("grpc-status:")
+                    .and_then(|value| value.trim().parse().ok())
+            })
+            .expect("gRPC-Web response must contain a status trailer")
+    }
+
+    #[tokio::test]
     async fn middleware_bypasses_only_operational_rpcs_and_propagates_principal() {
         let server = fake_server(
             StatusCode::OK,
@@ -846,6 +971,7 @@ mod tests {
         assert_eq!(server.state.calls.load(Ordering::Relaxed), 0);
 
         let mut protected = Request::builder()
+            .method(Method::POST)
             .uri("/protected.Service/Call")
             .body(())
             .unwrap();
@@ -855,11 +981,16 @@ mod tests {
         assert_eq!(server.state.calls.load(Ordering::Relaxed), 1);
 
         let unknown = Request::builder()
+            .method(Method::POST)
             .uri("/grpc.health.v1.Health/Unknown")
             .body(())
             .unwrap();
         let response = layer.layer(inner).oneshot(unknown).await.unwrap();
-        assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
+        let collected = response.into_body().collect().await.unwrap();
+        assert_eq!(
+            collected.trailers().unwrap().get("grpc-status").unwrap(),
+            "16"
+        );
         assert_eq!(server.state.calls.load(Ordering::Relaxed), 1);
     }
 }

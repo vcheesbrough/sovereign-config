@@ -1,0 +1,162 @@
+#![forbid(unsafe_code)]
+
+use async_trait::async_trait;
+use sovereign_config_core::{
+    AuthenticationStatus, ClientError, ErrorKind, PROTOCOL_VERSION, Secret, ServiceStatus,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RpcCode {
+    Unauthenticated,
+    PermissionDenied,
+    FailedPrecondition,
+    InvalidArgument,
+    Unavailable,
+    Other,
+}
+
+#[must_use]
+pub fn map_rpc_status(code: RpcCode) -> ClientError {
+    match code {
+        RpcCode::Unauthenticated => {
+            ClientError::new(ErrorKind::Unauthenticated, "authentication required")
+        }
+        RpcCode::PermissionDenied => {
+            ClientError::new(ErrorKind::PermissionDenied, "permission denied")
+        }
+        RpcCode::FailedPrecondition => ClientError::new(
+            ErrorKind::IncompatibleProtocol,
+            "service protocol is incompatible",
+        ),
+        RpcCode::InvalidArgument => {
+            ClientError::new(ErrorKind::InvalidRequest, "request is invalid")
+        }
+        RpcCode::Unavailable => ClientError::new(ErrorKind::Unavailable, "service is unavailable"),
+        RpcCode::Other => ClientError::new(ErrorKind::Internal, "request failed"),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionReply {
+    pub application_version: String,
+    pub protocol_version: String,
+}
+
+#[async_trait(?Send)]
+pub trait Transport {
+    async fn get_version(&self, protocol_version: &str) -> Result<VersionReply, ClientError>;
+    async fn get_identity(&self, bearer: &Secret) -> Result<AuthenticationStatus, ClientError>;
+}
+
+#[async_trait(?Send)]
+pub trait AccessTokenProvider {
+    async fn access_token(&self) -> Result<Option<Secret>, ClientError>;
+}
+
+pub struct Client<T, A> {
+    transport: T,
+    authentication: A,
+}
+
+impl<T, A> Client<T, A>
+where
+    T: Transport,
+    A: AccessTokenProvider,
+{
+    pub const fn new(transport: T, authentication: A) -> Self {
+        Self {
+            transport,
+            authentication,
+        }
+    }
+
+    /// Fetches and negotiates the service version without caching or retrying.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded transport or protocol compatibility error.
+    pub async fn service_status(&self) -> Result<ServiceStatus, ClientError> {
+        let reply = self.transport.get_version(PROTOCOL_VERSION).await?;
+        let status = ServiceStatus::negotiate(reply.application_version, reply.protocol_version);
+        if !status.compatible {
+            return Err(ClientError::new(
+                ErrorKind::IncompatibleProtocol,
+                "service protocol is incompatible",
+            ));
+        }
+        Ok(status)
+    }
+
+    /// Fetches authenticated identity state with a freshly supplied access token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication or transport error.
+    pub async fn authentication_status(&self) -> Result<AuthenticationStatus, ClientError> {
+        let token = self.authentication.access_token().await?.ok_or_else(|| {
+            ClientError::new(ErrorKind::Unauthenticated, "authentication required")
+        })?;
+        self.transport.get_identity(&token).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use async_trait::async_trait;
+    use sovereign_config_core::{AuthenticationStatus, ClientError, ErrorKind, Secret};
+
+    use super::{AccessTokenProvider, Client, RpcCode, Transport, VersionReply, map_rpc_status};
+
+    struct CountingTransport(Rc<Cell<usize>>);
+
+    #[async_trait(?Send)]
+    impl Transport for CountingTransport {
+        async fn get_version(&self, protocol: &str) -> Result<VersionReply, ClientError> {
+            self.0.set(self.0.get() + 1);
+            Ok(VersionReply {
+                application_version: "1.3.0".into(),
+                protocol_version: protocol.into(),
+            })
+        }
+
+        async fn get_identity(&self, _: &Secret) -> Result<AuthenticationStatus, ClientError> {
+            self.0.set(self.0.get() + 1);
+            Ok(AuthenticationStatus {
+                authenticated: true,
+            })
+        }
+    }
+
+    struct Authentication;
+
+    #[async_trait(?Send)]
+    impl AccessTokenProvider for Authentication {
+        async fn access_token(&self) -> Result<Option<Secret>, ClientError> {
+            Ok(Some(Secret::new("token-sentinel")))
+        }
+    }
+
+    #[tokio::test]
+    async fn each_operation_calls_transport_without_cache_or_retry() {
+        let calls = Rc::new(Cell::new(0));
+        let client = Client::new(CountingTransport(Rc::clone(&calls)), Authentication);
+        client.service_status().await.unwrap();
+        client.service_status().await.unwrap();
+        client.authentication_status().await.unwrap();
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn status_mapping_is_bounded() {
+        assert_eq!(
+            map_rpc_status(RpcCode::Unauthenticated).kind,
+            ErrorKind::Unauthenticated
+        );
+        assert_eq!(
+            map_rpc_status(RpcCode::Unavailable).to_string(),
+            "service is unavailable"
+        );
+    }
+}

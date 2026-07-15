@@ -1,5 +1,6 @@
-# Step DAG: compute-version ∥ contract-validation ∥ compose-validation →
-# build-server → publish-dev-image → apply-authentik-blueprint-auto-dev →
+# Step DAG: compute-version → build-server ┐
+# workspace-validation ∥ browser-validation ┴→ publish-dev-image →
+# validate-authentik-version → apply-authentik-blueprint-auto-dev →
 # auto-deploy-dev → tag-release-auto-dev.
 when:
   - event: [push, manual]
@@ -15,12 +16,12 @@ steps:
       github_token:
         from_secret: github_token
 
-  contract-validation:
+  workspace-validation:
     depends_on: []
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
     environment:
       CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
-      SOVEREIGN_CONFIG_TEST_DATABASE_URL: postgresql://sovereign_config_test:sovereign_config_test@postgres-migrations:5432/sovereign_config_test
+      SOVEREIGN_CONFIG_TEST_DATABASE_URL: postgresql://sovereign_config_test:sovereign_config_test@postgres-test:5432/sovereign_config_test
     volumes:
       - sovereign-config-cargo-registry:/usr/local/cargo/registry
       - sovereign-config-cargo-git:/usr/local/cargo/git
@@ -31,18 +32,32 @@ steps:
       - cargo clippy --workspace --all-targets -- -D warnings
       - cargo test --workspace
       - cargo test --package sovereign-config-server --test migrations -- --ignored
+      - rustup target add wasm32-unknown-unknown
+      - cargo check --target wasm32-unknown-unknown --package sovereign-config-core --package sovereign-config-client --package sovereign-config-web
 
-  compose-validation:
+  browser-validation:
     depends_on: []
-    image: docker.io/library/docker@sha256:862099ada15c669000bef53aa4cb9d821262829f45b0dda2159ccb276443043b
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     commands:
-      - SOVEREIGN_CONFIG_IMAGE_TAG=validation SOVEREIGN_CONFIG_HOST=config.example.internal SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-validation SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL=https://auth.example.internal/application/o/introspect/ SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.example.internal/application/o/sovereign-config-dev/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection-dev POSTGRES_PASSWORD_FILE=/dev/null DATABASE_URL_FILE=/dev/null OIDC_INTROSPECTION_CLIENT_SECRET_FILE=/dev/null docker compose config -q
+      - |
+        rm -rf .browser-dist
+        docker build --target web-dist-artifact --output type=local,dest=.browser-dist .
+        CONTAINER=$$(docker create --workdir /tests \
+          --env PLAYWRIGHT_STATIC=1 \
+          --env PLAYWRIGHT_STATIC_DIR=/web-dist \
+          mcr.microsoft.com/playwright:v1.61.1-noble@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48 \
+          sh -lc 'npm ci --ignore-scripts && npm test')
+        trap 'docker rm --force "$$CONTAINER" >/dev/null 2>&1 || true; rm -rf .browser-dist' EXIT
+        docker cp browser-tests/. "$$CONTAINER:/tests"
+        docker cp test-contracts/. "$$CONTAINER:/test-contracts"
+        docker cp .browser-dist/. "$$CONTAINER:/web-dist"
+        docker start --attach "$$CONTAINER"
 
   build-server:
     depends_on:
       - compute-version
-      - contract-validation
-      - compose-validation
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -56,6 +71,8 @@ steps:
   publish-dev-image:
     depends_on:
       - build-server
+      - workspace-validation
+      - browser-validation
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -74,7 +91,7 @@ steps:
 
   apply-authentik-blueprint-auto-dev:
     depends_on:
-      - publish-dev-image
+      - validate-authentik-version
     pull: true
     image: ghcr.io/vcheesbrough/woodpecker-plugin-authentik-blueprint:v0.2.0@sha256:9f262c4390205b5629e9af7560f4e492f0155395a429153703ba351206d9d975
     settings:
@@ -87,7 +104,25 @@ steps:
       vars:
         AUTHENTIK_SOVEREIGN_CONFIG_DEV_INTROSPECTION_CLIENT_SECRET:
           from_secret: sovereign_config_dev_oidc_introspection_client_secret
-        SOVEREIGN_CONFIG_DEV_OIDC_REDIRECT_URI: https://sovereign-config-dev.desync.link/auth/callback
+        SOVEREIGN_CONFIG_DEV_BROWSER_REDIRECT_URI: https://sovereign-config-dev.desync.link/auth/callback
+        AUTHENTIK_DEV_BRAND_DOMAIN: auth.desync.link
+
+  validate-authentik-version:
+    depends_on:
+      - publish-dev-image
+    image: docker.io/curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
+    environment:
+      AUTHENTIK_API_TOKEN:
+        from_secret: authentik_api_token
+    commands:
+      - |
+        umask 077
+        printf 'header = "Authorization: Bearer %s"\n' "$$AUTHENTIK_API_TOKEN" > /tmp/authentik-curl.conf
+        VERSION=$$(curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/admin/version/ | sed -n 's/.*"version_current":"\([^"]*\)".*/\1/p')
+        test -n "$$VERSION"
+        awk -v version="$$VERSION" 'BEGIN { split(version, part, "."); if (part[1] > 2026 || (part[1] == 2026 && part[2] > 5) || (part[1] == 2026 && part[2] == 5 && part[3] >= 2)) exit 0; exit 1 }'
+        curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/schema/ | grep -q 'grant_types'
+        echo "Validated compatible Authentik $$VERSION"
 
   auto-deploy-dev:
     depends_on:
@@ -105,7 +140,7 @@ steps:
     commands:
       - |
         ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
-        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL="$$OIDC_INTROSPECTION_URL" SOVEREIGN_CONFIG_OIDC_ISSUER="$$OIDC_ISSUER" SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET_FILE= SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET="$$OIDC_INTROSPECTION_CLIENT_SECRET" docker compose -p sovereign-config-dev up -d --wait --wait-timeout 90 || {
+        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL="$$OIDC_INTROSPECTION_URL" SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config-dev/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET_FILE= SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET="$$OIDC_INTROSPECTION_CLIENT_SECRET" docker compose -p sovereign-config-dev up -d --wait --wait-timeout 90 || {
           docker compose -p sovereign-config-dev logs --tail 200
           exit 1
         }
@@ -124,7 +159,7 @@ steps:
         from_secret: github_token
 
 services:
-  postgres-migrations:
+  postgres-test:
     image: docker.io/library/postgres@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4
     environment:
       POSTGRES_DB: sovereign_config_test
