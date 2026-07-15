@@ -61,8 +61,10 @@
           <form id="path-form" class="path-form" novalidate>
             <label for="selected-path">Selected path</label>
             <div class="field-command">
-              <input id="selected-path" name="path" type="text" list="existing-paths" autocomplete="off" spellcheck="false" required value="/" aria-describedby="path-error">
-              <datalist id="existing-paths"></datalist>
+              <div class="path-picker">
+                <input id="selected-path" name="path" type="text" role="combobox" autocomplete="off" spellcheck="false" required value="/" aria-autocomplete="list" aria-controls="existing-paths" aria-expanded="false" aria-haspopup="listbox" aria-describedby="path-error">
+                <div id="existing-paths" class="path-options" role="listbox" aria-label="Existing paths" hidden></div>
+              </div>
               <button id="open-path" type="submit">Open</button>
             </div>
             <p id="path-error" class="field-error" aria-live="polite" hidden></p>
