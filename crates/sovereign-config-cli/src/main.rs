@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use sovereign_config_client::{AccessTokenProvider, Client};
 use sovereign_config_core::{ClientError, Secret};
 use sovereign_config_native::{
-    CredentialStore, DeviceFlowClient, TonicTransport, default_credential_path,
+    CredentialStore, DeviceFlowClient, TonicTransport, default_credential_directory,
 };
 
 const APPLICATION_VERSION: &str = match option_env!("SOVEREIGN_CONFIG_RELEASE") {
@@ -22,7 +22,7 @@ struct Arguments {
 #[derive(Subcommand)]
 enum Command {
     Login(IdentityProviderArguments),
-    Logout,
+    Logout(IdentityProviderArguments),
     Status {
         #[arg(long, env = "SOVEREIGN_CONFIG_ENDPOINT")]
         endpoint: String,
@@ -55,9 +55,9 @@ impl AccessTokenProvider for InMemoryToken {
 #[tokio::main]
 async fn main() -> Result<()> {
     let arguments = Arguments::parse();
-    let credential_store = CredentialStore::new(default_credential_path()?)?;
     match arguments.command {
         Command::Login(identity_provider) => {
+            let credential_store = credential_store(&identity_provider)?;
             login(
                 &identity_provider.issuer,
                 identity_provider.client_id,
@@ -65,7 +65,8 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Logout => {
+        Command::Logout(identity_provider) => {
+            let credential_store = credential_store(&identity_provider)?;
             credential_store.delete()?;
             println!("Logged out");
             Ok(())
@@ -74,6 +75,7 @@ async fn main() -> Result<()> {
             endpoint,
             identity_provider,
         } => {
+            let credential_store = credential_store(&identity_provider)?;
             status(
                 endpoint,
                 &identity_provider.issuer,
@@ -83,6 +85,14 @@ async fn main() -> Result<()> {
             .await
         }
     }
+}
+
+fn credential_store(identity_provider: &IdentityProviderArguments) -> Result<CredentialStore> {
+    Ok(CredentialStore::new(
+        &default_credential_directory()?,
+        &identity_provider.issuer,
+        &identity_provider.client_id,
+    )?)
 }
 
 async fn login(issuer: &str, client_id: String, store: &CredentialStore) -> Result<()> {
