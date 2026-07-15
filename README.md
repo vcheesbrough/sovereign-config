@@ -49,12 +49,13 @@ sha256sum --check --ignore-missing SHA256SUMS
 install -m 0755 sovereign-config-linux-amd64 "$HOME/.local/bin/sovereign-config"
 ```
 
-Configure non-secret connection details and use device login:
+Configure the development connection and use device login. For another deployment, replace the
+service URL, issuer, and client ID with that environment's matching values:
 
 ```sh
-export SOVEREIGN_CONFIG_ENDPOINT='https://config.example.internal'
-export SOVEREIGN_CONFIG_OIDC_ISSUER='https://auth.example.internal/application/o/sovereign-config/'
-export SOVEREIGN_CONFIG_OIDC_CLI_CLIENT_ID='sovereign-config'
+export SOVEREIGN_CONFIG_ENDPOINT='https://sovereign-config-dev.desync.link'
+export SOVEREIGN_CONFIG_OIDC_ISSUER='https://auth.desync.link/application/o/sovereign-config-dev/'
+export SOVEREIGN_CONFIG_OIDC_CLI_CLIENT_ID='sovereign-config-dev'
 sovereign-config status
 sovereign-config login
 sovereign-config status
