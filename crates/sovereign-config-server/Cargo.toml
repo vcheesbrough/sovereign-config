@@ -33,5 +33,8 @@ tracing-subscriber.workspace = true
 sovereign-config-proto = { path = "../sovereign-config-proto" }
 sovereign-config-core = { path = "../sovereign-config-core" }
 
+[dev-dependencies]
+serde_yaml.workspace = true
+
 [lints]
 workspace = true

@@ -91,20 +91,29 @@ Authentik 2026.5.2 or newer is required. That version includes configurable gran
 
 The issuing providers use the selected Authentik signing certificate, five-minute access tokens, and rotating refresh tokens bounded to eight hours. Browser and human CLI clients request `openid sovereign-config offline_access`. Browser access tokens remain only in WASM memory; the rotating refresh credential is held in tab-scoped session storage so a reload can obtain a fresh access token without persisting a long-lived login across browser sessions. Logout, refresh expiry, or refresh rejection clears the browser session. Use authorization code with PKCE or device flow and keep all tokens out of shell history and logs.
 
-### Bootstrap administrator
+### Configuration grants
 
-Before starting Sovereign Config for the first time, create or select the administrator manually in Authentik and set this user attribute:
+Each blueprint creates an environment-specific contributor group that bundles global `read`, `write`, and `manage` grants:
+
+| Environment | Contributor group | Direct grant attribute |
+| --- | --- | --- |
+| Production | `sovereign-config-production-config-contributor` | `sovereign_config_prod_grants` |
+| Development | `sovereign-config-development-config-contributor` | `sovereign_config_dev_grants` |
+
+Add a user or service account only to the contributor groups required for that environment. Group membership is an Authentik administration convenience, not a Sovereign Config role: the environment's scope mapping emits the existing granular `sovereign_config_grants` claim, and the server independently evaluates `read`, `write`, or `manage` for every operation. No contributor role name is sent to or expanded by the server.
+
+For narrower access, place grants in the environment-specific direct grant attribute on a user, service account, or another group. For example, this development-only attribute permits reading one subtree without write or manage:
 
 ```yaml
-sovereign_config_grants:
-  - prefix: ""
+sovereign_config_dev_grants:
+  - prefix: apps/example
     permissions:
       - read
-      - write
-      - manage
 ```
 
-The empty prefix is the global root. The `sovereign-config` scope mapping combines and deduplicates grants from the authenticated user or service-account attributes and all group attributes. Sovereign Config rejects malformed, non-canonical, or unknown grants. It never seeds users or authorization state and PostgreSQL contains no ACL, grant, token, session, or audit records.
+Use `sovereign_config_prod_grants` for the equivalent production assignment. The empty prefix is the global root. Each environment's `sovereign-config` scope mapping combines and deduplicates only its own direct and group grants before emitting the common granular claim, so the same principal can have different development and production permissions. An existing access token retains its grants until it is replaced; log out and sign in again to apply a change immediately. Sovereign Config rejects malformed, non-canonical, or unknown grants. It never seeds users or authorization state and PostgreSQL contains no ACL, grant, token, session, or audit records.
+
+When upgrading from the shared `sovereign-config grants` scope mapping, apply both environment blueprints before deleting that legacy mapping manually. Neither blueprint deletes it because development and production can be migrated at different times.
 
 ### Request authentication
 
