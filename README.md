@@ -36,7 +36,7 @@ The development deployment is verified by calling `System.GetVersion` through th
 Build release images only for linux/amd64 with `docker build --platform linux/amd64 --tag sovereign-config:local .`.
 Woodpecker reuses Cargo dependency and compilation caches across validation and server-image builds.
 
-The server embeds the fingerprinted Rust WASM administration application and serves it with gRPC-Web on the native gRPC listener. Browser assets, runtime OIDC configuration, and gRPC-Web use the service origin; the server sends no cross-origin API permission. The browser retains access and rotating refresh tokens only in WASM memory. Access expiry refreshes transparently; reload or refresh-session failure requires a new PKCE authorization.
+The server embeds the fingerprinted Rust WASM administration application and serves it with gRPC-Web on the native gRPC listener. Browser assets, runtime OIDC configuration, and gRPC-Web use the service origin; the server sends no cross-origin API permission. Browser access tokens remain only in WASM memory, while rotating refresh tokens remain in tab-scoped session storage. Access expiry refreshes transparently and reload restores the tab's session; logout, absolute refresh expiry, or definitive refresh rejection require a new PKCE authorization.
 
 ## CLI
 
