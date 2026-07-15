@@ -59,6 +59,24 @@ dd { margin: 0; font-weight: 650; overflow-wrap: anywhere; }
 .path-form { padding: 18px 0 22px; border-top: 1px solid #cbd3cf; border-bottom: 1px solid #cbd3cf; }
 label { display: block; margin-bottom: 7px; font-weight: 700; }
 .field-command { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.path-picker { position: relative; min-width: 0; }
+.path-options {
+  position: absolute;
+  z-index: 10;
+  top: calc(100% + 4px);
+  width: 100%;
+  max-height: 320px;
+  overflow-y: auto;
+  color: #18201d;
+  background: #fff;
+  border: 1px solid #68756f;
+  border-radius: 4px;
+  box-shadow: 0 8px 20px rgb(16 33 27 / 18%);
+}
+.path-options.above { top: auto; bottom: calc(100% + 4px); }
+.path-option { min-height: 38px; padding: 9px 10px; cursor: pointer; overflow-wrap: anywhere; }
+.path-option + .path-option { border-top: 1px solid #e0e5e2; }
+.path-option:hover, .path-option.active { color: #fff; background: #17634c; }
 input, textarea { width: 100%; color: #18201d; background: #fff; border: 1px solid #8d9a94; border-radius: 4px; font: inherit; }
 input { min-height: 40px; padding: 8px 10px; }
 textarea { min-height: 64px; padding: 9px 10px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; line-height: 1.4; }

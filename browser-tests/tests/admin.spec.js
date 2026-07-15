@@ -444,7 +444,7 @@ test('configuration path is deep-linked, selectable, and restored by browser his
   const pathInput = page.getByLabel('Selected path');
   await expect(pathInput).toHaveValue('/apps/api');
   await expect(page.getByRole('row', { name: /feature-flag/ })).toBeVisible();
-  await expect(page.locator('#existing-paths option')).toHaveCount(4);
+  await expect(page.locator('#existing-paths [role="option"]')).toHaveCount(4);
 
   await pathInput.fill('/Apps/Worker');
   await page.getByRole('button', { name: 'Open' }).click();
@@ -466,16 +466,46 @@ test('path selector refreshes external paths and Enter opens the selected path',
   });
   await page.goto('/configuration/apps/api');
   const pathInput = page.getByLabel('Selected path');
-  await expect(page.locator('#existing-paths option[value="/services/worker"]')).toHaveCount(0);
+  await expect(page.locator('#existing-paths [role="option"][data-path="/services/worker"]')).toHaveCount(0);
 
   values.setValue('services/worker/concurrency', '4');
   await pathInput.focus();
-  await expect(page.locator('#existing-paths option[value="/services/worker"]')).toHaveCount(1);
+  const workerPath = page.locator('#existing-paths [role="option"][data-path="/services/worker"]');
+  await expect(workerPath).toHaveCount(1);
 
-  await pathInput.fill('/services/worker');
+  await workerPath.click();
+  await expect(pathInput).toHaveValue('/services/worker');
   await pathInput.press('Enter');
   await expect(page).toHaveURL(/\/configuration\/services\/worker$/);
   await expect(page.getByRole('row', { name: /concurrency/ })).toBeVisible();
+});
+
+test('path selector popup uses the available viewport height', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  const initial = Object.fromEntries(
+    Array.from({ length: 40 }, (_, index) => [`services/service-${index + 1}/enabled`, 'true'])
+  );
+  await mockValues(page, initial);
+  await page.goto('/configuration/services/service-1');
+  const pathInput = page.getByLabel('Selected path');
+  await pathInput.focus();
+  const popup = page.getByRole('listbox', { name: 'Existing paths' });
+  await expect(popup).toBeVisible();
+  await expect(page.locator('#existing-paths [role="option"]')).toHaveCount(42);
+
+  const bounds = await popup.boundingBox();
+  expect(bounds.height).toBeGreaterThan(400);
+  expect(bounds.y + bounds.height).toBeLessThanOrEqual(888);
+
+  const accessibility = await new AxeBuilder({ page }).analyze();
+  expect(accessibility.violations).toEqual([]);
+
+  await page.setViewportSize({ width: 390, height: 420 });
+  const mobileBounds = await popup.boundingBox();
+  expect(mobileBounds.y).toBeGreaterThanOrEqual(8);
+  expect(mobileBounds.y + mobileBounds.height).toBeLessThanOrEqual(412);
 });
 
 test('configuration grid is accessible and contained on desktop and mobile', async ({ page }, testInfo) => {
