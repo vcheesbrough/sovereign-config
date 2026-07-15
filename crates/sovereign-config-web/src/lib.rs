@@ -751,13 +751,27 @@ where
     if !response.ok() {
         return Err(map_rpc_status(RpcCode::Unavailable));
     }
+    let header_status = response
+        .headers()
+        .get("grpc-status")
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<u16>().ok());
     let buffer = JsFuture::from(response.array_buffer().map_err(|_| browser_error())?)
         .await
         .map_err(|_| browser_error())?;
-    decode_grpc_web(&Uint8Array::new(&buffer).to_vec())
+    decode_grpc_web_response(&Uint8Array::new(&buffer).to_vec(), header_status)
 }
 
+#[cfg(test)]
 fn decode_grpc_web<R: Message + Default>(bytes: &[u8]) -> Result<R, ClientError> {
+    decode_grpc_web_response(bytes, None)
+}
+
+fn decode_grpc_web_response<R: Message + Default>(
+    bytes: &[u8],
+    header_status: Option<u16>,
+) -> Result<R, ClientError> {
     let mut offset = 0;
     let mut payload = None;
     let mut status = None;
@@ -779,20 +793,26 @@ fn decode_grpc_web<R: Message + Default>(bytes: &[u8]) -> Result<R, ClientError>
         }
         offset += length;
     }
-    let status = status.ok_or_else(|| map_rpc_status(RpcCode::Other))?;
+    let status = status
+        .or(header_status)
+        .ok_or_else(|| map_rpc_status(RpcCode::Other))?;
     if status != 0 {
-        return Err(map_rpc_status(match status {
-            3 => RpcCode::InvalidArgument,
-            5 => RpcCode::NotFound,
-            7 => RpcCode::PermissionDenied,
-            9 => RpcCode::FailedPrecondition,
-            14 => RpcCode::Unavailable,
-            16 => RpcCode::Unauthenticated,
-            _ => RpcCode::Other,
-        }));
+        return Err(map_rpc_status(grpc_status_code(status)));
     }
     R::decode(payload.ok_or_else(|| map_rpc_status(RpcCode::Other))?)
         .map_err(|_| map_rpc_status(RpcCode::Other))
+}
+
+fn grpc_status_code(status: u16) -> RpcCode {
+    match status {
+        3 => RpcCode::InvalidArgument,
+        5 => RpcCode::NotFound,
+        7 => RpcCode::PermissionDenied,
+        9 => RpcCode::FailedPrecondition,
+        14 => RpcCode::Unavailable,
+        16 => RpcCode::Unauthenticated,
+        _ => RpcCode::Other,
+    }
 }
 
 async fn fetch(
@@ -963,7 +983,7 @@ mod tests {
     use sovereign_config_core::ErrorKind;
     use sovereign_config_proto::sovereign::config::v1::GetIdentityResponse;
 
-    use super::{classify_refresh_error, decode_grpc_web};
+    use super::{classify_refresh_error, decode_grpc_web, decode_grpc_web_response};
 
     #[test]
     fn refresh_error_rejects_only_invalid_grant() {
@@ -1026,5 +1046,12 @@ mod tests {
             assert_eq!(error.kind, ErrorKind::Internal);
             assert_eq!(error.message(), "request failed");
         }
+    }
+
+    #[test]
+    fn grpc_web_decoder_accepts_trailers_only_status_headers() {
+        let error = decode_grpc_web_response::<GetIdentityResponse>(&[], Some(7)).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::PermissionDenied);
+        assert_eq!(error.message(), "permission denied");
     }
 }

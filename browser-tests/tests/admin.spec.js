@@ -386,6 +386,23 @@ test('exact value lifecycle is accessible, case-insensitive, and permanently del
   ]);
 });
 
+test('trailers-only save errors retain their bounded gRPC status', async ({ page }) => {
+  await openCallback(page);
+  await page.route('**/sovereign.config.v1.Configuration/PutValue', route => route.fulfill({
+    status: 200,
+    headers: {
+      'content-type': 'application/grpc-web+proto',
+      'grpc-status': '7'
+    },
+    body: Buffer.alloc(0)
+  }));
+
+  await page.getByLabel('Path').fill('foo');
+  await page.getByLabel('Plain text value').fill('bar');
+  await page.getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByText('permission denied', { exact: true })).toBeVisible();
+});
+
 for (const contract of transportContract) {
   test(`browser transport maps gRPC status ${contract.grpc_status}`, async ({ page }) => {
     const requests = await openCallback(page, 'success', 'expected-state', contract.grpc_status);
