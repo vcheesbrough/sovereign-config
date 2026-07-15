@@ -6,12 +6,12 @@ use sovereign_config_client::{
     RpcCode, Transport, ValueTransport, VersionReply, map_rpc_status, timestamp,
 };
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ExactValue, PlainValue,
-    PutMetadata, Secret,
+    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ExactValue, ListedValue,
+    PlainValue, PutMetadata, Secret, ValueListing,
 };
 use sovereign_config_proto::sovereign::config::v1::{
-    DeleteValueRequest, GetIdentityRequest, GetValueRequest, GetVersionRequest, PutValueRequest,
-    configuration_client::ConfigurationClient, system_client::SystemClient,
+    DeleteValueRequest, GetIdentityRequest, GetValueRequest, GetVersionRequest, ListValuesRequest,
+    PutValueRequest, configuration_client::ConfigurationClient, system_client::SystemClient,
 };
 use tonic::{
     Code, Request,
@@ -29,6 +29,44 @@ pub struct TonicTransport {
 
 #[async_trait(?Send)]
 impl ValueTransport for TonicTransport {
+    async fn list_values(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ValueListing, ClientError> {
+        let mut client = ConfigurationClient::new(self.channel.clone());
+        let response = client
+            .list_values(authenticated_request(
+                ListValuesRequest {
+                    path: path.as_str().to_owned(),
+                },
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        let values = response
+            .values
+            .into_iter()
+            .map(|value| {
+                let created_at = value.created_at.ok_or_else(invalid_response)?;
+                let updated_at = value.updated_at.ok_or_else(invalid_response)?;
+                Ok(ListedValue {
+                    path: ConfigPath::parse(value.path).map_err(|_| invalid_response())?,
+                    value: PlainValue::new(value.value),
+                    created_at: timestamp(created_at.seconds, created_at.nanos)?,
+                    updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
+                })
+            })
+            .collect::<Result<Vec<_>, ClientError>>()?;
+        let paths = response
+            .paths
+            .into_iter()
+            .map(|path| ConfigPath::parse(path).map_err(|_| invalid_response()))
+            .collect::<Result<Vec<_>, ClientError>>()?;
+        Ok(ValueListing { values, paths })
+    }
+
     async fn get_value(
         &self,
         path: &ConfigPath,

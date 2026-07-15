@@ -1,9 +1,10 @@
-use std::time::SystemTime;
+use std::{collections::BTreeSet, time::SystemTime};
 
 use sovereign_config_core::ConfigPath;
 use sovereign_config_proto::sovereign::config::v1::{
-    DeleteValueRequest, DeleteValueResponse, GetValueRequest, GetValueResponse, PutValueRequest,
-    PutValueResponse, configuration_server::Configuration,
+    DeleteValueRequest, DeleteValueResponse, GetValueRequest, GetValueResponse, ListValuesRequest,
+    ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
+    configuration_server::Configuration,
 };
 use sqlx::{FromRow, PgPool};
 use time::OffsetDateTime;
@@ -24,6 +25,19 @@ struct ValueRow {
 }
 
 #[derive(FromRow)]
+struct ListedValueRow {
+    path: String,
+    value: String,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+#[derive(FromRow)]
+struct PathRow {
+    path: String,
+}
+
+#[derive(FromRow)]
 struct MutationRow {
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
@@ -37,6 +51,65 @@ impl ConfigurationService {
 
 #[tonic::async_trait]
 impl Configuration for ConfigurationService {
+    async fn list_values(
+        &self,
+        request: Request<ListValuesRequest>,
+    ) -> Result<Response<ListValuesResponse>, Status> {
+        let selected = ConfigPath::parse(&request.get_ref().path)
+            .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
+        let principal = request
+            .extensions()
+            .get::<AuthenticatedPrincipal>()
+            .ok_or_else(|| Status::unauthenticated("authentication required"))?;
+        let candidates =
+            sqlx::query_as::<_, PathRow>("SELECT path FROM configuration_values ORDER BY path")
+                .fetch_all(&self.database)
+                .await
+                .map_err(|_| storage_unavailable())?;
+
+        let mut readable_values = Vec::new();
+        let mut paths = BTreeSet::new();
+        for row in candidates {
+            let path = ConfigPath::parse(&row.path).map_err(|_| storage_unavailable())?;
+            if !principal.allows(&path, Permission::Read) {
+                continue;
+            }
+            add_parent_paths(&mut paths, &path);
+            if parent_path(&path) == selected.as_str() {
+                readable_values.push(row.path);
+            }
+        }
+
+        let mut values = Vec::new();
+        if !readable_values.is_empty() {
+            let rows = sqlx::query_as::<_, ListedValueRow>(
+                r"
+                SELECT path, value, created_at, updated_at
+                FROM configuration_values
+                WHERE path = ANY($1::TEXT[])
+                ORDER BY path
+                ",
+            )
+            .bind(&readable_values)
+            .fetch_all(&self.database)
+            .await
+            .map_err(|_| storage_unavailable())?;
+            for row in rows {
+                values.push(ListedValue {
+                    path: row.path,
+                    value: row.value,
+                    created_at: Some(to_proto_timestamp(row.created_at)?),
+                    updated_at: Some(to_proto_timestamp(row.updated_at)?),
+                });
+            }
+        }
+
+        Ok(Response::new(ListValuesResponse {
+            values,
+            paths: paths.into_iter().collect(),
+        }))
+    }
+
     async fn get_value(
         &self,
         request: Request<GetValueRequest>,
@@ -64,6 +137,11 @@ impl Configuration for ConfigurationService {
     ) -> Result<Response<PutValueResponse>, Status> {
         let path = authorize(&request, Permission::Write)?;
         let value = &request.get_ref().value;
+        if value.contains('\0') {
+            return Err(Status::invalid_argument(
+                "configuration value contains an invalid character",
+            ));
+        }
         let now = OffsetDateTime::from(SystemTime::now());
         let row = sqlx::query_as::<_, MutationRow>(
             r"
@@ -149,6 +227,28 @@ impl ValueRequest for DeleteValueRequest {
     }
 }
 
+fn parent_path(path: &ConfigPath) -> &str {
+    path.as_str()
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent)
+}
+
+fn add_parent_paths(paths: &mut BTreeSet<String>, path: &ConfigPath) {
+    let parent = parent_path(path);
+    if parent.is_empty() {
+        paths.insert(String::new());
+        return;
+    }
+    let mut prefix = String::new();
+    for segment in parent.split('/') {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(segment);
+        paths.insert(prefix.clone());
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn to_proto_timestamp(value: OffsetDateTime) -> Result<prost_types::Timestamp, Status> {
     let nanos = value.nanosecond();
@@ -174,15 +274,22 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
     use tonic::{Code, Request};
 
-    use super::{ConfigurationService, DeleteValueRequest, GetValueRequest, PutValueRequest};
+    use super::{
+        ConfigurationService, DeleteValueRequest, GetValueRequest, ListValuesRequest,
+        PutValueRequest,
+    };
     use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
 
     fn request<T>(message: T, permissions: &[Permission]) -> Request<T> {
+        request_for_prefix(message, "tests/exact", permissions)
+    }
+
+    fn request_for_prefix<T>(message: T, prefix: &str, permissions: &[Permission]) -> Request<T> {
         let mut request = Request::new(message);
         request.extensions_mut().insert(AuthenticatedPrincipal {
             subject: "integration-principal".into(),
             grants: vec![Grant {
-                prefix: "tests/exact".into(),
+                prefix: prefix.into(),
                 permissions: permissions.iter().copied().collect::<BTreeSet<_>>(),
             }],
         });
@@ -203,6 +310,28 @@ mod tests {
             .unwrap();
         let service = ConfigurationService::new(pool.clone());
 
+        let invalid_list = service
+            .list_values(request(
+                ListValuesRequest {
+                    path: "tests//exact".into(),
+                },
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid_list.code(), Code::InvalidArgument);
+        let invalid_value = service
+            .put_value(request(
+                PutValueRequest {
+                    path: "tests/exact/invalid".into(),
+                    value: "invalid\0value".into(),
+                },
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid_value.code(), Code::InvalidArgument);
+
         let first = service
             .put_value(request(
                 PutValueRequest {
@@ -214,6 +343,60 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
+        service
+            .put_value(request(
+                PutValueRequest {
+                    path: "tests/exact/nested/child".into(),
+                    value: "nested-value-sentinel".into(),
+                },
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        let listing = service
+            .list_values(request(
+                ListValuesRequest {
+                    path: "tests/exact".into(),
+                },
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listing.values.len(), 1);
+        assert_eq!(listing.values[0].path, "tests/exact/key");
+        assert_eq!(
+            listing.paths,
+            ["tests", "tests/exact", "tests/exact/nested"]
+        );
+        let nested_only = service
+            .list_values(request_for_prefix(
+                ListValuesRequest {
+                    path: "tests/exact".into(),
+                },
+                "tests/exact/nested",
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(nested_only.values.is_empty());
+        assert_eq!(
+            nested_only.paths,
+            ["tests", "tests/exact", "tests/exact/nested"]
+        );
+        let write_only = service
+            .list_values(request(
+                ListValuesRequest {
+                    path: "tests/exact".into(),
+                },
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(write_only.values.is_empty());
+        assert!(write_only.paths.is_empty());
         let denied = service
             .get_value(request(
                 GetValueRequest {

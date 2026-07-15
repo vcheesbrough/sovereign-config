@@ -137,6 +137,8 @@ Downgrades after a migration are unsupported. Restore the verified PostgreSQL ba
 
 Configuration values are stored in PostgreSQL as canonical paths, plain text, and service-generated UTC creation/update timestamps. Updates are last-write-wins and preserve the original creation timestamp. Deletion is a hard delete with no tombstone, rollback record, or retained value history. PostgreSQL volume and backup encryption remain operator responsibilities.
 
+The browser exposes system status and configuration values as separate client-side pages. Configuration URLs use `/configuration/<path>` and display absolute paths beginning with `/`; the final segment of each stored path is the value name. The path selector offers namespaces containing readable values and also accepts a valid namespace that does not exist yet. Listing filters every returned value through server-side `read` permission, while row saves and deletes continue to require independent `write` and `manage` permissions.
+
 ## Observability
 
 The application writes structured redacted JSON logs to stdout. Authentication events contain only the RPC path and bounded outcome/reason values. Internal Alloy discovers `/metrics` using the Docker labels in `compose.yaml`; that endpoint is not routed through Traefik. `sovereign_config_authentication_total` reports bounded success/failure reasons without request-derived labels. OTLP export is introduced by its separate card.

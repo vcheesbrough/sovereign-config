@@ -60,13 +60,79 @@ function mutationReply() {
   return Buffer.concat([field(1, instant), field(2, instant)]);
 }
 
-async function mockValues(page) {
-  let stored = null;
+function listedValue(path, value) {
+  const instant = timestamp(1700000000);
+  return Buffer.concat([
+    field(1, Buffer.from(path)),
+    field(2, Buffer.from(value)),
+    field(3, instant),
+    field(4, instant)
+  ]);
+}
+
+function listReply(values, paths) {
+  return Buffer.concat([
+    ...values.map(([path, value]) => field(1, listedValue(path, value))),
+    ...paths.map(path => field(2, Buffer.from(path)))
+  ]);
+}
+
+function readVarint(buffer, start) {
+  let value = 0;
+  let shift = 0;
+  let offset = start;
+  while (offset < buffer.length) {
+    const byte = buffer[offset++];
+    value |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) return [value, offset];
+    shift += 7;
+  }
+  throw new Error('invalid protobuf varint');
+}
+
+function stringFields(frame) {
+  const fields = new Map();
+  let offset = 5;
+  while (offset < frame.length) {
+    const [tag, afterTag] = readVarint(frame, offset);
+    offset = afterTag;
+    const [length, afterLength] = readVarint(frame, offset);
+    offset = afterLength;
+    fields.set(tag >> 3, frame.subarray(offset, offset + length).toString());
+    offset += length;
+  }
+  return fields;
+}
+
+function parentPath(path) {
+  const split = path.lastIndexOf('/');
+  return split === -1 ? '' : path.slice(0, split);
+}
+
+function existingPaths(values) {
+  const paths = new Set();
+  for (const path of values.keys()) {
+    const parent = parentPath(path);
+    if (parent === '') {
+      paths.add('');
+      continue;
+    }
+    const segments = parent.split('/');
+    for (let index = 1; index <= segments.length; index++) {
+      paths.add(segments.slice(0, index).join('/'));
+    }
+  }
+  return [...paths].sort();
+}
+
+async function mockValues(page, initial = {}) {
+  const stored = new Map(Object.entries(initial));
   const requests = [];
   await page.route('**/sovereign.config.v1.Configuration/*', route => {
     const method = route.request().url().split('/').pop();
     const body = route.request().postDataBuffer();
-    requests.push({ method, body });
+    const fields = stringFields(body);
+    requests.push({ method, body, fields });
     const authorized = route.request().headers().authorization === 'Bearer access-token-two';
     if (!authorized) {
       return route.fulfill({
@@ -75,22 +141,32 @@ async function mockValues(page) {
         body: grpcFrame(Buffer.alloc(0), 16)
       });
     }
-    if (method === 'GetValue') {
+    if (method === 'ListValues') {
+      const selected = fields.get(1) || '';
+      const values = [...stored].filter(([path]) => parentPath(path) === selected);
       return route.fulfill({
         status: 200,
         headers: { 'content-type': 'application/grpc-web+proto' },
-        body: stored === null ? grpcFrame(Buffer.alloc(0), 5) : grpcFrame(valueReply(stored))
+        body: grpcFrame(listReply(values, existingPaths(stored)))
+      });
+    }
+    if (method === 'GetValue') {
+      const value = stored.get(fields.get(1));
+      return route.fulfill({
+        status: 200,
+        headers: { 'content-type': 'application/grpc-web+proto' },
+        body: value === undefined ? grpcFrame(Buffer.alloc(0), 5) : grpcFrame(valueReply(value))
       });
     }
     if (method === 'PutValue') {
-      stored = 'plain-value-sentinel';
+      stored.set(fields.get(1), fields.get(2));
       return route.fulfill({
         status: 200,
         headers: { 'content-type': 'application/grpc-web+proto' },
         body: grpcFrame(mutationReply())
       });
     }
-    stored = null;
+    stored.delete(fields.get(1));
     return route.fulfill({
       status: 200,
       headers: { 'content-type': 'application/grpc-web+proto' },
@@ -117,6 +193,10 @@ async function mockApplication(page) {
       headers: { 'content-type': 'application/grpc-web+proto' },
       body: grpcFrame(message)
     });
+  });
+  await page.route('**/configuration/**', route => {
+    if (route.request().resourceType() !== 'document') return route.continue();
+    return route.fulfill({ contentType: 'text/html', path: path.join(staticDir, 'index.html') });
   });
 }
 
@@ -271,9 +351,14 @@ test('callback refreshes an expired access token and rotates the refresh token',
 
 test('same-page navigation does not discard the in-memory login session', async ({ page }) => {
   await openCallback(page);
+  await mockValues(page);
   await expect(page.getByText('Logged in')).toBeVisible();
+  await page.getByRole('link', { name: 'Configuration values' }).click();
+  await expect(page).toHaveURL(/\/configuration\/$/);
+  await expect(page.getByRole('heading', { name: 'Configuration values' })).toBeVisible();
   await page.getByRole('link', { name: 'System status' }).click();
-  await expect(page.getByText('Logged in')).toBeVisible();
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
 });
 
 test('refresh rejection clears the browser session', async ({ page }) => {
@@ -343,32 +428,130 @@ test('reload restores the session with a rotated refresh token', async ({ page }
   });
 });
 
-test('exact value lifecycle is accessible, case-insensitive, and permanently deletes', async ({ page }) => {
+test('configuration path is deep-linked, selectable, and restored by browser history', async ({ page }) => {
   await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, {
+    'apps/api/feature-flag': 'enabled',
+    'apps/worker/concurrency': '4'
+  });
+  await page.goto('/configuration/apps/api');
+  const pathInput = page.getByLabel('Selected path');
+  await expect(pathInput).toHaveValue('/apps/api');
+  await expect(page.getByRole('row', { name: /feature-flag/ })).toBeVisible();
+  await expect(page.locator('#existing-paths option')).toHaveCount(4);
+
+  await pathInput.fill('/Apps/Worker');
+  await page.getByRole('button', { name: 'Open' }).click();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+  await expect(pathInput).toHaveValue('/apps/worker');
+  await expect(page.getByRole('row', { name: /concurrency/ })).toBeVisible();
+
+  await page.goBack();
+  await expect(page).toHaveURL(/\/configuration\/apps\/api$/);
+  await expect(pathInput).toHaveValue('/apps/api');
+  await expect(page.getByRole('row', { name: /feature-flag/ })).toBeVisible();
+});
+
+test('configuration grid is accessible and contained on desktop and mobile', async ({ page }, testInfo) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, {
+    'apps/api/feature-flag': 'enabled',
+    'apps/api/retry-limit': '5'
+  });
+  await page.goto('/configuration/apps/api');
+  await expect(page.getByRole('row', { name: /feature-flag/ })).toBeVisible();
+
+  const accessibility = await new AxeBuilder({ page }).analyze();
+  expect(accessibility.violations).toEqual([]);
+  await page.screenshot({
+    path: `screenshots/configuration-${testInfo.project.name}.png`,
+    animations: 'disabled'
+  });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const containment = await page.evaluate(() => {
+    const grid = document.querySelector('.table-scroll');
+    window.scrollTo({ left: 100, top: 0 });
+    return {
+      bodyContained: document.body.scrollWidth <= innerWidth,
+      documentScroll: scrollX,
+      gridScrollable: grid.scrollWidth > grid.clientWidth
+    };
+  });
+  expect(containment).toEqual({ bodyContained: true, documentScroll: 0, gridScrollable: false });
+  await page.evaluate(() => new Promise(resolve => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+  await page.screenshot({
+    path: `screenshots/configuration-mobile-${testInfo.project.name}.png`,
+    animations: 'disabled'
+  });
+});
+
+test('path and new-value fields validate on every keystroke', async ({ page }) => {
+  await openCallback(page);
+  await mockValues(page);
+  await page.getByRole('link', { name: 'Configuration values' }).click();
+  const pathInput = page.getByLabel('Selected path');
+
+  await pathInput.fill('apps/bad_path');
+  await expect(pathInput).toHaveAttribute('aria-invalid', 'true');
+  await expect(page.getByText('path must begin with / and contain only letters, numbers, and hyphens')).toBeVisible();
+  await expect(page).toHaveURL(/\/configuration\/$/);
+
+  await pathInput.fill('/apps/new-area');
+  await expect(pathInput).toHaveAttribute('aria-invalid', 'false');
+  await page.getByRole('button', { name: 'Open' }).click();
+  await expect(page).toHaveURL(/\/configuration\/apps\/new-area$/);
+  await expect(page.getByText('No values at this path.')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Add value' }).click();
+  const name = page.getByLabel('Name');
+  await name.fill('bad_name');
+  await expect(name).toHaveAttribute('aria-invalid', 'true');
+  await expect(page.getByText('Name must contain only letters, numbers, and hyphens')).toBeVisible();
+  await name.fill('Feature-Flag');
+  await expect(name).toHaveAttribute('aria-invalid', 'false');
+
+  const value = page.getByLabel('Value', { exact: true });
+  await value.evaluate(element => {
+    element.value = `bad\u0000value`;
+    element.dispatchEvent(new InputEvent('input', { bubbles: true }));
+  });
+  await expect(value).toHaveAttribute('aria-invalid', 'true');
+  await expect(page.getByText('Value cannot contain a null character')).toBeVisible();
+});
+
+test('grid adds, edits, and permanently deletes individual values', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
   const requests = await mockValues(page);
-  const pathInput = page.getByLabel('Path');
-  const editor = page.getByLabel('Plain text value');
+  await page.goto('/configuration/apps/api');
+  await expect(page.getByText('No values at this path.')).toBeVisible();
 
-  await pathInput.fill('Apps/API/Feature-Flag');
-  await page.getByRole('button', { name: 'Load' }).click();
-  await expect(page.getByText('New value')).toBeVisible();
-  await expect(editor).toBeFocused();
-
-  await editor.fill('plain-value-sentinel');
+  await page.getByRole('button', { name: 'Add value' }).click();
+  await page.getByLabel('Name').fill('Feature-Flag');
+  await page.getByLabel('Value', { exact: true }).fill('plain-value-sentinel');
   await page.getByRole('button', { name: 'Save' }).click();
-  await expect(page.getByText('Saved')).toBeVisible();
-  await expect(page.locator('#created-value')).not.toHaveText('-');
-  expect(requests.at(-1).body.includes(Buffer.from('apps/api/feature-flag'))).toBe(true);
-  expect(requests.at(-1).body.includes(Buffer.from('plain-value-sentinel'))).toBe(true);
-
-  await editor.fill('discarded-local-edit');
-  await pathInput.fill('APPS/api/FEATURE-FLAG');
-  await page.getByRole('button', { name: 'Load' }).click();
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  const editor = page.getByLabel('Value for feature-flag');
   await expect(editor).toHaveValue('plain-value-sentinel');
+  expect(requests.at(-2).fields.get(1)).toBe('apps/api/feature-flag');
+  expect(requests.at(-2).fields.get(2)).toBe('plain-value-sentinel');
 
-  const remove = page.getByRole('button', { name: 'Delete', exact: true }).first();
+  await editor.fill('updated-value-sentinel');
+  await page.getByRole('row', { name: /feature-flag/ }).getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('Value for feature-flag')).toHaveValue('updated-value-sentinel');
+
+  const row = page.getByRole('row', { name: /feature-flag/ });
+  const remove = row.getByRole('button', { name: 'Delete' });
   await remove.click();
-  await expect(page.getByRole('dialog')).toBeVisible();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText('/apps/api/feature-flag')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Cancel' })).toBeFocused();
   await page.getByRole('button', { name: 'Cancel' }).click();
   await expect(remove).toBeFocused();
@@ -376,18 +559,15 @@ test('exact value lifecycle is accessible, case-insensitive, and permanently del
   await remove.click();
   await page.getByRole('dialog').getByRole('button', { name: 'Delete' }).click();
   await expect(page.getByText('Deleted')).toBeVisible();
-  await expect(pathInput).toBeFocused();
-  await expect(editor).toHaveValue('');
-
-  await page.getByRole('button', { name: 'Load' }).click();
-  await expect(page.getByText('New value')).toBeVisible();
+  await expect(page.getByText('No values at this path.')).toBeVisible();
   expect(requests.map(request => request.method)).toEqual([
-    'GetValue', 'PutValue', 'GetValue', 'DeleteValue', 'GetValue'
+    'ListValues', 'PutValue', 'ListValues', 'PutValue', 'ListValues', 'DeleteValue', 'ListValues'
   ]);
 });
 
 test('trailers-only save errors retain their bounded gRPC status', async ({ page }) => {
   await openCallback(page);
+  await mockValues(page);
   await page.route('**/sovereign.config.v1.Configuration/PutValue', route => route.fulfill({
     status: 200,
     headers: {
@@ -397,8 +577,10 @@ test('trailers-only save errors retain their bounded gRPC status', async ({ page
     body: Buffer.alloc(0)
   }));
 
-  await page.getByLabel('Path').fill('foo');
-  await page.getByLabel('Plain text value').fill('bar');
+  await page.getByRole('link', { name: 'Configuration values' }).click();
+  await page.getByRole('button', { name: 'Add value' }).click();
+  await page.getByLabel('Name').fill('foo');
+  await page.getByLabel('Value', { exact: true }).fill('bar');
   await page.getByRole('button', { name: 'Save' }).click();
   await expect(page.getByText('permission denied', { exact: true })).toBeVisible();
 });
