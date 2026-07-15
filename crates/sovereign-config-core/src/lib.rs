@@ -110,7 +110,7 @@ impl ConfigPath {
 }
 
 /// Plain configuration text that must be exposed explicitly.
-#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Default, Deserialize, Eq, PartialEq)]
 #[serde(transparent)]
 pub struct PlainValue(String);
 
