@@ -15,36 +15,113 @@
         <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
         <span>Sovereign Config</span>
       </a>
+      <div class="session-actions">
+        <button id="login" type="button">Log in</button>
+        <button id="logout" class="secondary inverse" type="button" hidden>Log out</button>
+      </div>
     </header>
     <div class="layout">
       <nav aria-label="Administration">
-        <a id="system-status-link" class="active" href="/">System status</a>
+        <a id="system-status-link" href="/">System status</a>
+        <a id="configuration-values-link" href="/configuration/">Configuration values</a>
       </nav>
       <main id="main">
-        <div class="page-heading">
-          <div>
-            <p class="eyebrow">Administration</p>
-            <h1>System status</h1>
-          </div>
-          <div class="actions">
-            <button id="login" type="button">Log in</button>
-            <button id="logout" class="secondary" type="button" hidden>Log out</button>
-          </div>
-        </div>
         <p id="error" class="error" role="alert" hidden></p>
-        <section aria-labelledby="service-heading">
-          <h2 id="service-heading">Service</h2>
-          <dl>
-            <div><dt>Connection</dt><dd id="service-value">Checking</dd></div>
-            <div><dt>Application version</dt><dd id="version-value">-</dd></div>
-            <div><dt>Protocol version</dt><dd id="protocol-value">-</dd></div>
-          </dl>
-        </section>
-        <section aria-labelledby="auth-heading">
-          <h2 id="auth-heading" tabindex="-1">Authentication</h2>
-          <dl><div><dt>Session</dt><dd id="auth-value">Checking</dd></div></dl>
-        </section>
+
+        <div id="system-page" class="page" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Administration</p>
+              <h1>System status</h1>
+            </div>
+          </div>
+          <section aria-labelledby="service-heading">
+            <h2 id="service-heading">Service</h2>
+            <dl>
+              <div><dt>Connection</dt><dd id="service-value">Checking</dd></div>
+              <div><dt>Application version</dt><dd id="version-value">-</dd></div>
+              <div><dt>Protocol version</dt><dd id="protocol-value">-</dd></div>
+            </dl>
+          </section>
+          <section aria-labelledby="auth-heading">
+            <h2 id="auth-heading" tabindex="-1">Authentication</h2>
+            <dl><div><dt>Session</dt><dd id="auth-value">Checking</dd></div></dl>
+          </section>
+        </div>
+
+        <div id="configuration-page" class="page" hidden>
+          <div class="page-heading configuration-heading">
+            <div>
+              <p class="eyebrow">Configuration</p>
+              <h1>Configuration values</h1>
+            </div>
+            <p id="value-state" class="status-text" aria-live="polite">Loading</p>
+          </div>
+
+          <form id="path-form" class="path-form" novalidate>
+            <label for="selected-path">Selected path</label>
+            <div class="field-command">
+              <div class="path-picker">
+                <input id="selected-path" name="path" type="text" role="combobox" autocomplete="off" spellcheck="false" required value="/" aria-autocomplete="list" aria-controls="existing-paths" aria-expanded="false" aria-haspopup="listbox" aria-describedby="path-error">
+                <div id="existing-paths" class="path-options" role="listbox" aria-label="Existing paths" hidden></div>
+              </div>
+              <button id="open-path" type="submit">Open</button>
+            </div>
+            <p id="path-error" class="field-error" aria-live="polite" hidden></p>
+          </form>
+
+          <div class="grid-toolbar">
+            <div>
+              <h2 id="values-heading">Values</h2>
+              <p id="value-count" class="status-text">0 values</p>
+            </div>
+            <button id="add-value" type="button">Add value</button>
+          </div>
+
+          <div class="table-scroll">
+            <table aria-labelledby="values-heading">
+              <thead>
+                <tr>
+                  <th scope="col">Name</th>
+                  <th scope="col">Value</th>
+                  <th scope="col">Updated</th>
+                  <th scope="col"><span class="visually-hidden">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="values-body">
+                <tr id="new-value-row" class="edit-row" hidden>
+                  <th scope="row">
+                    <label class="visually-hidden" for="new-value-name">Name</label>
+                    <input id="new-value-name" type="text" autocomplete="off" spellcheck="false" placeholder="value-name" aria-describedby="new-name-error">
+                    <p id="new-name-error" class="field-error" aria-live="polite" hidden></p>
+                  </th>
+                  <td>
+                    <label class="visually-hidden" for="new-value-content">Value</label>
+                    <textarea id="new-value-content" rows="2" spellcheck="false" aria-describedby="new-value-error"></textarea>
+                    <p id="new-value-error" class="field-error" aria-live="polite" hidden></p>
+                  </td>
+                  <td class="muted">New</td>
+                  <td>
+                    <div class="row-actions">
+                      <button id="save-new-value" type="button">Save</button>
+                      <button id="cancel-new-value" class="secondary" type="button">Cancel</button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p id="empty-values" class="empty-state" hidden>No values at this path.</p>
+        </div>
       </main>
     </div>
+    <dialog id="delete-dialog" aria-labelledby="delete-title">
+      <h2 id="delete-title">Permanently delete this value?</h2>
+      <p><code id="delete-path"></code> will be removed immediately. This operation cannot be undone.</p>
+      <div class="actions">
+        <button id="cancel-delete" class="secondary" type="button">Cancel</button>
+        <button id="confirm-delete" class="danger" type="button">Delete</button>
+      </div>
+    </dialog>
   </body>
 </html>

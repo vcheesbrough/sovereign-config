@@ -4,7 +4,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use sovereign_config_client::{AccessTokenProvider, Client};
-use sovereign_config_core::{ClientError, ConnectionUrl, ErrorKind, Secret};
+use sovereign_config_core::{
+    ClientError, ConfigPath, ConnectionUrl, ErrorKind, PlainValue, Secret,
+};
 use sovereign_config_native::{
     CredentialStore, DeviceFlowClient, ProfileStore, TonicTransport, default_credential_directory,
     default_profile_path,
@@ -34,6 +36,29 @@ enum Command {
     Login,
     Logout,
     Status,
+    Get {
+        #[arg(
+            value_name = "ABSOLUTE_PATH",
+            help = "Absolute configuration value path, beginning with /"
+        )]
+        path: String,
+    },
+    Put {
+        #[arg(
+            value_name = "ABSOLUTE_PATH",
+            help = "Absolute configuration value path, beginning with /"
+        )]
+        path: String,
+    },
+    Delete {
+        #[arg(
+            value_name = "ABSOLUTE_PATH",
+            help = "Absolute configuration value path, beginning with /"
+        )]
+        path: String,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -69,6 +94,9 @@ async fn main() -> Result<()> {
                 Command::Login => login(&connection).await,
                 Command::Logout => logout(&connection),
                 Command::Status => status(&connection).await,
+                Command::Get { path } => get_value(&connection, &path).await,
+                Command::Put { path } => put_value(&connection, &path).await,
+                Command::Delete { path, yes } => delete_value(&connection, &path, yes).await,
                 Command::Profile { .. } => unreachable!(),
             }
         }
@@ -184,7 +212,22 @@ async fn status(connection: &ConnectionUrl) -> Result<()> {
         service.application_version, service.protocol_version
     );
 
-    let access_token = if let Some(authentication) = connection.client_authentication() {
+    let Some(access_token) = maybe_access_token(connection).await? else {
+        println!("Authentication: logged out");
+        return Ok(());
+    };
+
+    let client = Client::new(transport, InMemoryToken(access_token));
+    let authentication = client.authentication_status().await?;
+    if !authentication.authenticated {
+        bail!("service returned an invalid authentication status");
+    }
+    println!("Authentication: logged in");
+    Ok(())
+}
+
+async fn maybe_access_token(connection: &ConnectionUrl) -> Result<Option<Secret>> {
+    let token = if let Some(authentication) = connection.client_authentication() {
         DeviceFlowClient::discover(connection.issuer(), connection.client_id().to_owned())
             .await?
             .client_credentials(authentication)
@@ -193,8 +236,7 @@ async fn status(connection: &ConnectionUrl) -> Result<()> {
     } else {
         let store = credential_store(connection)?;
         let Some(refresh) = store.load()? else {
-            println!("Authentication: logged out");
-            return Ok(());
+            return Ok(None);
         };
         let oidc =
             DeviceFlowClient::discover(connection.issuer(), connection.client_id().to_owned())
@@ -212,13 +254,90 @@ async fn status(connection: &ConnectionUrl) -> Result<()> {
         }
         tokens.access_token
     };
+    Ok(Some(token))
+}
 
-    let client = Client::new(transport, InMemoryToken(access_token));
-    let authentication = client.authentication_status().await?;
-    if !authentication.authenticated {
-        bail!("service returned an invalid authentication status");
+async fn access_token(connection: &ConnectionUrl) -> Result<Secret> {
+    maybe_access_token(connection)
+        .await?
+        .context("authentication required")
+}
+
+async fn operational_client(
+    connection: &ConnectionUrl,
+) -> Result<Client<TonicTransport, InMemoryToken>> {
+    let transport = TonicTransport::connect(connection.endpoint().to_owned()).await?;
+    Client::new(transport.clone(), MissingToken)
+        .service_status()
+        .await?;
+    Ok(Client::new(
+        transport,
+        InMemoryToken(access_token(connection).await?),
+    ))
+}
+
+fn operation_path(connection: &ConnectionUrl, path: &str) -> Result<ConfigPath> {
+    let path = ConfigPath::parse_operation(path).context("path must name a configuration value")?;
+    let root = connection.root().as_str();
+    if root != "/"
+        && path.as_str() != root
+        && !path
+            .as_str()
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    {
+        bail!("path is outside the selected profile root");
     }
-    println!("Authentication: logged in");
+    Ok(path)
+}
+
+async fn get_value(connection: &ConnectionUrl, path: &str) -> Result<()> {
+    let path = operation_path(connection, path)?;
+    let value = operational_client(connection)
+        .await?
+        .get_value(&path)
+        .await?;
+    print!("{}", value.value.expose());
+    Ok(())
+}
+
+async fn put_value(connection: &ConnectionUrl, path: &str) -> Result<()> {
+    let path = operation_path(connection, path)?;
+    let mut value = String::new();
+    io::stdin()
+        .read_to_string(&mut value)
+        .map_err(|_| anyhow!("configuration input is unavailable"))?;
+    operational_client(connection)
+        .await?
+        .put_value(&path, &PlainValue::new(value))
+        .await?;
+    println!("Value stored");
+    Ok(())
+}
+
+async fn delete_value(connection: &ConnectionUrl, path: &str, yes: bool) -> Result<()> {
+    let path = operation_path(connection, path)?;
+    if !yes {
+        if !io::stdin().is_terminal() {
+            bail!("deletion requires --yes when standard input is not a terminal");
+        }
+        eprint!(
+            "Permanently delete {}? Type 'delete' to confirm: ",
+            path.as_str()
+        );
+        let mut confirmation = String::new();
+        io::stdin()
+            .read_line(&mut confirmation)
+            .map_err(|_| anyhow!("deletion confirmation is unavailable"))?;
+        if confirmation.trim_end() != "delete" {
+            bail!("deletion cancelled");
+        }
+    }
+    operational_client(connection)
+        .await?
+        .delete_value(&path)
+        .await?;
+    println!("Value deleted");
     Ok(())
 }
 

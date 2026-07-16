@@ -1,0 +1,19 @@
+[package]
+name = "sovereign-config-rust-consumer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+sovereign-config-client = { path = "../../crates/sovereign-config-client" }
+sovereign-config-core = { path = "../../crates/sovereign-config-core" }
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
