@@ -179,7 +179,9 @@ mod tests {
 
     use http::{
         Request, Response,
-        header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_SECURITY_POLICY},
+        header::{
+            ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
+        },
     };
     use tonic::body::{BoxBody, empty_body};
     use tower::{Layer, ServiceExt, service_fn};
@@ -228,5 +230,17 @@ mod tests {
         ] {
             assert!(policy.contains(directive));
         }
+
+        let inner = service_fn(|_: Request<()>| async {
+            Ok::<_, Infallible>(Response::<BoxBody>::new(empty_body()))
+        });
+        let response = layer
+            .layer(inner)
+            .oneshot(Request::get("/configuration/apps/api").body(()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/html");
     }
 }

@@ -8,20 +8,34 @@ entries:
   - model: authentik_providers_oauth2.scopemapping
     state: present
     identifiers:
-      name: sovereign-config grants
+      name: sovereign-config development grants
     attrs:
-      name: sovereign-config grants
+      name: sovereign-config development grants
       scope_name: sovereign-config
-      description: "Sovereign Config path grants"
+      description: "Sovereign Config development path grants"
       expression: |
         grants = []
         attribute_sets = [request.user.attributes]
         attribute_sets.extend(group.attributes for group in request.user.ak_groups.all())
         for attributes in attribute_sets:
-            for grant in attributes.get("sovereign_config_grants", []):
+            for grant in attributes.get("sovereign_config_dev_grants", []):
                 if grant not in grants:
                     grants.append(grant)
         return {"sovereign_config_grants": grants}
+
+  - model: authentik_core.group
+    state: present
+    identifiers:
+      name: sovereign-config-development-config-contributor
+    attrs:
+      is_superuser: false
+      attributes:
+        sovereign_config_dev_grants:
+          - prefix: "/"
+            permissions:
+              - read
+              - write
+              - manage
 
   - model: authentik_providers_oauth2.oauth2provider
     state: present
@@ -65,7 +79,7 @@ entries:
       property_mappings:
         - !Find [authentik_providers_oauth2.scopemapping, [scope_name, openid]]
         - !Find [authentik_providers_oauth2.scopemapping, [scope_name, offline_access]]
-        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, sovereign-config]]
+        - !Find [authentik_providers_oauth2.scopemapping, [name, sovereign-config development grants]]
       jwt_federation_providers:
         - !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config-introspection-dev]]
 

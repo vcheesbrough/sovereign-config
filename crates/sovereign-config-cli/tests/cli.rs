@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -21,7 +21,10 @@ use axum::{
 use base64::{Engine, engine::general_purpose};
 use serde_json::json;
 use sovereign_config_proto::sovereign::config::v1::{
-    GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
+    DeleteValueRequest, DeleteValueResponse, GetIdentityRequest, GetIdentityResponse,
+    GetValueRequest, GetValueResponse, GetVersionRequest, GetVersionResponse, ListValuesRequest,
+    ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
+    configuration_server::{Configuration, ConfigurationServer},
     system_server::{System, SystemServer},
 };
 use tempfile::TempDir;
@@ -107,6 +110,180 @@ impl System for MockSystem {
             authenticated: true,
         }))
     }
+}
+
+#[derive(Clone, Default)]
+struct MockConfiguration {
+    values: Arc<Mutex<HashMap<String, (String, prost_types::Timestamp)>>>,
+}
+
+#[tonic::async_trait]
+impl Configuration for MockConfiguration {
+    async fn list_values(
+        &self,
+        request: Request<ListValuesRequest>,
+    ) -> Result<tonic::Response<ListValuesResponse>, Status> {
+        require_access_token(&request)?;
+        let selected = request.into_inner().path;
+        let values = self.values.lock().unwrap();
+        let values = values
+            .iter()
+            .filter(|(path, _)| path.rsplit_once('/').map_or("", |(parent, _)| parent) == selected)
+            .map(|(path, (value, created_at))| ListedValue {
+                path: path.clone(),
+                value: value.clone(),
+                created_at: Some(*created_at),
+                updated_at: Some(*created_at),
+            })
+            .collect();
+        Ok(tonic::Response::new(ListValuesResponse {
+            values,
+            paths: vec![selected],
+        }))
+    }
+
+    async fn get_value(
+        &self,
+        request: Request<GetValueRequest>,
+    ) -> Result<tonic::Response<GetValueResponse>, Status> {
+        require_access_token(&request)?;
+        let path = request.into_inner().path.to_ascii_lowercase();
+        let values = self.values.lock().unwrap();
+        let (value, created_at) = values
+            .get(&path)
+            .ok_or_else(|| Status::not_found("missing"))?;
+        Ok(tonic::Response::new(GetValueResponse {
+            value: value.clone(),
+            created_at: Some(*created_at),
+            updated_at: Some(prost_types::Timestamp {
+                seconds: 1_700_000_001,
+                nanos: 0,
+            }),
+        }))
+    }
+
+    async fn put_value(
+        &self,
+        request: Request<PutValueRequest>,
+    ) -> Result<tonic::Response<PutValueResponse>, Status> {
+        require_access_token(&request)?;
+        let request = request.into_inner();
+        let timestamp = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 0,
+        };
+        let mut values = self.values.lock().unwrap();
+        let created_at = values
+            .get(&request.path.to_ascii_lowercase())
+            .map_or(timestamp, |(_, created)| *created);
+        values.insert(
+            request.path.to_ascii_lowercase(),
+            (request.value, created_at),
+        );
+        Ok(tonic::Response::new(PutValueResponse {
+            created_at: Some(created_at),
+            updated_at: Some(timestamp),
+        }))
+    }
+
+    async fn delete_value(
+        &self,
+        request: Request<DeleteValueRequest>,
+    ) -> Result<tonic::Response<DeleteValueResponse>, Status> {
+        require_access_token(&request)?;
+        let path = request.into_inner().path.to_ascii_lowercase();
+        if self.values.lock().unwrap().remove(&path).is_none() {
+            return Err(Status::not_found("missing"));
+        }
+        Ok(tonic::Response::new(DeleteValueResponse {
+            deleted_at: Some(prost_types::Timestamp {
+                seconds: 1_700_000_002,
+                nanos: 0,
+            }),
+        }))
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn require_access_token<T>(request: &Request<T>) -> Result<(), Status> {
+    let authorization = request
+        .metadata()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
+    if authorization == Some("Bearer access-secret-sentinel") {
+        Ok(())
+    } else {
+        Err(Status::unauthenticated("authentication required"))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exact_value_commands_use_absolute_paths_within_profile_root_and_hard_delete() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let connection = connection_url(&services, true, "team/service");
+    let profile = run_cli_with_input(
+        home.path(),
+        &["profile", "add", "managed"],
+        Some(&format!("{connection}\n")),
+    )
+    .await;
+    assert_success(&profile);
+
+    let root_put = run_cli_with_input(
+        home.path(),
+        &["put", "/team/service"],
+        Some("root-value-sentinel"),
+    )
+    .await;
+    assert_success(&root_put);
+
+    let root_get = run_cli(home.path(), &["get", "/team/service"]).await;
+    assert_success(&root_get);
+    assert_eq!(
+        String::from_utf8_lossy(&root_get.stdout),
+        "root-value-sentinel"
+    );
+
+    let root_delete = run_cli(home.path(), &["delete", "/team/service", "--yes"]).await;
+    assert_success(&root_delete);
+
+    let put = run_cli_with_input(
+        home.path(),
+        &["put", "/team/service/Feature/Flag"],
+        Some("value-sentinel\nsecond-line"),
+    )
+    .await;
+    assert_success(&put);
+    assert_eq!(String::from_utf8_lossy(&put.stdout), "Value stored\n");
+    assert!(!combined(&put).contains("value-sentinel"));
+
+    let get = run_cli(home.path(), &["get", "/TEAM/SERVICE/FEATURE/FLAG"]).await;
+    assert_success(&get);
+    assert_eq!(
+        String::from_utf8_lossy(&get.stdout),
+        "value-sentinel\nsecond-line"
+    );
+
+    let delete = run_cli(
+        home.path(),
+        &["delete", "/team/service/feature/flag", "--yes"],
+    )
+    .await;
+    assert_success(&delete);
+    assert_eq!(String::from_utf8_lossy(&delete.stdout), "Value deleted\n");
+
+    let missing = run_cli(home.path(), &["get", "/team/service/feature/flag"]).await;
+    assert!(!missing.status.success());
+    assert!(combined(&missing).contains("configuration value not found"));
+
+    let relative = run_cli(home.path(), &["get", "team/service/feature/flag"]).await;
+    assert!(!relative.status.success());
+    assert!(combined(&relative).contains("path must name a configuration value"));
+
+    let outside_root = run_cli(home.path(), &["get", "/other/feature-flag"]).await;
+    assert!(!outside_root.status.success());
+    assert!(combined(&outside_root).contains("path is outside the selected profile root"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -548,6 +725,7 @@ async fn start_services(device_result: DeviceResult) -> TestServices {
     let grpc_task = tokio::spawn(
         Server::builder()
             .add_service(SystemServer::new(MockSystem))
+            .add_service(ConfigurationServer::new(MockConfiguration::default()))
             .serve_with_incoming(TcpListenerStream::new(grpc_listener)),
     );
 

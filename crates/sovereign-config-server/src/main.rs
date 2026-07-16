@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod metrics;
+mod values;
 mod web;
 
 use std::{env, net::SocketAddr, sync::Arc, time::Duration};
@@ -23,8 +24,10 @@ use metrics::AuthenticationMetrics;
 use sovereign_config_core::PROTOCOL_VERSION;
 use sovereign_config_proto::sovereign::config::v1::{
     GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
+    configuration_server::ConfigurationServer,
     system_server::{System, SystemServer},
 };
+use values::ConfigurationService;
 use web::WebAssetsLayer;
 
 const SYSTEM_SERVICE_NAME: &str = "sovereign.config.v1.System";
@@ -148,7 +151,7 @@ async fn main() -> Result<()> {
     let metrics_app = Router::new()
         .route("/metrics", get(metrics))
         .route("/readyz", get(ready))
-        .with_state(state);
+        .with_state(state.clone());
     let metrics_listener = TcpListener::bind(config.metrics_addr)
         .await
         .context("unable to bind metrics listener")?;
@@ -162,6 +165,9 @@ async fn main() -> Result<()> {
     health_reporter
         .set_serving::<SystemServer<SystemService>>()
         .await;
+    health_reporter
+        .set_serving::<ConfigurationServer<ConfigurationService>>()
+        .await;
 
     info!(grpc_addr = %config.grpc_addr, metrics_addr = %config.metrics_addr, protocol_version = PROTOCOL_VERSION, "sovereign-config started");
     Server::builder()
@@ -173,6 +179,9 @@ async fn main() -> Result<()> {
         .layer(web_assets)
         .add_service(health_service)
         .add_service(SystemServer::new(SystemService))
+        .add_service(ConfigurationServer::new(ConfigurationService::new(
+            state.database.clone(),
+        )))
         .serve_with_shutdown(config.grpc_addr, shutdown_signal())
         .await
         .context("gRPC server terminated")

@@ -2,7 +2,8 @@
 
 use async_trait::async_trait;
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ErrorKind, PROTOCOL_VERSION, Secret, ServiceStatus,
+    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, ExactValue,
+    PROTOCOL_VERSION, PlainValue, PutMetadata, Secret, ServiceStatus, Timestamp, ValueListing,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11,6 +12,7 @@ pub enum RpcCode {
     PermissionDenied,
     FailedPrecondition,
     InvalidArgument,
+    NotFound,
     Unavailable,
     Other,
 }
@@ -31,6 +33,7 @@ pub fn map_rpc_status(code: RpcCode) -> ClientError {
         RpcCode::InvalidArgument => {
             ClientError::new(ErrorKind::InvalidRequest, "request is invalid")
         }
+        RpcCode::NotFound => ClientError::new(ErrorKind::NotFound, "configuration value not found"),
         RpcCode::Unavailable => ClientError::new(ErrorKind::Unavailable, "service is unavailable"),
         RpcCode::Other => ClientError::new(ErrorKind::Internal, "request failed"),
     }
@@ -49,8 +52,104 @@ pub trait Transport {
 }
 
 #[async_trait(?Send)]
+pub trait ValueTransport: Transport {
+    async fn list_values(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ValueListing, ClientError>;
+
+    async fn get_value(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ExactValue, ClientError>;
+    async fn put_value(
+        &self,
+        path: &ConfigPath,
+        value: &PlainValue,
+        bearer: &Secret,
+    ) -> Result<PutMetadata, ClientError>;
+    async fn delete_value(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<DeleteMetadata, ClientError>;
+}
+
+#[async_trait(?Send)]
 pub trait AccessTokenProvider {
     async fn access_token(&self) -> Result<Option<Secret>, ClientError>;
+}
+
+impl<T, A> Client<T, A>
+where
+    T: ValueTransport,
+    A: AccessTokenProvider,
+{
+    /// Lists readable values directly below a namespace and its existing readable paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, validation, or dependency error.
+    pub async fn list_values(&self, path: &ConfigPath) -> Result<ValueListing, ClientError> {
+        let token = self.required_token().await?;
+        self.transport.list_values(path, &token).await
+    }
+
+    /// Reads one exact configuration value without caching or retrying.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, authorization, validation, missing-value,
+    /// or dependency error.
+    pub async fn get_value(&self, path: &ConfigPath) -> Result<ExactValue, ClientError> {
+        let token = self.required_token().await?;
+        self.transport.get_value(path, &token).await
+    }
+
+    /// Creates or replaces one exact configuration value without retrying.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, authorization, validation, or dependency error.
+    pub async fn put_value(
+        &self,
+        path: &ConfigPath,
+        value: &PlainValue,
+    ) -> Result<PutMetadata, ClientError> {
+        let token = self.required_token().await?;
+        self.transport.put_value(path, value, &token).await
+    }
+
+    /// Permanently deletes one exact configuration value without retrying.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, authorization, validation, missing-value,
+    /// or dependency error.
+    pub async fn delete_value(&self, path: &ConfigPath) -> Result<DeleteMetadata, ClientError> {
+        let token = self.required_token().await?;
+        self.transport.delete_value(path, &token).await
+    }
+
+    async fn required_token(&self) -> Result<Secret, ClientError> {
+        self.authentication
+            .access_token()
+            .await?
+            .ok_or_else(|| ClientError::new(ErrorKind::Unauthenticated, "authentication required"))
+    }
+}
+
+/// Validates a protobuf timestamp before exposing it to presentation code.
+///
+/// # Errors
+///
+/// Returns a bounded error when the timestamp is outside the supported range.
+pub fn timestamp(seconds: i64, nanos: i32) -> Result<Timestamp, ClientError> {
+    let timestamp = Timestamp { seconds, nanos };
+    timestamp.to_system_time()?;
+    Ok(timestamp)
 }
 
 pub struct Client<T, A> {
