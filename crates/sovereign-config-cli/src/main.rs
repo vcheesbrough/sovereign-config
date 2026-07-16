@@ -280,6 +280,7 @@ fn operation_path(connection: &ConnectionUrl, path: &str) -> Result<ConfigPath> 
     let path = ConfigPath::parse_operation(path).context("path must name a configuration value")?;
     let root = connection.root().as_str();
     if root != "/"
+        && path.as_str() != root
         && !path
             .as_str()
             .strip_prefix(root)

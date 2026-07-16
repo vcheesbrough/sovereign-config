@@ -230,6 +230,24 @@ async fn exact_value_commands_use_absolute_paths_within_profile_root_and_hard_de
     .await;
     assert_success(&profile);
 
+    let root_put = run_cli_with_input(
+        home.path(),
+        &["put", "/team/service"],
+        Some("root-value-sentinel"),
+    )
+    .await;
+    assert_success(&root_put);
+
+    let root_get = run_cli(home.path(), &["get", "/team/service"]).await;
+    assert_success(&root_get);
+    assert_eq!(
+        String::from_utf8_lossy(&root_get.stdout),
+        "root-value-sentinel"
+    );
+
+    let root_delete = run_cli(home.path(), &["delete", "/team/service", "--yes"]).await;
+    assert_success(&root_delete);
+
     let put = run_cli_with_input(
         home.path(),
         &["put", "/team/service/Feature/Flag"],
