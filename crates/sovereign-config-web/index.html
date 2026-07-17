@@ -75,10 +75,16 @@
               <h2 id="values-heading">Values</h2>
               <p id="value-count" class="status-text">0 values</p>
             </div>
-            <button id="add-value" type="button">Add value</button>
+            <div class="toolbar-actions">
+              <label class="format-switch" for="json-mode">
+                <input id="json-mode" type="checkbox" role="switch">
+                JSON
+              </label>
+              <button id="add-value" type="button">Add value</button>
+            </div>
           </div>
 
-          <div class="table-scroll">
+          <div id="value-table" class="table-scroll">
             <table aria-labelledby="values-heading">
               <thead>
                 <tr>
@@ -112,6 +118,14 @@
             </table>
           </div>
           <p id="empty-values" class="empty-state" hidden>No values at this path.</p>
+          <div id="json-editor" class="json-editor" hidden>
+            <label for="json-content">JSON subtree</label>
+            <textarea id="json-content" rows="18" spellcheck="false" aria-describedby="json-error"></textarea>
+            <p id="json-error" class="field-error" aria-live="polite" hidden></p>
+            <div class="json-actions">
+              <button id="save-json" type="button">Save JSON</button>
+            </div>
+          </div>
         </div>
       </main>
     </div>

@@ -9,12 +9,20 @@ mod tests {
         AccessTokenProvider, Client, Transport, ValueTransport, VersionReply,
     };
     use sovereign_config_core::{
-        AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, ExactValue,
-        ListedValue, PlainValue, PutMetadata, Secret, Timestamp, ValueListing,
+        AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, ListedValue,
+        PlainValue, PutMetadata, ReplaceMetadata, Secret, SubTreeValue, Timestamp, ValueListing,
+        ValueSubTree,
     };
 
+    #[derive(Clone)]
+    struct StoredValue {
+        value: PlainValue,
+        created_at: Timestamp,
+        updated_at: Timestamp,
+    }
+
     struct ConsumerTransport {
-        values: RefCell<BTreeMap<ConfigPath, ExactValue>>,
+        values: RefCell<BTreeMap<ConfigPath, StoredValue>>,
     }
 
     #[async_trait(?Send)]
@@ -64,13 +72,22 @@ mod tests {
             })
         }
 
-        async fn get_value(
+        async fn get_subtree(
             &self,
             path: &ConfigPath,
             _: &Secret,
-        ) -> Result<ExactValue, ClientError> {
-            self.values.borrow().get(path).cloned().ok_or_else(|| {
-                ClientError::new(ErrorKind::NotFound, "configuration value not found")
+        ) -> Result<ValueSubTree, ClientError> {
+            Ok(ValueSubTree {
+                values: self
+                    .values
+                    .borrow()
+                    .iter()
+                    .filter(|(candidate, _)| candidate.is_at_or_below(path))
+                    .map(|(path, value)| SubTreeValue {
+                        path: path.clone(),
+                        value: value.value.clone(),
+                    })
+                    .collect(),
             })
         }
 
@@ -86,7 +103,7 @@ mod tests {
             };
             self.values.borrow_mut().insert(
                 path.clone(),
-                ExactValue {
+                StoredValue {
                     value: value.clone(),
                     created_at: timestamp,
                     updated_at: timestamp,
@@ -98,19 +115,60 @@ mod tests {
             })
         }
 
-        async fn delete_value(
+        async fn replace_subtree(
             &self,
             path: &ConfigPath,
+            values: &[SubTreeValue],
+            _: &Secret,
+        ) -> Result<ReplaceMetadata, ClientError> {
+            let timestamp = Timestamp {
+                seconds: 1_700_000_001,
+                nanos: 0,
+            };
+            let mut stored = self.values.borrow_mut();
+            stored.retain(|candidate, _| !candidate.is_at_or_below(path));
+            for value in values {
+                stored.insert(
+                    value.path.clone(),
+                    StoredValue {
+                        value: value.value.clone(),
+                        created_at: timestamp,
+                        updated_at: timestamp,
+                    },
+                );
+            }
+            Ok(ReplaceMetadata {
+                updated_at: timestamp,
+                value_count: values.len() as u64,
+            })
+        }
+
+        async fn delete_values(
+            &self,
+            path: &ConfigPath,
+            recurse: bool,
             _: &Secret,
         ) -> Result<DeleteMetadata, ClientError> {
-            self.values.borrow_mut().remove(path).ok_or_else(|| {
-                ClientError::new(ErrorKind::NotFound, "configuration value not found")
-            })?;
+            let mut values = self.values.borrow_mut();
+            let before = values.len();
+            if recurse {
+                values.retain(|candidate, _| !candidate.is_at_or_below(path));
+            } else {
+                values.remove(path);
+            }
+            let deleted_count = u64::try_from(before - values.len()).unwrap();
+            if deleted_count == 0 {
+                return Err(ClientError::new(
+                    ErrorKind::NotFound,
+                    "configuration value not found",
+                ));
+            }
             Ok(DeleteMetadata {
                 deleted_at: Timestamp {
                     seconds: 1_700_000_001,
                     nanos: 0,
                 },
+                deleted_count,
             })
         }
     }
@@ -125,7 +183,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_client_api_supports_the_exact_value_lifecycle() {
+    async fn public_client_api_supports_the_v2_value_lifecycle() {
         let client = Client::new(
             ConsumerTransport {
                 values: RefCell::new(BTreeMap::new()),
@@ -143,13 +201,28 @@ mod tests {
         assert_eq!(listing.values.len(), 1);
         assert_eq!(listing.values[0].path, path);
         assert_eq!(
-            client.get_value(&path).await.unwrap().value.expose(),
+            client.get_subtree(&path).await.unwrap().values[0]
+                .value
+                .expose(),
             "consumer-value-sentinel"
         );
-        client.delete_value(&path).await.unwrap();
+        let child = SubTreeValue {
+            path: ConfigPath::parse("/apps/api/feature/child").unwrap(),
+            value: PlainValue::new("child"),
+        };
+        client
+            .replace_subtree(&path, std::slice::from_ref(&child))
+            .await
+            .unwrap();
+        assert_eq!(client.get_subtree(&path).await.unwrap().values, vec![child]);
         assert_eq!(
-            client.get_value(&path).await.unwrap_err().kind,
-            ErrorKind::NotFound
+            client
+                .delete_values(&path, true)
+                .await
+                .unwrap()
+                .deleted_count,
+            1
         );
+        assert!(client.get_subtree(&path).await.unwrap().values.is_empty());
     }
 }
