@@ -722,8 +722,8 @@ mod tests {
 
     #[test]
     fn protocol_negotiation_is_exact() {
-        assert!(ServiceStatus::negotiate("1.3.0".into(), PROTOCOL_VERSION.into()).compatible);
-        assert!(!ServiceStatus::negotiate("1.3.0".into(), "v1".into()).compatible);
+        assert!(ServiceStatus::negotiate("1.4.0".into(), PROTOCOL_VERSION.into()).compatible);
+        assert!(!ServiceStatus::negotiate("1.4.0".into(), "v1".into()).compatible);
     }
 
     #[test]

@@ -241,7 +241,7 @@ mod tests {
         async fn get_version(&self, protocol: &str) -> Result<VersionReply, ClientError> {
             self.0.set(self.0.get() + 1);
             Ok(VersionReply {
-                application_version: "1.3.0".into(),
+                application_version: "1.4.0".into(),
                 protocol_version: protocol.into(),
             })
         }
