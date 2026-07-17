@@ -167,7 +167,8 @@ function existingPaths(values) {
 async function mockValues(page, initial = {}) {
   const stored = new Map(Object.entries(initial));
   const requests = [];
-  await page.route('**/sovereign.config.v2.Configuration/*', route => {
+  let delayedSubtree;
+  await page.route('**/sovereign.config.v2.Configuration/*', async route => {
     const method = route.request().url().split('/').pop();
     const body = route.request().postDataBuffer();
     const fields = stringFields(body);
@@ -190,6 +191,11 @@ async function mockValues(page, initial = {}) {
       });
     }
     if (method === 'GetSubTree') {
+      if (delayedSubtree) {
+        const delay = delayedSubtree;
+        delayedSubtree = undefined;
+        await delay.promise;
+      }
       const selected = fields.get(1) || '/';
       const values = [...stored].filter(([path]) => (
         selected === '/' || path === selected || path.startsWith(`${selected}/`)
@@ -247,6 +253,12 @@ async function mockValues(page, initial = {}) {
   });
   return {
     requests,
+    delayNextSubtree() {
+      let release;
+      const promise = new Promise(resolve => { release = resolve; });
+      delayedSubtree = { promise };
+      return release;
+    },
     setValue(path, value) {
       stored.set(path, value);
     }
@@ -692,7 +704,7 @@ test('JSON mode reads and replaces subtrees without exposing row deletion', asyn
 test('JSON mode retains rejected edits and reports non-representable stored trees', async ({ page }) => {
   await openCallback(page);
   await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
-  await mockValues(page, {
+  const values = await mockValues(page, {
     '/collision': 'parent',
     '/collision/child': 'child',
     '/valid/value': 'before'
@@ -704,11 +716,18 @@ test('JSON mode retains rejected edits and reports non-representable stored tree
   await expect(page.getByText('configuration subtree cannot be represented as JSON')).toBeVisible();
 
   const pathInput = page.getByLabel('Selected path');
+  const releaseSubtree = values.delayNextSubtree();
   await pathInput.fill('/valid');
   await page.getByRole('button', { name: 'Open' }).click();
   const editor = page.getByLabel('JSON subtree');
   const rejected = '{"valid":{"value":"after"}}';
   await editor.fill(rejected);
+  const subtreeResponse = page.waitForResponse(
+    '**/sovereign.config.v2.Configuration/GetSubTree'
+  );
+  releaseSubtree();
+  await subtreeResponse;
+  await expect(editor).toHaveValue(rejected);
   await page.route('**/sovereign.config.v2.Configuration/ReplaceSubTree', route => route.fulfill({
     status: 200,
     headers: { 'content-type': 'application/grpc-web+proto' },
