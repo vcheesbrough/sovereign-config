@@ -64,12 +64,12 @@ Read and write exact plain-text values or complete JSON subtrees with the select
 sovereign-config get /apps/api/settings
 printf '%s' 'enabled=true' | sovereign-config put /apps/api/settings
 sovereign-config get /apps/api --format json
-printf '%s' '{"api":{"enabled":"true","workers":"4"}}' | sovereign-config put /apps/api --format json
+printf '%s' '{"enabled":"true","workers":"4"}' | sovereign-config put /apps/api --format json
 sovereign-config delete /apps/api/settings --yes
 sovereign-config delete /apps/api --recurse --yes
 ```
 
-Text get prints an exact stored value and requires `--format json` when descendants exist. JSON output is deterministic and pretty printed; each stored plain-text value is represented as a JSON string. A non-root selection is wrapped by its final path segment, while `/` is rendered as the root object. JSON put atomically replaces the selected subtree, deleting every omitted value. It requires both independent `write` and `manage` grants covering the selected root. Exact text put requires `write`; exact and recursive delete require `manage`. Put and delete print only fixed success summaries and never echo values.
+Text get prints an exact stored value and requires `--format json` when descendants exist. JSON output is deterministic and pretty printed; each stored plain-text value is represented as a JSON string. JSON is relative to the selected path, so selecting `/foo/foo2/foo3` containing `/foo/foo2/foo3/deepvalue` returns `{"deepvalue":"deepvalue"}` without a `foo3` wrapper. An exact selected value is a root JSON string, and `/` is the root object. JSON put atomically replaces the selected subtree using the same relative shape, deleting every omitted value. It requires both independent `write` and `manage` grants covering the selected root. Exact text put requires `write`; exact and recursive delete require `manage`. Put and delete print only fixed success summaries and never echo values.
 
 The native and gRPC-Web APIs use the breaking `sovereign.config.v2` protobuf package. Servers, CLIs, browser assets, and Rust clients must be upgraded together; there is no v1 fallback or mixed-version operation.
 
