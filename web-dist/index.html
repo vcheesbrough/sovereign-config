@@ -9,8 +9,8 @@
     <script src="/app-config.js"></script>
     
 <script type="module">
-import init, * as bindings from '/sovereign-config-web-bf104312b7f18c98.js';
-const wasm = await init({ module_or_path: '/sovereign-config-web-bf104312b7f18c98_bg.wasm' });
+import init, * as bindings from '/sovereign-config-web-dcdafc77d382c5d0.js';
+const wasm = await init({ module_or_path: '/sovereign-config-web-dcdafc77d382c5d0_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -19,7 +19,7 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-  <link rel="modulepreload" href="/sovereign-config-web-bf104312b7f18c98.js" crossorigin="anonymous" integrity="sha384-j76VOSk8IMDj+6EQNEq/pLVZGAnsNY4soSyHeezLi7b/U+QQi16L1Fp90nzaZjx6"><link rel="preload" href="/sovereign-config-web-bf104312b7f18c98_bg.wasm" crossorigin="anonymous" integrity="sha384-glZRnTQWrfyilpsoYcf83UwAZuQbhUhAm76VGJZJVz7O84gNEJfqTyBHo11S9wZc" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/sovereign-config-web-dcdafc77d382c5d0.js" crossorigin="anonymous" integrity="sha384-j76VOSk8IMDj+6EQNEq/pLVZGAnsNY4soSyHeezLi7b/U+QQi16L1Fp90nzaZjx6"><link rel="preload" href="/sovereign-config-web-dcdafc77d382c5d0_bg.wasm" crossorigin="anonymous" integrity="sha384-bi4LuCDM9CmMezRDvEwOx7ZDkXQ/4VWBj0+Xw6Q4lAO5JjmhxX6t5KmpZXcDLEic" as="fetch" type="application/wasm"></head>
   <body>
     <header>
       <a id="brand-link" class="brand" href="/" aria-label="Sovereign Config home">

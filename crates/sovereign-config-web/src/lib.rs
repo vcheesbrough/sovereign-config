@@ -413,6 +413,8 @@ fn install_configuration_actions(document: &Document) {
     }
     if let Some(editor) = document.get_element_by_id("json-content") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            CONFIGURATION_LOAD_GENERATION.set(CONFIGURATION_LOAD_GENERATION.get().wrapping_add(1));
+            set_text("value-state", "Edited");
             validate_json_editor();
         });
         let _ = editor.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
