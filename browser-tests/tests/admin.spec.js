@@ -46,18 +46,21 @@ function timestamp(seconds) {
   return Buffer.concat([Buffer.from([0x08]), varint(seconds)]);
 }
 
-function valueReply(value) {
-  const instant = timestamp(1700000000);
-  return Buffer.concat([
-    field(1, Buffer.from(value)),
-    field(2, instant),
-    field(3, instant)
-  ]);
-}
-
 function mutationReply() {
   const instant = timestamp(1700000000);
   return Buffer.concat([field(1, instant), field(2, instant)]);
+}
+
+function scalarField(number, value) {
+  return Buffer.concat([varint(number << 3), varint(value)]);
+}
+
+function subTreeValue(path, value) {
+  return Buffer.concat([field(1, Buffer.from(path)), field(2, Buffer.from(value))]);
+}
+
+function subtreeReply(values) {
+  return Buffer.concat(values.map(([path, value]) => field(1, subTreeValue(path, value))));
 }
 
 function listedValue(path, value) {
@@ -90,18 +93,54 @@ function readVarint(buffer, start) {
   throw new Error('invalid protobuf varint');
 }
 
-function stringFields(frame) {
+function messageFields(buffer, start = 0) {
   const fields = new Map();
-  let offset = 5;
-  while (offset < frame.length) {
-    const [tag, afterTag] = readVarint(frame, offset);
+  let offset = start;
+  while (offset < buffer.length) {
+    const [tag, afterTag] = readVarint(buffer, offset);
     offset = afterTag;
-    const [length, afterLength] = readVarint(frame, offset);
-    offset = afterLength;
-    fields.set(tag >> 3, frame.subarray(offset, offset + length).toString());
-    offset += length;
+    const number = tag >> 3;
+    const wire = tag & 0x07;
+    let value;
+    if (wire === 2) {
+      const [length, afterLength] = readVarint(buffer, offset);
+      offset = afterLength;
+      value = buffer.subarray(offset, offset + length);
+      offset += length;
+    } else if (wire === 0) {
+      [value, offset] = readVarint(buffer, offset);
+    } else {
+      throw new Error(`unsupported protobuf wire type ${wire}`);
+    }
+    const values = fields.get(number) || [];
+    values.push(value);
+    fields.set(number, values);
   }
   return fields;
+}
+
+function stringFields(frame) {
+  const decoded = messageFields(frame, 5);
+  const fields = new Map();
+  for (const [number, values] of decoded) {
+    const value = values[0];
+    fields.set(number, Buffer.isBuffer(value) ? value.toString() : value);
+  }
+  return fields;
+}
+
+function nestedStringFields(message) {
+  const decoded = messageFields(message);
+  const fields = new Map();
+  for (const [number, values] of decoded) {
+    const value = values[0];
+    fields.set(number, Buffer.isBuffer(value) ? value.toString() : value);
+  }
+  return fields;
+}
+
+function repeatedMessages(frame, number) {
+  return (messageFields(frame, 5).get(number) || []).map(nestedStringFields);
 }
 
 function parentPath(path) {
@@ -128,7 +167,7 @@ function existingPaths(values) {
 async function mockValues(page, initial = {}) {
   const stored = new Map(Object.entries(initial));
   const requests = [];
-  await page.route('**/sovereign.config.v1.Configuration/*', route => {
+  await page.route('**/sovereign.config.v2.Configuration/*', route => {
     const method = route.request().url().split('/').pop();
     const body = route.request().postDataBuffer();
     const fields = stringFields(body);
@@ -150,12 +189,15 @@ async function mockValues(page, initial = {}) {
         body: grpcFrame(listReply(values, existingPaths(stored)))
       });
     }
-    if (method === 'GetValue') {
-      const value = stored.get(fields.get(1));
+    if (method === 'GetSubTree') {
+      const selected = fields.get(1) || '/';
+      const values = [...stored].filter(([path]) => (
+        selected === '/' || path === selected || path.startsWith(`${selected}/`)
+      ));
       return route.fulfill({
         status: 200,
         headers: { 'content-type': 'application/grpc-web+proto' },
-        body: value === undefined ? grpcFrame(Buffer.alloc(0), 5) : grpcFrame(valueReply(value))
+        body: grpcFrame(subtreeReply(values))
       });
     }
     if (method === 'PutValue') {
@@ -166,11 +208,41 @@ async function mockValues(page, initial = {}) {
         body: grpcFrame(mutationReply())
       });
     }
-    stored.delete(fields.get(1));
+    if (method === 'ReplaceSubTree') {
+      const selected = fields.get(1) || '/';
+      for (const path of [...stored.keys()]) {
+        if (selected === '/' || path === selected || path.startsWith(`${selected}/`)) {
+          stored.delete(path);
+        }
+      }
+      const replacements = repeatedMessages(body, 2);
+      for (const value of replacements) stored.set(value.get(1), value.get(2));
+      return route.fulfill({
+        status: 200,
+        headers: { 'content-type': 'application/grpc-web+proto' },
+        body: grpcFrame(Buffer.concat([
+          field(1, timestamp(1700000001)), scalarField(2, replacements.length)
+        ]))
+      });
+    }
+    if (method !== 'DeleteValues') {
+      throw new Error(`unexpected Configuration RPC ${method}`);
+    }
+    const selected = fields.get(1);
+    const recurse = fields.get(2) === 1;
+    let deleted = 0;
+    for (const path of [...stored.keys()]) {
+      if (path === selected || (recurse && (selected === '/' || path.startsWith(`${selected}/`)))) {
+        stored.delete(path);
+        deleted++;
+      }
+    }
     return route.fulfill({
       status: 200,
       headers: { 'content-type': 'application/grpc-web+proto' },
-      body: grpcFrame(field(1, timestamp(1700000001)))
+      body: grpcFrame(Buffer.concat([
+        field(1, timestamp(1700000001)), scalarField(2, deleted)
+      ]))
     });
   });
   return {
@@ -186,9 +258,9 @@ async function mockApplication(page) {
     contentType: 'text/javascript',
     body: configScript
   }));
-  await page.route('**/sovereign.config.v1.System/GetVersion', route => {
+  await page.route('**/sovereign.config.v2.System/GetVersion', route => {
     const application = Buffer.from('1.3.0');
-    const protocol = Buffer.from('v1');
+    const protocol = Buffer.from('v2');
     const message = Buffer.concat([
       Buffer.from([0x0a, application.length]), application,
       Buffer.from([0x12, protocol.length]), protocol
@@ -286,7 +358,7 @@ async function openCallback(
       })
     });
   });
-  await page.route('**/sovereign.config.v1.System/GetIdentity', route => {
+  await page.route('**/sovereign.config.v2.System/GetIdentity', route => {
     const authorized = route.request().headers().authorization === 'Bearer access-token-two';
     const status = authorized ? identityStatus : 16;
     return route.fulfill({
@@ -545,6 +617,109 @@ test('configuration grid is accessible and contained on desktop and mobile', asy
   });
 });
 
+test('JSON mode reads and replaces subtrees without exposing row deletion', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  const { requests } = await mockValues(page, {
+    '/apps/api/enabled': 'true',
+    '/apps/api/nested/message': 'hello\nworld',
+    '/apps/worker/concurrency': '4'
+  });
+  await page.goto('/configuration/apps/api');
+
+  const mode = page.getByRole('switch', { name: 'JSON' });
+  await expect(mode).not.toBeChecked();
+  await mode.check();
+  await expect(page.getByRole('button', { name: 'Add value' })).toBeHidden();
+  await expect(page.getByRole('button', { name: 'Delete' })).toHaveCount(0);
+  const editor = page.getByLabel('JSON subtree');
+  await expect(editor).toHaveValue(
+    '{\n  "api": {\n    "enabled": "true",\n    "nested": {\n      "message": "hello\\nworld"\n    }\n  }\n}\n'
+  );
+
+  const beforeInvalid = requests.length;
+  await editor.fill('{"api":{"enabled":true}}');
+  await expect(editor).toHaveAttribute('aria-invalid', 'true');
+  await expect(page.getByText('configuration JSON is invalid')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Save JSON' })).toBeDisabled();
+  expect(requests).toHaveLength(beforeInvalid);
+
+  await editor.fill('{"api":{"enabled":"false","new-value":"new"}}');
+  await page.getByRole('button', { name: 'Save JSON' }).click();
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  await expect(editor).toHaveValue(
+    '{\n  "api": {\n    "enabled": "false",\n    "new-value": "new"\n  }\n}\n'
+  );
+  expect(requests.slice(-2).map(request => request.method)).toEqual([
+    'ReplaceSubTree', 'GetSubTree'
+  ]);
+
+  const pathInput = page.getByLabel('Selected path');
+  await pathInput.fill('/apps/api/enabled');
+  await page.getByRole('button', { name: 'Open' }).click();
+  await expect(editor).toHaveValue('{\n  "enabled": "false"\n}\n');
+  await page.goBack();
+  await expect(editor).toHaveValue(
+    '{\n  "api": {\n    "enabled": "false",\n    "new-value": "new"\n  }\n}\n'
+  );
+
+  await mode.uncheck();
+  await expect(page.getByLabel('Value for enabled')).toHaveValue('false');
+  await expect(page.getByLabel('Value for new-value')).toHaveValue('new');
+  await expect(page.getByText('message', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Add value' })).toBeVisible();
+
+  await mode.check();
+  await pathInput.fill('/apps/worker');
+  await page.getByRole('button', { name: 'Open' }).click();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+  await expect(mode).toBeChecked();
+  await expect(editor).toHaveValue(
+    '{\n  "worker": {\n    "concurrency": "4"\n  }\n}\n'
+  );
+
+  await pathInput.fill('/apps/empty');
+  await page.getByRole('button', { name: 'Open' }).click();
+  await expect(editor).toHaveValue('{}\n');
+  await pathInput.fill('/');
+  await page.getByRole('button', { name: 'Open' }).click();
+  await expect.poll(() => editor.inputValue()).toContain('"apps": {');
+  await expect.poll(() => editor.inputValue()).toContain('"concurrency": "4"');
+  const accessibility = await new AxeBuilder({ page }).analyze();
+  expect(accessibility.violations).toEqual([]);
+});
+
+test('JSON mode retains rejected edits and reports non-representable stored trees', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, {
+    '/collision': 'parent',
+    '/collision/child': 'child',
+    '/valid/value': 'before'
+  });
+  await page.goto('/configuration/collision');
+  await expect(page.getByLabel('Value for child')).toHaveValue('child');
+  const mode = page.getByRole('switch', { name: 'JSON' });
+  await mode.check();
+  await expect(page.getByText('configuration subtree cannot be represented as JSON')).toBeVisible();
+
+  const pathInput = page.getByLabel('Selected path');
+  await pathInput.fill('/valid');
+  await page.getByRole('button', { name: 'Open' }).click();
+  const editor = page.getByLabel('JSON subtree');
+  const rejected = '{"valid":{"value":"after"}}';
+  await editor.fill(rejected);
+  await page.route('**/sovereign.config.v2.Configuration/ReplaceSubTree', route => route.fulfill({
+    status: 200,
+    headers: { 'content-type': 'application/grpc-web+proto' },
+    body: grpcFrame(Buffer.alloc(0), 7)
+  }));
+  await page.getByRole('button', { name: 'Save JSON' }).click();
+  await expect(page.getByText('permission denied', { exact: true })).toBeVisible();
+  await expect(editor).toHaveValue(rejected);
+  await expect(page.getByRole('button', { name: 'Save JSON' })).toBeEnabled();
+});
+
 test('path and new-value fields validate on every keystroke', async ({ page }) => {
   await openCallback(page);
   await mockValues(page);
@@ -616,14 +791,14 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
   await expect(page.getByText('Deleted')).toBeVisible();
   await expect(page.getByText('No values at this path.')).toBeVisible();
   expect(requests.map(request => request.method)).toEqual([
-    'ListValues', 'PutValue', 'ListValues', 'PutValue', 'ListValues', 'DeleteValue', 'ListValues'
+    'ListValues', 'PutValue', 'ListValues', 'PutValue', 'ListValues', 'DeleteValues', 'ListValues'
   ]);
 });
 
 test('trailers-only save errors retain their bounded gRPC status', async ({ page }) => {
   await openCallback(page);
   await mockValues(page);
-  await page.route('**/sovereign.config.v1.Configuration/PutValue', route => route.fulfill({
+  await page.route('**/sovereign.config.v2.Configuration/PutValue', route => route.fulfill({
     status: 200,
     headers: {
       'content-type': 'application/grpc-web+proto',

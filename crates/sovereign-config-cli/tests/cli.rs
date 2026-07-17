@@ -20,10 +20,11 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose};
 use serde_json::json;
-use sovereign_config_proto::sovereign::config::v1::{
-    DeleteValueRequest, DeleteValueResponse, GetIdentityRequest, GetIdentityResponse,
-    GetValueRequest, GetValueResponse, GetVersionRequest, GetVersionResponse, ListValuesRequest,
-    ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
+use sovereign_config_proto::sovereign::config::v2::{
+    DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse,
+    GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest, GetVersionResponse,
+    ListValuesRequest, ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
+    ReplaceSubTreeRequest, ReplaceSubTreeResponse, SubTreeValue,
     configuration_server::{Configuration, ConfigurationServer},
     system_server::{System, SystemServer},
 };
@@ -86,12 +87,12 @@ impl System for MockSystem {
         &self,
         request: Request<GetVersionRequest>,
     ) -> Result<tonic::Response<GetVersionResponse>, Status> {
-        if request.into_inner().protocol_version != "v1" {
+        if request.into_inner().protocol_version != "v2" {
             return Err(Status::failed_precondition("protocol mismatch"));
         }
         Ok(tonic::Response::new(GetVersionResponse {
             application_version: "1.3.0-test".to_owned(),
-            protocol_version: "v1".to_owned(),
+            protocol_version: "v2".to_owned(),
         }))
     }
 
@@ -142,24 +143,29 @@ impl Configuration for MockConfiguration {
         }))
     }
 
-    async fn get_value(
+    async fn get_sub_tree(
         &self,
-        request: Request<GetValueRequest>,
-    ) -> Result<tonic::Response<GetValueResponse>, Status> {
+        request: Request<GetSubTreeRequest>,
+    ) -> Result<tonic::Response<GetSubTreeResponse>, Status> {
         require_access_token(&request)?;
         let path = request.into_inner().path.to_ascii_lowercase();
         let values = self.values.lock().unwrap();
-        let (value, created_at) = values
-            .get(&path)
-            .ok_or_else(|| Status::not_found("missing"))?;
-        Ok(tonic::Response::new(GetValueResponse {
-            value: value.clone(),
-            created_at: Some(*created_at),
-            updated_at: Some(prost_types::Timestamp {
-                seconds: 1_700_000_001,
-                nanos: 0,
-            }),
-        }))
+        let mut subtree = values
+            .iter()
+            .filter(|(candidate, _)| {
+                path == "/"
+                    || candidate.as_str() == path
+                    || candidate
+                        .strip_prefix(&path)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+            .map(|(path, (value, _))| SubTreeValue {
+                path: path.clone(),
+                value: value.clone(),
+            })
+            .collect::<Vec<_>>();
+        subtree.sort_by(|first, second| first.path.cmp(&second.path));
+        Ok(tonic::Response::new(GetSubTreeResponse { values: subtree }))
     }
 
     async fn put_value(
@@ -186,20 +192,67 @@ impl Configuration for MockConfiguration {
         }))
     }
 
-    async fn delete_value(
+    async fn replace_sub_tree(
         &self,
-        request: Request<DeleteValueRequest>,
-    ) -> Result<tonic::Response<DeleteValueResponse>, Status> {
+        request: Request<ReplaceSubTreeRequest>,
+    ) -> Result<tonic::Response<ReplaceSubTreeResponse>, Status> {
         require_access_token(&request)?;
-        let path = request.into_inner().path.to_ascii_lowercase();
-        if self.values.lock().unwrap().remove(&path).is_none() {
+        let request = request.into_inner();
+        let root = request.path.to_ascii_lowercase();
+        let timestamp = prost_types::Timestamp {
+            seconds: 1_700_000_002,
+            nanos: 0,
+        };
+        let mut values = self.values.lock().unwrap();
+        values.retain(|path, _| {
+            !(root == "/"
+                || path == &root
+                || path
+                    .strip_prefix(&root)
+                    .is_some_and(|suffix| suffix.starts_with('/')))
+        });
+        for value in &request.values {
+            values.insert(
+                value.path.to_ascii_lowercase(),
+                (value.value.clone(), timestamp),
+            );
+        }
+        Ok(tonic::Response::new(ReplaceSubTreeResponse {
+            updated_at: Some(timestamp),
+            value_count: request.values.len() as u64,
+        }))
+    }
+
+    async fn delete_values(
+        &self,
+        request: Request<DeleteValuesRequest>,
+    ) -> Result<tonic::Response<DeleteValuesResponse>, Status> {
+        require_access_token(&request)?;
+        let request = request.into_inner();
+        let path = request.path.to_ascii_lowercase();
+        let mut values = self.values.lock().unwrap();
+        let before = values.len();
+        if request.recurse {
+            values.retain(|candidate, _| {
+                !(path == "/"
+                    || candidate == &path
+                    || candidate
+                        .strip_prefix(&path)
+                        .is_some_and(|suffix| suffix.starts_with('/')))
+            });
+        } else {
+            values.remove(&path);
+        }
+        let deleted_count = (before - values.len()) as u64;
+        if deleted_count == 0 {
             return Err(Status::not_found("missing"));
         }
-        Ok(tonic::Response::new(DeleteValueResponse {
+        Ok(tonic::Response::new(DeleteValuesResponse {
             deleted_at: Some(prost_types::Timestamp {
                 seconds: 1_700_000_002,
                 nanos: 0,
             }),
+            deleted_count,
         }))
     }
 }
@@ -279,11 +332,182 @@ async fn exact_value_commands_use_absolute_paths_within_profile_root_and_hard_de
 
     let relative = run_cli(home.path(), &["get", "team/service/feature/flag"]).await;
     assert!(!relative.status.success());
-    assert!(combined(&relative).contains("path must name a configuration value"));
+    assert!(combined(&relative).contains("path must name a configuration subtree"));
 
     let outside_root = run_cli(home.path(), &["get", "/other/feature-flag"]).await;
     assert!(!outside_root.status.success());
     assert!(combined(&outside_root).contains("path is outside the selected profile root"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundaries() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let connection = connection_url(&services, true, "team/service");
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["profile", "add", "managed"],
+            Some(&format!("{connection}\n")),
+        )
+        .await,
+    );
+
+    for (path, value) in [
+        ("/team/service/apps/enabled", "true"),
+        ("/team/service/apps/nested/message", "hello\nworld"),
+        ("/team/service/apps-v2/kept", "boundary"),
+    ] {
+        assert_success(&run_cli_with_input(home.path(), &["put", path], Some(value)).await);
+    }
+
+    let text_subtree = run_cli(home.path(), &["get", "/team/service/apps"]).await;
+    assert!(!text_subtree.status.success());
+    assert!(
+        combined(&text_subtree).contains("JSON format is required to read a configuration subtree")
+    );
+
+    let json = run_cli(
+        home.path(),
+        &["get", "/TEAM/SERVICE/APPS", "--format", "json"],
+    )
+    .await;
+    assert_success(&json);
+    assert_eq!(
+        String::from_utf8_lossy(&json.stdout),
+        "{\n  \"apps\": {\n    \"enabled\": \"true\",\n    \"nested\": {\n      \"message\": \"hello\\nworld\"\n    }\n  }\n}\n"
+    );
+
+    let replacement = run_cli_with_input(
+        home.path(),
+        &["put", "/team/service/apps", "--format", "json"],
+        Some("{\"apps\":{\"enabled\":\"false\",\"new-value\":\"new\"}}"),
+    )
+    .await;
+    assert_success(&replacement);
+    assert_eq!(replacement.stdout, b"Subtree replaced\n");
+    let replaced = run_cli(
+        home.path(),
+        &["get", "/team/service/apps", "--format", "json"],
+    )
+    .await;
+    assert_success(&replaced);
+    assert_eq!(
+        String::from_utf8_lossy(&replaced.stdout),
+        "{\n  \"apps\": {\n    \"enabled\": \"false\",\n    \"new-value\": \"new\"\n  }\n}\n"
+    );
+
+    let invalid = run_cli_with_input(
+        home.path(),
+        &["put", "/team/service/apps", "--format", "json"],
+        Some("{\"apps\":{\"enabled\":true}}"),
+    )
+    .await;
+    assert!(!invalid.status.success());
+    assert!(combined(&invalid).contains("configuration JSON is invalid"));
+    let unchanged = run_cli(home.path(), &["get", "/team/service/apps/enabled"]).await;
+    assert_success(&unchanged);
+    assert_eq!(unchanged.stdout, b"false");
+
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["put", "/team/service/collision"],
+            Some("parent"),
+        )
+        .await,
+    );
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["put", "/team/service/collision/child"],
+            Some("child"),
+        )
+        .await,
+    );
+    let collision = run_cli(
+        home.path(),
+        &["get", "/team/service/collision", "--format", "json"],
+    )
+    .await;
+    assert!(!collision.status.success());
+    assert!(combined(&collision).contains("configuration subtree cannot be represented as JSON"));
+
+    let deleted = run_cli(
+        home.path(),
+        &["delete", "/team/service/apps", "--recurse", "--yes"],
+    )
+    .await;
+    assert_success(&deleted);
+    assert_eq!(deleted.stdout, b"Subtree deleted\n");
+    let empty = run_cli(
+        home.path(),
+        &["get", "/team/service/apps", "--format", "json"],
+    )
+    .await;
+    assert_success(&empty);
+    assert_eq!(empty.stdout, b"{}\n");
+    let boundary = run_cli(home.path(), &["get", "/team/service/apps-v2/kept"]).await;
+    assert_success(&boundary);
+    assert_eq!(boundary.stdout, b"boundary");
+
+    let invalid_format = run_cli(
+        home.path(),
+        &["get", "/team/service/apps", "--format", "yaml"],
+    )
+    .await;
+    assert!(!invalid_format.status.success());
+    assert!(combined(&invalid_format).contains("invalid value 'yaml'"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn json_root_operations_require_a_root_profile() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let connection = connection_url(&services, true, "team/service");
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["profile", "add", "managed"],
+            Some(&format!("{connection}\n")),
+        )
+        .await,
+    );
+    let outside = run_cli(home.path(), &["get", "/", "--format", "json"]).await;
+    assert!(!outside.status.success());
+    assert!(combined(&outside).contains("path is outside the selected profile root"));
+
+    let root_connection = connection_url(&services, true, "");
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["profile", "add", "root"],
+            Some(&format!("{root_connection}\n")),
+        )
+        .await,
+    );
+    let root_put = run_cli_with_input(
+        home.path(),
+        &["--profile", "root", "put", "/", "--format", "json"],
+        Some("{\"root-value\":\"stored\"}"),
+    )
+    .await;
+    assert_success(&root_put);
+    let root_get = run_cli(
+        home.path(),
+        &["--profile", "root", "get", "/", "--format", "json"],
+    )
+    .await;
+    assert_success(&root_get);
+    assert_eq!(
+        String::from_utf8_lossy(&root_get.stdout),
+        "{\n  \"root-value\": \"stored\"\n}\n"
+    );
+    let exact_root_delete =
+        run_cli(home.path(), &["--profile", "root", "delete", "/", "--yes"]).await;
+    assert!(!exact_root_delete.status.success());
+    assert!(combined(&exact_root_delete).contains("path must name a configuration value"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -309,7 +533,7 @@ async fn login_status_logout_flow_is_authenticated_private_and_secret_safe() {
     let status = run_cli(home.path(), &["status"]).await;
     assert_success(&status);
     let status_output = combined(&status);
-    assert!(status_output.contains("Service 1.3.0-test (protocol v1)"));
+    assert!(status_output.contains("Service 1.3.0-test (protocol v2)"));
     assert!(status_output.contains("Authentication: logged in"));
     assert_secrets_absent(&status_output);
     assert_eq!(

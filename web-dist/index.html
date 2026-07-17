@@ -5,12 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#10211b">
     <title>Sovereign Config</title>
-    <link rel="stylesheet" href="/style-bd60fe38eb427add.css" integrity="sha384-Y6MGLYX22kJQf5UXfvbNLt45CCmzp9rIYJqxLDUEktTOxUt54Rdi5jjhbk5UZcQk"/>
+    <link rel="stylesheet" href="/style-f98fc904f525d229.css" integrity="sha384-N6Qvg/VkLtNejpJPlJu6HRYbC9gXpbe6NiZ+8p7BP7O5Zj9RthCvKeOGPnu75g18"/>
     <script src="/app-config.js"></script>
     
 <script type="module">
-import init, * as bindings from '/sovereign-config-web-fbd131589ec23d78.js';
-const wasm = await init({ module_or_path: '/sovereign-config-web-fbd131589ec23d78_bg.wasm' });
+import init, * as bindings from '/sovereign-config-web-578c87dcba6b89ca.js';
+const wasm = await init({ module_or_path: '/sovereign-config-web-578c87dcba6b89ca_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -19,7 +19,7 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-  <link rel="modulepreload" href="/sovereign-config-web-fbd131589ec23d78.js" crossorigin="anonymous" integrity="sha384-O/94zSLbUY1HuF1qOxPdN4565ZvcBtquSMShbj2Yz9673mjioacRxOM5Q2/srBYS"><link rel="preload" href="/sovereign-config-web-fbd131589ec23d78_bg.wasm" crossorigin="anonymous" integrity="sha384-4JmVqrmh5HuL1ucBCnU7vFRrZ+KYCxpvKKxE5y72pCl1f/OvNk+kooOmij4MfTrf" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/sovereign-config-web-578c87dcba6b89ca.js" crossorigin="anonymous" integrity="sha384-nqIzd6hoceKNhm6grZQsLNIQ7EdMt4SmcwMPHbrNM8VQvh4M0ijFGmQj3P3Br4VE"><link rel="preload" href="/sovereign-config-web-578c87dcba6b89ca_bg.wasm" crossorigin="anonymous" integrity="sha384-V0yFYGqWwtUYWlQHQbbE8F3OsQQZYTdLYOrzEbUQXUL/MZuP/Gfr5ysAPklF0hMy" as="fetch" type="application/wasm"></head>
   <body>
     <header>
       <a id="brand-link" class="brand" href="/" aria-label="Sovereign Config home">
@@ -86,10 +86,16 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
               <h2 id="values-heading">Values</h2>
               <p id="value-count" class="status-text">0 values</p>
             </div>
-            <button id="add-value" type="button">Add value</button>
+            <div class="toolbar-actions">
+              <label class="format-switch" for="json-mode">
+                <input id="json-mode" type="checkbox" role="switch">
+                JSON
+              </label>
+              <button id="add-value" type="button">Add value</button>
+            </div>
           </div>
 
-          <div class="table-scroll">
+          <div id="value-table" class="table-scroll">
             <table aria-labelledby="values-heading">
               <thead>
                 <tr>
@@ -123,6 +129,14 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             </table>
           </div>
           <p id="empty-values" class="empty-state" hidden>No values at this path.</p>
+          <div id="json-editor" class="json-editor" hidden>
+            <label for="json-content">JSON subtree</label>
+            <textarea id="json-content" rows="18" spellcheck="false" aria-describedby="json-error"></textarea>
+            <p id="json-error" class="field-error" aria-live="polite" hidden></p>
+            <div class="json-actions">
+              <button id="save-json" type="button">Save JSON</button>
+            </div>
+          </div>
         </div>
       </main>
     </div>
@@ -134,5 +148,134 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         <button id="confirm-delete" class="danger" type="button">Delete</button>
       </div>
     </dialog>
-  </body>
+  <script>"use strict";
+
+(function () {
+
+    const address = '{{__TRUNK_ADDRESS__}}';
+    const base = '{{__TRUNK_WS_BASE__}}';
+    let protocol = '';
+    protocol =
+        protocol
+            ? protocol
+            : window.location.protocol === 'https:'
+                ? 'wss'
+                : 'ws';
+    const url = protocol + '://' + address + base + '.well-known/trunk/ws';
+
+    class Overlay {
+        constructor() {
+            // create an overlay
+            this._overlay = document.createElement("div");
+            const style = this._overlay.style;
+            style.height = "100vh";
+            style.width = "100vw";
+            style.position = "fixed";
+            style.top = "0";
+            style.left = "0";
+            style.backgroundColor = "rgba(222, 222, 222, 0.5)";
+            style.fontFamily = "sans-serif";
+            // not sure that's the right approach
+            style.zIndex = "1000000";
+            style.backdropFilter = "blur(1rem)";
+
+            const container = document.createElement("div");
+            // center it
+            container.style.position = "absolute";
+            container.style.top = "30%";
+            container.style.left = "15%";
+            container.style.maxWidth = "85%";
+
+            this._title = document.createElement("div");
+            this._title.innerText = "Build failure";
+            this._title.style.paddingBottom = "2rem";
+            this._title.style.fontSize = "2.5rem";
+
+            this._message = document.createElement("div");
+            this._message.style.whiteSpace = "pre-wrap";
+
+            const icon= document.createElement("div");
+            icon.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" fill="#dc3545" viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>';
+            this._title.prepend(icon);
+
+            container.append(this._title, this._message);
+            this._overlay.append(container);
+
+            this._inject();
+            window.setInterval(() => {
+                this._inject();
+            }, 250);
+        }
+
+        set reason(reason) {
+            this._message.textContent = reason;
+        }
+
+        _inject() {
+            if (!this._overlay.isConnected) {
+                // prepend it
+                document.body?.prepend(this._overlay);
+            }
+        }
+
+    }
+
+    class Client {
+        constructor(url) {
+            this.url = url;
+            this.poll_interval = 5000;
+            this._overlay = null;
+        }
+
+        start() {
+            const ws = new WebSocket(this.url);
+            ws.onmessage = (ev) => {
+                const msg = JSON.parse(ev.data);
+                switch (msg.type) {
+                    case "reload":
+                        this.reload();
+                        break;
+                    case "buildFailure":
+                        this.buildFailure(msg.data)
+                        break;
+                }
+            };
+            ws.onclose = () => this.onclose();
+        }
+
+        onclose() {
+            window.setTimeout(
+                () => {
+                    // when we successfully reconnect, we'll force a
+                    // reload (since we presumably lost connection to
+                    // trunk due to it being killed, so it will have
+                    // rebuilt on restart)
+                    const ws = new WebSocket(this.url);
+                    ws.onopen = () => window.location.reload();
+                    ws.onclose = () => this.onclose();
+                },
+                this.poll_interval);
+        }
+
+        reload() {
+            window.location.reload();
+        }
+
+        buildFailure({reason}) {
+            // also log the console
+            console.error("Build failed:", reason);
+
+            console.debug("Overlay", this._overlay);
+
+            if (!this._overlay) {
+                this._overlay = new Overlay();
+            }
+            this._overlay.reason = reason;
+        }
+    }
+
+    new Client(url).start();
+
+})()
+</script></body>
 </html>

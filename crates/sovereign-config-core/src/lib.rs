@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: &str = "v1";
+pub const PROTOCOL_VERSION: &str = "v2";
 
 pub use connection::{ConnectionUrl, ConnectionUrlError};
 
@@ -80,6 +80,20 @@ impl ConfigPath {
         Self::parse(value.to_ascii_lowercase())
     }
 
+    /// Parses an absolute operation selection, including the tree root, and
+    /// normalizes ASCII letters to lowercase.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError::NonCanonical`] for unrooted paths, empty segments,
+    /// non-ASCII text, percent encoding, or unsupported characters.
+    pub fn parse_selection(value: impl AsRef<str>) -> Result<Self, PathError> {
+        if value.as_ref() == "/" {
+            return Ok(Self::root());
+        }
+        Self::parse_operation(value)
+    }
+
     /// Appends one value name to a canonical rooted namespace.
     ///
     /// # Errors
@@ -106,6 +120,21 @@ impl ConfigPath {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    #[must_use]
+    pub fn is_at_or_below(&self, root: &Self) -> bool {
+        root.as_str() == "/"
+            || self == root
+            || self
+                .as_str()
+                .strip_prefix(root.as_str())
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }
+
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.0.rsplit('/').next().filter(|name| !name.is_empty())
     }
 }
 
@@ -190,13 +219,6 @@ fn invalid_timestamp() -> ClientError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExactValue {
-    pub value: PlainValue,
-    pub created_at: Timestamp,
-    pub updated_at: Timestamp,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListedValue {
     pub path: ConfigPath,
     pub value: PlainValue,
@@ -210,6 +232,17 @@ pub struct ValueListing {
     pub paths: Vec<ConfigPath>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubTreeValue {
+    pub path: ConfigPath,
+    pub value: PlainValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValueSubTree {
+    pub values: Vec<SubTreeValue>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PutMetadata {
     pub created_at: Timestamp,
@@ -219,6 +252,13 @@ pub struct PutMetadata {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeleteMetadata {
     pub deleted_at: Timestamp,
+    pub deleted_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplaceMetadata {
+    pub updated_at: Timestamp,
+    pub value_count: u64,
 }
 
 impl fmt::Display for ConfigPath {
@@ -227,15 +267,211 @@ impl fmt::Display for ConfigPath {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(untagged)]
-pub enum ConfigValue {
-    Null,
-    Boolean(bool),
-    Integer(i64),
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum JsonNode {
     String(String),
-    Sequence(Vec<ConfigValue>),
-    Object(BTreeMap<String, ConfigValue>),
+    Object(BTreeMap<String, Self>),
+}
+
+impl Serialize for JsonNode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::String(value) => serializer.serialize_str(value),
+            Self::Object(values) => values.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonNode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = JsonNode;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object or string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(JsonNode::String(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(JsonNode::String(value))
+            }
+
+            fn visit_map<A>(self, mut values: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut object = BTreeMap::new();
+                while let Some((key, value)) = values.next_entry::<String, JsonNode>()? {
+                    if object.insert(key, value).is_some() {
+                        return Err(serde::de::Error::custom("duplicate JSON object key"));
+                    }
+                }
+                Ok(JsonNode::Object(object))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// Renders a flat absolute-path collection as deterministic, pretty JSON.
+///
+/// # Errors
+///
+/// Returns a bounded validation error when a path is outside the selection or
+/// when a value and an object would occupy the same JSON node.
+pub fn render_subtree_json(
+    root: &ConfigPath,
+    values: &[SubTreeValue],
+) -> Result<String, ClientError> {
+    let mut object = BTreeMap::new();
+    for value in values {
+        if value.path.as_str() == "/" || !value.path.is_at_or_below(root) {
+            return Err(invalid_subtree());
+        }
+        let segments = json_segments(root, &value.path)?;
+        insert_json_value(&mut object, &segments, value.value.expose())?;
+    }
+    serde_json::to_string_pretty(&JsonNode::Object(object))
+        .map(|json| format!("{json}\n"))
+        .map_err(|_| invalid_subtree())
+}
+
+/// Parses strict subtree JSON into canonical absolute paths and plain strings.
+///
+/// # Errors
+///
+/// Returns a bounded validation error for malformed JSON, duplicate keys,
+/// invalid path segments, an incorrect wrapper, or non-string leaves.
+pub fn parse_subtree_json(root: &ConfigPath, json: &str) -> Result<Vec<SubTreeValue>, ClientError> {
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    let node = JsonNode::deserialize(&mut deserializer).map_err(|_| invalid_json())?;
+    deserializer.end().map_err(|_| invalid_json())?;
+    let JsonNode::Object(mut object) = node else {
+        return Err(invalid_json());
+    };
+
+    let mut values = Vec::new();
+    if root.as_str() == "/" {
+        flatten_json_object(root, object, &mut values)?;
+    } else if object.is_empty() {
+        return Ok(values);
+    } else {
+        let name = root.name().ok_or_else(invalid_json)?;
+        if object.len() != 1 || !object.contains_key(name) {
+            return Err(invalid_json());
+        }
+        let node = object.remove(name).ok_or_else(invalid_json)?;
+        flatten_json_node(root, node, &mut values)?;
+    }
+    Ok(values)
+}
+
+fn json_segments(root: &ConfigPath, path: &ConfigPath) -> Result<Vec<String>, ClientError> {
+    if root.as_str() == "/" {
+        return Ok(path
+            .as_str()
+            .trim_start_matches('/')
+            .split('/')
+            .map(str::to_owned)
+            .collect());
+    }
+    let mut segments = vec![root.name().ok_or_else(invalid_subtree)?.to_owned()];
+    if path != root {
+        let relative = path
+            .as_str()
+            .strip_prefix(root.as_str())
+            .and_then(|suffix| suffix.strip_prefix('/'))
+            .ok_or_else(invalid_subtree)?;
+        segments.extend(relative.split('/').map(str::to_owned));
+    }
+    Ok(segments)
+}
+
+fn insert_json_value(
+    object: &mut BTreeMap<String, JsonNode>,
+    segments: &[String],
+    value: &str,
+) -> Result<(), ClientError> {
+    let Some((segment, remaining)) = segments.split_first() else {
+        return Err(invalid_subtree());
+    };
+    if remaining.is_empty() {
+        if object
+            .insert(segment.clone(), JsonNode::String(value.to_owned()))
+            .is_some()
+        {
+            return Err(invalid_subtree());
+        }
+        return Ok(());
+    }
+    let node = object
+        .entry(segment.clone())
+        .or_insert_with(|| JsonNode::Object(BTreeMap::new()));
+    let JsonNode::Object(child) = node else {
+        return Err(invalid_subtree());
+    };
+    insert_json_value(child, remaining, value)
+}
+
+fn flatten_json_object(
+    root: &ConfigPath,
+    object: BTreeMap<String, JsonNode>,
+    values: &mut Vec<SubTreeValue>,
+) -> Result<(), ClientError> {
+    for (name, node) in object {
+        let path = root.join_name(name).map_err(|_| invalid_json())?;
+        flatten_json_node(&path, node, values)?;
+    }
+    Ok(())
+}
+
+fn flatten_json_node(
+    path: &ConfigPath,
+    node: JsonNode,
+    values: &mut Vec<SubTreeValue>,
+) -> Result<(), ClientError> {
+    match node {
+        JsonNode::String(value) => {
+            if value.contains('\0') {
+                return Err(invalid_json());
+            }
+            values.push(SubTreeValue {
+                path: path.clone(),
+                value: PlainValue::new(value),
+            });
+            Ok(())
+        }
+        JsonNode::Object(object) => flatten_json_object(path, object, values),
+    }
+}
+
+fn invalid_json() -> ClientError {
+    ClientError::new(ErrorKind::InvalidRequest, "configuration JSON is invalid")
+}
+
+fn invalid_subtree() -> ClientError {
+    ClientError::new(
+        ErrorKind::InvalidRequest,
+        "configuration subtree cannot be represented as JSON",
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -339,7 +575,10 @@ impl fmt::Display for Secret {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigPath, ErrorKind, PROTOCOL_VERSION, PlainValue, Secret, ServiceStatus};
+    use super::{
+        ConfigPath, ErrorKind, PROTOCOL_VERSION, PlainValue, Secret, ServiceStatus, SubTreeValue,
+        parse_subtree_json, render_subtree_json,
+    };
 
     #[test]
     fn paths_are_canonical_and_root_is_explicit() {
@@ -374,6 +613,103 @@ mod tests {
             );
         }
         assert!(root.join_name("apps/api").is_err());
+        assert_eq!(
+            ConfigPath::parse_selection("/").unwrap(),
+            ConfigPath::root()
+        );
+        assert_eq!(
+            ConfigPath::parse_selection("/Apps/API").unwrap().as_str(),
+            "/apps/api"
+        );
+        assert!(
+            ConfigPath::parse("/apps/api/key")
+                .unwrap()
+                .is_at_or_below(&ConfigPath::parse("/apps/api").unwrap())
+        );
+        assert!(
+            !ConfigPath::parse("/apps/api-v2/key")
+                .unwrap()
+                .is_at_or_below(&ConfigPath::parse("/apps/api").unwrap())
+        );
+    }
+
+    fn subtree_value(path: &str, value: &str) -> SubTreeValue {
+        SubTreeValue {
+            path: ConfigPath::parse(path).unwrap(),
+            value: PlainValue::new(value),
+        }
+    }
+
+    #[test]
+    fn subtree_json_round_trips_exact_nested_root_and_empty_values() {
+        let selected = ConfigPath::parse("/apps/api").unwrap();
+        let values = vec![
+            subtree_value("/apps/api/enabled", "true"),
+            subtree_value("/apps/api/nested/message", "line one\nline two"),
+        ];
+        let json = render_subtree_json(&selected, &values).unwrap();
+        assert_eq!(
+            json,
+            "{\n  \"api\": {\n    \"enabled\": \"true\",\n    \"nested\": {\n      \"message\": \"line one\\nline two\"\n    }\n  }\n}\n"
+        );
+        assert_eq!(parse_subtree_json(&selected, &json).unwrap(), values);
+
+        let exact = vec![subtree_value("/apps/api", "value")];
+        assert_eq!(
+            render_subtree_json(&selected, &exact).unwrap(),
+            "{\n  \"api\": \"value\"\n}\n"
+        );
+        assert_eq!(
+            parse_subtree_json(&selected, "{\"api\":\"value\"}").unwrap(),
+            exact
+        );
+
+        let root = ConfigPath::root();
+        assert_eq!(
+            parse_subtree_json(&root, "{\"apps\":{\"enabled\":\"yes\"}}").unwrap(),
+            vec![subtree_value("/apps/enabled", "yes")]
+        );
+        assert_eq!(render_subtree_json(&selected, &[]).unwrap(), "{}\n");
+        assert!(parse_subtree_json(&selected, "{}").unwrap().is_empty());
+    }
+
+    #[test]
+    fn subtree_json_rejects_lossy_or_invalid_shapes() {
+        let selected = ConfigPath::parse("/apps/api").unwrap();
+        let collisions = vec![
+            subtree_value("/apps/api", "parent"),
+            subtree_value("/apps/api/child", "child"),
+        ];
+        assert!(render_subtree_json(&selected, &collisions).is_err());
+        assert!(
+            render_subtree_json(&selected, &[subtree_value("/apps/api-v2/child", "outside")])
+                .is_err()
+        );
+        assert!(
+            render_subtree_json(
+                &ConfigPath::root(),
+                &[SubTreeValue {
+                    path: ConfigPath::root(),
+                    value: PlainValue::new("invalid-root-value"),
+                }]
+            )
+            .is_err()
+        );
+        for invalid in [
+            "[]",
+            "{\"wrong\":\"value\"}",
+            "{\"api\":true}",
+            "{\"api\":null}",
+            "{\"api\":[\"value\"]}",
+            "{\"api\":{\"bad_key\":\"value\"}}",
+            "{\"api\":\"first\",\"api\":\"second\"}",
+            "{\"api\":\"bad\\u0000value\"}",
+        ] {
+            assert!(
+                parse_subtree_json(&selected, invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -387,7 +723,7 @@ mod tests {
     #[test]
     fn protocol_negotiation_is_exact() {
         assert!(ServiceStatus::negotiate("1.3.0".into(), PROTOCOL_VERSION.into()).compatible);
-        assert!(!ServiceStatus::negotiate("1.3.0".into(), "v2".into()).compatible);
+        assert!(!ServiceStatus::negotiate("1.3.0".into(), "v1".into()).compatible);
     }
 
     #[test]
