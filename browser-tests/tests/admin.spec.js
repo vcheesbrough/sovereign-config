@@ -635,7 +635,8 @@ test('JSON mode reads and replaces subtrees without exposing row deletion', asyn
   const { requests } = await mockValues(page, {
     '/apps/api/enabled': 'true',
     '/apps/api/nested/message': 'hello\nworld',
-    '/apps/worker/concurrency': '4'
+    '/apps/worker/concurrency': '4',
+    '/foo/foo2/foo3/deepvalue': 'deepvalue'
   });
   await page.goto('/configuration/apps/api');
 
@@ -646,21 +647,21 @@ test('JSON mode reads and replaces subtrees without exposing row deletion', asyn
   await expect(page.getByRole('button', { name: 'Delete' })).toHaveCount(0);
   const editor = page.getByLabel('JSON subtree');
   await expect(editor).toHaveValue(
-    '{\n  "api": {\n    "enabled": "true",\n    "nested": {\n      "message": "hello\\nworld"\n    }\n  }\n}\n'
+    '{\n  "enabled": "true",\n  "nested": {\n    "message": "hello\\nworld"\n  }\n}\n'
   );
 
   const beforeInvalid = requests.length;
-  await editor.fill('{"api":{"enabled":true}}');
+  await editor.fill('{"enabled":true}');
   await expect(editor).toHaveAttribute('aria-invalid', 'true');
   await expect(page.getByText('configuration JSON is invalid')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Save JSON' })).toBeDisabled();
   expect(requests).toHaveLength(beforeInvalid);
 
-  await editor.fill('{"api":{"enabled":"false","new-value":"new"}}');
+  await editor.fill('{"enabled":"false","new-value":"new"}');
   await page.getByRole('button', { name: 'Save JSON' }).click();
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
   await expect(editor).toHaveValue(
-    '{\n  "api": {\n    "enabled": "false",\n    "new-value": "new"\n  }\n}\n'
+    '{\n  "enabled": "false",\n  "new-value": "new"\n}\n'
   );
   expect(requests.slice(-2).map(request => request.method)).toEqual([
     'ReplaceSubTree', 'GetSubTree'
@@ -669,14 +670,18 @@ test('JSON mode reads and replaces subtrees without exposing row deletion', asyn
   const pathInput = page.getByLabel('Selected path');
   await pathInput.fill('/apps/api/enabled');
   await page.getByRole('button', { name: 'Open' }).click();
-  await expect(editor).toHaveValue('{\n  "enabled": "false"\n}\n');
+  await expect(editor).toHaveValue('"false"\n');
+  await editor.fill('"exact-json"');
+  await page.getByRole('button', { name: 'Save JSON' }).click();
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  await expect(editor).toHaveValue('"exact-json"\n');
   await page.goBack();
   await expect(editor).toHaveValue(
-    '{\n  "api": {\n    "enabled": "false",\n    "new-value": "new"\n  }\n}\n'
+    '{\n  "enabled": "exact-json",\n  "new-value": "new"\n}\n'
   );
 
   await mode.uncheck();
-  await expect(page.getByLabel('Value for enabled')).toHaveValue('false');
+  await expect(page.getByLabel('Value for enabled')).toHaveValue('exact-json');
   await expect(page.getByLabel('Value for new-value')).toHaveValue('new');
   await expect(page.getByText('message', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Add value' })).toBeVisible();
@@ -687,8 +692,12 @@ test('JSON mode reads and replaces subtrees without exposing row deletion', asyn
   await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
   await expect(mode).toBeChecked();
   await expect(editor).toHaveValue(
-    '{\n  "worker": {\n    "concurrency": "4"\n  }\n}\n'
+    '{\n  "concurrency": "4"\n}\n'
   );
+
+  await pathInput.fill('/foo/foo2/foo3');
+  await page.getByRole('button', { name: 'Open' }).click();
+  await expect(editor).toHaveValue('{\n  "deepvalue": "deepvalue"\n}\n');
 
   await pathInput.fill('/apps/empty');
   await page.getByRole('button', { name: 'Open' }).click();
@@ -720,7 +729,7 @@ test('JSON mode retains rejected edits and reports non-representable stored tree
   await pathInput.fill('/valid');
   await page.getByRole('button', { name: 'Open' }).click();
   const editor = page.getByLabel('JSON subtree');
-  const rejected = '{"valid":{"value":"after"}}';
+  const rejected = '{"value":"after"}';
   await editor.fill(rejected);
   const subtreeResponse = page.waitForResponse(
     '**/sovereign.config.v2.Configuration/GetSubTree'

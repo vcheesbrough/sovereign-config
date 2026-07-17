@@ -342,14 +342,26 @@ pub fn render_subtree_json(
     values: &[SubTreeValue],
 ) -> Result<String, ClientError> {
     let mut object = BTreeMap::new();
+    let mut exact = None;
     for value in values {
         if value.path.as_str() == "/" || !value.path.is_at_or_below(root) {
             return Err(invalid_subtree());
         }
+        if value.path == *root {
+            if exact.replace(value.value.expose()).is_some() {
+                return Err(invalid_subtree());
+            }
+            continue;
+        }
         let segments = json_segments(root, &value.path)?;
         insert_json_value(&mut object, &segments, value.value.expose())?;
     }
-    serde_json::to_string_pretty(&JsonNode::Object(object))
+    let node = match exact {
+        Some(value) if object.is_empty() => JsonNode::String(value.to_owned()),
+        Some(_) => return Err(invalid_subtree()),
+        None => JsonNode::Object(object),
+    };
+    serde_json::to_string_pretty(&node)
         .map(|json| format!("{json}\n"))
         .map_err(|_| invalid_subtree())
 }
@@ -359,26 +371,18 @@ pub fn render_subtree_json(
 /// # Errors
 ///
 /// Returns a bounded validation error for malformed JSON, duplicate keys,
-/// invalid path segments, an incorrect wrapper, or non-string leaves.
+/// invalid path segments, or non-string leaves below an object.
 pub fn parse_subtree_json(root: &ConfigPath, json: &str) -> Result<Vec<SubTreeValue>, ClientError> {
     let mut deserializer = serde_json::Deserializer::from_str(json);
     let node = JsonNode::deserialize(&mut deserializer).map_err(|_| invalid_json())?;
     deserializer.end().map_err(|_| invalid_json())?;
-    let JsonNode::Object(mut object) = node else {
-        return Err(invalid_json());
-    };
-
     let mut values = Vec::new();
     if root.as_str() == "/" {
-        flatten_json_object(root, object, &mut values)?;
-    } else if object.is_empty() {
-        return Ok(values);
-    } else {
-        let name = root.name().ok_or_else(invalid_json)?;
-        if object.len() != 1 || !object.contains_key(name) {
+        let JsonNode::Object(object) = node else {
             return Err(invalid_json());
-        }
-        let node = object.remove(name).ok_or_else(invalid_json)?;
+        };
+        flatten_json_object(root, object, &mut values)?;
+    } else {
         flatten_json_node(root, node, &mut values)?;
     }
     Ok(values)
@@ -393,16 +397,12 @@ fn json_segments(root: &ConfigPath, path: &ConfigPath) -> Result<Vec<String>, Cl
             .map(str::to_owned)
             .collect());
     }
-    let mut segments = vec![root.name().ok_or_else(invalid_subtree)?.to_owned()];
-    if path != root {
-        let relative = path
-            .as_str()
-            .strip_prefix(root.as_str())
-            .and_then(|suffix| suffix.strip_prefix('/'))
-            .ok_or_else(invalid_subtree)?;
-        segments.extend(relative.split('/').map(str::to_owned));
-    }
-    Ok(segments)
+    let relative = path
+        .as_str()
+        .strip_prefix(root.as_str())
+        .and_then(|suffix| suffix.strip_prefix('/'))
+        .ok_or_else(invalid_subtree)?;
+    Ok(relative.split('/').map(str::to_owned).collect())
 }
 
 fn insert_json_value(
@@ -650,18 +650,25 @@ mod tests {
         let json = render_subtree_json(&selected, &values).unwrap();
         assert_eq!(
             json,
-            "{\n  \"api\": {\n    \"enabled\": \"true\",\n    \"nested\": {\n      \"message\": \"line one\\nline two\"\n    }\n  }\n}\n"
+            "{\n  \"enabled\": \"true\",\n  \"nested\": {\n    \"message\": \"line one\\nline two\"\n  }\n}\n"
         );
         assert_eq!(parse_subtree_json(&selected, &json).unwrap(), values);
 
         let exact = vec![subtree_value("/apps/api", "value")];
         assert_eq!(
             render_subtree_json(&selected, &exact).unwrap(),
-            "{\n  \"api\": \"value\"\n}\n"
+            "\"value\"\n"
+        );
+        assert_eq!(parse_subtree_json(&selected, "\"value\"").unwrap(), exact);
+
+        let same_name_child = vec![subtree_value("/apps/api/api", "child")];
+        assert_eq!(
+            render_subtree_json(&selected, &same_name_child).unwrap(),
+            "{\n  \"api\": \"child\"\n}\n"
         );
         assert_eq!(
-            parse_subtree_json(&selected, "{\"api\":\"value\"}").unwrap(),
-            exact
+            parse_subtree_json(&selected, "{\"api\":\"child\"}").unwrap(),
+            same_name_child
         );
 
         let root = ConfigPath::root();
@@ -697,19 +704,21 @@ mod tests {
         );
         for invalid in [
             "[]",
-            "{\"wrong\":\"value\"}",
-            "{\"api\":true}",
-            "{\"api\":null}",
-            "{\"api\":[\"value\"]}",
-            "{\"api\":{\"bad_key\":\"value\"}}",
-            "{\"api\":\"first\",\"api\":\"second\"}",
-            "{\"api\":\"bad\\u0000value\"}",
+            "true",
+            "null",
+            "{\"enabled\":true}",
+            "{\"enabled\":null}",
+            "{\"enabled\":[\"value\"]}",
+            "{\"nested\":{\"bad_key\":\"value\"}}",
+            "{\"enabled\":\"first\",\"enabled\":\"second\"}",
+            "{\"enabled\":\"bad\\u0000value\"}",
         ] {
             assert!(
                 parse_subtree_json(&selected, invalid).is_err(),
                 "accepted {invalid}"
             );
         }
+        assert!(parse_subtree_json(&ConfigPath::root(), "\"root-value\"").is_err());
     }
 
     #[test]

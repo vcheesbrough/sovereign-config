@@ -358,6 +358,7 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
         ("/team/service/apps/enabled", "true"),
         ("/team/service/apps/nested/message", "hello\nworld"),
         ("/team/service/apps-v2/kept", "boundary"),
+        ("/team/service/foo/foo2/foo3/deepvalue", "deepvalue"),
     ] {
         assert_success(&run_cli_with_input(home.path(), &["put", path], Some(value)).await);
     }
@@ -376,13 +377,21 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
     assert_success(&json);
     assert_eq!(
         String::from_utf8_lossy(&json.stdout),
-        "{\n  \"apps\": {\n    \"enabled\": \"true\",\n    \"nested\": {\n      \"message\": \"hello\\nworld\"\n    }\n  }\n}\n"
+        "{\n  \"enabled\": \"true\",\n  \"nested\": {\n    \"message\": \"hello\\nworld\"\n  }\n}\n"
     );
+
+    let deep_json = run_cli(
+        home.path(),
+        &["get", "/team/service/foo/foo2/foo3", "--format", "json"],
+    )
+    .await;
+    assert_success(&deep_json);
+    assert_eq!(deep_json.stdout, b"{\n  \"deepvalue\": \"deepvalue\"\n}\n");
 
     let replacement = run_cli_with_input(
         home.path(),
         &["put", "/team/service/apps", "--format", "json"],
-        Some("{\"apps\":{\"enabled\":\"false\",\"new-value\":\"new\"}}"),
+        Some("{\"enabled\":\"false\",\"new-value\":\"new\"}"),
     )
     .await;
     assert_success(&replacement);
@@ -395,20 +404,38 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
     assert_success(&replaced);
     assert_eq!(
         String::from_utf8_lossy(&replaced.stdout),
-        "{\n  \"apps\": {\n    \"enabled\": \"false\",\n    \"new-value\": \"new\"\n  }\n}\n"
+        "{\n  \"enabled\": \"false\",\n  \"new-value\": \"new\"\n}\n"
     );
+
+    let exact_json = run_cli(
+        home.path(),
+        &["get", "/team/service/apps/enabled", "--format", "json"],
+    )
+    .await;
+    assert_success(&exact_json);
+    assert_eq!(exact_json.stdout, b"\"false\"\n");
+    let exact_replacement = run_cli_with_input(
+        home.path(),
+        &["put", "/team/service/apps/enabled", "--format", "json"],
+        Some("\"exact-json\""),
+    )
+    .await;
+    assert_success(&exact_replacement);
+    let exact_text = run_cli(home.path(), &["get", "/team/service/apps/enabled"]).await;
+    assert_success(&exact_text);
+    assert_eq!(exact_text.stdout, b"exact-json");
 
     let invalid = run_cli_with_input(
         home.path(),
         &["put", "/team/service/apps", "--format", "json"],
-        Some("{\"apps\":{\"enabled\":true}}"),
+        Some("{\"enabled\":true}"),
     )
     .await;
     assert!(!invalid.status.success());
     assert!(combined(&invalid).contains("configuration JSON is invalid"));
     let unchanged = run_cli(home.path(), &["get", "/team/service/apps/enabled"]).await;
     assert_success(&unchanged);
-    assert_eq!(unchanged.stdout, b"false");
+    assert_eq!(unchanged.stdout, b"exact-json");
 
     assert_success(
         &run_cli_with_input(
