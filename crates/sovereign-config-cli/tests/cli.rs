@@ -91,7 +91,7 @@ impl System for MockSystem {
             return Err(Status::failed_precondition("protocol mismatch"));
         }
         Ok(tonic::Response::new(GetVersionResponse {
-            application_version: "1.3.0-test".to_owned(),
+            application_version: "1.4.0-test".to_owned(),
             protocol_version: "v2".to_owned(),
         }))
     }
@@ -533,7 +533,7 @@ async fn login_status_logout_flow_is_authenticated_private_and_secret_safe() {
     let status = run_cli(home.path(), &["status"]).await;
     assert_success(&status);
     let status_output = combined(&status);
-    assert!(status_output.contains("Service 1.3.0-test (protocol v2)"));
+    assert!(status_output.contains("Service 1.4.0-test (protocol v2)"));
     assert!(status_output.contains("Authentication: logged in"));
     assert_secrets_absent(&status_output);
     assert_eq!(
@@ -915,7 +915,7 @@ fn version_does_not_require_profile_configuration() {
     assert_success(&output);
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "sovereign-config 1.3.0"
+        "sovereign-config 1.4.0"
     );
 }
 

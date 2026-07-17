@@ -259,7 +259,7 @@ async function mockApplication(page) {
     body: configScript
   }));
   await page.route('**/sovereign.config.v2.System/GetVersion', route => {
-    const application = Buffer.from('1.3.0');
+    const application = Buffer.from('1.4.0');
     const protocol = Buffer.from('v2');
     const message = Buffer.concat([
       Buffer.from([0x0a, application.length]), application,
@@ -378,7 +378,7 @@ test.beforeEach(async ({ page }) => {
 test('reports service and logged-out state accessibly', async ({ page }, testInfo) => {
   await page.goto('/');
   await expect(page.getByText('Available')).toBeVisible();
-  await expect(page.getByText('1.3.0')).toBeVisible();
+  await expect(page.getByText('1.4.0')).toBeVisible();
   await expect(page.getByText('Logged out')).toBeVisible();
 
   const accessibility = await new AxeBuilder({ page }).analyze();
@@ -569,7 +569,7 @@ test('path selector popup uses the available viewport height', async ({ page }) 
 
   const bounds = await popup.boundingBox();
   expect(bounds.height).toBeGreaterThan(400);
-  expect(bounds.y + bounds.height).toBeLessThanOrEqual(888);
+  expect(bounds.y + bounds.height).toBeLessThanOrEqual(page.viewportSize().height - 8);
 
   const accessibility = await new AxeBuilder({ page }).analyze();
   expect(accessibility.violations).toEqual([]);
@@ -577,7 +577,7 @@ test('path selector popup uses the available viewport height', async ({ page }) 
   await page.setViewportSize({ width: 390, height: 420 });
   const mobileBounds = await popup.boundingBox();
   expect(mobileBounds.y).toBeGreaterThanOrEqual(8);
-  expect(mobileBounds.y + mobileBounds.height).toBeLessThanOrEqual(412);
+  expect(mobileBounds.y + mobileBounds.height).toBeLessThanOrEqual(page.viewportSize().height - 8);
 });
 
 test('configuration grid is accessible and contained on desktop and mobile', async ({ page }, testInfo) => {
