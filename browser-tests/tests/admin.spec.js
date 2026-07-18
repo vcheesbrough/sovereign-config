@@ -636,7 +636,8 @@ test('JSON mode reads and replaces subtrees without exposing row deletion', asyn
     '/apps/api/enabled': 'true',
     '/apps/api/nested/message': 'hello\nworld',
     '/apps/worker/concurrency': '4',
-    '/foo/foo2/foo3/deepvalue': 'deepvalue'
+    '/foo/foo2/foo3/deepvalue': 'deepvalue',
+    '/foo/second/abc': 'bar'
   });
   await page.goto('/configuration/apps/api');
 
@@ -698,6 +699,16 @@ test('JSON mode reads and replaces subtrees without exposing row deletion', asyn
   await pathInput.fill('/foo/foo2/foo3');
   await page.getByRole('button', { name: 'Open' }).click();
   await expect(editor).toHaveValue('{\n  "deepvalue": "deepvalue"\n}\n');
+
+  await pathInput.fill('/foo/s');
+  await page.getByRole('button', { name: 'Open' }).click();
+  await expect(editor).toHaveValue('{}\n');
+  await editor.fill('{"child":"value"}');
+  await page.getByRole('button', { name: 'Save JSON' }).click();
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  await pathInput.fill('/foo/second');
+  await page.getByRole('button', { name: 'Open' }).click();
+  await expect(editor).toHaveValue('{\n  "abc": "bar"\n}\n');
 
   await pathInput.fill('/apps/empty');
   await page.getByRole('button', { name: 'Open' }).click();

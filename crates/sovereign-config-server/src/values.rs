@@ -174,7 +174,7 @@ impl Configuration for ConfigurationService {
         let path = authorize(&request, &[Permission::Write, Permission::Manage], true)?;
         let mut values = request.get_ref().values.clone();
         values.sort_by(|first, second| first.path.cmp(&second.path));
-        let mut previous: Option<&str> = None;
+        let mut accepted_paths = BTreeSet::new();
         for value in &values {
             let value_path = ConfigPath::parse(&value.path)
                 .map_err(|_| Status::invalid_argument("configuration subtree is invalid"))?;
@@ -184,16 +184,21 @@ impl Configuration for ConfigurationService {
             {
                 return Err(Status::invalid_argument("configuration subtree is invalid"));
             }
-            if previous.is_some_and(|previous| {
-                value.path == previous
-                    || value
-                        .path
-                        .strip_prefix(previous)
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-            }) {
+            let mut ancestor = value.path.as_str();
+            let mut has_stored_ancestor = false;
+            while let Some((parent, _)) = ancestor.rsplit_once('/') {
+                if parent.is_empty() {
+                    break;
+                }
+                if accepted_paths.contains(parent) {
+                    has_stored_ancestor = true;
+                    break;
+                }
+                ancestor = parent;
+            }
+            if has_stored_ancestor || !accepted_paths.insert(value.path.as_str()) {
                 return Err(Status::invalid_argument("configuration subtree is invalid"));
             }
-            previous = Some(&value.path);
         }
 
         let now = OffsetDateTime::from(SystemTime::now());
@@ -602,12 +607,16 @@ mod tests {
                     path: "/tests/exact".into(),
                     values: vec![
                         SubTreeValue {
-                            path: "/tests/exact/collision".into(),
-                            value: "parent".into(),
-                        },
-                        SubTreeValue {
                             path: "/tests/exact/collision/child".into(),
                             value: "child".into(),
+                        },
+                        SubTreeValue {
+                            path: "/tests/exact/collision-sibling".into(),
+                            value: "sibling".into(),
+                        },
+                        SubTreeValue {
+                            path: "/tests/exact/collision".into(),
+                            value: "parent".into(),
                         },
                     ],
                 },
