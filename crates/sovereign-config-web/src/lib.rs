@@ -1205,6 +1205,11 @@ async fn save_existing_secret(path: ConfigPath, input_id: String) {
 }
 
 async fn reveal_existing_secret(path: ConfigPath, output_id: String, button_id: String) {
+    let generation = CONFIGURATION_LOAD_GENERATION.get();
+    let route_path = match route_from_location() {
+        Route::Configuration(path) => path,
+        Route::System => return,
+    };
     clear_error();
     hide_revealed_secret(&output_id, &button_id);
     let result = async {
@@ -1212,6 +1217,13 @@ async fn reveal_existing_secret(path: ConfigPath, output_id: String, button_id: 
         value_client(&config).reveal_secret(&path).await
     }
     .await;
+    let current_path = match route_from_location() {
+        Route::Configuration(path) => path,
+        Route::System => return,
+    };
+    if generation != CONFIGURATION_LOAD_GENERATION.get() || current_path != route_path {
+        return;
+    }
     match result {
         Ok(value) => {
             if let Some(output) = element::<HtmlTextAreaElement>(&output_id) {

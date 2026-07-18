@@ -179,6 +179,7 @@ async function mockValues(page, initial = {}) {
   const stored = new Map(Object.entries(initial).map(([path, value]) => [path, storedValue(value)]));
   const requests = [];
   let delayedSubtree;
+  let delayedReveal;
   await page.route('**/sovereign.config.v3.Configuration/*', async route => {
     const method = route.request().url().split('/').pop();
     const body = route.request().postDataBuffer();
@@ -246,6 +247,11 @@ async function mockValues(page, initial = {}) {
       });
     }
     if (method === 'RevealSecret') {
+      if (delayedReveal) {
+        const delay = delayedReveal;
+        delayedReveal = undefined;
+        await delay.promise;
+      }
       const selected = fields.get(1);
       const value = stored.get(selected);
       const status = value?.secret ? 0 : (value ? 3 : 5);
@@ -281,6 +287,12 @@ async function mockValues(page, initial = {}) {
       let release;
       const promise = new Promise(resolve => { release = resolve; });
       delayedSubtree = { promise };
+      return release;
+    },
+    delayNextReveal() {
+      let release;
+      const promise = new Promise(resolve => { release = resolve; });
+      delayedReveal = { promise };
       return release;
     },
     setValue(path, value, secret = false) {
@@ -992,6 +1004,36 @@ test('secret values stay masked, rotate explicitly, and survive JSON edits', asy
 
   const accessibility = await new AxeBuilder({ page }).analyze();
   expect(accessibility.violations).toEqual([]);
+});
+
+test('delayed secret reveals are discarded after configuration navigation', async ({ page }) => {
+  const oldSecret = 'old-path-secret-sentinel';
+  const newSecret = 'new-path-secret-sentinel';
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  const values = await mockValues(page, {
+    '/apps/api/api-token': { value: oldSecret, secret: true },
+    '/apps/worker/worker-token': { value: newSecret, secret: true }
+  });
+  await page.goto('/configuration/apps/api');
+  await expect(page.getByRole('row', { name: /api-token/ })).toBeVisible();
+  const releaseReveal = values.delayNextReveal();
+  const revealResponse = page.waitForResponse(
+    '**/sovereign.config.v3.Configuration/RevealSecret'
+  );
+  await page.getByRole('row', { name: /api-token/ }).getByRole('button', { name: 'Reveal' }).click();
+
+  const pathInput = page.getByLabel('Selected path');
+  await pathInput.fill('/apps/worker');
+  await page.getByRole('button', { name: 'Open' }).click();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+  await expect(page.getByRole('row', { name: /worker-token/ })).toBeVisible();
+
+  releaseReveal();
+  await revealResponse;
+  await expect(page.getByLabel('Revealed secret for worker-token')).toBeHidden();
+  await expect(page.getByLabel('Revealed secret for worker-token')).toHaveValue('');
+  await expect(page.locator('body')).not.toContainText(oldSecret);
 });
 
 test('trailers-only save errors retain their bounded gRPC status', async ({ page }) => {
