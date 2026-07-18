@@ -66,14 +66,15 @@ sovereign-config get /apps/api/settings
 printf '%s' 'enabled=true' | sovereign-config put /apps/api/settings
 printf '%s' 'database-password' | sovereign-config secret put /apps/api/database-password
 sovereign-config get /apps/api/database-password
-sovereign-config secret reveal /apps/api/database-password
+sovereign-config get --reveal /apps/api/database-password
 sovereign-config get /apps/api --format json
+sovereign-config get --reveal /apps/api --format json
 printf '%s' '{"enabled":"true","workers":"4"}' | sovereign-config put /apps/api --format json
 sovereign-config delete /apps/api/settings --yes
 sovereign-config delete /apps/api --recurse --yes
 ```
 
-Text get prints an exact plain value and prints `********` for a secret; it requires `--format json` when descendants exist. `secret put` is write-only and reads replacement content from standard input. `secret reveal` is the only CLI operation that emits secret plaintext and requires an exact `read` grant. Rotation requires `write`, while exact or recursive deletion requires `manage` and permanently removes the secret.
+Text get prints an exact plain value and prints `********` for a secret; it requires `--format json` when descendants exist. Add `--reveal` to return plaintext for an exact secret, or to reveal every secret leaf in a JSON result; it requires `read` permission and never changes the stored data. `secret put` is write-only and reads replacement content from standard input. `secret reveal` remains an explicit exact-value alias and requires a `read` grant. Rotation requires `write`, while exact or recursive deletion requires `manage` and permanently removes the secret.
 
 JSON output is deterministic and pretty printed; each stored plain-text value is represented as a JSON string and every secret is represented by the exact preservation marker `"********"`. JSON is relative to the selected path, so selecting `/foo/foo2/foo3` containing `/foo/foo2/foo3/deepvalue` returns `{"deepvalue":"deepvalue"}` without a `foo3` wrapper. An exact selected value is a root JSON string, and `/` is the root object. JSON put atomically replaces the selected subtree using the same relative shape. Omitted plain values are deleted, but existing secrets are never deleted or overwritten by a subtree replacement whether omitted or represented by their mask marker; a plain value may not collide structurally with an existing secret. Use an exact put, secret rotation, or explicit delete for those transitions. JSON replacement requires both independent `write` and `manage` grants covering the selected root. Exact text put requires `write`. Put and delete print only fixed success summaries and never echo values.
 
