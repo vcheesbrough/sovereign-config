@@ -631,6 +631,11 @@ mod tests {
                 .unwrap()
                 .is_at_or_below(&ConfigPath::parse("/apps/api").unwrap())
         );
+        assert!(
+            !ConfigPath::parse("/foo/second/abc")
+                .unwrap()
+                .is_at_or_below(&ConfigPath::parse("/foo/s").unwrap())
+        );
     }
 
     fn subtree_value(path: &str, value: &str) -> SubTreeValue {

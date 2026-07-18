@@ -359,6 +359,7 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
         ("/team/service/apps/nested/message", "hello\nworld"),
         ("/team/service/apps-v2/kept", "boundary"),
         ("/team/service/foo/foo2/foo3/deepvalue", "deepvalue"),
+        ("/team/service/foo/second/abc", "bar"),
     ] {
         assert_success(&run_cli_with_input(home.path(), &["put", path], Some(value)).await);
     }
@@ -387,6 +388,36 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
     .await;
     assert_success(&deep_json);
     assert_eq!(deep_json.stdout, b"{\n  \"deepvalue\": \"deepvalue\"\n}\n");
+
+    let partial_segment = run_cli(
+        home.path(),
+        &["get", "/team/service/foo/s", "--format", "json"],
+    )
+    .await;
+    assert_success(&partial_segment);
+    assert_eq!(partial_segment.stdout, b"{}\n");
+    assert_success(
+        &run_cli_with_input(home.path(), &["put", "/team/service/foo/s"], Some("short")).await,
+    );
+    assert_success(&run_cli(home.path(), &["delete", "/team/service/foo/s", "--yes"]).await);
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["put", "/team/service/foo/s", "--format", "json"],
+            Some("{\"child\":\"value\"}"),
+        )
+        .await,
+    );
+    assert_success(
+        &run_cli(
+            home.path(),
+            &["delete", "/team/service/foo/s", "--recurse", "--yes"],
+        )
+        .await,
+    );
+    let completed_segment = run_cli(home.path(), &["get", "/team/service/foo/second/abc"]).await;
+    assert_success(&completed_segment);
+    assert_eq!(completed_segment.stdout, b"bar");
 
     let replacement = run_cli_with_input(
         home.path(),
