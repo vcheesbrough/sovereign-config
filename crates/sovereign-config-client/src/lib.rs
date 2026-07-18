@@ -2,8 +2,9 @@
 
 use async_trait::async_trait;
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, ExactValue,
-    PROTOCOL_VERSION, PlainValue, PutMetadata, Secret, ServiceStatus, Timestamp, ValueListing,
+    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, PROTOCOL_VERSION,
+    PlainValue, PutMetadata, ReplaceMetadata, Secret, ServiceStatus, SubTreeValue, Timestamp,
+    ValueListing, ValueSubTree,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,20 +60,27 @@ pub trait ValueTransport: Transport {
         bearer: &Secret,
     ) -> Result<ValueListing, ClientError>;
 
-    async fn get_value(
+    async fn get_subtree(
         &self,
         path: &ConfigPath,
         bearer: &Secret,
-    ) -> Result<ExactValue, ClientError>;
+    ) -> Result<ValueSubTree, ClientError>;
     async fn put_value(
         &self,
         path: &ConfigPath,
         value: &PlainValue,
         bearer: &Secret,
     ) -> Result<PutMetadata, ClientError>;
-    async fn delete_value(
+    async fn replace_subtree(
         &self,
         path: &ConfigPath,
+        values: &[SubTreeValue],
+        bearer: &Secret,
+    ) -> Result<ReplaceMetadata, ClientError>;
+    async fn delete_values(
+        &self,
+        path: &ConfigPath,
+        recurse: bool,
         bearer: &Secret,
     ) -> Result<DeleteMetadata, ClientError>;
 }
@@ -97,15 +105,15 @@ where
         self.transport.list_values(path, &token).await
     }
 
-    /// Reads one exact configuration value without caching or retrying.
+    /// Reads every configuration value at or below a selected path.
     ///
     /// # Errors
     ///
     /// Returns a bounded authentication, authorization, validation, missing-value,
     /// or dependency error.
-    pub async fn get_value(&self, path: &ConfigPath) -> Result<ExactValue, ClientError> {
+    pub async fn get_subtree(&self, path: &ConfigPath) -> Result<ValueSubTree, ClientError> {
         let token = self.required_token().await?;
-        self.transport.get_value(path, &token).await
+        self.transport.get_subtree(path, &token).await
     }
 
     /// Creates or replaces one exact configuration value without retrying.
@@ -122,15 +130,33 @@ where
         self.transport.put_value(path, value, &token).await
     }
 
-    /// Permanently deletes one exact configuration value without retrying.
+    /// Atomically replaces every value at or below a selected path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, authorization, validation, or dependency error.
+    pub async fn replace_subtree(
+        &self,
+        path: &ConfigPath,
+        values: &[SubTreeValue],
+    ) -> Result<ReplaceMetadata, ClientError> {
+        let token = self.required_token().await?;
+        self.transport.replace_subtree(path, values, &token).await
+    }
+
+    /// Permanently deletes one exact value or a complete subtree without retrying.
     ///
     /// # Errors
     ///
     /// Returns a bounded authentication, authorization, validation, missing-value,
     /// or dependency error.
-    pub async fn delete_value(&self, path: &ConfigPath) -> Result<DeleteMetadata, ClientError> {
+    pub async fn delete_values(
+        &self,
+        path: &ConfigPath,
+        recurse: bool,
+    ) -> Result<DeleteMetadata, ClientError> {
         let token = self.required_token().await?;
-        self.transport.delete_value(path, &token).await
+        self.transport.delete_values(path, recurse, &token).await
     }
 
     async fn required_token(&self) -> Result<Secret, ClientError> {
@@ -215,7 +241,7 @@ mod tests {
         async fn get_version(&self, protocol: &str) -> Result<VersionReply, ClientError> {
             self.0.set(self.0.get() + 1);
             Ok(VersionReply {
-                application_version: "1.3.0".into(),
+                application_version: "1.4.0".into(),
                 protocol_version: protocol.into(),
             })
         }

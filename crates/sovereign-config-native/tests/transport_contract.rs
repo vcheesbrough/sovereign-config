@@ -1,11 +1,12 @@
 use serde::Deserialize;
 use sovereign_config_client::{Transport, ValueTransport};
-use sovereign_config_core::{ClientError, ConfigPath, ErrorKind, Secret};
+use sovereign_config_core::{ClientError, ConfigPath, ErrorKind, PlainValue, Secret, SubTreeValue};
 use sovereign_config_native::TonicTransport;
-use sovereign_config_proto::sovereign::config::v1::{
-    DeleteValueRequest, DeleteValueResponse, GetIdentityRequest, GetIdentityResponse,
-    GetValueRequest, GetValueResponse, GetVersionRequest, GetVersionResponse, ListValuesRequest,
-    ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
+use sovereign_config_proto::sovereign::config::v2::{
+    DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse,
+    GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest, GetVersionResponse,
+    ListValuesRequest, ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
+    ReplaceSubTreeRequest, ReplaceSubTreeResponse, SubTreeValue as ProtoSubTreeValue,
     configuration_server::{Configuration, ConfigurationServer},
     system_server::{System, SystemServer},
 };
@@ -51,25 +52,81 @@ impl Configuration for ContractConfiguration {
         }))
     }
 
-    async fn get_value(
+    async fn get_sub_tree(
         &self,
-        _: Request<GetValueRequest>,
-    ) -> Result<tonic::Response<GetValueResponse>, Status> {
-        Err(Status::unimplemented("not used"))
+        request: Request<GetSubTreeRequest>,
+    ) -> Result<tonic::Response<GetSubTreeResponse>, Status> {
+        require_bearer(&request)?;
+        assert_eq!(request.into_inner().path, "/apps/api");
+        Ok(tonic::Response::new(GetSubTreeResponse {
+            values: vec![ProtoSubTreeValue {
+                path: "/apps/api/feature".into(),
+                value: "contract-value-sentinel".into(),
+            }],
+        }))
     }
 
     async fn put_value(
         &self,
-        _: Request<PutValueRequest>,
+        request: Request<PutValueRequest>,
     ) -> Result<tonic::Response<PutValueResponse>, Status> {
-        Err(Status::unimplemented("not used"))
+        require_bearer(&request)?;
+        let request = request.into_inner();
+        assert_eq!(request.path, "/apps/api/feature");
+        assert_eq!(request.value, "put-value-sentinel");
+        let timestamp = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 0,
+        };
+        Ok(tonic::Response::new(PutValueResponse {
+            created_at: Some(timestamp),
+            updated_at: Some(timestamp),
+        }))
     }
 
-    async fn delete_value(
+    async fn replace_sub_tree(
         &self,
-        _: Request<DeleteValueRequest>,
-    ) -> Result<tonic::Response<DeleteValueResponse>, Status> {
-        Err(Status::unimplemented("not used"))
+        request: Request<ReplaceSubTreeRequest>,
+    ) -> Result<tonic::Response<ReplaceSubTreeResponse>, Status> {
+        require_bearer(&request)?;
+        let request = request.into_inner();
+        assert_eq!(request.path, "/apps/api");
+        assert_eq!(request.values.len(), 1);
+        assert_eq!(request.values[0].path, "/apps/api/new");
+        assert_eq!(request.values[0].value, "replacement-sentinel");
+        Ok(tonic::Response::new(ReplaceSubTreeResponse {
+            updated_at: Some(prost_types::Timestamp {
+                seconds: 1_700_000_001,
+                nanos: 0,
+            }),
+            value_count: 1,
+        }))
+    }
+
+    async fn delete_values(
+        &self,
+        request: Request<DeleteValuesRequest>,
+    ) -> Result<tonic::Response<DeleteValuesResponse>, Status> {
+        require_bearer(&request)?;
+        let request = request.into_inner();
+        assert_eq!(request.path, "/apps/api");
+        assert!(request.recurse);
+        Ok(tonic::Response::new(DeleteValuesResponse {
+            deleted_at: Some(prost_types::Timestamp {
+                seconds: 1_700_000_002,
+                nanos: 0,
+            }),
+            deleted_count: 2,
+        }))
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn require_bearer<T>(request: &Request<T>) -> Result<(), Status> {
+    if request.metadata().get("authorization").is_some() {
+        Ok(())
+    } else {
+        Err(Status::unauthenticated("missing bearer"))
     }
 }
 
@@ -81,7 +138,7 @@ impl System for ContractSystem {
     ) -> Result<tonic::Response<GetVersionResponse>, Status> {
         Ok(tonic::Response::new(GetVersionResponse {
             application_version: "contract-version".to_owned(),
-            protocol_version: "v1".to_owned(),
+            protocol_version: "v2".to_owned(),
         }))
     }
 
@@ -119,9 +176,9 @@ async fn tonic_transport_satisfies_shared_contract() {
         .await
         .unwrap();
 
-    let version = transport.get_version("v1").await.unwrap();
+    let version = transport.get_version("v2").await.unwrap();
     assert_eq!(version.application_version, "contract-version");
-    assert_eq!(version.protocol_version, "v1");
+    assert_eq!(version.protocol_version, "v2");
 
     let listing = transport
         .list_values(
@@ -133,6 +190,45 @@ async fn tonic_transport_satisfies_shared_contract() {
     assert_eq!(listing.paths, [ConfigPath::parse("/apps/api").unwrap()]);
     assert_eq!(listing.values[0].path.as_str(), "/apps/api/feature");
     assert_eq!(listing.values[0].value.expose(), "contract-value-sentinel");
+
+    let selected = ConfigPath::parse("/apps/api").unwrap();
+    let subtree = transport
+        .get_subtree(&selected, &Secret::new("contract-token-sentinel"))
+        .await
+        .unwrap();
+    assert_eq!(subtree.values[0].path.as_str(), "/apps/api/feature");
+    transport
+        .put_value(
+            &ConfigPath::parse("/apps/api/feature").unwrap(),
+            &PlainValue::new("put-value-sentinel"),
+            &Secret::new("contract-token-sentinel"),
+        )
+        .await
+        .unwrap();
+    let replacement = SubTreeValue {
+        path: ConfigPath::parse("/apps/api/new").unwrap(),
+        value: PlainValue::new("replacement-sentinel"),
+    };
+    assert_eq!(
+        transport
+            .replace_subtree(
+                &selected,
+                &[replacement],
+                &Secret::new("contract-token-sentinel"),
+            )
+            .await
+            .unwrap()
+            .value_count,
+        1
+    );
+    assert_eq!(
+        transport
+            .delete_values(&selected, true, &Secret::new("contract-token-sentinel"),)
+            .await
+            .unwrap()
+            .deleted_count,
+        2
+    );
 
     for case in contract() {
         let result = transport

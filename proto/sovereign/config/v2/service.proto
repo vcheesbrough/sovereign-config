@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package sovereign.config.v1;
+package sovereign.config.v2;
 
 import "google/protobuf/timestamp.proto";
 
@@ -11,9 +11,10 @@ service System {
 
 service Configuration {
   rpc ListValues(ListValuesRequest) returns (ListValuesResponse);
-  rpc GetValue(GetValueRequest) returns (GetValueResponse);
+  rpc GetSubTree(GetSubTreeRequest) returns (GetSubTreeResponse);
   rpc PutValue(PutValueRequest) returns (PutValueResponse);
-  rpc DeleteValue(DeleteValueRequest) returns (DeleteValueResponse);
+  rpc ReplaceSubTree(ReplaceSubTreeRequest) returns (ReplaceSubTreeResponse);
+  rpc DeleteValues(DeleteValuesRequest) returns (DeleteValuesResponse);
 }
 
 message ListValuesRequest {
@@ -34,15 +35,19 @@ message ListValuesResponse {
   repeated string paths = 2;
 }
 
-message GetValueRequest {
-  // Canonical absolute configuration value path.
+message GetSubTreeRequest {
+  // Canonical absolute configuration path. `/` selects the tree root.
   string path = 1;
 }
 
-message GetValueResponse {
-  string value = 1;
-  google.protobuf.Timestamp created_at = 2;
-  google.protobuf.Timestamp updated_at = 3;
+message SubTreeValue {
+  // Canonical absolute configuration value path.
+  string path = 1;
+  string value = 2;
+}
+
+message GetSubTreeResponse {
+  repeated SubTreeValue values = 1;
 }
 
 message PutValueRequest {
@@ -56,13 +61,26 @@ message PutValueResponse {
   google.protobuf.Timestamp updated_at = 2;
 }
 
-message DeleteValueRequest {
-  // Canonical absolute configuration value path.
+message ReplaceSubTreeRequest {
+  // Canonical absolute configuration path. `/` selects the tree root.
   string path = 1;
+  repeated SubTreeValue values = 2;
 }
 
-message DeleteValueResponse {
+message ReplaceSubTreeResponse {
+  google.protobuf.Timestamp updated_at = 1;
+  uint64 value_count = 2;
+}
+
+message DeleteValuesRequest {
+  // Canonical absolute configuration path. `/` is valid only when recurse is true.
+  string path = 1;
+  bool recurse = 2;
+}
+
+message DeleteValuesResponse {
   google.protobuf.Timestamp deleted_at = 1;
+  uint64 deleted_count = 2;
 }
 
 message GetIdentityRequest {}

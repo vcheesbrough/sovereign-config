@@ -37,7 +37,7 @@ const MAX_INTROSPECTION_RESPONSE_BYTES: usize = 64 * 1024;
 const OPERATIONAL_RPCS: [&str; 3] = [
     "/grpc.health.v1.Health/Check",
     "/grpc.health.v1.Health/Watch",
-    "/sovereign.config.v1.System/GetVersion",
+    "/sovereign.config.v2.System/GetVersion",
 ];
 
 #[derive(Clone)]
@@ -867,10 +867,10 @@ mod tests {
     fn only_health_and_version_are_operational() {
         assert!(is_operational_rpc("/grpc.health.v1.Health/Check"));
         assert!(is_operational_rpc("/grpc.health.v1.Health/Watch"));
-        assert!(is_operational_rpc("/sovereign.config.v1.System/GetVersion"));
+        assert!(is_operational_rpc("/sovereign.config.v2.System/GetVersion"));
         assert!(!is_operational_rpc("/grpc.health.v1.Health/Unknown"));
         assert!(!is_operational_rpc(
-            "/sovereign.config.v1.Configuration/GetValue"
+            "/sovereign.config.v2.Configuration/GetSubTree"
         ));
     }
 
@@ -880,11 +880,11 @@ mod tests {
         assert!(is_web_asset_request(&Method::HEAD, "/app-config.js"));
         assert!(!is_web_asset_request(
             &Method::POST,
-            "/sovereign.config.v1.System/GetIdentity"
+            "/sovereign.config.v2.System/GetIdentity"
         ));
         assert!(!is_web_asset_request(
             &Method::GET,
-            "/sovereign.config.v1.System/GetVersion"
+            "/sovereign.config.v2.System/GetVersion"
         ));
     }
 
@@ -967,7 +967,7 @@ mod tests {
         });
         let mut request = Request::builder()
             .method(Method::POST)
-            .uri("/sovereign.config.v1.System/GetIdentity")
+            .uri("/sovereign.config.v2.System/GetIdentity")
             .header(CONTENT_TYPE, "application/grpc-web+proto")
             .body(empty_body())
             .unwrap();
@@ -1015,7 +1015,7 @@ mod tests {
         });
 
         let version = Request::builder()
-            .uri("/sovereign.config.v1.System/GetVersion")
+            .uri("/sovereign.config.v2.System/GetVersion")
             .body(())
             .unwrap();
         let response = layer.clone().layer(inner).oneshot(version).await.unwrap();

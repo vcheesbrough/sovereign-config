@@ -1,12 +1,13 @@
 use std::{collections::BTreeSet, time::SystemTime};
 
 use sovereign_config_core::ConfigPath;
-use sovereign_config_proto::sovereign::config::v1::{
-    DeleteValueRequest, DeleteValueResponse, GetValueRequest, GetValueResponse, ListValuesRequest,
-    ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
+use sovereign_config_proto::sovereign::config::v2::{
+    DeleteValuesRequest, DeleteValuesResponse, GetSubTreeRequest, GetSubTreeResponse,
+    ListValuesRequest, ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
+    ReplaceSubTreeRequest, ReplaceSubTreeResponse, SubTreeValue,
     configuration_server::Configuration,
 };
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use tonic::{Request, Response, Status};
 
@@ -15,13 +16,6 @@ use crate::auth::{AuthenticatedPrincipal, Permission};
 #[derive(Clone)]
 pub(crate) struct ConfigurationService {
     database: PgPool,
-}
-
-#[derive(FromRow)]
-struct ValueRow {
-    value: String,
-    created_at: OffsetDateTime,
-    updated_at: OffsetDateTime,
 }
 
 #[derive(FromRow)]
@@ -110,24 +104,32 @@ impl Configuration for ConfigurationService {
         }))
     }
 
-    async fn get_value(
+    async fn get_sub_tree(
         &self,
-        request: Request<GetValueRequest>,
-    ) -> Result<Response<GetValueResponse>, Status> {
-        let path = authorize(&request, Permission::Read)?;
-        let row = sqlx::query_as::<_, ValueRow>(
-            "SELECT value, created_at, updated_at FROM configuration_values WHERE path = $1",
+        request: Request<GetSubTreeRequest>,
+    ) -> Result<Response<GetSubTreeResponse>, Status> {
+        let path = authorize(&request, &[Permission::Read], true)?;
+        let rows = sqlx::query_as::<_, ListedValueRow>(
+            r"
+            SELECT path, value, created_at, updated_at
+            FROM configuration_values
+            WHERE $1 = '/' OR path = $1 OR path LIKE $1 || '/%'
+            ORDER BY path
+            ",
         )
         .bind(path.as_str())
-        .fetch_optional(&self.database)
+        .fetch_all(&self.database)
         .await
-        .map_err(|_| storage_unavailable())?
-        .ok_or_else(|| Status::not_found("configuration value not found"))?;
+        .map_err(|_| storage_unavailable())?;
 
-        Ok(Response::new(GetValueResponse {
-            value: row.value,
-            created_at: Some(to_proto_timestamp(row.created_at)?),
-            updated_at: Some(to_proto_timestamp(row.updated_at)?),
+        Ok(Response::new(GetSubTreeResponse {
+            values: rows
+                .into_iter()
+                .map(|row| SubTreeValue {
+                    path: row.path,
+                    value: row.value,
+                })
+                .collect(),
         }))
     }
 
@@ -135,13 +137,19 @@ impl Configuration for ConfigurationService {
         &self,
         request: Request<PutValueRequest>,
     ) -> Result<Response<PutValueResponse>, Status> {
-        let path = authorize(&request, Permission::Write)?;
+        let path = authorize(&request, &[Permission::Write], false)?;
         let value = &request.get_ref().value;
         if value.contains('\0') {
             return Err(Status::invalid_argument(
                 "configuration value contains an invalid character",
             ));
         }
+        let mut transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(|_| storage_unavailable())?;
+        lock_mutation_path(&mut transaction, &path).await?;
         let now = OffsetDateTime::from(SystemTime::now());
         let row = sqlx::query_as::<_, MutationRow>(
             r"
@@ -155,9 +163,13 @@ impl Configuration for ConfigurationService {
         .bind(path.as_str())
         .bind(value)
         .bind(now)
-        .fetch_one(&self.database)
+        .fetch_one(&mut *transaction)
         .await
         .map_err(|_| storage_unavailable())?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| storage_unavailable())?;
 
         Ok(Response::new(PutValueResponse {
             created_at: Some(to_proto_timestamp(row.created_at)?),
@@ -165,39 +177,194 @@ impl Configuration for ConfigurationService {
         }))
     }
 
-    async fn delete_value(
+    async fn replace_sub_tree(
         &self,
-        request: Request<DeleteValueRequest>,
-    ) -> Result<Response<DeleteValueResponse>, Status> {
-        let path = authorize(&request, Permission::Manage)?;
-        let deleted =
+        request: Request<ReplaceSubTreeRequest>,
+    ) -> Result<Response<ReplaceSubTreeResponse>, Status> {
+        let path = authorize(&request, &[Permission::Write, Permission::Manage], true)?;
+        let mut values = request.get_ref().values.clone();
+        values.sort_by(|first, second| first.path.cmp(&second.path));
+        let mut accepted_paths = BTreeSet::new();
+        for value in &values {
+            let value_path = ConfigPath::parse(&value.path)
+                .map_err(|_| Status::invalid_argument("configuration subtree is invalid"))?;
+            if value_path.as_str() == "/"
+                || !value_path.is_at_or_below(&path)
+                || value.value.contains('\0')
+            {
+                return Err(Status::invalid_argument("configuration subtree is invalid"));
+            }
+            let mut ancestor = value.path.as_str();
+            let mut has_stored_ancestor = false;
+            while let Some((parent, _)) = ancestor.rsplit_once('/') {
+                if parent.is_empty() {
+                    break;
+                }
+                if accepted_paths.contains(parent) {
+                    has_stored_ancestor = true;
+                    break;
+                }
+                ancestor = parent;
+            }
+            if has_stored_ancestor || !accepted_paths.insert(value.path.as_str()) {
+                return Err(Status::invalid_argument("configuration subtree is invalid"));
+            }
+        }
+
+        let paths = values
+            .iter()
+            .map(|value| value.path.clone())
+            .collect::<Vec<_>>();
+        let mut transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(|_| storage_unavailable())?;
+        lock_mutation_path(&mut transaction, &path).await?;
+        let now = OffsetDateTime::from(SystemTime::now());
+        sqlx::query(
+            r"
+            DELETE FROM configuration_values
+            WHERE ($1 = '/' OR path = $1 OR path LIKE $1 || '/%')
+              AND NOT (path = ANY($2::TEXT[]))
+            ",
+        )
+        .bind(path.as_str())
+        .bind(&paths)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| storage_unavailable())?;
+        for value in &values {
+            sqlx::query(
+                r"
+                INSERT INTO configuration_values (path, value, created_at, updated_at)
+                VALUES ($1, $2, $3, $3)
+                ON CONFLICT (path) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+                ",
+            )
+            .bind(&value.path)
+            .bind(&value.value)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| storage_unavailable())?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| storage_unavailable())?;
+        Ok(Response::new(ReplaceSubTreeResponse {
+            updated_at: Some(to_proto_timestamp(now)?),
+            value_count: u64::try_from(values.len()).map_err(|_| storage_unavailable())?,
+        }))
+    }
+
+    async fn delete_values(
+        &self,
+        request: Request<DeleteValuesRequest>,
+    ) -> Result<Response<DeleteValuesResponse>, Status> {
+        let recurse = request.get_ref().recurse;
+        let path = authorize(&request, &[Permission::Manage], recurse)?;
+        let mut transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(|_| storage_unavailable())?;
+        lock_mutation_path(&mut transaction, &path).await?;
+        let deleted = if recurse {
+            sqlx::query(
+                "DELETE FROM configuration_values WHERE $1 = '/' OR path = $1 OR path LIKE $1 || '/%' RETURNING path",
+            )
+            .bind(path.as_str())
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|_| storage_unavailable())?
+        } else {
             sqlx::query("DELETE FROM configuration_values WHERE path = $1 RETURNING path")
                 .bind(path.as_str())
-                .fetch_optional(&self.database)
+                .fetch_all(&mut *transaction)
                 .await
-                .map_err(|_| storage_unavailable())?;
-        if deleted.is_none() {
+                .map_err(|_| storage_unavailable())?
+        };
+        if deleted.is_empty() {
             return Err(Status::not_found("configuration value not found"));
         }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| storage_unavailable())?;
         let deleted_at = OffsetDateTime::from(SystemTime::now());
-        Ok(Response::new(DeleteValueResponse {
+        Ok(Response::new(DeleteValuesResponse {
             deleted_at: Some(to_proto_timestamp(deleted_at)?),
+            deleted_count: u64::try_from(deleted.len()).map_err(|_| storage_unavailable())?,
         }))
     }
 }
 
+// Shared ancestor locks and an exclusive target lock form a hierarchy: sibling
+// subtrees can proceed together, while identical or parent/descendant mutations
+// serialize. A hash collision can only add serialization, never remove it.
+async fn lock_mutation_path(
+    transaction: &mut Transaction<'_, Postgres>,
+    path: &ConfigPath,
+) -> Result<(), Status> {
+    if path.as_str() != "/" {
+        lock_path(transaction, "/", false).await?;
+        let parent = parent_path(path);
+        if parent != "/" {
+            let mut prefix = String::new();
+            for segment in parent.trim_start_matches('/').split('/') {
+                prefix.push('/');
+                prefix.push_str(segment);
+                lock_path(transaction, &prefix, false).await?;
+            }
+        }
+    }
+    lock_path(transaction, path.as_str(), true).await
+}
+
+async fn lock_path(
+    transaction: &mut Transaction<'_, Postgres>,
+    path: &str,
+    exclusive: bool,
+) -> Result<(), Status> {
+    let query = if exclusive {
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
+    } else {
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))"
+    };
+    sqlx::query(query)
+        .bind(path)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| storage_unavailable())?;
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
-fn authorize<T>(request: &Request<T>, permission: Permission) -> Result<ConfigPath, Status>
+fn authorize<T>(
+    request: &Request<T>,
+    permissions: &[Permission],
+    allow_root: bool,
+) -> Result<ConfigPath, Status>
 where
     T: ValueRequest,
 {
-    let path = ConfigPath::parse_operation(request.get_ref().path())
-        .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
+    let path = if allow_root {
+        ConfigPath::parse_selection(request.get_ref().path())
+    } else {
+        ConfigPath::parse_operation(request.get_ref().path())
+    }
+    .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
     let principal = request
         .extensions()
         .get::<AuthenticatedPrincipal>()
         .ok_or_else(|| Status::unauthenticated("authentication required"))?;
-    if !principal.allows(&path, permission) {
+    if permissions
+        .iter()
+        .any(|permission| !principal.allows(&path, *permission))
+    {
         return Err(Status::permission_denied(
             "configuration operation is not permitted",
         ));
@@ -209,7 +376,7 @@ trait ValueRequest {
     fn path(&self) -> &str;
 }
 
-impl ValueRequest for GetValueRequest {
+impl ValueRequest for GetSubTreeRequest {
     fn path(&self) -> &str {
         &self.path
     }
@@ -221,7 +388,13 @@ impl ValueRequest for PutValueRequest {
     }
 }
 
-impl ValueRequest for DeleteValueRequest {
+impl ValueRequest for ReplaceSubTreeRequest {
+    fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl ValueRequest for DeleteValuesRequest {
     fn path(&self) -> &str {
         &self.path
     }
@@ -267,15 +440,16 @@ fn invalid_timestamp() -> Status {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, env};
+    use std::{collections::BTreeSet, env, time::Duration};
 
-    use sovereign_config_proto::sovereign::config::v1::configuration_server::Configuration;
+    use sovereign_config_proto::sovereign::config::v2::configuration_server::Configuration;
     use sqlx::postgres::PgPoolOptions;
+    use tokio::time::{sleep, timeout};
     use tonic::{Code, Request};
 
     use super::{
-        ConfigurationService, DeleteValueRequest, GetValueRequest, ListValuesRequest,
-        PutValueRequest,
+        ConfigurationService, DeleteValuesRequest, GetSubTreeRequest, ListValuesRequest,
+        PutValueRequest, ReplaceSubTreeRequest, SubTreeValue,
     };
     use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
 
@@ -298,12 +472,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
     #[allow(clippy::too_many_lines)]
-    async fn postgres_service_enforces_permissions_and_exact_value_lifecycle() {
+    async fn postgres_service_enforces_atomic_v2_value_lifecycle() {
         let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
             .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        sqlx::query("DELETE FROM configuration_values WHERE path LIKE '/tests/exact/%'")
+        sqlx::query(
+            "DELETE FROM configuration_values WHERE path = '/tests/exact' OR path LIKE '/tests/exact/%' OR path LIKE '/tests/exactly/%'",
+        )
             .execute(&pool)
             .await
             .unwrap();
@@ -320,8 +496,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(invalid_list.code(), Code::InvalidArgument);
         let unrooted_value = service
-            .get_value(request(
-                GetValueRequest {
+            .get_sub_tree(request(
+                GetSubTreeRequest {
                     path: "tests/exact/key".into(),
                 },
                 &[Permission::Read],
@@ -341,7 +517,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(invalid_value.code(), Code::InvalidArgument);
 
-        let first = service
+        service
             .put_value(request(
                 PutValueRequest {
                     path: "/Tests/Exact/Key".into(),
@@ -350,8 +526,18 @@ mod tests {
                 &[Permission::Write],
             ))
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
+        service
+            .put_value(request_for_prefix(
+                PutValueRequest {
+                    path: "/tests/exactly/outside".into(),
+                    value: "boundary-value-sentinel".into(),
+                },
+                "/",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
         service
             .put_value(request(
                 PutValueRequest {
@@ -407,9 +593,9 @@ mod tests {
         assert!(write_only.values.is_empty());
         assert!(write_only.paths.is_empty());
         let denied = service
-            .get_value(request(
-                GetValueRequest {
-                    path: "/tests/exact/key".into(),
+            .get_sub_tree(request(
+                GetSubTreeRequest {
+                    path: "/tests/exact".into(),
                 },
                 &[Permission::Write],
             ))
@@ -419,41 +605,36 @@ mod tests {
         assert!(!denied.message().contains("value-sentinel"));
 
         let stored = service
-            .get_value(request(
-                GetValueRequest {
-                    path: "/TESTS/EXACT/KEY".into(),
+            .get_sub_tree(request(
+                GetSubTreeRequest {
+                    path: "/TESTS/EXACT".into(),
                 },
                 &[Permission::Read],
             ))
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(stored.value, "value-sentinel-one");
-        assert_eq!(stored.created_at, first.created_at);
+        assert_eq!(stored.values.len(), 2);
+        assert_eq!(stored.values[0].path, "/tests/exact/key");
+        assert_eq!(stored.values[0].value, "value-sentinel-one");
+        assert_eq!(stored.values[1].path, "/tests/exact/nested/child");
 
-        let second = service
-            .put_value(request(
-                PutValueRequest {
-                    path: "/tests/exact/key".into(),
-                    value: "value-sentinel-two".into(),
+        let narrower_read = service
+            .get_sub_tree(request_for_prefix(
+                GetSubTreeRequest {
+                    path: "/tests/exact".into(),
                 },
-                &[Permission::Write],
+                "/tests/exact/nested",
+                &[Permission::Read],
             ))
             .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(second.created_at, first.created_at);
-        let first_updated = first.updated_at.unwrap();
-        let second_updated = second.updated_at.unwrap();
-        assert!(
-            (second_updated.seconds, second_updated.nanos)
-                >= (first_updated.seconds, first_updated.nanos)
-        );
+            .unwrap_err();
+        assert_eq!(narrower_read.code(), Code::PermissionDenied);
 
         let boundary = service
-            .get_value(request(
-                GetValueRequest {
-                    path: "/tests/exactly/key".into(),
+            .get_sub_tree(request(
+                GetSubTreeRequest {
+                    path: "/tests/exactly".into(),
                 },
                 &[Permission::Read],
             ))
@@ -461,36 +642,323 @@ mod tests {
             .unwrap_err();
         assert_eq!(boundary.code(), Code::PermissionDenied);
 
-        service
-            .delete_value(request(
-                DeleteValueRequest {
-                    path: "/tests/exact/key".into(),
+        let write_only_replace = service
+            .replace_sub_tree(request(
+                ReplaceSubTreeRequest {
+                    path: "/tests/exact".into(),
+                    values: vec![],
                 },
-                &[Permission::Manage],
+                &[Permission::Write],
             ))
             .await
-            .unwrap();
-        let missing = service
-            .get_value(request(
-                GetValueRequest {
-                    path: "/tests/exact/key".into(),
+            .unwrap_err();
+        assert_eq!(write_only_replace.code(), Code::PermissionDenied);
+
+        let invalid_replace = service
+            .replace_sub_tree(request(
+                ReplaceSubTreeRequest {
+                    path: "/tests/exact".into(),
+                    values: vec![
+                        SubTreeValue {
+                            path: "/tests/exact/collision/child".into(),
+                            value: "child".into(),
+                        },
+                        SubTreeValue {
+                            path: "/tests/exact/collision-sibling".into(),
+                            value: "sibling".into(),
+                        },
+                        SubTreeValue {
+                            path: "/tests/exact/collision".into(),
+                            value: "parent".into(),
+                        },
+                    ],
+                },
+                &[Permission::Write, Permission::Manage],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid_replace.code(), Code::InvalidArgument);
+        let invalid_root_value = service
+            .replace_sub_tree(request_for_prefix(
+                ReplaceSubTreeRequest {
+                    path: "/".into(),
+                    values: vec![SubTreeValue {
+                        path: "/".into(),
+                        value: "invalid-root-value".into(),
+                    }],
+                },
+                "/",
+                &[Permission::Write, Permission::Manage],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid_root_value.code(), Code::InvalidArgument);
+        assert_eq!(
+            service
+                .get_sub_tree(request(
+                    GetSubTreeRequest {
+                        path: "/tests/exact".into()
+                    },
+                    &[Permission::Read]
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .values
+                .len(),
+            2
+        );
+
+        let replacement = service
+            .replace_sub_tree(request(
+                ReplaceSubTreeRequest {
+                    path: "/tests/exact".into(),
+                    values: vec![
+                        SubTreeValue {
+                            path: "/tests/exact/alpha".into(),
+                            value: "one".into(),
+                        },
+                        SubTreeValue {
+                            path: "/tests/exact/nested/beta".into(),
+                            value: "two".into(),
+                        },
+                    ],
+                },
+                &[Permission::Write, Permission::Manage],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(replacement.value_count, 2);
+        let replaced = service
+            .get_sub_tree(request(
+                GetSubTreeRequest {
+                    path: "/tests/exact".into(),
                 },
                 &[Permission::Read],
             ))
             .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            replaced
+                .values
+                .iter()
+                .map(|value| value.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/tests/exact/alpha", "/tests/exact/nested/beta"]
+        );
+
+        let exact_delete = service
+            .delete_values(request(
+                DeleteValuesRequest {
+                    path: "/tests/exact/alpha".into(),
+                    recurse: false,
+                },
+                &[Permission::Manage],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(exact_delete.deleted_count, 1);
+        let recursive_delete = service
+            .delete_values(request(
+                DeleteValuesRequest {
+                    path: "/tests/exact".into(),
+                    recurse: true,
+                },
+                &[Permission::Manage],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(recursive_delete.deleted_count, 1);
+        let preserved_boundary = service
+            .get_sub_tree(request_for_prefix(
+                GetSubTreeRequest {
+                    path: "/tests/exactly".into(),
+                },
+                "/",
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(preserved_boundary.values.len(), 1);
+        assert_eq!(preserved_boundary.values[0].path, "/tests/exactly/outside");
+        let missing_delete = service
+            .delete_values(request(
+                DeleteValuesRequest {
+                    path: "/tests/exact".into(),
+                    recurse: true,
+                },
+                &[Permission::Manage],
+            ))
+            .await
             .unwrap_err();
-        assert_eq!(missing.code(), Code::NotFound);
+        assert_eq!(missing_delete.code(), Code::NotFound);
+        assert!(
+            service
+                .get_sub_tree(request(
+                    GetSubTreeRequest {
+                        path: "/tests/exact".into()
+                    },
+                    &[Permission::Read]
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .values
+                .is_empty()
+        );
 
         pool.close().await;
         let unavailable = service
-            .get_value(request(
-                GetValueRequest {
-                    path: "/tests/exact/key".into(),
+            .get_sub_tree(request(
+                GetSubTreeRequest {
+                    path: "/tests/exact".into(),
                 },
                 &[Permission::Read],
             ))
             .await
             .unwrap_err();
         assert_eq!(unavailable.code(), Code::Unavailable);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_serializes_overlapping_subtree_replacements() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "DELETE FROM configuration_values WHERE path = '/tests/concurrent' OR path LIKE '/tests/concurrent/%'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO configuration_values (path, value, created_at, updated_at) VALUES ('/tests/concurrent/existing', 'seed', NOW(), NOW())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT path FROM configuration_values WHERE path = '/tests/concurrent/existing' FOR UPDATE",
+        )
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+        let service = ConfigurationService::new(pool.clone());
+        let first_service = service.clone();
+        let first = tokio::spawn(async move {
+            first_service
+                .replace_sub_tree(request_for_prefix(
+                    ReplaceSubTreeRequest {
+                        path: "/tests/concurrent".into(),
+                        values: vec![
+                            SubTreeValue {
+                                path: "/tests/concurrent/alpha-one".into(),
+                                value: "one".into(),
+                            },
+                            SubTreeValue {
+                                path: "/tests/concurrent/alpha-two".into(),
+                                value: "two".into(),
+                            },
+                        ],
+                    },
+                    "/tests/concurrent",
+                    &[Permission::Write, Permission::Manage],
+                ))
+                .await
+        });
+        let second = tokio::spawn(async move {
+            service
+                .replace_sub_tree(request_for_prefix(
+                    ReplaceSubTreeRequest {
+                        path: "/tests/concurrent".into(),
+                        values: vec![
+                            SubTreeValue {
+                                path: "/tests/concurrent/beta-one".into(),
+                                value: "one".into(),
+                            },
+                            SubTreeValue {
+                                path: "/tests/concurrent/beta-two".into(),
+                                value: "two".into(),
+                            },
+                        ],
+                    },
+                    "/tests/concurrent",
+                    &[Permission::Write, Permission::Manage],
+                ))
+                .await
+        });
+
+        let both_waiting = timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    r"
+                    SELECT COUNT(*)
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND pid <> pg_backend_pid()
+                      AND wait_event_type = 'Lock'
+                      AND (
+                        query LIKE '%DELETE FROM configuration_values%'
+                        OR query LIKE '%pg_advisory_xact_lock%'
+                      )
+                    ",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if waiting >= 2 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        blocker.commit().await.unwrap();
+        assert!(
+            both_waiting.is_ok(),
+            "concurrent replacements did not both reach their lock waits"
+        );
+        for replacement in [first, second] {
+            timeout(Duration::from_secs(5), replacement)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+
+        let paths = sqlx::query_scalar::<_, String>(
+            "SELECT path FROM configuration_values WHERE path LIKE '/tests/concurrent/%' ORDER BY path",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            paths == ["/tests/concurrent/alpha-one", "/tests/concurrent/alpha-two",]
+                || paths == ["/tests/concurrent/beta-one", "/tests/concurrent/beta-two",],
+            "final subtree was not one complete replacement: {paths:?}"
+        );
+
+        sqlx::query(
+            "DELETE FROM configuration_values WHERE path = '/tests/concurrent' OR path LIKE '/tests/concurrent/%'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
     }
 }
