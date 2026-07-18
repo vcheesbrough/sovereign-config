@@ -7,7 +7,7 @@ use sovereign_config_proto::sovereign::config::v2::{
     ReplaceSubTreeRequest, ReplaceSubTreeResponse, SubTreeValue,
     configuration_server::Configuration,
 };
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use tonic::{Request, Response, Status};
 
@@ -144,6 +144,12 @@ impl Configuration for ConfigurationService {
                 "configuration value contains an invalid character",
             ));
         }
+        let mut transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(|_| storage_unavailable())?;
+        lock_mutation_path(&mut transaction, &path).await?;
         let now = OffsetDateTime::from(SystemTime::now());
         let row = sqlx::query_as::<_, MutationRow>(
             r"
@@ -157,9 +163,13 @@ impl Configuration for ConfigurationService {
         .bind(path.as_str())
         .bind(value)
         .bind(now)
-        .fetch_one(&self.database)
+        .fetch_one(&mut *transaction)
         .await
         .map_err(|_| storage_unavailable())?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| storage_unavailable())?;
 
         Ok(Response::new(PutValueResponse {
             created_at: Some(to_proto_timestamp(row.created_at)?),
@@ -201,7 +211,6 @@ impl Configuration for ConfigurationService {
             }
         }
 
-        let now = OffsetDateTime::from(SystemTime::now());
         let paths = values
             .iter()
             .map(|value| value.path.clone())
@@ -211,6 +220,8 @@ impl Configuration for ConfigurationService {
             .begin()
             .await
             .map_err(|_| storage_unavailable())?;
+        lock_mutation_path(&mut transaction, &path).await?;
+        let now = OffsetDateTime::from(SystemTime::now());
         sqlx::query(
             r"
             DELETE FROM configuration_values
@@ -260,6 +271,7 @@ impl Configuration for ConfigurationService {
             .begin()
             .await
             .map_err(|_| storage_unavailable())?;
+        lock_mutation_path(&mut transaction, &path).await?;
         let deleted = if recurse {
             sqlx::query(
                 "DELETE FROM configuration_values WHERE $1 = '/' OR path = $1 OR path LIKE $1 || '/%' RETURNING path",
@@ -288,6 +300,46 @@ impl Configuration for ConfigurationService {
             deleted_count: u64::try_from(deleted.len()).map_err(|_| storage_unavailable())?,
         }))
     }
+}
+
+// Shared ancestor locks and an exclusive target lock form a hierarchy: sibling
+// subtrees can proceed together, while identical or parent/descendant mutations
+// serialize. A hash collision can only add serialization, never remove it.
+async fn lock_mutation_path(
+    transaction: &mut Transaction<'_, Postgres>,
+    path: &ConfigPath,
+) -> Result<(), Status> {
+    if path.as_str() != "/" {
+        lock_path(transaction, "/", false).await?;
+        let parent = parent_path(path);
+        if parent != "/" {
+            let mut prefix = String::new();
+            for segment in parent.trim_start_matches('/').split('/') {
+                prefix.push('/');
+                prefix.push_str(segment);
+                lock_path(transaction, &prefix, false).await?;
+            }
+        }
+    }
+    lock_path(transaction, path.as_str(), true).await
+}
+
+async fn lock_path(
+    transaction: &mut Transaction<'_, Postgres>,
+    path: &str,
+    exclusive: bool,
+) -> Result<(), Status> {
+    let query = if exclusive {
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
+    } else {
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))"
+    };
+    sqlx::query(query)
+        .bind(path)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| storage_unavailable())?;
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -388,10 +440,11 @@ fn invalid_timestamp() -> Status {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, env};
+    use std::{collections::BTreeSet, env, time::Duration};
 
     use sovereign_config_proto::sovereign::config::v2::configuration_server::Configuration;
     use sqlx::postgres::PgPoolOptions;
+    use tokio::time::{sleep, timeout};
     use tonic::{Code, Request};
 
     use super::{
@@ -770,5 +823,142 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(unavailable.code(), Code::Unavailable);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_serializes_overlapping_subtree_replacements() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "DELETE FROM configuration_values WHERE path = '/tests/concurrent' OR path LIKE '/tests/concurrent/%'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO configuration_values (path, value, created_at, updated_at) VALUES ('/tests/concurrent/existing', 'seed', NOW(), NOW())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT path FROM configuration_values WHERE path = '/tests/concurrent/existing' FOR UPDATE",
+        )
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+        let service = ConfigurationService::new(pool.clone());
+        let first_service = service.clone();
+        let first = tokio::spawn(async move {
+            first_service
+                .replace_sub_tree(request_for_prefix(
+                    ReplaceSubTreeRequest {
+                        path: "/tests/concurrent".into(),
+                        values: vec![
+                            SubTreeValue {
+                                path: "/tests/concurrent/alpha-one".into(),
+                                value: "one".into(),
+                            },
+                            SubTreeValue {
+                                path: "/tests/concurrent/alpha-two".into(),
+                                value: "two".into(),
+                            },
+                        ],
+                    },
+                    "/tests/concurrent",
+                    &[Permission::Write, Permission::Manage],
+                ))
+                .await
+        });
+        let second = tokio::spawn(async move {
+            service
+                .replace_sub_tree(request_for_prefix(
+                    ReplaceSubTreeRequest {
+                        path: "/tests/concurrent".into(),
+                        values: vec![
+                            SubTreeValue {
+                                path: "/tests/concurrent/beta-one".into(),
+                                value: "one".into(),
+                            },
+                            SubTreeValue {
+                                path: "/tests/concurrent/beta-two".into(),
+                                value: "two".into(),
+                            },
+                        ],
+                    },
+                    "/tests/concurrent",
+                    &[Permission::Write, Permission::Manage],
+                ))
+                .await
+        });
+
+        let both_waiting = timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    r"
+                    SELECT COUNT(*)
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND pid <> pg_backend_pid()
+                      AND wait_event_type = 'Lock'
+                      AND (
+                        query LIKE '%DELETE FROM configuration_values%'
+                        OR query LIKE '%pg_advisory_xact_lock%'
+                      )
+                    ",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if waiting >= 2 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        blocker.commit().await.unwrap();
+        assert!(
+            both_waiting.is_ok(),
+            "concurrent replacements did not both reach their lock waits"
+        );
+        for replacement in [first, second] {
+            timeout(Duration::from_secs(5), replacement)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+
+        let paths = sqlx::query_scalar::<_, String>(
+            "SELECT path FROM configuration_values WHERE path LIKE '/tests/concurrent/%' ORDER BY path",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            paths == ["/tests/concurrent/alpha-one", "/tests/concurrent/alpha-two",]
+                || paths == ["/tests/concurrent/beta-one", "/tests/concurrent/beta-two",],
+            "final subtree was not one complete replacement: {paths:?}"
+        );
+
+        sqlx::query(
+            "DELETE FROM configuration_values WHERE path = '/tests/concurrent' OR path LIKE '/tests/concurrent/%'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
     }
 }
