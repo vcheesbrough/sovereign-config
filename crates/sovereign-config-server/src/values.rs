@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, time::SystemTime};
 
-use sovereign_config_core::ConfigPath;
+use sovereign_config_core::{ConfigPath, MASKED_SECRET_TEXT};
 use sovereign_config_proto::sovereign::config::v3::{
     DeleteValuesRequest, DeleteValuesResponse, GetSubTreeRequest, GetSubTreeResponse,
     ListValuesRequest, ListValuesResponse, ListedValue, MaskedSecret, PutValueRequest,
@@ -200,8 +200,6 @@ impl Configuration for ConfigurationService {
         let mut values = request.get_ref().values.clone();
         values.sort_by(|first, second| first.path.cmp(&second.path));
         let mut accepted_paths = BTreeSet::new();
-        let mut plain_paths = Vec::new();
-        let mut preserve_paths = BTreeSet::new();
         for value in &values {
             let value_path = ConfigPath::parse(&value.path)
                 .map_err(|_| Status::invalid_argument("configuration subtree is invalid"))?;
@@ -210,13 +208,8 @@ impl Configuration for ConfigurationService {
             }
             match value.content.as_ref() {
                 Some(sub_tree_mutation_value::Content::PlainValue(content))
-                    if !content.contains('\0') =>
-                {
-                    plain_paths.push(value.path.clone());
-                }
-                Some(sub_tree_mutation_value::Content::PreserveSecret(_)) => {
-                    preserve_paths.insert(value.path.clone());
-                }
+                    if !content.contains('\0') => {}
+                Some(sub_tree_mutation_value::Content::PreserveSecret(_)) => {}
                 _ => return Err(Status::invalid_argument("configuration subtree is invalid")),
             }
             let mut ancestor = value.path.as_str();
@@ -259,12 +252,46 @@ impl Configuration for ConfigurationService {
             .into_iter()
             .map(|row| row.path)
             .collect::<BTreeSet<_>>();
-        if !preserve_paths.is_subset(&secret_paths)
-            || plain_paths.iter().any(|plain| {
-                secret_paths
-                    .iter()
-                    .any(|secret| paths_collide(plain, secret))
+        // The JSON representation uses the masked token for both a preserved
+        // secret and a legitimate plain value with the same text. Resolve
+        // that ambiguity against the stored classification while the
+        // mutation path is locked. Unknown markers are therefore stored as a
+        // plain masked token; markers colliding with an existing secret still
+        // fail the subtree validation below.
+        for value in &mut values {
+            let Some(sub_tree_mutation_value::Content::PreserveSecret(_)) = value.content.as_ref()
+            else {
+                continue;
+            };
+            if !secret_paths.contains(&value.path) {
+                value.content = Some(sub_tree_mutation_value::Content::PlainValue(
+                    MASKED_SECRET_TEXT.into(),
+                ));
+            }
+        }
+        let plain_paths: Vec<String> = values
+            .iter()
+            .filter_map(|value| match value.content.as_ref() {
+                Some(sub_tree_mutation_value::Content::PlainValue(_)) => Some(value.path.clone()),
+                _ => None,
             })
+            .collect();
+        let preserve_paths = values
+            .iter()
+            .filter_map(|value| match value.content.as_ref() {
+                Some(sub_tree_mutation_value::Content::PreserveSecret(_)) => {
+                    Some(value.path.as_str())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if plain_paths.iter().any(|plain| {
+            secret_paths
+                .iter()
+                .any(|secret| paths_collide(plain, secret))
+        }) || !preserve_paths
+            .iter()
+            .all(|preserve| secret_paths.contains(*preserve))
         {
             return Err(Status::invalid_argument("configuration subtree is invalid"));
         }
@@ -578,7 +605,7 @@ mod tests {
 
     use super::{
         ConfigurationService, DeleteValuesRequest, GetSubTreeRequest, ListValuesRequest,
-        PutValueRequest, ReplaceSubTreeRequest,
+        MASKED_SECRET_TEXT, PutValueRequest, ReplaceSubTreeRequest,
     };
     use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
 
@@ -1003,6 +1030,44 @@ mod tests {
             listing.values[0].content,
             Some(listed_value::Content::MaskedSecret(_))
         ));
+
+        // A plain value that happens to equal the JSON mask token must still
+        // round-trip as plain when the marker is resolved against stored
+        // classifications.
+        service
+            .replace_sub_tree(request_for_prefix(
+                ReplaceSubTreeRequest {
+                    path: "/tests/secrets".into(),
+                    values: vec![
+                        preserve_secret("/tests/secrets/credential"),
+                        preserve_secret("/tests/secrets/plain-mask"),
+                    ],
+                },
+                "/tests/secrets",
+                &[Permission::Write, Permission::Manage],
+            ))
+            .await
+            .unwrap();
+        let round_tripped = service
+            .get_sub_tree(request_for_prefix(
+                GetSubTreeRequest {
+                    path: "/tests/secrets".into(),
+                },
+                "/tests/secrets",
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(round_tripped.values.iter().any(|value| {
+            value.path == "/tests/secrets/plain-mask"
+                && value.classification == ValueClassification::Plain as i32
+                && matches!(
+                    value.content.as_ref(),
+                    Some(sub_tree_value::Content::PlainValue(content))
+                        if content == MASKED_SECRET_TEXT
+                )
+        }));
 
         let revealed = service
             .reveal_secret(request_for_prefix(
