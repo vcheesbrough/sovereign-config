@@ -5,12 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#10211b">
     <title>Sovereign Config</title>
-    <link rel="stylesheet" href="/style-f98fc904f525d229.css" integrity="sha384-N6Qvg/VkLtNejpJPlJu6HRYbC9gXpbe6NiZ+8p7BP7O5Zj9RthCvKeOGPnu75g18"/>
+    <link rel="stylesheet" href="/style-4cdc3201850c435b.css" integrity="sha384-yu1woeCvAgEIOXIAvb8cemlTMspoNNClcDcgAuIR7p2EtxdnQ0cFQRaMc76u1JnS"/>
     <script src="/app-config.js"></script>
     
 <script type="module">
-import init, * as bindings from '/sovereign-config-web-f5811dd82a1a265a.js';
-const wasm = await init({ module_or_path: '/sovereign-config-web-f5811dd82a1a265a_bg.wasm' });
+import init, * as bindings from '/sovereign-config-web-5503f71e2ed6198a.js';
+const wasm = await init({ module_or_path: '/sovereign-config-web-5503f71e2ed6198a_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -19,7 +19,7 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-  <link rel="modulepreload" href="/sovereign-config-web-f5811dd82a1a265a.js" crossorigin="anonymous" integrity="sha384-j76VOSk8IMDj+6EQNEq/pLVZGAnsNY4soSyHeezLi7b/U+QQi16L1Fp90nzaZjx6"><link rel="preload" href="/sovereign-config-web-f5811dd82a1a265a_bg.wasm" crossorigin="anonymous" integrity="sha384-XrVI3lTSX65gyObz8IpNyd4Dez2Cc5xDvO3o5C8GnIg9lesiFHKf4+2OLaixUWon" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/sovereign-config-web-5503f71e2ed6198a.js" crossorigin="anonymous" integrity="sha384-r/VF3yuS1zYdyiKGnR1tL5Nldzr3R1oY1iBW1ar0Ze8t7K/ulURg/BioIRQUawOM"><link rel="preload" href="/sovereign-config-web-5503f71e2ed6198a_bg.wasm" crossorigin="anonymous" integrity="sha384-Wzv8HvIhOmkno+HDIWXb1h31V2Ma4yJMm8M0mNmaP9zf1o6a3p2yIB/o2aBRNuPF" as="fetch" type="application/wasm"></head>
   <body>
     <header>
       <a id="brand-link" class="brand" href="/" aria-label="Sovereign Config home">
@@ -111,10 +111,17 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
                     <label class="visually-hidden" for="new-value-name">Name</label>
                     <input id="new-value-name" type="text" autocomplete="off" spellcheck="false" placeholder="value-name" aria-describedby="new-name-error">
                     <p id="new-name-error" class="field-error" aria-live="polite" hidden></p>
+                    <label class="secret-choice" for="new-value-secret">
+                      <input id="new-value-secret" type="checkbox">
+                      Store as secret
+                    </label>
                   </th>
                   <td>
                     <label class="visually-hidden" for="new-value-content">Value</label>
                     <textarea id="new-value-content" rows="2" spellcheck="false" aria-describedby="new-value-error"></textarea>
+                    <label class="visually-hidden" for="new-secret-content">Secret value</label>
+                    <input id="new-secret-content" type="password" autocomplete="new-password" aria-describedby="new-value-error" hidden>
+                    <button id="toggle-new-secret" class="secondary secret-input-toggle" type="button" aria-controls="new-secret-content" aria-pressed="false" hidden>Show input</button>
                     <p id="new-value-error" class="field-error" aria-live="polite" hidden></p>
                   </td>
                   <td class="muted">New</td>

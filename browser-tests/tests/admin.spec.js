@@ -55,21 +55,32 @@ function scalarField(number, value) {
   return Buffer.concat([varint(number << 3), varint(value)]);
 }
 
-function subTreeValue(path, value) {
-  return Buffer.concat([field(1, Buffer.from(path)), field(2, Buffer.from(value))]);
+function storedValue(value) {
+  return typeof value === 'string' ? { value, secret: false } : value;
+}
+
+function subTreeValue(path, stored) {
+  const value = storedValue(stored);
+  return Buffer.concat([
+    field(1, Buffer.from(path)),
+    value.secret ? field(3, Buffer.alloc(0)) : field(2, Buffer.from(value.value)),
+    scalarField(4, value.secret ? 2 : 1)
+  ]);
 }
 
 function subtreeReply(values) {
   return Buffer.concat(values.map(([path, value]) => field(1, subTreeValue(path, value))));
 }
 
-function listedValue(path, value) {
+function listedValue(path, stored) {
+  const value = storedValue(stored);
   const instant = timestamp(1700000000);
   return Buffer.concat([
     field(1, Buffer.from(path)),
-    field(2, Buffer.from(value)),
+    value.secret ? field(5, Buffer.alloc(0)) : field(2, Buffer.from(value.value)),
     field(3, instant),
-    field(4, instant)
+    field(4, instant),
+    scalarField(6, value.secret ? 2 : 1)
   ]);
 }
 
@@ -165,10 +176,10 @@ function existingPaths(values) {
 }
 
 async function mockValues(page, initial = {}) {
-  const stored = new Map(Object.entries(initial));
+  const stored = new Map(Object.entries(initial).map(([path, value]) => [path, storedValue(value)]));
   const requests = [];
   let delayedSubtree;
-  await page.route('**/sovereign.config.v2.Configuration/*', async route => {
+  await page.route('**/sovereign.config.v3.Configuration/*', async route => {
     const method = route.request().url().split('/').pop();
     const body = route.request().postDataBuffer();
     const fields = stringFields(body);
@@ -207,7 +218,8 @@ async function mockValues(page, initial = {}) {
       });
     }
     if (method === 'PutValue') {
-      stored.set(fields.get(1), fields.get(2));
+      const secret = fields.has(3);
+      stored.set(fields.get(1), { value: fields.get(secret ? 3 : 2), secret });
       return route.fulfill({
         status: 200,
         headers: { 'content-type': 'application/grpc-web+proto' },
@@ -217,18 +229,30 @@ async function mockValues(page, initial = {}) {
     if (method === 'ReplaceSubTree') {
       const selected = fields.get(1) || '/';
       for (const path of [...stored.keys()]) {
-        if (selected === '/' || path === selected || path.startsWith(`${selected}/`)) {
+        if (!stored.get(path).secret && (selected === '/' || path === selected || path.startsWith(`${selected}/`))) {
           stored.delete(path);
         }
       }
       const replacements = repeatedMessages(body, 2);
-      for (const value of replacements) stored.set(value.get(1), value.get(2));
+      for (const value of replacements) {
+        if (value.has(2)) stored.set(value.get(1), { value: value.get(2), secret: false });
+      }
       return route.fulfill({
         status: 200,
         headers: { 'content-type': 'application/grpc-web+proto' },
         body: grpcFrame(Buffer.concat([
           field(1, timestamp(1700000001)), scalarField(2, replacements.length)
         ]))
+      });
+    }
+    if (method === 'RevealSecret') {
+      const selected = fields.get(1);
+      const value = stored.get(selected);
+      const status = value?.secret ? 0 : (value ? 3 : 5);
+      return route.fulfill({
+        status: 200,
+        headers: { 'content-type': 'application/grpc-web+proto' },
+        body: grpcFrame(status === 0 ? field(1, Buffer.from(value.value)) : Buffer.alloc(0), status)
       });
     }
     if (method !== 'DeleteValues') {
@@ -259,8 +283,11 @@ async function mockValues(page, initial = {}) {
       delayedSubtree = { promise };
       return release;
     },
-    setValue(path, value) {
-      stored.set(path, value);
+    setValue(path, value, secret = false) {
+      stored.set(path, { value, secret });
+    },
+    getValue(path) {
+      return stored.get(path);
     }
   };
 }
@@ -270,9 +297,9 @@ async function mockApplication(page) {
     contentType: 'text/javascript',
     body: configScript
   }));
-  await page.route('**/sovereign.config.v2.System/GetVersion', route => {
-    const application = Buffer.from('1.4.0');
-    const protocol = Buffer.from('v2');
+  await page.route('**/sovereign.config.v3.System/GetVersion', route => {
+    const application = Buffer.from('1.5.0');
+    const protocol = Buffer.from('v3');
     const message = Buffer.concat([
       Buffer.from([0x0a, application.length]), application,
       Buffer.from([0x12, protocol.length]), protocol
@@ -370,7 +397,7 @@ async function openCallback(
       })
     });
   });
-  await page.route('**/sovereign.config.v2.System/GetIdentity', route => {
+  await page.route('**/sovereign.config.v3.System/GetIdentity', route => {
     const authorized = route.request().headers().authorization === 'Bearer access-token-two';
     const status = authorized ? identityStatus : 16;
     return route.fulfill({
@@ -390,7 +417,7 @@ test.beforeEach(async ({ page }) => {
 test('reports service and logged-out state accessibly', async ({ page }, testInfo) => {
   await page.goto('/');
   await expect(page.getByText('Available')).toBeVisible();
-  await expect(page.getByText('1.4.0')).toBeVisible();
+  await expect(page.getByText('1.5.0')).toBeVisible();
   await expect(page.getByText('Logged out')).toBeVisible();
 
   const accessibility = await new AxeBuilder({ page }).analyze();
@@ -743,12 +770,12 @@ test('JSON mode retains rejected edits and reports non-representable stored tree
   const rejected = '{"value":"after"}';
   await editor.fill(rejected);
   const subtreeResponse = page.waitForResponse(
-    '**/sovereign.config.v2.Configuration/GetSubTree'
+    '**/sovereign.config.v3.Configuration/GetSubTree'
   );
   releaseSubtree();
   await subtreeResponse;
   await expect(editor).toHaveValue(rejected);
-  await page.route('**/sovereign.config.v2.Configuration/ReplaceSubTree', route => route.fulfill({
+  await page.route('**/sovereign.config.v3.Configuration/ReplaceSubTree', route => route.fulfill({
     status: 200,
     headers: { 'content-type': 'application/grpc-web+proto' },
     body: grpcFrame(Buffer.alloc(0), 7)
@@ -803,7 +830,7 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
   await page.getByRole('button', { name: 'Add value' }).click();
   await page.getByLabel('Name').fill('Feature-Flag');
   await page.getByLabel('Value', { exact: true }).fill('plain-value-sentinel');
-  await page.getByRole('button', { name: 'Save' }).click();
+  await page.locator('#new-value-row').getByRole('button', { name: 'Save' }).click();
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
   const editor = page.getByLabel('Value for feature-flag');
   await expect(editor).toHaveValue('plain-value-sentinel');
@@ -834,10 +861,143 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
   ]);
 });
 
+test('secret values stay masked, rotate explicitly, and survive JSON edits', async ({ page }) => {
+  const originalSecret = 'original-browser-secret-sentinel';
+  const rotatedSecret = 'rotated-browser-secret-sentinel';
+  const addedSecret = 'added-browser-secret-sentinel';
+  const unsubmittedSecret = 'unsubmitted-browser-secret-sentinel';
+  const consoleMessages = [];
+  const pageErrors = [];
+  page.on('console', message => consoleMessages.push(message.text()));
+  page.on('pageerror', error => pageErrors.push(error.message));
+
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  const values = await mockValues(page, {
+    '/apps/api/api-token': { value: originalSecret, secret: true },
+    '/apps/api/enabled': 'true'
+  });
+  await page.goto('/configuration/apps/api');
+
+  const row = page.getByRole('row', { name: /api-token/ });
+  await expect(row.getByText('Secret', { exact: true })).toBeVisible();
+  await expect(row.getByLabel('Secret value for api-token is hidden')).toHaveText('********');
+  await expect(page.locator('body')).not.toContainText(originalSecret);
+
+  const reveal = row.locator('button[aria-controls^="revealed-secret-"]');
+  await reveal.focus();
+  await page.keyboard.press('Enter');
+  const revealed = page.getByLabel('Revealed secret for api-token');
+  await expect(revealed).toHaveValue(originalSecret);
+  await expect(revealed).toHaveAttribute('readonly', '');
+  await expect(reveal).toHaveAttribute('aria-expanded', 'true');
+  await reveal.focus();
+  await page.keyboard.press('Enter');
+  await expect(revealed).toBeHidden();
+  await expect(revealed).toHaveValue('');
+
+  const replacement = page.getByLabel('Replacement secret for api-token');
+  const showReplacement = row.getByRole('button', { name: 'Show input' });
+  await showReplacement.focus();
+  await page.keyboard.press('Enter');
+  await expect(replacement).toHaveAttribute('type', 'text');
+  await page.keyboard.press('Enter');
+  await expect(replacement).toHaveAttribute('type', 'password');
+  await replacement.fill(rotatedSecret);
+  await row.getByRole('button', { name: 'Replace' }).click();
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  expect(values.getValue('/apps/api/api-token')).toEqual({ value: rotatedSecret, secret: true });
+  await expect(page.locator('body')).not.toContainText(rotatedSecret);
+
+  await page.getByRole('button', { name: 'Add value' }).click();
+  await page.getByLabel('Name').fill('Signing-Key');
+  await page.getByLabel('Store as secret').check();
+  const newSecret = page.getByLabel('Secret value', { exact: true });
+  await expect(newSecret).toHaveAttribute('type', 'password');
+  await newSecret.fill(addedSecret);
+  await page.locator('#new-value-row').getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  expect(values.getValue('/apps/api/signing-key')).toEqual({ value: addedSecret, secret: true });
+  await expect(page.locator('body')).not.toContainText(addedSecret);
+
+  const mode = page.getByRole('switch', { name: 'JSON' });
+  await mode.check();
+  const editor = page.getByLabel('JSON subtree');
+  await expect(editor).toHaveValue(
+    '{\n  "api-token": "********",\n  "enabled": "true",\n  "signing-key": "********"\n}\n'
+  );
+  await expect(editor).not.toHaveValue(new RegExp(`${rotatedSecret}|${addedSecret}`));
+  await editor.fill('{"api-token":"********","enabled":"false","signing-key":"********"}');
+  await page.getByRole('button', { name: 'Save JSON' }).click();
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  expect(values.getValue('/apps/api/api-token')).toEqual({ value: rotatedSecret, secret: true });
+  expect(values.getValue('/apps/api/signing-key')).toEqual({ value: addedSecret, secret: true });
+  expect(values.getValue('/apps/api/enabled')).toEqual({ value: 'false', secret: false });
+
+  await mode.uncheck();
+  const refreshedRow = page.getByRole('row', { name: /api-token/ });
+  await refreshedRow.getByRole('button', { name: 'Reveal' }).click();
+  await expect(page.getByLabel('Revealed secret for api-token')).toHaveValue(rotatedSecret);
+
+  const failedPut = '**/sovereign.config.v3.Configuration/PutValue';
+  await page.route(failedPut, route => route.fulfill({
+    status: 200,
+    headers: { 'content-type': 'application/grpc-web+proto' },
+    body: grpcFrame(Buffer.alloc(0), 7)
+  }));
+  await page.getByRole('button', { name: 'Add value' }).click();
+  await page.getByLabel('Name').fill('failed-value');
+  await page.getByLabel('Value', { exact: true }).fill('never-stored');
+  await page.locator('#new-value-row').getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByText('permission denied', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('Revealed secret for api-token')).toBeHidden();
+  await expect(page.getByLabel('Revealed secret for api-token')).toHaveValue('');
+  await page.unroute(failedPut);
+  await page.locator('#new-value-row').getByRole('button', { name: 'Cancel' }).click();
+
+  await refreshedRow.getByRole('button', { name: 'Reveal' }).click();
+  await expect(page.getByLabel('Revealed secret for api-token')).toHaveValue(rotatedSecret);
+  await page.reload();
+  await expect(page.getByRole('row', { name: /api-token/ })).toBeVisible();
+  await expect(page.getByLabel('Revealed secret for api-token')).toBeHidden();
+  await expect(page.getByLabel('Revealed secret for api-token')).toHaveValue('');
+  await expect(page.locator('body')).not.toContainText(rotatedSecret);
+
+  await page.getByRole('button', { name: 'Add value' }).click();
+  await page.getByLabel('Name').fill('unsubmitted-secret');
+  await page.getByLabel('Store as secret').check();
+  await page.getByLabel('Secret value', { exact: true }).fill(unsubmittedSecret);
+  await page.getByRole('link', { name: 'System status' }).click();
+  await expect(page.locator('body')).not.toContainText(unsubmittedSecret);
+  await page.goBack();
+  await expect(page.getByRole('row', { name: /api-token/ })).toBeVisible();
+  await page.getByRole('button', { name: 'Add value' }).click();
+  await page.getByLabel('Store as secret').check();
+  await expect(page.getByLabel('Secret value', { exact: true })).toHaveValue('');
+  await page.locator('#new-value-row').getByRole('button', { name: 'Cancel' }).click();
+
+  await page.getByRole('row', { name: /api-token/ }).getByRole('button', { name: 'Reveal' }).click();
+  await expect(page.getByLabel('Revealed secret for api-token')).toHaveValue(rotatedSecret);
+  await page.getByRole('button', { name: 'Log out' }).click();
+  await expect(page.getByRole('button', { name: 'Log in' })).toBeVisible();
+  await expect(page.locator('body')).not.toContainText(rotatedSecret);
+  expect(consoleMessages.join('\n')).not.toContain(originalSecret);
+  expect(consoleMessages.join('\n')).not.toContain(rotatedSecret);
+  expect(consoleMessages.join('\n')).not.toContain(addedSecret);
+  expect(consoleMessages.join('\n')).not.toContain(unsubmittedSecret);
+  expect(pageErrors.join('\n')).not.toContain(originalSecret);
+  expect(pageErrors.join('\n')).not.toContain(rotatedSecret);
+  expect(pageErrors.join('\n')).not.toContain(addedSecret);
+  expect(pageErrors.join('\n')).not.toContain(unsubmittedSecret);
+
+  const accessibility = await new AxeBuilder({ page }).analyze();
+  expect(accessibility.violations).toEqual([]);
+});
+
 test('trailers-only save errors retain their bounded gRPC status', async ({ page }) => {
   await openCallback(page);
   await mockValues(page);
-  await page.route('**/sovereign.config.v2.Configuration/PutValue', route => route.fulfill({
+  await page.route('**/sovereign.config.v3.Configuration/PutValue', route => route.fulfill({
     status: 200,
     headers: {
       'content-type': 'application/grpc-web+proto',

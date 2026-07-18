@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use clap::{Parser, Subcommand, ValueEnum};
 use sovereign_config_client::{AccessTokenProvider, Client};
 use sovereign_config_core::{
-    ClientError, ConfigPath, ConnectionUrl, ErrorKind, PlainValue, Secret, parse_subtree_json,
-    render_subtree_json,
+    ClientError, ConfigPath, ConnectionUrl, ErrorKind, PlainValue, Secret, SecretInput,
+    parse_subtree_json, render_subtree_json,
 };
 use sovereign_config_native::{
     CredentialStore, DeviceFlowClient, ProfileStore, TonicTransport, default_credential_directory,
@@ -55,6 +55,10 @@ enum Command {
         #[arg(long, value_enum, default_value_t = ValueFormat::Text)]
         format: ValueFormat,
     },
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
     Delete {
         #[arg(
             value_name = "ABSOLUTE_PATH",
@@ -65,6 +69,18 @@ enum Command {
         yes: bool,
         #[arg(long)]
         recurse: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretCommand {
+    Put {
+        #[arg(value_name = "ABSOLUTE_PATH")]
+        path: String,
+    },
+    Reveal {
+        #[arg(value_name = "ABSOLUTE_PATH")]
+        path: String,
     },
 }
 
@@ -109,6 +125,7 @@ async fn main() -> Result<()> {
                 Command::Status => status(&connection).await,
                 Command::Get { path, format } => get_value(&connection, &path, format).await,
                 Command::Put { path, format } => put_value(&connection, &path, format).await,
+                Command::Secret { command } => secret_value(&connection, command).await,
                 Command::Delete { path, yes, recurse } => {
                     delete_values(&connection, &path, yes, recurse).await
                 }
@@ -321,7 +338,7 @@ async fn get_value(connection: &ConnectionUrl, path: &str, format: ValueFormat) 
     } else if let [value] = subtree.values.as_slice()
         && value.path == path
     {
-        print!("{}", value.value.expose());
+        print!("{}", value.value.display_text());
     } else if subtree.values.is_empty() {
         bail!("configuration value not found");
     } else {
@@ -344,6 +361,32 @@ async fn put_value(connection: &ConnectionUrl, path: &str, format: ValueFormat) 
     } else {
         client.put_value(&path, &PlainValue::new(value)).await?;
         println!("Value stored");
+    }
+    Ok(())
+}
+
+async fn secret_value(connection: &ConnectionUrl, command: SecretCommand) -> Result<()> {
+    match command {
+        SecretCommand::Put { path } => {
+            let path = operation_path(connection, &path, false)?;
+            let mut value = String::new();
+            io::stdin()
+                .read_to_string(&mut value)
+                .map_err(|_| anyhow!("secret input is unavailable"))?;
+            operational_client(connection)
+                .await?
+                .put_secret(&path, &SecretInput::new(value))
+                .await?;
+            println!("Secret stored");
+        }
+        SecretCommand::Reveal { path } => {
+            let path = operation_path(connection, &path, false)?;
+            let value = operational_client(connection)
+                .await?
+                .reveal_secret(&path)
+                .await?;
+            print!("{}", value.expose());
+        }
     }
     Ok(())
 }

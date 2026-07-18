@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use sovereign_config_core::{
     AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, PROTOCOL_VERSION,
-    PlainValue, PutMetadata, ReplaceMetadata, Secret, ServiceStatus, SubTreeValue, Timestamp,
-    ValueListing, ValueSubTree,
+    PlainValue, PutMetadata, ReplaceMetadata, RevealedSecret, Secret, SecretInput, ServiceStatus,
+    SubTreeMutationValue, Timestamp, ValueListing, ValueSubTree,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,10 +71,16 @@ pub trait ValueTransport: Transport {
         value: &PlainValue,
         bearer: &Secret,
     ) -> Result<PutMetadata, ClientError>;
+    async fn put_secret(
+        &self,
+        path: &ConfigPath,
+        value: &SecretInput,
+        bearer: &Secret,
+    ) -> Result<PutMetadata, ClientError>;
     async fn replace_subtree(
         &self,
         path: &ConfigPath,
-        values: &[SubTreeValue],
+        values: &[SubTreeMutationValue],
         bearer: &Secret,
     ) -> Result<ReplaceMetadata, ClientError>;
     async fn delete_values(
@@ -83,6 +89,11 @@ pub trait ValueTransport: Transport {
         recurse: bool,
         bearer: &Secret,
     ) -> Result<DeleteMetadata, ClientError>;
+    async fn reveal_secret(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<RevealedSecret, ClientError>;
 }
 
 #[async_trait(?Send)]
@@ -130,6 +141,20 @@ where
         self.transport.put_value(path, value, &token).await
     }
 
+    /// Creates or replaces one exact secret without reading it back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, authorization, validation, or dependency error.
+    pub async fn put_secret(
+        &self,
+        path: &ConfigPath,
+        value: &SecretInput,
+    ) -> Result<PutMetadata, ClientError> {
+        let token = self.required_token().await?;
+        self.transport.put_secret(path, value, &token).await
+    }
+
     /// Atomically replaces every value at or below a selected path.
     ///
     /// # Errors
@@ -138,7 +163,7 @@ where
     pub async fn replace_subtree(
         &self,
         path: &ConfigPath,
-        values: &[SubTreeValue],
+        values: &[SubTreeMutationValue],
     ) -> Result<ReplaceMetadata, ClientError> {
         let token = self.required_token().await?;
         self.transport.replace_subtree(path, values, &token).await
@@ -157,6 +182,17 @@ where
     ) -> Result<DeleteMetadata, ClientError> {
         let token = self.required_token().await?;
         self.transport.delete_values(path, recurse, &token).await
+    }
+
+    /// Explicitly reveals one secret value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, authorization, validation, missing-value,
+    /// classification, or dependency error.
+    pub async fn reveal_secret(&self, path: &ConfigPath) -> Result<RevealedSecret, ClientError> {
+        let token = self.required_token().await?;
+        self.transport.reveal_secret(path, &token).await
     }
 
     async fn required_token(&self) -> Result<Secret, ClientError> {
@@ -241,7 +277,7 @@ mod tests {
         async fn get_version(&self, protocol: &str) -> Result<VersionReply, ClientError> {
             self.0.set(self.0.get() + 1);
             Ok(VersionReply {
-                application_version: "1.4.0".into(),
+                application_version: "1.5.0".into(),
                 protocol_version: protocol.into(),
             })
         }
