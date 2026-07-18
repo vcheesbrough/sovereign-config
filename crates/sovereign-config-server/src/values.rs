@@ -162,6 +162,25 @@ impl Configuration for ConfigurationService {
             .await
             .map_err(|_| storage_unavailable())?;
         lock_mutation_path(&mut transaction, &path).await?;
+        let collides = sqlx::query_scalar::<_, String>(
+            r"
+            SELECT path
+            FROM configuration_values
+            WHERE path <> $1
+              AND (path LIKE $1 || '/%' OR $1 LIKE path || '/%')
+            LIMIT 1
+            ",
+        )
+        .bind(path.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| storage_unavailable())?
+        .is_some();
+        if collides {
+            return Err(Status::invalid_argument(
+                "configuration value collides with an existing value",
+            ));
+        }
         let now = OffsetDateTime::from(SystemTime::now());
         let row = sqlx::query_as::<_, MutationRow>(
             r"
@@ -1068,6 +1087,64 @@ mod tests {
                         if content == MASKED_SECRET_TEXT
                 )
         }));
+
+        service
+            .put_value(request_for_prefix(
+                secret_put(
+                    "/tests/secrets/collision-parent",
+                    "collision-parent-sentinel",
+                ),
+                "/tests/secrets",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        let rejected_child = service
+            .put_value(request_for_prefix(
+                plain_put(
+                    "/tests/secrets/collision-parent/child",
+                    "collision-child-sentinel",
+                ),
+                "/tests/secrets",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected_child.code(), Code::InvalidArgument);
+        assert!(
+            !rejected_child
+                .message()
+                .contains("collision-child-sentinel")
+        );
+
+        service
+            .put_value(request_for_prefix(
+                secret_put(
+                    "/tests/secrets/collision-child/leaf",
+                    "collision-leaf-sentinel",
+                ),
+                "/tests/secrets",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        let rejected_parent = service
+            .put_value(request_for_prefix(
+                plain_put(
+                    "/tests/secrets/collision-child",
+                    "collision-parent-sentinel",
+                ),
+                "/tests/secrets",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected_parent.code(), Code::InvalidArgument);
+        assert!(
+            !rejected_parent
+                .message()
+                .contains("collision-parent-sentinel")
+        );
 
         let revealed = service
             .reveal_secret(request_for_prefix(
