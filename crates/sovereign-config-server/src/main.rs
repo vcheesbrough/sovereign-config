@@ -22,7 +22,7 @@ use auth::{Authenticator, grpc_authentication_layer};
 use config::{Config, required_env};
 use metrics::AuthenticationMetrics;
 use sovereign_config_core::PROTOCOL_VERSION;
-use sovereign_config_proto::sovereign::config::v1::{
+use sovereign_config_proto::sovereign::config::v2::{
     GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
     configuration_server::ConfigurationServer,
     system_server::{System, SystemServer},
@@ -30,7 +30,7 @@ use sovereign_config_proto::sovereign::config::v1::{
 use values::ConfigurationService;
 use web::WebAssetsLayer;
 
-const SYSTEM_SERVICE_NAME: &str = "sovereign.config.v1.System";
+const SYSTEM_SERVICE_NAME: &str = "sovereign.config.v2.System";
 const APPLICATION_VERSION: &str = application_version(option_env!("SOVEREIGN_CONFIG_RELEASE"));
 
 const fn application_version(release_version: Option<&str>) -> &str {
@@ -246,7 +246,7 @@ mod tests {
     use super::{
         APPLICATION_VERSION, PROTOCOL_VERSION, System, SystemService, application_version,
     };
-    use sovereign_config_proto::sovereign::config::v1::GetVersionRequest;
+    use sovereign_config_proto::sovereign::config::v2::GetVersionRequest;
     use tonic::Request;
 
     #[test]

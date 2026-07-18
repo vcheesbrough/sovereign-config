@@ -2,8 +2,8 @@
 
 pub mod sovereign {
     pub mod config {
-        pub mod v1 {
-            tonic::include_proto!("sovereign.config.v1");
+        pub mod v2 {
+            tonic::include_proto!("sovereign.config.v2");
         }
     }
 }

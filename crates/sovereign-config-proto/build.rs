@@ -8,7 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .build_transport(false)
         .compile_protos(
-            &["../../proto/sovereign/config/v1/service.proto"],
+            &["../../proto/sovereign/config/v2/service.proto"],
             &["../../proto"],
         )?;
     Ok(())

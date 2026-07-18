@@ -15,13 +15,15 @@ use sovereign_config_client::{
     timestamp,
 };
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, ExactValue,
-    ListedValue, PlainValue, PutMetadata, Secret, Timestamp, ValueListing,
+    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, ListedValue,
+    PlainValue, PutMetadata, ReplaceMetadata, Secret, SubTreeValue, Timestamp, ValueListing,
+    ValueSubTree, parse_subtree_json, render_subtree_json,
 };
-use sovereign_config_proto::sovereign::config::v1::{
-    DeleteValueRequest, DeleteValueResponse, GetIdentityRequest, GetIdentityResponse,
-    GetValueRequest, GetValueResponse, GetVersionRequest, GetVersionResponse, ListValuesRequest,
-    ListValuesResponse, PutValueRequest, PutValueResponse,
+use sovereign_config_proto::sovereign::config::v2::{
+    DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse,
+    GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest, GetVersionResponse,
+    ListValuesRequest, ListValuesResponse, PutValueRequest, PutValueResponse,
+    ReplaceSubTreeRequest, ReplaceSubTreeResponse, SubTreeValue as ProtoSubTreeValue,
 };
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -44,6 +46,8 @@ thread_local! {
     static DELETE_TARGET: RefCell<Option<DeleteTarget>> = const { RefCell::new(None) };
     static PATH_OPTIONS_REFRESHING: Cell<bool> = const { Cell::new(false) };
     static ACTIVE_PATH_OPTION: Cell<Option<usize>> = const { Cell::new(None) };
+    static JSON_MODE: Cell<bool> = const { Cell::new(false) };
+    static CONFIGURATION_LOAD_GENERATION: Cell<u64> = const { Cell::new(0) };
 }
 
 struct DeleteTarget {
@@ -117,7 +121,7 @@ impl AccessTokenProvider for MemoryAuthentication {
 impl Transport for BrowserTransport {
     async fn get_version(&self, protocol_version: &str) -> Result<VersionReply, ClientError> {
         let response: GetVersionResponse = grpc_unary(
-            "/sovereign.config.v1.System/GetVersion",
+            "/sovereign.config.v2.System/GetVersion",
             &GetVersionRequest {
                 protocol_version: protocol_version.to_owned(),
             },
@@ -132,7 +136,7 @@ impl Transport for BrowserTransport {
 
     async fn get_identity(&self, bearer: &Secret) -> Result<AuthenticationStatus, ClientError> {
         let response: GetIdentityResponse = grpc_unary(
-            "/sovereign.config.v1.System/GetIdentity",
+            "/sovereign.config.v2.System/GetIdentity",
             &GetIdentityRequest {},
             Some(bearer),
         )
@@ -151,7 +155,7 @@ impl ValueTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<ValueListing, ClientError> {
         let response: ListValuesResponse = grpc_unary(
-            "/sovereign.config.v1.Configuration/ListValues",
+            "/sovereign.config.v2.Configuration/ListValues",
             &ListValuesRequest {
                 path: path.as_str().to_owned(),
             },
@@ -178,24 +182,37 @@ impl ValueTransport for BrowserTransport {
         Ok(ValueListing { values, paths })
     }
 
-    async fn get_value(
+    async fn get_subtree(
         &self,
         path: &ConfigPath,
         bearer: &Secret,
-    ) -> Result<ExactValue, ClientError> {
-        let response: GetValueResponse = grpc_unary(
-            "/sovereign.config.v1.Configuration/GetValue",
-            &GetValueRequest {
+    ) -> Result<ValueSubTree, ClientError> {
+        let response: GetSubTreeResponse = grpc_unary(
+            "/sovereign.config.v2.Configuration/GetSubTree",
+            &GetSubTreeRequest {
                 path: path.as_str().to_owned(),
             },
             Some(bearer),
         )
         .await?;
-        Ok(ExactValue {
-            value: PlainValue::new(response.value),
-            created_at: proto_timestamp(response.created_at)?,
-            updated_at: proto_timestamp(response.updated_at)?,
-        })
+        let values = response
+            .values
+            .into_iter()
+            .map(|value| {
+                if value.value.contains('\0') {
+                    return Err(browser_error());
+                }
+                let value_path = ConfigPath::parse(value.path).map_err(|_| browser_error())?;
+                if value_path.as_str() == "/" || !value_path.is_at_or_below(path) {
+                    return Err(browser_error());
+                }
+                Ok(SubTreeValue {
+                    path: value_path,
+                    value: PlainValue::new(value.value),
+                })
+            })
+            .collect::<Result<Vec<_>, ClientError>>()?;
+        Ok(ValueSubTree { values })
     }
 
     async fn put_value(
@@ -205,7 +222,7 @@ impl ValueTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<PutMetadata, ClientError> {
         let response: PutValueResponse = grpc_unary(
-            "/sovereign.config.v1.Configuration/PutValue",
+            "/sovereign.config.v2.Configuration/PutValue",
             &PutValueRequest {
                 path: path.as_str().to_owned(),
                 value: value.expose().to_owned(),
@@ -219,21 +236,51 @@ impl ValueTransport for BrowserTransport {
         })
     }
 
-    async fn delete_value(
+    async fn replace_subtree(
         &self,
         path: &ConfigPath,
+        values: &[SubTreeValue],
+        bearer: &Secret,
+    ) -> Result<ReplaceMetadata, ClientError> {
+        let response: ReplaceSubTreeResponse = grpc_unary(
+            "/sovereign.config.v2.Configuration/ReplaceSubTree",
+            &ReplaceSubTreeRequest {
+                path: path.as_str().to_owned(),
+                values: values
+                    .iter()
+                    .map(|value| ProtoSubTreeValue {
+                        path: value.path.as_str().to_owned(),
+                        value: value.value.expose().to_owned(),
+                    })
+                    .collect(),
+            },
+            Some(bearer),
+        )
+        .await?;
+        Ok(ReplaceMetadata {
+            updated_at: proto_timestamp(response.updated_at)?,
+            value_count: response.value_count,
+        })
+    }
+
+    async fn delete_values(
+        &self,
+        path: &ConfigPath,
+        recurse: bool,
         bearer: &Secret,
     ) -> Result<DeleteMetadata, ClientError> {
-        let response: DeleteValueResponse = grpc_unary(
-            "/sovereign.config.v1.Configuration/DeleteValue",
-            &DeleteValueRequest {
+        let response: DeleteValuesResponse = grpc_unary(
+            "/sovereign.config.v2.Configuration/DeleteValues",
+            &DeleteValuesRequest {
                 path: path.as_str().to_owned(),
+                recurse,
             },
             Some(bearer),
         )
         .await?;
         Ok(DeleteMetadata {
             deleted_at: proto_timestamp(response.deleted_at)?,
+            deleted_count: response.deleted_count,
         })
     }
 }
@@ -308,12 +355,15 @@ fn install_actions() {
     }
     if let Some(logout) = document.get_element_by_id("logout") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: web_sys::Event| {
+            CONFIGURATION_LOAD_GENERATION.set(CONFIGURATION_LOAD_GENERATION.get().wrapping_add(1));
             clear_browser_session();
             set_text("auth-value", "Logged out");
             set_hidden("login", false);
             set_hidden("logout", true);
             set_text("value-state", "Log in to view values");
             clear_value_rows();
+            set_textarea("json-content", "");
+            set_text("value-count", "0 values");
             focus("login");
         });
         let _ = logout.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
@@ -343,6 +393,33 @@ fn install_configuration_actions(document: &Document) {
         callback.forget();
     }
     install_path_selector_actions(document);
+    if let Some(mode) = document.get_element_by_id("json-mode") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            let enabled =
+                element::<HtmlInputElement>("json-mode").is_some_and(|input| input.checked());
+            JSON_MODE.set(enabled);
+            update_configuration_mode();
+            spawn_local(async { load_current_configuration().await });
+        });
+        let _ = mode.add_event_listener_with_callback("change", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(save) = document.get_element_by_id("save-json") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            spawn_local(async { save_json_subtree().await });
+        });
+        let _ = save.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(editor) = document.get_element_by_id("json-content") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            CONFIGURATION_LOAD_GENERATION.set(CONFIGURATION_LOAD_GENERATION.get().wrapping_add(1));
+            set_text("value-state", "Edited");
+            validate_json_editor();
+        });
+        let _ = editor.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
     if let Some(add) = document.get_element_by_id("add-value") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
             show_new_value_row();
@@ -753,25 +830,133 @@ fn value_client(config: &AppConfig) -> Client<BrowserTransport, MemoryAuthentica
 }
 
 async fn load_current_configuration() {
+    let generation = CONFIGURATION_LOAD_GENERATION.get().wrapping_add(1);
+    CONFIGURATION_LOAD_GENERATION.set(generation);
     let Route::Configuration(path) = route_from_location() else {
         return;
     };
     clear_error();
     set_text("value-state", "Loading");
+    let json_mode = JSON_MODE.get();
+    update_configuration_mode();
+    if json_mode {
+        set_textarea("json-content", "");
+        set_validation("json-content", "json-error", None);
+        set_text("value-count", "0 values");
+    }
     let result = async {
         let config = app_config()?;
-        value_client(&config).list_values(&path).await
+        if json_mode {
+            value_client(&config)
+                .get_subtree(&path)
+                .await
+                .map(ConfigurationData::SubTree)
+        } else {
+            value_client(&config)
+                .list_values(&path)
+                .await
+                .map(ConfigurationData::Listing)
+        }
     }
     .await;
+    if CONFIGURATION_LOAD_GENERATION.get() != generation {
+        return;
+    }
     match result {
-        Ok(listing) => {
+        Ok(ConfigurationData::Listing(listing)) => {
             if let Err(error) = render_listing(&listing) {
                 show_error(error.message());
                 return;
             }
             set_text("value-state", "Loaded");
         }
+        Ok(ConfigurationData::SubTree(subtree)) => {
+            match render_subtree_json(&path, &subtree.values) {
+                Ok(json) => {
+                    set_textarea("json-content", &json);
+                    set_validation("json-content", "json-error", None);
+                    let count = subtree.values.len();
+                    set_text(
+                        "value-count",
+                        &format!("{count} {}", if count == 1 { "value" } else { "values" }),
+                    );
+                    set_text("value-state", "Loaded");
+                }
+                Err(error) => show_error(error.message()),
+            }
+        }
         Err(error) => show_error(error.message()),
+    }
+}
+
+enum ConfigurationData {
+    Listing(ValueListing),
+    SubTree(ValueSubTree),
+}
+
+fn update_configuration_mode() {
+    let json = JSON_MODE.get();
+    set_hidden("value-table", json);
+    set_hidden("json-editor", !json);
+    set_hidden("add-value", json);
+    if json {
+        set_hidden("empty-values", true);
+        hide_new_value_row();
+    }
+}
+
+fn validate_json_editor() -> bool {
+    let result = (|| {
+        let Route::Configuration(path) = route_from_location() else {
+            return Err(browser_error());
+        };
+        let json = element::<HtmlTextAreaElement>("json-content")
+            .ok_or_else(browser_error)?
+            .value();
+        parse_subtree_json(&path, &json).map(|_| ())
+    })();
+    match result {
+        Ok(()) => {
+            set_validation("json-content", "json-error", None);
+            set_button_disabled("save-json", false);
+            true
+        }
+        Err(error) => {
+            set_validation("json-content", "json-error", Some(error.message()));
+            set_button_disabled("save-json", true);
+            false
+        }
+    }
+}
+
+async fn save_json_subtree() {
+    if !validate_json_editor() {
+        return;
+    }
+    clear_error();
+    set_button_disabled("save-json", true);
+    let result = async {
+        let Route::Configuration(path) = route_from_location() else {
+            return Err(browser_error());
+        };
+        let json = element::<HtmlTextAreaElement>("json-content")
+            .ok_or_else(browser_error)?
+            .value();
+        let values = parse_subtree_json(&path, &json)?;
+        let config = app_config()?;
+        value_client(&config).replace_subtree(&path, &values).await
+    }
+    .await;
+    match result {
+        Ok(_) => {
+            load_current_configuration().await;
+            set_text("value-state", "Saved");
+            focus("json-content");
+        }
+        Err(error) => {
+            set_button_disabled("save-json", false);
+            show_error(error.message());
+        }
     }
 }
 
@@ -884,7 +1069,9 @@ async fn delete_selected_value() {
     clear_error();
     let result = async {
         let config = app_config()?;
-        value_client(&config).delete_value(&target.path).await
+        value_client(&config)
+            .delete_values(&target.path, false)
+            .await
     }
     .await;
     close_delete_dialog();
@@ -1820,7 +2007,7 @@ fn oidc_error() -> ClientError {
 mod tests {
     use prost::Message;
     use sovereign_config_core::ErrorKind;
-    use sovereign_config_proto::sovereign::config::v1::GetIdentityResponse;
+    use sovereign_config_proto::sovereign::config::v2::GetIdentityResponse;
 
     use super::{
         Route, classify_refresh_error, decode_grpc_web, decode_grpc_web_response,

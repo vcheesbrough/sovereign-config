@@ -2,10 +2,11 @@ use std::io::{self, IsTerminal, Read};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use sovereign_config_client::{AccessTokenProvider, Client};
 use sovereign_config_core::{
-    ClientError, ConfigPath, ConnectionUrl, ErrorKind, PlainValue, Secret,
+    ClientError, ConfigPath, ConnectionUrl, ErrorKind, PlainValue, Secret, parse_subtree_json,
+    render_subtree_json,
 };
 use sovereign_config_native::{
     CredentialStore, DeviceFlowClient, ProfileStore, TonicTransport, default_credential_directory,
@@ -39,26 +40,38 @@ enum Command {
     Get {
         #[arg(
             value_name = "ABSOLUTE_PATH",
-            help = "Absolute configuration value path, beginning with /"
+            help = "Absolute configuration value or subtree path, beginning with /"
         )]
         path: String,
+        #[arg(long, value_enum, default_value_t = ValueFormat::Text)]
+        format: ValueFormat,
     },
     Put {
         #[arg(
             value_name = "ABSOLUTE_PATH",
-            help = "Absolute configuration value path, beginning with /"
+            help = "Absolute configuration value or subtree path, beginning with /"
         )]
         path: String,
+        #[arg(long, value_enum, default_value_t = ValueFormat::Text)]
+        format: ValueFormat,
     },
     Delete {
         #[arg(
             value_name = "ABSOLUTE_PATH",
-            help = "Absolute configuration value path, beginning with /"
+            help = "Absolute configuration value or subtree path, beginning with /"
         )]
         path: String,
         #[arg(long)]
         yes: bool,
+        #[arg(long)]
+        recurse: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ValueFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -94,9 +107,11 @@ async fn main() -> Result<()> {
                 Command::Login => login(&connection).await,
                 Command::Logout => logout(&connection),
                 Command::Status => status(&connection).await,
-                Command::Get { path } => get_value(&connection, &path).await,
-                Command::Put { path } => put_value(&connection, &path).await,
-                Command::Delete { path, yes } => delete_value(&connection, &path, yes).await,
+                Command::Get { path, format } => get_value(&connection, &path, format).await,
+                Command::Put { path, format } => put_value(&connection, &path, format).await,
+                Command::Delete { path, yes, recurse } => {
+                    delete_values(&connection, &path, yes, recurse).await
+                }
                 Command::Profile { .. } => unreachable!(),
             }
         }
@@ -276,8 +291,12 @@ async fn operational_client(
     ))
 }
 
-fn operation_path(connection: &ConnectionUrl, path: &str) -> Result<ConfigPath> {
-    let path = ConfigPath::parse_operation(path).context("path must name a configuration value")?;
+fn operation_path(connection: &ConnectionUrl, path: &str, allow_root: bool) -> Result<ConfigPath> {
+    let path = if allow_root {
+        ConfigPath::parse_selection(path).context("path must name a configuration subtree")?
+    } else {
+        ConfigPath::parse_operation(path).context("path must name a configuration value")?
+    };
     let root = connection.root().as_str();
     if root != "/"
         && path.as_str() != root
@@ -291,40 +310,66 @@ fn operation_path(connection: &ConnectionUrl, path: &str) -> Result<ConfigPath> 
     Ok(path)
 }
 
-async fn get_value(connection: &ConnectionUrl, path: &str) -> Result<()> {
-    let path = operation_path(connection, path)?;
-    let value = operational_client(connection)
+async fn get_value(connection: &ConnectionUrl, path: &str, format: ValueFormat) -> Result<()> {
+    let path = operation_path(connection, path, true)?;
+    let subtree = operational_client(connection)
         .await?
-        .get_value(&path)
+        .get_subtree(&path)
         .await?;
-    print!("{}", value.value.expose());
+    if format == ValueFormat::Json {
+        print!("{}", render_subtree_json(&path, &subtree.values)?);
+    } else if let [value] = subtree.values.as_slice()
+        && value.path == path
+    {
+        print!("{}", value.value.expose());
+    } else if subtree.values.is_empty() {
+        bail!("configuration value not found");
+    } else {
+        bail!("JSON format is required to read a configuration subtree");
+    }
     Ok(())
 }
 
-async fn put_value(connection: &ConnectionUrl, path: &str) -> Result<()> {
-    let path = operation_path(connection, path)?;
+async fn put_value(connection: &ConnectionUrl, path: &str, format: ValueFormat) -> Result<()> {
+    let path = operation_path(connection, path, format == ValueFormat::Json)?;
     let mut value = String::new();
     io::stdin()
         .read_to_string(&mut value)
         .map_err(|_| anyhow!("configuration input is unavailable"))?;
-    operational_client(connection)
-        .await?
-        .put_value(&path, &PlainValue::new(value))
-        .await?;
-    println!("Value stored");
+    let client = operational_client(connection).await?;
+    if format == ValueFormat::Json {
+        let values = parse_subtree_json(&path, &value)?;
+        client.replace_subtree(&path, &values).await?;
+        println!("Subtree replaced");
+    } else {
+        client.put_value(&path, &PlainValue::new(value)).await?;
+        println!("Value stored");
+    }
     Ok(())
 }
 
-async fn delete_value(connection: &ConnectionUrl, path: &str, yes: bool) -> Result<()> {
-    let path = operation_path(connection, path)?;
+async fn delete_values(
+    connection: &ConnectionUrl,
+    path: &str,
+    yes: bool,
+    recurse: bool,
+) -> Result<()> {
+    let path = operation_path(connection, path, recurse)?;
     if !yes {
         if !io::stdin().is_terminal() {
             bail!("deletion requires --yes when standard input is not a terminal");
         }
-        eprint!(
-            "Permanently delete {}? Type 'delete' to confirm: ",
-            path.as_str()
-        );
+        if recurse {
+            eprint!(
+                "Permanently delete {} and all descendants? Type 'delete' to confirm: ",
+                path.as_str()
+            );
+        } else {
+            eprint!(
+                "Permanently delete {}? Type 'delete' to confirm: ",
+                path.as_str()
+            );
+        }
         let mut confirmation = String::new();
         io::stdin()
             .read_line(&mut confirmation)
@@ -335,9 +380,16 @@ async fn delete_value(connection: &ConnectionUrl, path: &str, yes: bool) -> Resu
     }
     operational_client(connection)
         .await?
-        .delete_value(&path)
+        .delete_values(&path, recurse)
         .await?;
-    println!("Value deleted");
+    println!(
+        "{}",
+        if recurse {
+            "Subtree deleted"
+        } else {
+            "Value deleted"
+        }
+    );
     Ok(())
 }
 

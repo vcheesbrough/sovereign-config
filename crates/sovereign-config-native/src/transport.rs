@@ -6,12 +6,13 @@ use sovereign_config_client::{
     RpcCode, Transport, ValueTransport, VersionReply, map_rpc_status, timestamp,
 };
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ExactValue, ListedValue,
-    PlainValue, PutMetadata, Secret, ValueListing,
+    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ListedValue, PlainValue,
+    PutMetadata, ReplaceMetadata, Secret, SubTreeValue, ValueListing, ValueSubTree,
 };
-use sovereign_config_proto::sovereign::config::v1::{
-    DeleteValueRequest, GetIdentityRequest, GetValueRequest, GetVersionRequest, ListValuesRequest,
-    PutValueRequest, configuration_client::ConfigurationClient, system_client::SystemClient,
+use sovereign_config_proto::sovereign::config::v2::{
+    DeleteValuesRequest, GetIdentityRequest, GetSubTreeRequest, GetVersionRequest,
+    ListValuesRequest, PutValueRequest, ReplaceSubTreeRequest, SubTreeValue as ProtoSubTreeValue,
+    configuration_client::ConfigurationClient, system_client::SystemClient,
 };
 use tonic::{
     Code, Request,
@@ -67,15 +68,15 @@ impl ValueTransport for TonicTransport {
         Ok(ValueListing { values, paths })
     }
 
-    async fn get_value(
+    async fn get_subtree(
         &self,
         path: &ConfigPath,
         bearer: &Secret,
-    ) -> Result<ExactValue, ClientError> {
+    ) -> Result<ValueSubTree, ClientError> {
         let mut client = ConfigurationClient::new(self.channel.clone());
         let response = client
-            .get_value(authenticated_request(
-                GetValueRequest {
+            .get_sub_tree(authenticated_request(
+                GetSubTreeRequest {
                     path: path.as_str().to_owned(),
                 },
                 bearer,
@@ -83,13 +84,24 @@ impl ValueTransport for TonicTransport {
             .await
             .map_err(|status| map_status(&status))?
             .into_inner();
-        let created_at = response.created_at.ok_or_else(invalid_response)?;
-        let updated_at = response.updated_at.ok_or_else(invalid_response)?;
-        Ok(ExactValue {
-            value: PlainValue::new(response.value),
-            created_at: timestamp(created_at.seconds, created_at.nanos)?,
-            updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
-        })
+        let values = response
+            .values
+            .into_iter()
+            .map(|value| {
+                if value.value.contains('\0') {
+                    return Err(invalid_response());
+                }
+                let value_path = ConfigPath::parse(value.path).map_err(|_| invalid_response())?;
+                if value_path.as_str() == "/" || !value_path.is_at_or_below(path) {
+                    return Err(invalid_response());
+                }
+                Ok(SubTreeValue {
+                    path: value_path,
+                    value: PlainValue::new(value.value),
+                })
+            })
+            .collect::<Result<Vec<_>, ClientError>>()?;
+        Ok(ValueSubTree { values })
     }
 
     async fn put_value(
@@ -118,16 +130,49 @@ impl ValueTransport for TonicTransport {
         })
     }
 
-    async fn delete_value(
+    async fn replace_subtree(
         &self,
         path: &ConfigPath,
+        values: &[SubTreeValue],
+        bearer: &Secret,
+    ) -> Result<ReplaceMetadata, ClientError> {
+        let mut client = ConfigurationClient::new(self.channel.clone());
+        let response = client
+            .replace_sub_tree(authenticated_request(
+                ReplaceSubTreeRequest {
+                    path: path.as_str().to_owned(),
+                    values: values
+                        .iter()
+                        .map(|value| ProtoSubTreeValue {
+                            path: value.path.as_str().to_owned(),
+                            value: value.value.expose().to_owned(),
+                        })
+                        .collect(),
+                },
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        let updated_at = response.updated_at.ok_or_else(invalid_response)?;
+        Ok(ReplaceMetadata {
+            updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
+            value_count: response.value_count,
+        })
+    }
+
+    async fn delete_values(
+        &self,
+        path: &ConfigPath,
+        recurse: bool,
         bearer: &Secret,
     ) -> Result<DeleteMetadata, ClientError> {
         let mut client = ConfigurationClient::new(self.channel.clone());
         let response = client
-            .delete_value(authenticated_request(
-                DeleteValueRequest {
+            .delete_values(authenticated_request(
+                DeleteValuesRequest {
                     path: path.as_str().to_owned(),
+                    recurse,
                 },
                 bearer,
             )?)
@@ -137,6 +182,7 @@ impl ValueTransport for TonicTransport {
         let deleted_at = response.deleted_at.ok_or_else(invalid_response)?;
         Ok(DeleteMetadata {
             deleted_at: timestamp(deleted_at.seconds, deleted_at.nanos)?,
+            deleted_count: response.deleted_count,
         })
     }
 }
@@ -249,7 +295,7 @@ mod tests {
 
     use sovereign_config_client::Transport;
     use sovereign_config_core::{ErrorKind, Secret};
-    use sovereign_config_proto::sovereign::config::v1::{
+    use sovereign_config_proto::sovereign::config::v2::{
         GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
         system_server::{System, SystemServer},
     };

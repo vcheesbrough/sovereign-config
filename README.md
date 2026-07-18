@@ -58,15 +58,20 @@ sovereign-config logout
 
 Use `sovereign-config profile update <name>` to replace a URL and `sovereign-config profile default <name>` to change the default. A URL can instead be supplied as exactly one line on standard input. Profile URLs are never accepted as process arguments. Operational commands accept a global override, for example `sovereign-config --profile prod status`.
 
-Read, create or replace, and permanently delete one exact plain-text value with the selected profile. Every command path is absolute, begins with `/`, and is ASCII case-insensitive; the service stores one lowercase canonical path. A profile with a configured root accepts only absolute paths within that subtree. Put content is read from standard input so it does not appear in process arguments. Interactive deletion requires typing `delete`; automation must pass `--yes` explicitly.
+Read and write exact plain-text values or complete JSON subtrees with the selected profile. Every command path is absolute, begins with `/`, and is ASCII case-insensitive; the service stores one lowercase canonical path. A profile with a configured root accepts only absolute paths within that subtree. Put content is read from standard input so it does not appear in process arguments. Interactive deletion requires typing `delete`; automation must pass `--yes` explicitly.
 
 ```sh
 sovereign-config get /apps/api/settings
 printf '%s' 'enabled=true' | sovereign-config put /apps/api/settings
+sovereign-config get /apps/api --format json
+printf '%s' '{"enabled":"true","workers":"4"}' | sovereign-config put /apps/api --format json
 sovereign-config delete /apps/api/settings --yes
+sovereign-config delete /apps/api --recurse --yes
 ```
 
-Get prints the exact stored text. Put and delete print only fixed success summaries and never echo the value. Read, write, and manage grants are independent: get requires `read`, put requires `write`, and delete requires `manage` on the exact path or an ancestor prefix.
+Text get prints an exact stored value and requires `--format json` when descendants exist. JSON output is deterministic and pretty printed; each stored plain-text value is represented as a JSON string. JSON is relative to the selected path, so selecting `/foo/foo2/foo3` containing `/foo/foo2/foo3/deepvalue` returns `{"deepvalue":"deepvalue"}` without a `foo3` wrapper. An exact selected value is a root JSON string, and `/` is the root object. JSON put atomically replaces the selected subtree using the same relative shape, deleting every omitted value. It requires both independent `write` and `manage` grants covering the selected root. Exact text put requires `write`; exact and recursive delete require `manage`. Put and delete print only fixed success summaries and never echo values.
+
+The native and gRPC-Web APIs use the breaking `sovereign.config.v2` protobuf package. Servers, CLIs, browser assets, and Rust clients must be upgraded together; there is no v1 fallback or mixed-version operation.
 
 The version-1 URL origin is the native gRPC endpoint, its path is the canonical configuration root, and its fragment contains the OIDC issuer and client ID. Without `client_secret`, login uses device flow. With `client_secret`, the value is unpadded Base64URL-encoded `service-account-username:app-password`; the CLI obtains a fresh client-credentials access token for each operation and does not support login or logout for that profile. The entire managed URL is a secret even though its credential is encoded.
 
@@ -137,7 +142,7 @@ Downgrades after a migration are unsupported. Restore the verified PostgreSQL ba
 
 Configuration values are stored in PostgreSQL as canonical absolute paths beginning with `/`, plain text, and service-generated UTC creation/update timestamps. Updates are last-write-wins and preserve the original creation timestamp. Deletion is a hard delete with no tombstone, rollback record, or retained value history. PostgreSQL volume and backup encryption remain operator responsibilities.
 
-The browser exposes system status and configuration values as separate client-side pages. Configuration URLs use `/configuration/<path>` and display absolute paths beginning with `/`; the final segment of each stored path is the value name. The path selector offers namespaces containing readable values and also accepts a valid namespace that does not exist yet. Listing filters every returned value through server-side `read` permission, while row saves and deletes continue to require independent `write` and `manage` permissions.
+The browser exposes system status and configuration values as separate client-side pages. Configuration URLs use `/configuration/<path>` and display absolute paths beginning with `/`; the final segment of each stored path is the value name. The path selector offers namespaces containing readable values and also accepts a valid namespace that does not exist yet. Listing filters every returned value through server-side `read` permission, while row saves and deletes continue to require independent `write` and `manage` permissions. The JSON switch is off by default; when enabled it loads the entire selected subtree with all-or-nothing `read` authorization and replaces the grid with a pretty JSON editor. Saving replaces the subtree atomically and per-value deletion is unavailable in JSON mode.
 
 ## Observability
 
