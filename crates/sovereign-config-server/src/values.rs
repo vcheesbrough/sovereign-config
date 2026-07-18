@@ -259,7 +259,12 @@ impl Configuration for ConfigurationService {
             SELECT path
             FROM configuration_values
             WHERE classification = 'secret'
-              AND ($1 = '/' OR path = $1 OR path LIKE $1 || '/%')
+              AND (
+                    $1 = '/'
+                    OR path = $1
+                    OR path LIKE $1 || '/%'
+                    OR $1 LIKE path || '/%'
+                  )
             ORDER BY path
             ",
         )
@@ -1144,6 +1149,35 @@ mod tests {
             !rejected_parent
                 .message()
                 .contains("collision-parent-sentinel")
+        );
+
+        service
+            .put_value(request_for_prefix(
+                secret_put("/tests/secrets/subtree-secret", "subtree-secret-sentinel"),
+                "/tests/secrets",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        let rejected_subtree = service
+            .replace_sub_tree(request_for_prefix(
+                ReplaceSubTreeRequest {
+                    path: "/tests/secrets/subtree-secret/child-area".into(),
+                    values: vec![plain_mutation(
+                        "/tests/secrets/subtree-secret/child-area/key",
+                        "subtree-child-sentinel",
+                    )],
+                },
+                "/tests/secrets",
+                &[Permission::Write, Permission::Manage],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected_subtree.code(), Code::InvalidArgument);
+        assert!(
+            !rejected_subtree
+                .message()
+                .contains("subtree-child-sentinel")
         );
 
         let revealed = service
