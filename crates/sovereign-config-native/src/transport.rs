@@ -6,13 +6,17 @@ use sovereign_config_client::{
     RpcCode, Transport, ValueTransport, VersionReply, map_rpc_status, timestamp,
 };
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ListedValue, PlainValue,
-    PutMetadata, ReplaceMetadata, Secret, SubTreeValue, ValueListing, ValueSubTree,
+    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ListedValue, MaskedSecret,
+    PlainValue, PutMetadata, ReplaceMetadata, RevealedSecret, Secret, SecretInput,
+    SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, ValueContent, ValueListing,
+    ValueSubTree,
 };
-use sovereign_config_proto::sovereign::config::v2::{
+use sovereign_config_proto::sovereign::config::v3::{
     DeleteValuesRequest, GetIdentityRequest, GetSubTreeRequest, GetVersionRequest,
-    ListValuesRequest, PutValueRequest, ReplaceSubTreeRequest, SubTreeValue as ProtoSubTreeValue,
-    configuration_client::ConfigurationClient, system_client::SystemClient,
+    ListValuesRequest, PreserveSecret, PutValueRequest, ReplaceSubTreeRequest, RevealSecretRequest,
+    SubTreeMutationValue as ProtoSubTreeMutationValue, ValueClassification as ProtoClassification,
+    configuration_client::ConfigurationClient, listed_value, put_value_request,
+    sub_tree_mutation_value, sub_tree_value, system_client::SystemClient,
 };
 use tonic::{
     Code, Request,
@@ -54,7 +58,7 @@ impl ValueTransport for TonicTransport {
                 let updated_at = value.updated_at.ok_or_else(invalid_response)?;
                 Ok(ListedValue {
                     path: ConfigPath::parse(value.path).map_err(|_| invalid_response())?,
-                    value: PlainValue::new(value.value),
+                    value: listed_content(value.classification, value.content)?,
                     created_at: timestamp(created_at.seconds, created_at.nanos)?,
                     updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
                 })
@@ -88,16 +92,13 @@ impl ValueTransport for TonicTransport {
             .values
             .into_iter()
             .map(|value| {
-                if value.value.contains('\0') {
-                    return Err(invalid_response());
-                }
                 let value_path = ConfigPath::parse(value.path).map_err(|_| invalid_response())?;
                 if value_path.as_str() == "/" || !value_path.is_at_or_below(path) {
                     return Err(invalid_response());
                 }
                 Ok(SubTreeValue {
                     path: value_path,
-                    value: PlainValue::new(value.value),
+                    value: subtree_content(value.classification, value.content)?,
                 })
             })
             .collect::<Result<Vec<_>, ClientError>>()?;
@@ -115,7 +116,37 @@ impl ValueTransport for TonicTransport {
             .put_value(authenticated_request(
                 PutValueRequest {
                     path: path.as_str().to_owned(),
-                    value: value.expose().to_owned(),
+                    content: Some(put_value_request::Content::PlainValue(
+                        value.expose().to_owned(),
+                    )),
+                },
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        let created_at = response.created_at.ok_or_else(invalid_response)?;
+        let updated_at = response.updated_at.ok_or_else(invalid_response)?;
+        Ok(PutMetadata {
+            created_at: timestamp(created_at.seconds, created_at.nanos)?,
+            updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
+        })
+    }
+
+    async fn put_secret(
+        &self,
+        path: &ConfigPath,
+        value: &SecretInput,
+        bearer: &Secret,
+    ) -> Result<PutMetadata, ClientError> {
+        let mut client = ConfigurationClient::new(self.channel.clone());
+        let response = client
+            .put_value(authenticated_request(
+                PutValueRequest {
+                    path: path.as_str().to_owned(),
+                    content: Some(put_value_request::Content::SecretValue(
+                        value.expose().to_owned(),
+                    )),
                 },
                 bearer,
             )?)
@@ -133,7 +164,7 @@ impl ValueTransport for TonicTransport {
     async fn replace_subtree(
         &self,
         path: &ConfigPath,
-        values: &[SubTreeValue],
+        values: &[SubTreeMutationValue],
         bearer: &Secret,
     ) -> Result<ReplaceMetadata, ClientError> {
         let mut client = ConfigurationClient::new(self.channel.clone());
@@ -143,9 +174,20 @@ impl ValueTransport for TonicTransport {
                     path: path.as_str().to_owned(),
                     values: values
                         .iter()
-                        .map(|value| ProtoSubTreeValue {
+                        .map(|value| ProtoSubTreeMutationValue {
                             path: value.path.as_str().to_owned(),
-                            value: value.value.expose().to_owned(),
+                            content: Some(match &value.value {
+                                SubTreeMutationContent::Plain(value) => {
+                                    sub_tree_mutation_value::Content::PlainValue(
+                                        value.expose().to_owned(),
+                                    )
+                                }
+                                SubTreeMutationContent::PreserveSecret => {
+                                    sub_tree_mutation_value::Content::PreserveSecret(
+                                        PreserveSecret {},
+                                    )
+                                }
+                            }),
                         })
                         .collect(),
                 },
@@ -184,6 +226,62 @@ impl ValueTransport for TonicTransport {
             deleted_at: timestamp(deleted_at.seconds, deleted_at.nanos)?,
             deleted_count: response.deleted_count,
         })
+    }
+
+    async fn reveal_secret(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<RevealedSecret, ClientError> {
+        let mut client = ConfigurationClient::new(self.channel.clone());
+        let response = client
+            .reveal_secret(authenticated_request(
+                RevealSecretRequest {
+                    path: path.as_str().to_owned(),
+                },
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        if response.value.contains('\0') {
+            return Err(invalid_response());
+        }
+        Ok(RevealedSecret::new(response.value))
+    }
+}
+
+fn listed_content(
+    classification: i32,
+    content: Option<listed_value::Content>,
+) -> Result<ValueContent, ClientError> {
+    match (ProtoClassification::try_from(classification), content) {
+        (Ok(ProtoClassification::Plain), Some(listed_value::Content::PlainValue(value)))
+            if !value.contains('\0') =>
+        {
+            Ok(ValueContent::Plain(PlainValue::new(value)))
+        }
+        (Ok(ProtoClassification::Secret), Some(listed_value::Content::MaskedSecret(_))) => {
+            Ok(ValueContent::Secret(MaskedSecret))
+        }
+        _ => Err(invalid_response()),
+    }
+}
+
+fn subtree_content(
+    classification: i32,
+    content: Option<sub_tree_value::Content>,
+) -> Result<ValueContent, ClientError> {
+    match (ProtoClassification::try_from(classification), content) {
+        (Ok(ProtoClassification::Plain), Some(sub_tree_value::Content::PlainValue(value)))
+            if !value.contains('\0') =>
+        {
+            Ok(ValueContent::Plain(PlainValue::new(value)))
+        }
+        (Ok(ProtoClassification::Secret), Some(sub_tree_value::Content::MaskedSecret(_))) => {
+            Ok(ValueContent::Secret(MaskedSecret))
+        }
+        _ => Err(invalid_response()),
     }
 }
 
@@ -295,7 +393,7 @@ mod tests {
 
     use sovereign_config_client::Transport;
     use sovereign_config_core::{ErrorKind, Secret};
-    use sovereign_config_proto::sovereign::config::v2::{
+    use sovereign_config_proto::sovereign::config::v3::{
         GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
         system_server::{System, SystemServer},
     };

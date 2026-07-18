@@ -16,14 +16,17 @@ use sovereign_config_client::{
 };
 use sovereign_config_core::{
     AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, ListedValue,
-    PlainValue, PutMetadata, ReplaceMetadata, Secret, SubTreeValue, Timestamp, ValueListing,
-    ValueSubTree, parse_subtree_json, render_subtree_json,
+    MaskedSecret, PlainValue, PutMetadata, ReplaceMetadata, RevealedSecret, Secret, SecretInput,
+    SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, Timestamp, ValueContent,
+    ValueListing, ValueSubTree, parse_subtree_json, render_subtree_json,
 };
-use sovereign_config_proto::sovereign::config::v2::{
+use sovereign_config_proto::sovereign::config::v3::{
     DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse,
     GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest, GetVersionResponse,
-    ListValuesRequest, ListValuesResponse, PutValueRequest, PutValueResponse,
-    ReplaceSubTreeRequest, ReplaceSubTreeResponse, SubTreeValue as ProtoSubTreeValue,
+    ListValuesRequest, ListValuesResponse, PreserveSecret, PutValueRequest, PutValueResponse,
+    ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest, RevealSecretResponse,
+    SubTreeMutationValue as ProtoSubTreeMutationValue, ValueClassification as ProtoClassification,
+    listed_value, put_value_request, sub_tree_mutation_value, sub_tree_value,
 };
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -121,7 +124,7 @@ impl AccessTokenProvider for MemoryAuthentication {
 impl Transport for BrowserTransport {
     async fn get_version(&self, protocol_version: &str) -> Result<VersionReply, ClientError> {
         let response: GetVersionResponse = grpc_unary(
-            "/sovereign.config.v2.System/GetVersion",
+            "/sovereign.config.v3.System/GetVersion",
             &GetVersionRequest {
                 protocol_version: protocol_version.to_owned(),
             },
@@ -136,7 +139,7 @@ impl Transport for BrowserTransport {
 
     async fn get_identity(&self, bearer: &Secret) -> Result<AuthenticationStatus, ClientError> {
         let response: GetIdentityResponse = grpc_unary(
-            "/sovereign.config.v2.System/GetIdentity",
+            "/sovereign.config.v3.System/GetIdentity",
             &GetIdentityRequest {},
             Some(bearer),
         )
@@ -155,7 +158,7 @@ impl ValueTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<ValueListing, ClientError> {
         let response: ListValuesResponse = grpc_unary(
-            "/sovereign.config.v2.Configuration/ListValues",
+            "/sovereign.config.v3.Configuration/ListValues",
             &ListValuesRequest {
                 path: path.as_str().to_owned(),
             },
@@ -168,7 +171,7 @@ impl ValueTransport for BrowserTransport {
             .map(|value| {
                 Ok(ListedValue {
                     path: ConfigPath::parse(value.path).map_err(|_| browser_error())?,
-                    value: PlainValue::new(value.value),
+                    value: listed_content(value.classification, value.content)?,
                     created_at: proto_timestamp(value.created_at)?,
                     updated_at: proto_timestamp(value.updated_at)?,
                 })
@@ -188,7 +191,7 @@ impl ValueTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<ValueSubTree, ClientError> {
         let response: GetSubTreeResponse = grpc_unary(
-            "/sovereign.config.v2.Configuration/GetSubTree",
+            "/sovereign.config.v3.Configuration/GetSubTree",
             &GetSubTreeRequest {
                 path: path.as_str().to_owned(),
             },
@@ -199,16 +202,13 @@ impl ValueTransport for BrowserTransport {
             .values
             .into_iter()
             .map(|value| {
-                if value.value.contains('\0') {
-                    return Err(browser_error());
-                }
                 let value_path = ConfigPath::parse(value.path).map_err(|_| browser_error())?;
                 if value_path.as_str() == "/" || !value_path.is_at_or_below(path) {
                     return Err(browser_error());
                 }
                 Ok(SubTreeValue {
                     path: value_path,
-                    value: PlainValue::new(value.value),
+                    value: subtree_content(value.classification, value.content)?,
                 })
             })
             .collect::<Result<Vec<_>, ClientError>>()?;
@@ -222,10 +222,35 @@ impl ValueTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<PutMetadata, ClientError> {
         let response: PutValueResponse = grpc_unary(
-            "/sovereign.config.v2.Configuration/PutValue",
+            "/sovereign.config.v3.Configuration/PutValue",
             &PutValueRequest {
                 path: path.as_str().to_owned(),
-                value: value.expose().to_owned(),
+                content: Some(put_value_request::Content::PlainValue(
+                    value.expose().to_owned(),
+                )),
+            },
+            Some(bearer),
+        )
+        .await?;
+        Ok(PutMetadata {
+            created_at: proto_timestamp(response.created_at)?,
+            updated_at: proto_timestamp(response.updated_at)?,
+        })
+    }
+
+    async fn put_secret(
+        &self,
+        path: &ConfigPath,
+        value: &SecretInput,
+        bearer: &Secret,
+    ) -> Result<PutMetadata, ClientError> {
+        let response: PutValueResponse = grpc_unary(
+            "/sovereign.config.v3.Configuration/PutValue",
+            &PutValueRequest {
+                path: path.as_str().to_owned(),
+                content: Some(put_value_request::Content::SecretValue(
+                    value.expose().to_owned(),
+                )),
             },
             Some(bearer),
         )
@@ -239,18 +264,27 @@ impl ValueTransport for BrowserTransport {
     async fn replace_subtree(
         &self,
         path: &ConfigPath,
-        values: &[SubTreeValue],
+        values: &[SubTreeMutationValue],
         bearer: &Secret,
     ) -> Result<ReplaceMetadata, ClientError> {
         let response: ReplaceSubTreeResponse = grpc_unary(
-            "/sovereign.config.v2.Configuration/ReplaceSubTree",
+            "/sovereign.config.v3.Configuration/ReplaceSubTree",
             &ReplaceSubTreeRequest {
                 path: path.as_str().to_owned(),
                 values: values
                     .iter()
-                    .map(|value| ProtoSubTreeValue {
+                    .map(|value| ProtoSubTreeMutationValue {
                         path: value.path.as_str().to_owned(),
-                        value: value.value.expose().to_owned(),
+                        content: Some(match &value.value {
+                            SubTreeMutationContent::Plain(value) => {
+                                sub_tree_mutation_value::Content::PlainValue(
+                                    value.expose().to_owned(),
+                                )
+                            }
+                            SubTreeMutationContent::PreserveSecret => {
+                                sub_tree_mutation_value::Content::PreserveSecret(PreserveSecret {})
+                            }
+                        }),
                     })
                     .collect(),
             },
@@ -270,7 +304,7 @@ impl ValueTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<DeleteMetadata, ClientError> {
         let response: DeleteValuesResponse = grpc_unary(
-            "/sovereign.config.v2.Configuration/DeleteValues",
+            "/sovereign.config.v3.Configuration/DeleteValues",
             &DeleteValuesRequest {
                 path: path.as_str().to_owned(),
                 recurse,
@@ -282,6 +316,59 @@ impl ValueTransport for BrowserTransport {
             deleted_at: proto_timestamp(response.deleted_at)?,
             deleted_count: response.deleted_count,
         })
+    }
+
+    async fn reveal_secret(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<RevealedSecret, ClientError> {
+        let response: RevealSecretResponse = grpc_unary(
+            "/sovereign.config.v3.Configuration/RevealSecret",
+            &RevealSecretRequest {
+                path: path.as_str().to_owned(),
+            },
+            Some(bearer),
+        )
+        .await?;
+        if response.value.contains('\0') {
+            return Err(browser_error());
+        }
+        Ok(RevealedSecret::new(response.value))
+    }
+}
+
+fn listed_content(
+    classification: i32,
+    content: Option<listed_value::Content>,
+) -> Result<ValueContent, ClientError> {
+    match (ProtoClassification::try_from(classification), content) {
+        (Ok(ProtoClassification::Plain), Some(listed_value::Content::PlainValue(value)))
+            if !value.contains('\0') =>
+        {
+            Ok(ValueContent::Plain(PlainValue::new(value)))
+        }
+        (Ok(ProtoClassification::Secret), Some(listed_value::Content::MaskedSecret(_))) => {
+            Ok(ValueContent::Secret(MaskedSecret))
+        }
+        _ => Err(browser_error()),
+    }
+}
+
+fn subtree_content(
+    classification: i32,
+    content: Option<sub_tree_value::Content>,
+) -> Result<ValueContent, ClientError> {
+    match (ProtoClassification::try_from(classification), content) {
+        (Ok(ProtoClassification::Plain), Some(sub_tree_value::Content::PlainValue(value)))
+            if !value.contains('\0') =>
+        {
+            Ok(ValueContent::Plain(PlainValue::new(value)))
+        }
+        (Ok(ProtoClassification::Secret), Some(sub_tree_value::Content::MaskedSecret(_))) => {
+            Ok(ValueContent::Secret(MaskedSecret))
+        }
+        _ => Err(browser_error()),
     }
 }
 
@@ -361,6 +448,7 @@ fn install_actions() {
             set_hidden("login", false);
             set_hidden("logout", true);
             set_text("value-state", "Log in to view values");
+            hide_new_value_row();
             clear_value_rows();
             set_textarea("json-content", "");
             set_text("value-count", "0 values");
@@ -383,6 +471,7 @@ fn install_route_link(document: &Document, id: &str, route: Route) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn install_configuration_actions(document: &Document) {
     if let Some(form) = document.get_element_by_id("path-form") {
         let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
@@ -427,6 +516,14 @@ fn install_configuration_actions(document: &Document) {
         let _ = add.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
         callback.forget();
     }
+    if let Some(classification) = document.get_element_by_id("new-value-secret") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            update_new_value_classification();
+        });
+        let _ = classification
+            .add_event_listener_with_callback("change", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
     if let Some(cancel) = document.get_element_by_id("cancel-new-value") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
             hide_new_value_row();
@@ -456,6 +553,21 @@ fn install_configuration_actions(document: &Document) {
             update_new_save_state();
         });
         let _ = value.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(value) = document.get_element_by_id("new-secret-content") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            validate_secret_field("new-secret-content", "new-value-error");
+            update_new_save_state();
+        });
+        let _ = value.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(toggle) = document.get_element_by_id("toggle-new-secret") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            toggle_secret_input("new-secret-content", "toggle-new-secret");
+        });
+        let _ = toggle.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
         callback.forget();
     }
     if let Some(cancel) = document.get_element_by_id("cancel-delete") {
@@ -832,6 +944,9 @@ fn value_client(config: &AppConfig) -> Client<BrowserTransport, MemoryAuthentica
 async fn load_current_configuration() {
     let generation = CONFIGURATION_LOAD_GENERATION.get().wrapping_add(1);
     CONFIGURATION_LOAD_GENERATION.set(generation);
+    hide_new_value_row();
+    clear_value_rows();
+    set_textarea("json-content", "");
     let Route::Configuration(path) = route_from_location() else {
         return;
     };
@@ -985,7 +1100,14 @@ async fn refresh_path_options() {
 }
 
 async fn save_new_value() {
-    if !validate_name_field() || !validate_value_field("new-value-content", "new-value-error") {
+    let secret =
+        element::<HtmlInputElement>("new-value-secret").is_some_and(|input| input.checked());
+    let value_valid = if secret {
+        validate_secret_field("new-secret-content", "new-value-error")
+    } else {
+        validate_value_field("new-value-content", "new-value-error")
+    };
+    if !validate_name_field() || !value_valid {
         return;
     }
     clear_error();
@@ -996,12 +1118,21 @@ async fn save_new_value() {
             .ok_or_else(browser_error)?
             .value();
         let path = namespace.join_name(name).map_err(|_| invalid_path())?;
-        let value = element::<HtmlTextAreaElement>("new-value-content")
-            .ok_or_else(browser_error)?
-            .value();
-        value_client(&config)
-            .put_value(&path, &PlainValue::new(value))
-            .await
+        if secret {
+            let value = element::<HtmlInputElement>("new-secret-content")
+                .ok_or_else(browser_error)?
+                .value();
+            value_client(&config)
+                .put_secret(&path, &SecretInput::new(value))
+                .await
+        } else {
+            let value = element::<HtmlTextAreaElement>("new-value-content")
+                .ok_or_else(browser_error)?
+                .value();
+            value_client(&config)
+                .put_value(&path, &PlainValue::new(value))
+                .await
+        }
     }
     .await;
     match result {
@@ -1011,7 +1142,12 @@ async fn save_new_value() {
             set_text("value-state", "Saved");
             focus("add-value");
         }
-        Err(error) => show_error(error.message()),
+        Err(error) => {
+            if let Some(input) = element::<HtmlInputElement>("new-secret-content") {
+                input.set_value("");
+            }
+            show_error(error.message());
+        }
     }
 }
 
@@ -1039,6 +1175,84 @@ async fn save_existing_value(path: ConfigPath, input_id: String) {
         }
         Err(error) => show_error(error.message()),
     }
+}
+
+async fn save_existing_secret(path: ConfigPath, input_id: String) {
+    clear_error();
+    let result = async {
+        let config = app_config()?;
+        let input = element::<HtmlInputElement>(&input_id).ok_or_else(browser_error)?;
+        let value = input.value();
+        input.set_value("");
+        value_client(&config)
+            .put_secret(&path, &SecretInput::new(value))
+            .await
+    }
+    .await;
+    match result {
+        Ok(_) => {
+            load_current_configuration().await;
+            set_text("value-state", "Saved");
+            focus("values-heading");
+        }
+        Err(error) => {
+            if let Some(input) = element::<HtmlInputElement>(&input_id) {
+                input.set_value("");
+            }
+            show_error(error.message());
+        }
+    }
+}
+
+async fn reveal_existing_secret(path: ConfigPath, output_id: String, button_id: String) {
+    clear_error();
+    hide_revealed_secret(&output_id, &button_id);
+    let result = async {
+        let config = app_config()?;
+        value_client(&config).reveal_secret(&path).await
+    }
+    .await;
+    match result {
+        Ok(value) => {
+            if let Some(output) = element::<HtmlTextAreaElement>(&output_id) {
+                output.set_value(value.expose());
+            }
+            set_hidden(&output_id, false);
+            set_text(&button_id, "Hide");
+            if let Some(button) = window()
+                .and_then(|window| window.document())
+                .and_then(|document| document.get_element_by_id(&button_id))
+            {
+                let _ = button.set_attribute("aria-expanded", "true");
+            }
+            focus(&output_id);
+        }
+        Err(error) => {
+            hide_revealed_secret(&output_id, &button_id);
+            show_error(error.message());
+        }
+    }
+}
+
+fn hide_revealed_secret(output_id: &str, button_id: &str) {
+    if let Some(output) = element::<HtmlTextAreaElement>(output_id) {
+        output.set_value("");
+    }
+    set_hidden(output_id, true);
+    set_text(button_id, "Reveal");
+    if let Some(button) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id(button_id))
+    {
+        let _ = button.set_attribute("aria-expanded", "false");
+    }
+}
+
+fn element_is_hidden(id: &str) -> bool {
+    window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id(id))
+        .is_none_or(|element| element.has_attribute("hidden"))
 }
 
 fn open_delete(path: ConfigPath, return_focus: String) {
@@ -1174,11 +1388,15 @@ fn render_path_options(listing: &ValueListing) -> Result<(), ClientError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_value_row(
     document: &Document,
     value: &ListedValue,
     index: usize,
 ) -> Result<Element, ClientError> {
+    if matches!(&value.value, ValueContent::Secret(_)) {
+        return render_secret_value_row(document, value, index);
+    }
     let row = create_element(document, "tr", None)?;
     row.set_attribute("data-value-row", "")
         .map_err(|_| browser_error())?;
@@ -1222,7 +1440,7 @@ fn render_value_row(
         .clone()
         .dyn_into::<HtmlTextAreaElement>()
         .map_err(|_| browser_error())?
-        .set_value(value.value.expose());
+        .set_value(value.value.display_text());
     let field_error = create_element(document, "p", Some("field-error"))?;
     field_error
         .set_attribute("id", &error_id)
@@ -1269,6 +1487,156 @@ fn render_value_row(
     });
     editor
         .add_event_listener_with_callback("input", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
+
+    let delete_path = value.path.clone();
+    let delete_focus = remove_id;
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        open_delete(delete_path.clone(), delete_focus.clone());
+    });
+    remove
+        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
+
+    append(&row, &name_cell)?;
+    append(&row, &value_cell)?;
+    append(&row, &updated)?;
+    append(&row, &actions_cell)?;
+    Ok(row)
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_secret_value_row(
+    document: &Document,
+    value: &ListedValue,
+    index: usize,
+) -> Result<Element, ClientError> {
+    let row = create_element(document, "tr", None)?;
+    row.set_attribute("data-value-row", "")
+        .map_err(|_| browser_error())?;
+    let name = value.path.name().ok_or_else(browser_error)?;
+
+    let name_cell = create_element(document, "th", None)?;
+    name_cell
+        .set_attribute("scope", "row")
+        .map_err(|_| browser_error())?;
+    let name_text = create_element(document, "span", Some("value-name"))?;
+    name_text.set_text_content(Some(name));
+    let full_path = create_element(document, "span", Some("full-path"))?;
+    full_path.set_text_content(Some(&absolute_path(&value.path)));
+    append(&name_cell, &name_text)?;
+    append(&name_cell, &full_path)?;
+
+    let value_cell = create_element(document, "td", None)?;
+    let kind = create_element(document, "span", Some("secret-kind"))?;
+    kind.set_text_content(Some("Secret"));
+    let mask = create_element(document, "span", Some("secret-mask"))?;
+    mask.set_text_content(Some(value.value.display_text()));
+    mask.set_attribute("aria-label", &format!("Secret value for {name} is hidden"))
+        .map_err(|_| browser_error())?;
+    append(&value_cell, &kind)?;
+    append(&value_cell, &mask)?;
+
+    let input_id = format!("secret-replacement-{index}");
+    let input = create_element(document, "input", None)?;
+    input
+        .set_attribute("id", &input_id)
+        .map_err(|_| browser_error())?;
+    input
+        .set_attribute("type", "password")
+        .map_err(|_| browser_error())?;
+    input
+        .set_attribute("autocomplete", "new-password")
+        .map_err(|_| browser_error())?;
+    input
+        .set_attribute("aria-label", &format!("Replacement secret for {name}"))
+        .map_err(|_| browser_error())?;
+    append(&value_cell, &input)?;
+
+    let toggle_id = format!("toggle-secret-input-{index}");
+    let toggle = create_button(document, &toggle_id, "Show input", Some("secondary"))?;
+    toggle
+        .set_attribute("aria-controls", &input_id)
+        .map_err(|_| browser_error())?;
+    toggle
+        .set_attribute("aria-pressed", "false")
+        .map_err(|_| browser_error())?;
+    append(&value_cell, &toggle)?;
+
+    let revealed_id = format!("revealed-secret-{index}");
+    let revealed = create_element(document, "textarea", Some("revealed-secret"))?;
+    revealed
+        .set_attribute("id", &revealed_id)
+        .map_err(|_| browser_error())?;
+    revealed
+        .set_attribute("readonly", "")
+        .map_err(|_| browser_error())?;
+    revealed
+        .set_attribute("hidden", "")
+        .map_err(|_| browser_error())?;
+    revealed
+        .set_attribute("aria-label", &format!("Revealed secret for {name}"))
+        .map_err(|_| browser_error())?;
+    append(&value_cell, &revealed)?;
+
+    let updated = create_element(document, "td", Some("updated-time"))?;
+    updated.set_text_content(Some(&format_timestamp(value.updated_at)));
+    let actions_cell = create_element(document, "td", None)?;
+    let actions = create_element(document, "div", Some("row-actions"))?;
+    let save_id = format!("save-secret-{index}");
+    let save = create_button(document, &save_id, "Replace", None)?;
+    let reveal_id = format!("reveal-secret-{index}");
+    let reveal = create_button(document, &reveal_id, "Reveal", Some("secondary"))?;
+    reveal
+        .set_attribute("aria-controls", &revealed_id)
+        .map_err(|_| browser_error())?;
+    reveal
+        .set_attribute("aria-expanded", "false")
+        .map_err(|_| browser_error())?;
+    let remove_id = format!("delete-listed-value-{index}");
+    let remove = create_button(document, &remove_id, "Delete", Some("danger"))?;
+    append(&actions, &save)?;
+    append(&actions, &reveal)?;
+    append(&actions, &remove)?;
+    append(&actions_cell, &actions)?;
+
+    let save_path = value.path.clone();
+    let save_input = input_id.clone();
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        spawn_local(save_existing_secret(save_path.clone(), save_input.clone()));
+    });
+    save.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
+
+    let toggle_input = input_id;
+    let toggle_button = toggle_id;
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        toggle_secret_input(&toggle_input, &toggle_button);
+    });
+    toggle
+        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
+
+    let reveal_path = value.path.clone();
+    let reveal_output = revealed_id;
+    let reveal_button = reveal_id;
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        if element_is_hidden(&reveal_output) {
+            spawn_local(reveal_existing_secret(
+                reveal_path.clone(),
+                reveal_output.clone(),
+                reveal_button.clone(),
+            ));
+        } else {
+            hide_revealed_secret(&reveal_output, &reveal_button);
+        }
+    });
+    reveal
+        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
         .map_err(|_| browser_error())?;
     callback.forget();
 
@@ -1342,8 +1710,62 @@ fn clear_value_rows() {
     set_hidden("empty-values", false);
 }
 
+fn clear_revealed_secrets() {
+    let Some(document) = window().and_then(|window| window.document()) else {
+        return;
+    };
+    let outputs = document.get_elements_by_class_name("revealed-secret");
+    for index in 0..outputs.length() {
+        let Some(output) = outputs.item(index) else {
+            continue;
+        };
+        let output_id = output.id();
+        let Some(suffix) = output_id.strip_prefix("revealed-secret-") else {
+            continue;
+        };
+        hide_revealed_secret(&output_id, &format!("reveal-secret-{suffix}"));
+    }
+}
+
+fn clear_write_only_secret_inputs() {
+    let Some(document) = window().and_then(|window| window.document()) else {
+        return;
+    };
+    let inputs = document.get_elements_by_tag_name("input");
+    for index in 0..inputs.length() {
+        let Some(element) = inputs.item(index) else {
+            continue;
+        };
+        let input_id = element.id();
+        if input_id != "new-secret-content" && !input_id.starts_with("secret-replacement-") {
+            continue;
+        }
+        if let Ok(input) = element.dyn_into::<HtmlInputElement>() {
+            input.set_value("");
+            input.set_type("password");
+        }
+        let button_id = input_id.strip_prefix("secret-replacement-").map_or_else(
+            || "toggle-new-secret".to_owned(),
+            |suffix| format!("toggle-secret-input-{suffix}"),
+        );
+        set_text(&button_id, "Show input");
+        if let Some(button) = document.get_element_by_id(&button_id) {
+            let _ = button.set_attribute("aria-pressed", "false");
+        }
+    }
+}
+
 fn show_new_value_row() {
     set_textarea("new-value-content", "");
+    if let Some(secret) = element::<HtmlInputElement>("new-value-secret") {
+        secret.set_checked(false);
+    }
+    if let Some(input) = element::<HtmlInputElement>("new-secret-content") {
+        input.set_value("");
+        input.set_type("password");
+    }
+    set_text("toggle-new-secret", "Show input");
+    update_new_value_classification();
     if let Some(name) = element::<HtmlInputElement>("new-value-name") {
         name.set_value("");
     }
@@ -1356,8 +1778,40 @@ fn show_new_value_row() {
 
 fn hide_new_value_row() {
     set_hidden("new-value-row", true);
+    set_textarea("new-value-content", "");
+    if let Some(input) = element::<HtmlInputElement>("new-secret-content") {
+        input.set_value("");
+        input.set_type("password");
+    }
+    set_text("toggle-new-secret", "Show input");
     set_validation("new-value-name", "new-name-error", None);
     set_validation("new-value-content", "new-value-error", None);
+}
+
+fn update_new_value_classification() {
+    let secret =
+        element::<HtmlInputElement>("new-value-secret").is_some_and(|input| input.checked());
+    set_hidden("new-value-content", secret);
+    set_hidden("new-secret-content", !secret);
+    set_hidden("toggle-new-secret", !secret);
+    set_validation("new-value-content", "new-value-error", None);
+    set_validation("new-secret-content", "new-value-error", None);
+    update_new_save_state();
+}
+
+fn toggle_secret_input(input_id: &str, button_id: &str) {
+    let Some(input) = element::<HtmlInputElement>(input_id) else {
+        return;
+    };
+    let visible = input.type_() == "text";
+    input.set_type(if visible { "password" } else { "text" });
+    set_text(button_id, if visible { "Show input" } else { "Hide input" });
+    if let Some(button) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id(button_id))
+    {
+        let _ = button.set_attribute("aria-pressed", if visible { "false" } else { "true" });
+    }
 }
 
 fn validate_path_field() -> bool {
@@ -1396,6 +1850,18 @@ fn validate_value_field(input_id: &str, error_id: &str) -> bool {
     message.is_none()
 }
 
+fn validate_secret_field(input_id: &str, error_id: &str) -> bool {
+    let Some(input) = element::<HtmlInputElement>(input_id) else {
+        return false;
+    };
+    let message = input
+        .value()
+        .contains('\0')
+        .then_some("Secret cannot contain a null character");
+    set_validation(input_id, error_id, message);
+    message.is_none()
+}
+
 fn set_validation(input_id: &str, error_id: &str, message: Option<&str>) {
     if let Some(input) = element::<HtmlInputElement>(input_id) {
         input.set_custom_validity(message.unwrap_or_default());
@@ -1417,8 +1883,15 @@ fn set_validation(input_id: &str, error_id: &str, message: Option<&str>) {
 fn update_new_save_state() {
     let name_valid = element::<HtmlInputElement>("new-value-name")
         .is_some_and(|input| !input.value().is_empty() && input.check_validity());
-    let value_valid = element::<HtmlTextAreaElement>("new-value-content")
-        .is_some_and(|input| input.check_validity());
+    let secret =
+        element::<HtmlInputElement>("new-value-secret").is_some_and(|input| input.checked());
+    let value_valid = if secret {
+        element::<HtmlInputElement>("new-secret-content")
+            .is_some_and(|input| input.check_validity())
+    } else {
+        element::<HtmlTextAreaElement>("new-value-content")
+            .is_some_and(|input| input.check_validity())
+    };
     set_button_disabled("save-new-value", !(name_valid && value_valid));
 }
 
@@ -1986,6 +2459,8 @@ fn focus(id: &str) {
 }
 
 fn show_error(message: &str) {
+    clear_revealed_secrets();
+    clear_write_only_secret_inputs();
     set_text("error", message);
     set_hidden("error", false);
 }
@@ -2007,7 +2482,7 @@ fn oidc_error() -> ClientError {
 mod tests {
     use prost::Message;
     use sovereign_config_core::ErrorKind;
-    use sovereign_config_proto::sovereign::config::v2::GetIdentityResponse;
+    use sovereign_config_proto::sovereign::config::v3::GetIdentityResponse;
 
     use super::{
         Route, classify_refresh_error, decode_grpc_web, decode_grpc_web_response,

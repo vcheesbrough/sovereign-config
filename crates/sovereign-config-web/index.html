@@ -100,10 +100,17 @@
                     <label class="visually-hidden" for="new-value-name">Name</label>
                     <input id="new-value-name" type="text" autocomplete="off" spellcheck="false" placeholder="value-name" aria-describedby="new-name-error">
                     <p id="new-name-error" class="field-error" aria-live="polite" hidden></p>
+                    <label class="secret-choice" for="new-value-secret">
+                      <input id="new-value-secret" type="checkbox">
+                      Store as secret
+                    </label>
                   </th>
                   <td>
                     <label class="visually-hidden" for="new-value-content">Value</label>
                     <textarea id="new-value-content" rows="2" spellcheck="false" aria-describedby="new-value-error"></textarea>
+                    <label class="visually-hidden" for="new-secret-content">Secret value</label>
+                    <input id="new-secret-content" type="password" autocomplete="new-password" aria-describedby="new-value-error" hidden>
+                    <button id="toggle-new-secret" class="secondary secret-input-toggle" type="button" aria-controls="new-secret-content" aria-pressed="false" hidden>Show input</button>
                     <p id="new-value-error" class="field-error" aria-live="polite" hidden></p>
                   </td>
                   <td class="muted">New</td>

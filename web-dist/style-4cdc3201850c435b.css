@@ -106,6 +106,12 @@ tbody th { font-weight: 700; }
 .row-actions button { min-height: 34px; padding: 0 10px; font-size: 13px; }
 .empty-state { margin: 0; padding: 30px 12px; color: #58655f; text-align: center; border-bottom: 1px solid #aeb9b4; }
 .muted { color: #68756f; }
+.secret-choice { margin-top: 10px; font-size: 13px; }
+.secret-choice input { width: auto; min-height: auto; margin-right: 6px; }
+.secret-mask { display: block; margin-bottom: 8px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.secret-kind { display: inline-block; margin-bottom: 6px; padding: 2px 6px; color: #4a3510; background: #f6e7bd; border-radius: 3px; font-size: 12px; font-weight: 750; }
+.revealed-secret { margin-top: 8px; }
+.secret-input-toggle { margin-top: 8px; }
 dialog { width: min(480px, calc(100% - 32px)); padding: 24px; color: #18201d; background: #fff; border: 1px solid #8d9a94; border-radius: 6px; }
 dialog::backdrop { background: rgb(16 33 27 / 55%); }
 dialog p { margin: 12px 0 24px; line-height: 1.5; }

@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package sovereign.config.v2;
+package sovereign.config.v3;
 
 import "google/protobuf/timestamp.proto";
 
@@ -15,19 +15,31 @@ service Configuration {
   rpc PutValue(PutValueRequest) returns (PutValueResponse);
   rpc ReplaceSubTree(ReplaceSubTreeRequest) returns (ReplaceSubTreeResponse);
   rpc DeleteValues(DeleteValuesRequest) returns (DeleteValuesResponse);
+  rpc RevealSecret(RevealSecretRequest) returns (RevealSecretResponse);
 }
 
+enum ValueClassification {
+  VALUE_CLASSIFICATION_UNSPECIFIED = 0;
+  VALUE_CLASSIFICATION_PLAIN = 1;
+  VALUE_CLASSIFICATION_SECRET = 2;
+}
+
+message MaskedSecret {}
+message PreserveSecret {}
+
 message ListValuesRequest {
-  // Canonical absolute configuration namespace path. `/` selects the tree root.
   string path = 1;
 }
 
 message ListedValue {
-  // Canonical absolute configuration value path.
   string path = 1;
-  string value = 2;
+  oneof content {
+    string plain_value = 2;
+    MaskedSecret masked_secret = 5;
+  }
   google.protobuf.Timestamp created_at = 3;
   google.protobuf.Timestamp updated_at = 4;
+  ValueClassification classification = 6;
 }
 
 message ListValuesResponse {
@@ -36,14 +48,16 @@ message ListValuesResponse {
 }
 
 message GetSubTreeRequest {
-  // Canonical absolute configuration path. `/` selects the tree root.
   string path = 1;
 }
 
 message SubTreeValue {
-  // Canonical absolute configuration value path.
   string path = 1;
-  string value = 2;
+  oneof content {
+    string plain_value = 2;
+    MaskedSecret masked_secret = 3;
+  }
+  ValueClassification classification = 4;
 }
 
 message GetSubTreeResponse {
@@ -51,9 +65,11 @@ message GetSubTreeResponse {
 }
 
 message PutValueRequest {
-  // Canonical absolute configuration value path.
   string path = 1;
-  string value = 2;
+  oneof content {
+    string plain_value = 2;
+    string secret_value = 3;
+  }
 }
 
 message PutValueResponse {
@@ -61,10 +77,17 @@ message PutValueResponse {
   google.protobuf.Timestamp updated_at = 2;
 }
 
-message ReplaceSubTreeRequest {
-  // Canonical absolute configuration path. `/` selects the tree root.
+message SubTreeMutationValue {
   string path = 1;
-  repeated SubTreeValue values = 2;
+  oneof content {
+    string plain_value = 2;
+    PreserveSecret preserve_secret = 3;
+  }
+}
+
+message ReplaceSubTreeRequest {
+  string path = 1;
+  repeated SubTreeMutationValue values = 2;
 }
 
 message ReplaceSubTreeResponse {
@@ -73,7 +96,6 @@ message ReplaceSubTreeResponse {
 }
 
 message DeleteValuesRequest {
-  // Canonical absolute configuration path. `/` is valid only when recurse is true.
   string path = 1;
   bool recurse = 2;
 }
@@ -81,6 +103,14 @@ message DeleteValuesRequest {
 message DeleteValuesResponse {
   google.protobuf.Timestamp deleted_at = 1;
   uint64 deleted_count = 2;
+}
+
+message RevealSecretRequest {
+  string path = 1;
+}
+
+message RevealSecretResponse {
+  string value = 1;
 }
 
 message GetIdentityRequest {}
