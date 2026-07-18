@@ -401,6 +401,7 @@ async fn exact_value_commands_use_absolute_paths_within_profile_root_and_hard_de
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn secret_commands_mask_preserve_rotate_reveal_and_delete_values() {
     let services = start_services(DeviceResult::Success).await;
     let home = TempDir::new().unwrap();
@@ -429,6 +430,21 @@ async fn secret_commands_mask_preserve_rotate_reveal_and_delete_values() {
     assert_success(&masked);
     assert_eq!(String::from_utf8_lossy(&masked.stdout), "********");
     assert!(!combined(&masked).contains(first));
+    let masked_json = run_cli(home.path(), &["get", "/team/service", "--format", "json"]).await;
+    assert_success(&masked_json);
+    assert_eq!(
+        String::from_utf8_lossy(&masked_json.stdout),
+        "{\n  \"credential\": \"********\"\n}\n"
+    );
+    assert!(!combined(&masked_json).contains(first));
+    let revealed_by_get = run_cli(
+        home.path(),
+        &["get", "/team/service/credential", "--reveal"],
+    )
+    .await;
+    assert_success(&revealed_by_get);
+    assert_eq!(String::from_utf8_lossy(&revealed_by_get.stdout), first);
+    assert!(revealed_by_get.stderr.is_empty());
     let revealed = run_cli(
         home.path(),
         &["secret", "reveal", "/team/service/credential"],
@@ -450,6 +466,13 @@ async fn secret_commands_mask_preserve_rotate_reveal_and_delete_values() {
     let sibling =
         run_cli_with_input(home.path(), &["put", "/team/service/enabled"], Some("true")).await;
     assert_success(&sibling);
+    let masked_json = run_cli(home.path(), &["get", "/team/service", "--format", "json"]).await;
+    assert_success(&masked_json);
+    assert_eq!(
+        String::from_utf8_lossy(&masked_json.stdout),
+        "{\n  \"credential\": \"********\",\n  \"enabled\": \"true\"\n}\n"
+    );
+    assert!(!combined(&masked_json).contains(second));
     let json = run_cli_with_input(
         home.path(),
         &["put", "/team/service", "--format", "json"],
@@ -458,6 +481,17 @@ async fn secret_commands_mask_preserve_rotate_reveal_and_delete_values() {
     .await;
     assert_success(&json);
     assert!(!combined(&json).contains(second));
+    let revealed_json = run_cli(
+        home.path(),
+        &["get", "/team/service", "--format", "json", "--reveal"],
+    )
+    .await;
+    assert_success(&revealed_json);
+    assert_eq!(
+        String::from_utf8_lossy(&revealed_json.stdout),
+        format!("{{\n  \"credential\": \"{second}\",\n  \"enabled\": \"false\"\n}}\n")
+    );
+    assert!(revealed_json.stderr.is_empty());
     let revealed = run_cli(
         home.path(),
         &["secret", "reveal", "/team/service/credential"],

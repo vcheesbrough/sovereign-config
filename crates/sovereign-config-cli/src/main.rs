@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use sovereign_config_client::{AccessTokenProvider, Client};
 use sovereign_config_core::{
     ClientError, ConfigPath, ConnectionUrl, ErrorKind, PlainValue, Secret, SecretInput,
-    parse_subtree_json, render_subtree_json,
+    SubTreeValue, ValueContent, parse_subtree_json, render_subtree_json,
 };
 use sovereign_config_native::{
     CredentialStore, DeviceFlowClient, ProfileStore, TonicTransport, default_credential_directory,
@@ -45,6 +45,8 @@ enum Command {
         path: String,
         #[arg(long, value_enum, default_value_t = ValueFormat::Text)]
         format: ValueFormat,
+        #[arg(long, help = "Reveal secret values in the requested result")]
+        reveal: bool,
     },
     Put {
         #[arg(
@@ -123,7 +125,11 @@ async fn main() -> Result<()> {
                 Command::Login => login(&connection).await,
                 Command::Logout => logout(&connection),
                 Command::Status => status(&connection).await,
-                Command::Get { path, format } => get_value(&connection, &path, format).await,
+                Command::Get {
+                    path,
+                    format,
+                    reveal,
+                } => get_value(&connection, &path, format, reveal).await,
                 Command::Put { path, format } => put_value(&connection, &path, format).await,
                 Command::Secret { command } => secret_value(&connection, command).await,
                 Command::Delete { path, yes, recurse } => {
@@ -327,22 +333,46 @@ fn operation_path(connection: &ConnectionUrl, path: &str, allow_root: bool) -> R
     Ok(path)
 }
 
-async fn get_value(connection: &ConnectionUrl, path: &str, format: ValueFormat) -> Result<()> {
+async fn get_value(
+    connection: &ConnectionUrl,
+    path: &str,
+    format: ValueFormat,
+    reveal: bool,
+) -> Result<()> {
     let path = operation_path(connection, path, true)?;
-    let subtree = operational_client(connection)
-        .await?
-        .get_subtree(&path)
-        .await?;
+    let client = operational_client(connection).await?;
+    let mut subtree = client.get_subtree(&path).await?;
     if format == ValueFormat::Json {
+        if reveal {
+            reveal_subtree(&client, &mut subtree.values).await?;
+        }
         print!("{}", render_subtree_json(&path, &subtree.values)?);
     } else if let [value] = subtree.values.as_slice()
         && value.path == path
     {
-        print!("{}", value.value.display_text());
+        if reveal && matches!(value.value, ValueContent::Secret(_)) {
+            let revealed = client.reveal_secret(&value.path).await?;
+            print!("{}", revealed.expose());
+        } else {
+            print!("{}", value.value.display_text());
+        }
     } else if subtree.values.is_empty() {
         bail!("configuration value not found");
     } else {
         bail!("JSON format is required to read a configuration subtree");
+    }
+    Ok(())
+}
+
+async fn reveal_subtree(
+    client: &Client<TonicTransport, InMemoryToken>,
+    values: &mut [SubTreeValue],
+) -> Result<()> {
+    for value in values {
+        if matches!(value.value, ValueContent::Secret(_)) {
+            let revealed = client.reveal_secret(&value.path).await?;
+            value.value = ValueContent::Plain(PlainValue::new(revealed.expose()));
+        }
     }
     Ok(())
 }
