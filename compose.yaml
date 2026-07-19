@@ -62,7 +62,7 @@ services:
       - "observability.service=sovereign-config"
       - "observability.env=${SOVEREIGN_CONFIG_ENV:-dev}"
       - "observability.release=${SOVEREIGN_CONFIG_IMAGE_TAG:-local}"
-      - "observability.protocol=v1"
+      - "observability.protocol=v3"
     restart: unless-stopped
 
 secrets:
@@ -75,7 +75,8 @@ secrets:
 
 volumes:
   postgres_data:
-    name: ${POSTGRES_DATA_VOLUME:-sovereign-config-postgres-data}
+    external: true
+    name: ${POSTGRES_DATA_VOLUME:?Set POSTGRES_DATA_VOLUME to a pre-created encrypted volume}
 
 networks:
   sovereign_config_private:

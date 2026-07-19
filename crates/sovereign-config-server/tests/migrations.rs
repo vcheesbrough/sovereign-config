@@ -34,12 +34,12 @@ async fn reset_schema(pool: &PgPool, context: &str) {
 
 async fn rooted_path_constraint_accepts_only_rooted_values(pool: &PgPool) {
     let invalid_path = sqlx::query(
-        "INSERT INTO configuration_values (path, value, created_at, updated_at) VALUES ('Invalid/Path', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        "INSERT INTO configuration_values (path, value, classification, created_at, updated_at) VALUES ('Invalid/Path', '', 'plain', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .execute(pool)
     .await;
     let rooted_path = sqlx::query(
-        "INSERT INTO configuration_values (path, value, created_at, updated_at) VALUES ('/valid/path', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        "INSERT INTO configuration_values (path, value, classification, created_at, updated_at) VALUES ('/valid/path', '', 'plain', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .execute(pool)
     .await;
@@ -53,8 +53,25 @@ async fn rooted_path_constraint_accepts_only_rooted_values(pool: &PgPool) {
     assert_eq!(retained_values, 1);
 }
 
+async fn classification_is_explicit_and_constrained(pool: &PgPool) {
+    let invalid = sqlx::query(
+        "INSERT INTO configuration_values (path, value, classification, created_at, updated_at) VALUES ('/invalid/classification', '', 'unknown', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .execute(pool)
+    .await;
+    let omitted = sqlx::query(
+        "INSERT INTO configuration_values (path, value, created_at, updated_at) VALUES ('/missing/classification', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .execute(pool)
+    .await;
+
+    assert!(invalid.is_err());
+    assert!(omitted.is_err());
+}
+
 #[tokio::test]
 #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+#[allow(clippy::too_many_lines)]
 async fn migrations_are_repeatable_against_postgresql() {
     let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
         .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
@@ -106,6 +123,34 @@ async fn migrations_are_repeatable_against_postgresql() {
 
     reset_schema(&pool, "after upgrade validation").await;
 
+    let v2_release = Migrator {
+        migrations: Cow::Owned(migrator.migrations[..3].to_vec()),
+        ..Migrator::DEFAULT
+    };
+    v2_release
+        .run(&pool)
+        .await
+        .expect("v2 schema migration must succeed");
+    sqlx::query(
+        "INSERT INTO configuration_values (path, value, created_at, updated_at) VALUES ('/existing/value', 'plain-sentinel', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .execute(&pool)
+    .await
+    .expect("v2 value must be insertable");
+    migrator
+        .run(&pool)
+        .await
+        .expect("v2 classification upgrade must succeed");
+    let migrated: (String, String) = sqlx::query_as(
+        "SELECT value, classification FROM configuration_values WHERE path = '/existing/value'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("migrated value must be readable");
+    assert_eq!(migrated, ("plain-sentinel".into(), "plain".into()));
+
+    reset_schema(&pool, "after v2 classification validation").await;
+
     migrator
         .run(&pool)
         .await
@@ -135,6 +180,9 @@ async fn migrations_are_repeatable_against_postgresql() {
             OR table_name LIKE '%token%'
             OR table_name LIKE '%session%'
             OR table_name LIKE '%audit%'
+            OR table_name LIKE '%history%'
+            OR table_name LIKE '%tombstone%'
+            OR table_name LIKE '%key%'
           )
         ",
     )
@@ -148,15 +196,16 @@ async fn migrations_are_repeatable_against_postgresql() {
         FROM information_schema.columns
         WHERE table_schema = current_schema()
           AND table_name = 'configuration_values'
-          AND column_name IN ('path', 'value', 'created_at', 'updated_at')
+          AND column_name IN ('path', 'value', 'classification', 'created_at', 'updated_at')
         ",
     )
     .fetch_one(&pool)
     .await
     .expect("configuration value schema must be readable");
-    assert_eq!(applied_migrations, 3);
+    assert_eq!(applied_migrations, 4);
     assert_eq!(metadata_rows, 1);
     assert_eq!(authorization_tables, 0);
-    assert_eq!(value_columns, 4);
+    assert_eq!(value_columns, 5);
     rooted_path_constraint_accepts_only_rooted_values(&pool).await;
+    classification_is_explicit_and_constrained(&pool).await;
 }

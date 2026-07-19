@@ -10,13 +10,20 @@ mod tests {
     };
     use sovereign_config_core::{
         AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, ListedValue,
-        PlainValue, PutMetadata, ReplaceMetadata, Secret, SubTreeValue, Timestamp, ValueListing,
-        ValueSubTree,
+        MaskedSecret, PlainValue, PutMetadata, ReplaceMetadata, RevealedSecret, Secret,
+        SecretInput, SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, Timestamp,
+        ValueContent, ValueListing, ValueSubTree,
     };
 
     #[derive(Clone)]
+    enum StoredContent {
+        Plain(PlainValue),
+        Secret(String),
+    }
+
+    #[derive(Clone)]
     struct StoredValue {
-        value: PlainValue,
+        value: StoredContent,
         created_at: Timestamp,
         updated_at: Timestamp,
     }
@@ -61,7 +68,7 @@ mod tests {
                 })
                 .map(|(path, value)| ListedValue {
                     path: path.clone(),
-                    value: value.value.clone(),
+                    value: ordinary_content(&value.value),
                     created_at: value.created_at,
                     updated_at: value.updated_at,
                 })
@@ -85,7 +92,7 @@ mod tests {
                     .filter(|(candidate, _)| candidate.is_at_or_below(path))
                     .map(|(path, value)| SubTreeValue {
                         path: path.clone(),
-                        value: value.value.clone(),
+                        value: ordinary_content(&value.value),
                     })
                     .collect(),
             })
@@ -104,7 +111,31 @@ mod tests {
             self.values.borrow_mut().insert(
                 path.clone(),
                 StoredValue {
-                    value: value.clone(),
+                    value: StoredContent::Plain(value.clone()),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                },
+            );
+            Ok(PutMetadata {
+                created_at: timestamp,
+                updated_at: timestamp,
+            })
+        }
+
+        async fn put_secret(
+            &self,
+            path: &ConfigPath,
+            value: &SecretInput,
+            _: &Secret,
+        ) -> Result<PutMetadata, ClientError> {
+            let timestamp = Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 0,
+            };
+            self.values.borrow_mut().insert(
+                path.clone(),
+                StoredValue {
+                    value: StoredContent::Secret(value.expose().to_owned()),
                     created_at: timestamp,
                     updated_at: timestamp,
                 },
@@ -118,7 +149,7 @@ mod tests {
         async fn replace_subtree(
             &self,
             path: &ConfigPath,
-            values: &[SubTreeValue],
+            values: &[SubTreeMutationValue],
             _: &Secret,
         ) -> Result<ReplaceMetadata, ClientError> {
             let timestamp = Timestamp {
@@ -126,12 +157,17 @@ mod tests {
                 nanos: 0,
             };
             let mut stored = self.values.borrow_mut();
-            stored.retain(|candidate, _| !candidate.is_at_or_below(path));
+            stored.retain(|candidate, value| {
+                !candidate.is_at_or_below(path) || matches!(value.value, StoredContent::Secret(_))
+            });
             for value in values {
+                let SubTreeMutationContent::Plain(content) = &value.value else {
+                    continue;
+                };
                 stored.insert(
                     value.path.clone(),
                     StoredValue {
-                        value: value.value.clone(),
+                        value: StoredContent::Plain(content.clone()),
                         created_at: timestamp,
                         updated_at: timestamp,
                     },
@@ -171,6 +207,36 @@ mod tests {
                 deleted_count,
             })
         }
+
+        async fn reveal_secret(
+            &self,
+            path: &ConfigPath,
+            _: &Secret,
+        ) -> Result<RevealedSecret, ClientError> {
+            match self
+                .values
+                .borrow()
+                .get(path)
+                .map(|value| value.value.clone())
+            {
+                Some(StoredContent::Secret(value)) => Ok(RevealedSecret::new(value)),
+                Some(StoredContent::Plain(_)) => Err(ClientError::new(
+                    ErrorKind::InvalidRequest,
+                    "configuration value is not a secret",
+                )),
+                None => Err(ClientError::new(
+                    ErrorKind::NotFound,
+                    "configuration value not found",
+                )),
+            }
+        }
+    }
+
+    fn ordinary_content(value: &StoredContent) -> ValueContent {
+        match value {
+            StoredContent::Plain(value) => ValueContent::Plain(value.clone()),
+            StoredContent::Secret(_) => ValueContent::Secret(MaskedSecret),
+        }
     }
 
     struct ConsumerAuthentication;
@@ -183,7 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_client_api_supports_the_v2_value_lifecycle() {
+    async fn public_client_api_supports_the_v3_secret_safe_value_lifecycle() {
         let client = Client::new(
             ConsumerTransport {
                 values: RefCell::new(BTreeMap::new()),
@@ -203,25 +269,44 @@ mod tests {
         assert_eq!(
             client.get_subtree(&path).await.unwrap().values[0]
                 .value
-                .expose(),
+                .display_text(),
             "consumer-value-sentinel"
         );
-        let child = SubTreeValue {
+        let child = SubTreeMutationValue {
             path: ConfigPath::parse("/apps/api/feature/child").unwrap(),
-            value: PlainValue::new("child"),
+            value: SubTreeMutationContent::Plain(PlainValue::new("child")),
         };
         client
             .replace_subtree(&path, std::slice::from_ref(&child))
             .await
             .unwrap();
-        assert_eq!(client.get_subtree(&path).await.unwrap().values, vec![child]);
+        assert_eq!(
+            client.get_subtree(&path).await.unwrap().values,
+            vec![SubTreeValue {
+                path: child.path.clone(),
+                value: ValueContent::Plain(PlainValue::new("child")),
+            }]
+        );
+        let secret_path = ConfigPath::parse("/apps/api/feature/credential").unwrap();
+        client
+            .put_secret(&secret_path, &SecretInput::new("consumer-secret-sentinel"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.get_subtree(&secret_path).await.unwrap().values[0].value,
+            ValueContent::Secret(_)
+        ));
+        assert_eq!(
+            client.reveal_secret(&secret_path).await.unwrap().expose(),
+            "consumer-secret-sentinel"
+        );
         assert_eq!(
             client
                 .delete_values(&path, true)
                 .await
                 .unwrap()
                 .deleted_count,
-            1
+            2
         );
         assert!(client.get_subtree(&path).await.unwrap().values.is_empty());
     }

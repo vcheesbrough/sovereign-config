@@ -1,11 +1,12 @@
 use std::{collections::BTreeSet, time::SystemTime};
 
-use sovereign_config_core::ConfigPath;
-use sovereign_config_proto::sovereign::config::v2::{
+use sovereign_config_core::{ConfigPath, MASKED_SECRET_TEXT};
+use sovereign_config_proto::sovereign::config::v3::{
     DeleteValuesRequest, DeleteValuesResponse, GetSubTreeRequest, GetSubTreeResponse,
-    ListValuesRequest, ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
-    ReplaceSubTreeRequest, ReplaceSubTreeResponse, SubTreeValue,
-    configuration_server::Configuration,
+    ListValuesRequest, ListValuesResponse, ListedValue, MaskedSecret, PutValueRequest,
+    PutValueResponse, ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest,
+    RevealSecretResponse, SubTreeValue, ValueClassification, configuration_server::Configuration,
+    listed_value, put_value_request, sub_tree_mutation_value, sub_tree_value,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
@@ -22,6 +23,7 @@ pub(crate) struct ConfigurationService {
 struct ListedValueRow {
     path: String,
     value: String,
+    classification: String,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
 }
@@ -43,6 +45,7 @@ impl ConfigurationService {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 #[tonic::async_trait]
 impl Configuration for ConfigurationService {
     async fn list_values(
@@ -78,7 +81,7 @@ impl Configuration for ConfigurationService {
         if !readable_values.is_empty() {
             let rows = sqlx::query_as::<_, ListedValueRow>(
                 r"
-                SELECT path, value, created_at, updated_at
+                SELECT path, value, classification, created_at, updated_at
                 FROM configuration_values
                 WHERE path = ANY($1::TEXT[])
                 ORDER BY path
@@ -89,11 +92,14 @@ impl Configuration for ConfigurationService {
             .await
             .map_err(|_| storage_unavailable())?;
             for row in rows {
+                let (classification, content) = listed_content(row.value, &row.classification)
+                    .ok_or_else(storage_unavailable)?;
                 values.push(ListedValue {
                     path: row.path,
-                    value: row.value,
                     created_at: Some(to_proto_timestamp(row.created_at)?),
                     updated_at: Some(to_proto_timestamp(row.updated_at)?),
+                    classification,
+                    content: Some(content),
                 });
             }
         }
@@ -111,7 +117,7 @@ impl Configuration for ConfigurationService {
         let path = authorize(&request, &[Permission::Read], true)?;
         let rows = sqlx::query_as::<_, ListedValueRow>(
             r"
-            SELECT path, value, created_at, updated_at
+            SELECT path, value, classification, created_at, updated_at
             FROM configuration_values
             WHERE $1 = '/' OR path = $1 OR path LIKE $1 || '/%'
             ORDER BY path
@@ -122,15 +128,17 @@ impl Configuration for ConfigurationService {
         .await
         .map_err(|_| storage_unavailable())?;
 
-        Ok(Response::new(GetSubTreeResponse {
-            values: rows
-                .into_iter()
-                .map(|row| SubTreeValue {
-                    path: row.path,
-                    value: row.value,
-                })
-                .collect(),
-        }))
+        let mut values = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (classification, content) =
+                subtree_content(row.value, &row.classification).ok_or_else(storage_unavailable)?;
+            values.push(SubTreeValue {
+                path: row.path,
+                classification,
+                content: Some(content),
+            });
+        }
+        Ok(Response::new(GetSubTreeResponse { values }))
     }
 
     async fn put_value(
@@ -138,7 +146,11 @@ impl Configuration for ConfigurationService {
         request: Request<PutValueRequest>,
     ) -> Result<Response<PutValueResponse>, Status> {
         let path = authorize(&request, &[Permission::Write], false)?;
-        let value = &request.get_ref().value;
+        let (value, classification) = match request.get_ref().content.as_ref() {
+            Some(put_value_request::Content::PlainValue(value)) => (value, "plain"),
+            Some(put_value_request::Content::SecretValue(value)) => (value, "secret"),
+            None => return Err(Status::invalid_argument("configuration value is invalid")),
+        };
         if value.contains('\0') {
             return Err(Status::invalid_argument(
                 "configuration value contains an invalid character",
@@ -150,18 +162,40 @@ impl Configuration for ConfigurationService {
             .await
             .map_err(|_| storage_unavailable())?;
         lock_mutation_path(&mut transaction, &path).await?;
+        let collides = sqlx::query_scalar::<_, String>(
+            r"
+            SELECT path
+            FROM configuration_values
+            WHERE path <> $1
+              AND (path LIKE $1 || '/%' OR $1 LIKE path || '/%')
+            LIMIT 1
+            ",
+        )
+        .bind(path.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| storage_unavailable())?
+        .is_some();
+        if collides {
+            return Err(Status::invalid_argument(
+                "configuration value collides with an existing value",
+            ));
+        }
         let now = OffsetDateTime::from(SystemTime::now());
         let row = sqlx::query_as::<_, MutationRow>(
             r"
-            INSERT INTO configuration_values (path, value, created_at, updated_at)
-            VALUES ($1, $2, $3, $3)
+            INSERT INTO configuration_values (path, value, classification, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $4)
             ON CONFLICT (path) DO UPDATE
-            SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+            SET value = EXCLUDED.value,
+                classification = EXCLUDED.classification,
+                updated_at = EXCLUDED.updated_at
             RETURNING created_at, updated_at
             ",
         )
         .bind(path.as_str())
         .bind(value)
+        .bind(classification)
         .bind(now)
         .fetch_one(&mut *transaction)
         .await
@@ -188,11 +222,14 @@ impl Configuration for ConfigurationService {
         for value in &values {
             let value_path = ConfigPath::parse(&value.path)
                 .map_err(|_| Status::invalid_argument("configuration subtree is invalid"))?;
-            if value_path.as_str() == "/"
-                || !value_path.is_at_or_below(&path)
-                || value.value.contains('\0')
-            {
+            if value_path.as_str() == "/" || !value_path.is_at_or_below(&path) {
                 return Err(Status::invalid_argument("configuration subtree is invalid"));
+            }
+            match value.content.as_ref() {
+                Some(sub_tree_mutation_value::Content::PlainValue(content))
+                    if !content.contains('\0') => {}
+                Some(sub_tree_mutation_value::Content::PreserveSecret(_)) => {}
+                _ => return Err(Status::invalid_argument("configuration subtree is invalid")),
             }
             let mut ancestor = value.path.as_str();
             let mut has_stored_ancestor = false;
@@ -211,40 +248,110 @@ impl Configuration for ConfigurationService {
             }
         }
 
-        let paths = values
-            .iter()
-            .map(|value| value.path.clone())
-            .collect::<Vec<_>>();
         let mut transaction = self
             .database
             .begin()
             .await
             .map_err(|_| storage_unavailable())?;
         lock_mutation_path(&mut transaction, &path).await?;
+        let secret_rows = sqlx::query_as::<_, PathRow>(
+            r"
+            SELECT path
+            FROM configuration_values
+            WHERE classification = 'secret'
+              AND (
+                    $1 = '/'
+                    OR path = $1
+                    OR path LIKE $1 || '/%'
+                    OR $1 LIKE path || '/%'
+                  )
+            ORDER BY path
+            ",
+        )
+        .bind(path.as_str())
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|_| storage_unavailable())?;
+        let secret_paths = secret_rows
+            .into_iter()
+            .map(|row| row.path)
+            .collect::<BTreeSet<_>>();
+        // The JSON representation uses the masked token for both a preserved
+        // secret and a legitimate plain value with the same text. Resolve
+        // that ambiguity against the stored classification while the
+        // mutation path is locked. Unknown markers are therefore stored as a
+        // plain masked token; markers colliding with an existing secret still
+        // fail the subtree validation below.
+        for value in &mut values {
+            let Some(sub_tree_mutation_value::Content::PreserveSecret(_)) = value.content.as_ref()
+            else {
+                continue;
+            };
+            if !secret_paths.contains(&value.path) {
+                value.content = Some(sub_tree_mutation_value::Content::PlainValue(
+                    MASKED_SECRET_TEXT.into(),
+                ));
+            }
+        }
+        let plain_paths: Vec<String> = values
+            .iter()
+            .filter_map(|value| match value.content.as_ref() {
+                Some(sub_tree_mutation_value::Content::PlainValue(_)) => Some(value.path.clone()),
+                _ => None,
+            })
+            .collect();
+        let preserve_paths = values
+            .iter()
+            .filter_map(|value| match value.content.as_ref() {
+                Some(sub_tree_mutation_value::Content::PreserveSecret(_)) => {
+                    Some(value.path.as_str())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if plain_paths.iter().any(|plain| {
+            secret_paths
+                .iter()
+                .any(|secret| paths_collide(plain, secret))
+        }) || !preserve_paths
+            .iter()
+            .all(|preserve| secret_paths.contains(*preserve))
+        {
+            return Err(Status::invalid_argument("configuration subtree is invalid"));
+        }
         let now = OffsetDateTime::from(SystemTime::now());
         sqlx::query(
             r"
             DELETE FROM configuration_values
             WHERE ($1 = '/' OR path = $1 OR path LIKE $1 || '/%')
+              AND classification = 'plain'
               AND NOT (path = ANY($2::TEXT[]))
             ",
         )
         .bind(path.as_str())
-        .bind(&paths)
+        .bind(&plain_paths)
         .execute(&mut *transaction)
         .await
         .map_err(|_| storage_unavailable())?;
         for value in &values {
+            let Some(sub_tree_mutation_value::Content::PlainValue(content)) =
+                value.content.as_ref()
+            else {
+                continue;
+            };
             sqlx::query(
                 r"
-                INSERT INTO configuration_values (path, value, created_at, updated_at)
-                VALUES ($1, $2, $3, $3)
+                INSERT INTO configuration_values
+                    (path, value, classification, created_at, updated_at)
+                VALUES ($1, $2, 'plain', $3, $3)
                 ON CONFLICT (path) DO UPDATE
-                SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+                SET value = EXCLUDED.value,
+                    classification = 'plain',
+                    updated_at = EXCLUDED.updated_at
                 ",
             )
             .bind(&value.path)
-            .bind(&value.value)
+            .bind(content)
             .bind(now)
             .execute(&mut *transaction)
             .await
@@ -300,6 +407,41 @@ impl Configuration for ConfigurationService {
             deleted_count: u64::try_from(deleted.len()).map_err(|_| storage_unavailable())?,
         }))
     }
+
+    async fn reveal_secret(
+        &self,
+        request: Request<RevealSecretRequest>,
+    ) -> Result<Response<RevealSecretResponse>, Status> {
+        let path = authorize(&request, &[Permission::Read], false)?;
+        let row = sqlx::query_as::<_, ListedValueRow>(
+            r"
+            SELECT path, value, classification, created_at, updated_at
+            FROM configuration_values
+            WHERE path = $1
+            ",
+        )
+        .bind(path.as_str())
+        .fetch_optional(&self.database)
+        .await
+        .map_err(|_| storage_unavailable())?
+        .ok_or_else(|| Status::not_found("configuration value not found"))?;
+        if row.classification != "secret" {
+            return Err(Status::invalid_argument(
+                "configuration value is not a secret",
+            ));
+        }
+        Ok(Response::new(RevealSecretResponse { value: row.value }))
+    }
+}
+
+fn paths_collide(first: &str, second: &str) -> bool {
+    first == second
+        || first
+            .strip_prefix(second)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || second
+            .strip_prefix(first)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 // Shared ancestor locks and an exclusive target lock form a hierarchy: sibling
@@ -400,6 +542,40 @@ impl ValueRequest for DeleteValuesRequest {
     }
 }
 
+impl ValueRequest for RevealSecretRequest {
+    fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+fn listed_content(value: String, classification: &str) -> Option<(i32, listed_value::Content)> {
+    match classification {
+        "plain" => Some((
+            ValueClassification::Plain as i32,
+            listed_value::Content::PlainValue(value),
+        )),
+        "secret" => Some((
+            ValueClassification::Secret as i32,
+            listed_value::Content::MaskedSecret(MaskedSecret {}),
+        )),
+        _ => None,
+    }
+}
+
+fn subtree_content(value: String, classification: &str) -> Option<(i32, sub_tree_value::Content)> {
+    match classification {
+        "plain" => Some((
+            ValueClassification::Plain as i32,
+            sub_tree_value::Content::PlainValue(value),
+        )),
+        "secret" => Some((
+            ValueClassification::Secret as i32,
+            sub_tree_value::Content::MaskedSecret(MaskedSecret {}),
+        )),
+        _ => None,
+    }
+}
+
 fn parent_path(path: &ConfigPath) -> &str {
     path.as_str().rsplit_once('/').map_or(
         "/",
@@ -442,14 +618,18 @@ fn invalid_timestamp() -> Status {
 mod tests {
     use std::{collections::BTreeSet, env, time::Duration};
 
-    use sovereign_config_proto::sovereign::config::v2::configuration_server::Configuration;
+    use sovereign_config_proto::sovereign::config::v3::{
+        PreserveSecret, RevealSecretRequest, SubTreeMutationValue, ValueClassification,
+        configuration_server::Configuration, listed_value, put_value_request,
+        sub_tree_mutation_value, sub_tree_value,
+    };
     use sqlx::postgres::PgPoolOptions;
     use tokio::time::{sleep, timeout};
     use tonic::{Code, Request};
 
     use super::{
         ConfigurationService, DeleteValuesRequest, GetSubTreeRequest, ListValuesRequest,
-        PutValueRequest, ReplaceSubTreeRequest, SubTreeValue,
+        MASKED_SECRET_TEXT, PutValueRequest, ReplaceSubTreeRequest,
     };
     use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
 
@@ -469,10 +649,40 @@ mod tests {
         request
     }
 
+    fn plain_put(path: &str, value: &str) -> PutValueRequest {
+        PutValueRequest {
+            path: path.into(),
+            content: Some(put_value_request::Content::PlainValue(value.into())),
+        }
+    }
+
+    fn secret_put(path: &str, value: &str) -> PutValueRequest {
+        PutValueRequest {
+            path: path.into(),
+            content: Some(put_value_request::Content::SecretValue(value.into())),
+        }
+    }
+
+    fn plain_mutation(path: &str, value: &str) -> SubTreeMutationValue {
+        SubTreeMutationValue {
+            path: path.into(),
+            content: Some(sub_tree_mutation_value::Content::PlainValue(value.into())),
+        }
+    }
+
+    fn preserve_secret(path: &str) -> SubTreeMutationValue {
+        SubTreeMutationValue {
+            path: path.into(),
+            content: Some(sub_tree_mutation_value::Content::PreserveSecret(
+                PreserveSecret {},
+            )),
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
     #[allow(clippy::too_many_lines)]
-    async fn postgres_service_enforces_atomic_v2_value_lifecycle() {
+    async fn postgres_service_enforces_atomic_v3_value_lifecycle() {
         let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
             .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
@@ -507,10 +717,7 @@ mod tests {
         assert_eq!(unrooted_value.code(), Code::InvalidArgument);
         let invalid_value = service
             .put_value(request(
-                PutValueRequest {
-                    path: "/tests/exact/invalid".into(),
-                    value: "invalid\0value".into(),
-                },
+                plain_put("/tests/exact/invalid", "invalid\0value"),
                 &[Permission::Write],
             ))
             .await
@@ -519,20 +726,14 @@ mod tests {
 
         service
             .put_value(request(
-                PutValueRequest {
-                    path: "/Tests/Exact/Key".into(),
-                    value: "value-sentinel-one".into(),
-                },
+                plain_put("/Tests/Exact/Key", "value-sentinel-one"),
                 &[Permission::Write],
             ))
             .await
             .unwrap();
         service
             .put_value(request_for_prefix(
-                PutValueRequest {
-                    path: "/tests/exactly/outside".into(),
-                    value: "boundary-value-sentinel".into(),
-                },
+                plain_put("/tests/exactly/outside", "boundary-value-sentinel"),
                 "/",
                 &[Permission::Write],
             ))
@@ -540,10 +741,7 @@ mod tests {
             .unwrap();
         service
             .put_value(request(
-                PutValueRequest {
-                    path: "/tests/exact/nested/child".into(),
-                    value: "nested-value-sentinel".into(),
-                },
+                plain_put("/tests/exact/nested/child", "nested-value-sentinel"),
                 &[Permission::Write],
             ))
             .await
@@ -616,7 +814,10 @@ mod tests {
             .into_inner();
         assert_eq!(stored.values.len(), 2);
         assert_eq!(stored.values[0].path, "/tests/exact/key");
-        assert_eq!(stored.values[0].value, "value-sentinel-one");
+        assert!(matches!(
+            stored.values[0].content.as_ref(),
+            Some(sub_tree_value::Content::PlainValue(value)) if value == "value-sentinel-one"
+        ));
         assert_eq!(stored.values[1].path, "/tests/exact/nested/child");
 
         let narrower_read = service
@@ -659,18 +860,9 @@ mod tests {
                 ReplaceSubTreeRequest {
                     path: "/tests/exact".into(),
                     values: vec![
-                        SubTreeValue {
-                            path: "/tests/exact/collision/child".into(),
-                            value: "child".into(),
-                        },
-                        SubTreeValue {
-                            path: "/tests/exact/collision-sibling".into(),
-                            value: "sibling".into(),
-                        },
-                        SubTreeValue {
-                            path: "/tests/exact/collision".into(),
-                            value: "parent".into(),
-                        },
+                        plain_mutation("/tests/exact/collision/child", "child"),
+                        plain_mutation("/tests/exact/collision-sibling", "sibling"),
+                        plain_mutation("/tests/exact/collision", "parent"),
                     ],
                 },
                 &[Permission::Write, Permission::Manage],
@@ -682,10 +874,7 @@ mod tests {
             .replace_sub_tree(request_for_prefix(
                 ReplaceSubTreeRequest {
                     path: "/".into(),
-                    values: vec![SubTreeValue {
-                        path: "/".into(),
-                        value: "invalid-root-value".into(),
-                    }],
+                    values: vec![plain_mutation("/", "invalid-root-value")],
                 },
                 "/",
                 &[Permission::Write, Permission::Manage],
@@ -714,14 +903,8 @@ mod tests {
                 ReplaceSubTreeRequest {
                     path: "/tests/exact".into(),
                     values: vec![
-                        SubTreeValue {
-                            path: "/tests/exact/alpha".into(),
-                            value: "one".into(),
-                        },
-                        SubTreeValue {
-                            path: "/tests/exact/nested/beta".into(),
-                            value: "two".into(),
-                        },
+                        plain_mutation("/tests/exact/alpha", "one"),
+                        plain_mutation("/tests/exact/nested/beta", "two"),
                     ],
                 },
                 &[Permission::Write, Permission::Manage],
@@ -828,6 +1011,328 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
     #[allow(clippy::too_many_lines)]
+    async fn postgres_masks_rotates_reveals_and_preserves_secrets() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "DELETE FROM configuration_values WHERE path = '/tests/secrets' OR path LIKE '/tests/secrets/%'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let service = ConfigurationService::new(pool.clone());
+
+        for sentinel in ["secret-sentinel-one", "secret-sentinel-two"] {
+            service
+                .put_value(request_for_prefix(
+                    secret_put("/tests/secrets/credential", sentinel),
+                    "/tests/secrets",
+                    &[Permission::Write],
+                ))
+                .await
+                .unwrap();
+        }
+
+        let listing = service
+            .list_values(request_for_prefix(
+                ListValuesRequest {
+                    path: "/tests/secrets".into(),
+                },
+                "/tests/secrets",
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            listing.values[0].classification,
+            ValueClassification::Secret as i32
+        );
+        assert!(matches!(
+            listing.values[0].content,
+            Some(listed_value::Content::MaskedSecret(_))
+        ));
+
+        // A plain value that happens to equal the JSON mask token must still
+        // round-trip as plain when the marker is resolved against stored
+        // classifications.
+        service
+            .replace_sub_tree(request_for_prefix(
+                ReplaceSubTreeRequest {
+                    path: "/tests/secrets".into(),
+                    values: vec![
+                        preserve_secret("/tests/secrets/credential"),
+                        preserve_secret("/tests/secrets/plain-mask"),
+                    ],
+                },
+                "/tests/secrets",
+                &[Permission::Write, Permission::Manage],
+            ))
+            .await
+            .unwrap();
+        let round_tripped = service
+            .get_sub_tree(request_for_prefix(
+                GetSubTreeRequest {
+                    path: "/tests/secrets".into(),
+                },
+                "/tests/secrets",
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(round_tripped.values.iter().any(|value| {
+            value.path == "/tests/secrets/plain-mask"
+                && value.classification == ValueClassification::Plain as i32
+                && matches!(
+                    value.content.as_ref(),
+                    Some(sub_tree_value::Content::PlainValue(content))
+                        if content == MASKED_SECRET_TEXT
+                )
+        }));
+
+        service
+            .put_value(request_for_prefix(
+                secret_put(
+                    "/tests/secrets/collision-parent",
+                    "collision-parent-sentinel",
+                ),
+                "/tests/secrets",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        let rejected_child = service
+            .put_value(request_for_prefix(
+                plain_put(
+                    "/tests/secrets/collision-parent/child",
+                    "collision-child-sentinel",
+                ),
+                "/tests/secrets",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected_child.code(), Code::InvalidArgument);
+        assert!(
+            !rejected_child
+                .message()
+                .contains("collision-child-sentinel")
+        );
+
+        service
+            .put_value(request_for_prefix(
+                secret_put(
+                    "/tests/secrets/collision-child/leaf",
+                    "collision-leaf-sentinel",
+                ),
+                "/tests/secrets",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        let rejected_parent = service
+            .put_value(request_for_prefix(
+                plain_put(
+                    "/tests/secrets/collision-child",
+                    "collision-parent-sentinel",
+                ),
+                "/tests/secrets",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected_parent.code(), Code::InvalidArgument);
+        assert!(
+            !rejected_parent
+                .message()
+                .contains("collision-parent-sentinel")
+        );
+
+        service
+            .put_value(request_for_prefix(
+                secret_put("/tests/secrets/subtree-secret", "subtree-secret-sentinel"),
+                "/tests/secrets",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        let rejected_subtree = service
+            .replace_sub_tree(request_for_prefix(
+                ReplaceSubTreeRequest {
+                    path: "/tests/secrets/subtree-secret/child-area".into(),
+                    values: vec![plain_mutation(
+                        "/tests/secrets/subtree-secret/child-area/key",
+                        "subtree-child-sentinel",
+                    )],
+                },
+                "/tests/secrets",
+                &[Permission::Write, Permission::Manage],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected_subtree.code(), Code::InvalidArgument);
+        assert!(
+            !rejected_subtree
+                .message()
+                .contains("subtree-child-sentinel")
+        );
+
+        let revealed = service
+            .reveal_secret(request_for_prefix(
+                RevealSecretRequest {
+                    path: "/tests/secrets/credential".into(),
+                },
+                "/tests/secrets",
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(revealed.value, "secret-sentinel-two");
+        let denied = service
+            .reveal_secret(request_for_prefix(
+                RevealSecretRequest {
+                    path: "/tests/secrets/credential".into(),
+                },
+                "/tests/secrets",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), Code::PermissionDenied);
+        assert!(!denied.message().contains("secret-sentinel"));
+
+        service
+            .replace_sub_tree(request_for_prefix(
+                ReplaceSubTreeRequest {
+                    path: "/tests/secrets".into(),
+                    values: vec![
+                        preserve_secret("/tests/secrets/credential"),
+                        plain_mutation("/tests/secrets/enabled", "true"),
+                    ],
+                },
+                "/tests/secrets",
+                &[Permission::Write, Permission::Manage],
+            ))
+            .await
+            .unwrap();
+        service
+            .replace_sub_tree(request_for_prefix(
+                ReplaceSubTreeRequest {
+                    path: "/tests/secrets".into(),
+                    values: vec![plain_mutation("/tests/secrets/enabled", "false")],
+                },
+                "/tests/secrets",
+                &[Permission::Write, Permission::Manage],
+            ))
+            .await
+            .unwrap();
+        let rejected = service
+            .replace_sub_tree(request_for_prefix(
+                ReplaceSubTreeRequest {
+                    path: "/tests/secrets".into(),
+                    values: vec![plain_mutation(
+                        "/tests/secrets/credential",
+                        "attempted-overwrite-sentinel",
+                    )],
+                },
+                "/tests/secrets",
+                &[Permission::Write, Permission::Manage],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code(), Code::InvalidArgument);
+        assert!(!rejected.message().contains("attempted-overwrite-sentinel"));
+        let rejected_child = service
+            .replace_sub_tree(request_for_prefix(
+                ReplaceSubTreeRequest {
+                    path: "/tests/secrets".into(),
+                    values: vec![plain_mutation(
+                        "/tests/secrets/credential/child",
+                        "attempted-child-sentinel",
+                    )],
+                },
+                "/tests/secrets",
+                &[Permission::Write, Permission::Manage],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected_child.code(), Code::InvalidArgument);
+        assert!(
+            !rejected_child
+                .message()
+                .contains("attempted-child-sentinel")
+        );
+        assert_eq!(
+            service
+                .reveal_secret(request_for_prefix(
+                    RevealSecretRequest {
+                        path: "/tests/secrets/credential".into(),
+                    },
+                    "/tests/secrets",
+                    &[Permission::Read],
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .value,
+            "secret-sentinel-two"
+        );
+
+        service
+            .put_value(request_for_prefix(
+                plain_put("/tests/secrets/credential", "now-plain"),
+                "/tests/secrets",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        let not_secret = service
+            .reveal_secret(request_for_prefix(
+                RevealSecretRequest {
+                    path: "/tests/secrets/credential".into(),
+                },
+                "/tests/secrets",
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(not_secret.code(), Code::InvalidArgument);
+
+        service
+            .put_value(request_for_prefix(
+                secret_put("/tests/secrets/credential", "secret-sentinel-three"),
+                "/tests/secrets",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        service
+            .delete_values(request_for_prefix(
+                DeleteValuesRequest {
+                    path: "/tests/secrets/credential".into(),
+                    recurse: false,
+                },
+                "/tests/secrets",
+                &[Permission::Manage],
+            ))
+            .await
+            .unwrap();
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM configuration_values WHERE path = '/tests/secrets/credential'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    #[allow(clippy::too_many_lines)]
     async fn postgres_serializes_overlapping_subtree_replacements() {
         let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
             .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
@@ -844,7 +1349,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO configuration_values (path, value, created_at, updated_at) VALUES ('/tests/concurrent/existing', 'seed', NOW(), NOW())",
+            "INSERT INTO configuration_values (path, value, classification, created_at, updated_at) VALUES ('/tests/concurrent/existing', 'seed', 'plain', NOW(), NOW())",
         )
         .execute(&pool)
         .await
@@ -866,14 +1371,8 @@ mod tests {
                     ReplaceSubTreeRequest {
                         path: "/tests/concurrent".into(),
                         values: vec![
-                            SubTreeValue {
-                                path: "/tests/concurrent/alpha-one".into(),
-                                value: "one".into(),
-                            },
-                            SubTreeValue {
-                                path: "/tests/concurrent/alpha-two".into(),
-                                value: "two".into(),
-                            },
+                            plain_mutation("/tests/concurrent/alpha-one", "one"),
+                            plain_mutation("/tests/concurrent/alpha-two", "two"),
                         ],
                     },
                     "/tests/concurrent",
@@ -887,14 +1386,8 @@ mod tests {
                     ReplaceSubTreeRequest {
                         path: "/tests/concurrent".into(),
                         values: vec![
-                            SubTreeValue {
-                                path: "/tests/concurrent/beta-one".into(),
-                                value: "one".into(),
-                            },
-                            SubTreeValue {
-                                path: "/tests/concurrent/beta-two".into(),
-                                value: "two".into(),
-                            },
+                            plain_mutation("/tests/concurrent/beta-one", "one"),
+                            plain_mutation("/tests/concurrent/beta-two", "two"),
                         ],
                     },
                     "/tests/concurrent",
