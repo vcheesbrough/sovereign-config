@@ -1,13 +1,18 @@
 use serde::Deserialize;
 use sovereign_config_client::{Transport, ValueTransport};
-use sovereign_config_core::{ClientError, ConfigPath, ErrorKind, PlainValue, Secret, SubTreeValue};
+use sovereign_config_core::{
+    ClientError, ConfigPath, ErrorKind, PlainValue, Secret, SecretInput, SubTreeMutationContent,
+    SubTreeMutationValue,
+};
 use sovereign_config_native::TonicTransport;
-use sovereign_config_proto::sovereign::config::v2::{
+use sovereign_config_proto::sovereign::config::v3::{
     DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse,
     GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest, GetVersionResponse,
     ListValuesRequest, ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
-    ReplaceSubTreeRequest, ReplaceSubTreeResponse, SubTreeValue as ProtoSubTreeValue,
+    ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest, RevealSecretResponse,
+    SubTreeValue as ProtoSubTreeValue, ValueClassification,
     configuration_server::{Configuration, ConfigurationServer},
+    listed_value, put_value_request, sub_tree_mutation_value, sub_tree_value,
     system_server::{System, SystemServer},
 };
 use tokio_stream::wrappers::TcpListenerStream;
@@ -38,7 +43,9 @@ impl Configuration for ContractConfiguration {
         Ok(tonic::Response::new(ListValuesResponse {
             values: vec![ListedValue {
                 path: "/apps/api/feature".into(),
-                value: "contract-value-sentinel".into(),
+                content: Some(listed_value::Content::PlainValue(
+                    "contract-value-sentinel".into(),
+                )),
                 created_at: Some(prost_types::Timestamp {
                     seconds: 1_700_000_000,
                     nanos: 0,
@@ -47,6 +54,7 @@ impl Configuration for ContractConfiguration {
                     seconds: 1_700_000_001,
                     nanos: 0,
                 }),
+                classification: ValueClassification::Plain as i32,
             }],
             paths: vec![request.into_inner().path],
         }))
@@ -61,7 +69,10 @@ impl Configuration for ContractConfiguration {
         Ok(tonic::Response::new(GetSubTreeResponse {
             values: vec![ProtoSubTreeValue {
                 path: "/apps/api/feature".into(),
-                value: "contract-value-sentinel".into(),
+                content: Some(sub_tree_value::Content::PlainValue(
+                    "contract-value-sentinel".into(),
+                )),
+                classification: ValueClassification::Plain as i32,
             }],
         }))
     }
@@ -72,8 +83,19 @@ impl Configuration for ContractConfiguration {
     ) -> Result<tonic::Response<PutValueResponse>, Status> {
         require_bearer(&request)?;
         let request = request.into_inner();
-        assert_eq!(request.path, "/apps/api/feature");
-        assert_eq!(request.value, "put-value-sentinel");
+        match request.path.as_str() {
+            "/apps/api/feature" => assert!(matches!(
+                request.content,
+                Some(put_value_request::Content::PlainValue(value))
+                    if value == "put-value-sentinel"
+            )),
+            "/apps/api/credential" => assert!(matches!(
+                request.content,
+                Some(put_value_request::Content::SecretValue(value))
+                    if value == "contract-secret-sentinel"
+            )),
+            _ => panic!("unexpected put path"),
+        }
         let timestamp = prost_types::Timestamp {
             seconds: 1_700_000_000,
             nanos: 0,
@@ -93,7 +115,11 @@ impl Configuration for ContractConfiguration {
         assert_eq!(request.path, "/apps/api");
         assert_eq!(request.values.len(), 1);
         assert_eq!(request.values[0].path, "/apps/api/new");
-        assert_eq!(request.values[0].value, "replacement-sentinel");
+        assert!(matches!(
+            request.values[0].content.as_ref(),
+            Some(sub_tree_mutation_value::Content::PlainValue(value))
+                if value == "replacement-sentinel"
+        ));
         Ok(tonic::Response::new(ReplaceSubTreeResponse {
             updated_at: Some(prost_types::Timestamp {
                 seconds: 1_700_000_001,
@@ -119,6 +145,17 @@ impl Configuration for ContractConfiguration {
             deleted_count: 2,
         }))
     }
+
+    async fn reveal_secret(
+        &self,
+        request: Request<RevealSecretRequest>,
+    ) -> Result<tonic::Response<RevealSecretResponse>, Status> {
+        require_bearer(&request)?;
+        assert_eq!(request.into_inner().path, "/apps/api/credential");
+        Ok(tonic::Response::new(RevealSecretResponse {
+            value: "contract-secret-sentinel".into(),
+        }))
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -138,7 +175,7 @@ impl System for ContractSystem {
     ) -> Result<tonic::Response<GetVersionResponse>, Status> {
         Ok(tonic::Response::new(GetVersionResponse {
             application_version: "contract-version".to_owned(),
-            protocol_version: "v2".to_owned(),
+            protocol_version: "v3".to_owned(),
         }))
     }
 
@@ -176,9 +213,9 @@ async fn tonic_transport_satisfies_shared_contract() {
         .await
         .unwrap();
 
-    let version = transport.get_version("v2").await.unwrap();
+    let version = transport.get_version("v3").await.unwrap();
     assert_eq!(version.application_version, "contract-version");
-    assert_eq!(version.protocol_version, "v2");
+    assert_eq!(version.protocol_version, "v3");
 
     let listing = transport
         .list_values(
@@ -189,7 +226,10 @@ async fn tonic_transport_satisfies_shared_contract() {
         .unwrap();
     assert_eq!(listing.paths, [ConfigPath::parse("/apps/api").unwrap()]);
     assert_eq!(listing.values[0].path.as_str(), "/apps/api/feature");
-    assert_eq!(listing.values[0].value.expose(), "contract-value-sentinel");
+    assert_eq!(
+        listing.values[0].value.display_text(),
+        "contract-value-sentinel"
+    );
 
     let selected = ConfigPath::parse("/apps/api").unwrap();
     let subtree = transport
@@ -205,9 +245,28 @@ async fn tonic_transport_satisfies_shared_contract() {
         )
         .await
         .unwrap();
-    let replacement = SubTreeValue {
+    transport
+        .put_secret(
+            &ConfigPath::parse("/apps/api/credential").unwrap(),
+            &SecretInput::new("contract-secret-sentinel"),
+            &Secret::new("contract-token-sentinel"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        transport
+            .reveal_secret(
+                &ConfigPath::parse("/apps/api/credential").unwrap(),
+                &Secret::new("contract-token-sentinel"),
+            )
+            .await
+            .unwrap()
+            .expose(),
+        "contract-secret-sentinel"
+    );
+    let replacement = SubTreeMutationValue {
         path: ConfigPath::parse("/apps/api/new").unwrap(),
-        value: PlainValue::new("replacement-sentinel"),
+        value: SubTreeMutationContent::Plain(PlainValue::new("replacement-sentinel")),
     };
     assert_eq!(
         transport

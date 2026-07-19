@@ -9,7 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: &str = "v2";
+pub const PROTOCOL_VERSION: &str = "v3";
+pub const MASKED_SECRET_TEXT: &str = "********";
 
 pub use connection::{ConnectionUrl, ConnectionUrlError};
 
@@ -172,6 +173,133 @@ impl fmt::Display for PlainValue {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValueClassification {
+    Plain,
+    Secret,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MaskedSecret;
+
+impl MaskedSecret {
+    #[must_use]
+    pub const fn text(self) -> &'static str {
+        MASKED_SECRET_TEXT
+    }
+}
+
+impl fmt::Display for MaskedSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(MASKED_SECRET_TEXT)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValueContent {
+    Plain(PlainValue),
+    Secret(MaskedSecret),
+}
+
+impl ValueContent {
+    #[must_use]
+    pub const fn classification(&self) -> ValueClassification {
+        match self {
+            Self::Plain(_) => ValueClassification::Plain,
+            Self::Secret(_) => ValueClassification::Secret,
+        }
+    }
+
+    #[must_use]
+    pub fn display_text(&self) -> &str {
+        match self {
+            Self::Plain(value) => value.expose(),
+            Self::Secret(_) => MASKED_SECRET_TEXT,
+        }
+    }
+
+    #[must_use]
+    pub const fn plain(&self) -> Option<&PlainValue> {
+        match self {
+            Self::Plain(value) => Some(value),
+            Self::Secret(_) => None,
+        }
+    }
+}
+
+/// A secret accepted only as write input. It is never serializable and all
+/// formatting is redacted.
+///
+/// ```compile_fail
+/// use serde::Serialize;
+/// use sovereign_config_core::SecretInput;
+///
+/// fn assert_serializable<T: Serialize>() {}
+/// assert_serializable::<SecretInput>();
+/// ```
+#[derive(Clone)]
+pub struct SecretInput(String);
+
+impl SecretInput {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretInput([REDACTED])")
+    }
+}
+
+impl fmt::Display for SecretInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+/// Plaintext returned only by the explicit reveal operation.
+///
+/// ```compile_fail
+/// use serde::Serialize;
+/// use sovereign_config_core::RevealedSecret;
+///
+/// fn assert_serializable<T: Serialize>() {}
+/// assert_serializable::<RevealedSecret>();
+/// ```
+#[derive(Clone)]
+pub struct RevealedSecret(String);
+
+impl RevealedSecret {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RevealedSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RevealedSecret([REDACTED])")
+    }
+}
+
+impl fmt::Display for RevealedSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Timestamp {
     pub seconds: i64,
@@ -221,7 +349,7 @@ fn invalid_timestamp() -> ClientError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListedValue {
     pub path: ConfigPath,
-    pub value: PlainValue,
+    pub value: ValueContent,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -235,7 +363,19 @@ pub struct ValueListing {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubTreeValue {
     pub path: ConfigPath,
-    pub value: PlainValue,
+    pub value: ValueContent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubTreeMutationContent {
+    Plain(PlainValue),
+    PreserveSecret,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubTreeMutationValue {
+    pub path: ConfigPath,
+    pub value: SubTreeMutationContent,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -348,13 +488,13 @@ pub fn render_subtree_json(
             return Err(invalid_subtree());
         }
         if value.path == *root {
-            if exact.replace(value.value.expose()).is_some() {
+            if exact.replace(value.value.display_text()).is_some() {
                 return Err(invalid_subtree());
             }
             continue;
         }
         let segments = json_segments(root, &value.path)?;
-        insert_json_value(&mut object, &segments, value.value.expose())?;
+        insert_json_value(&mut object, &segments, value.value.display_text())?;
     }
     let node = match exact {
         Some(value) if object.is_empty() => JsonNode::String(value.to_owned()),
@@ -372,7 +512,10 @@ pub fn render_subtree_json(
 ///
 /// Returns a bounded validation error for malformed JSON, duplicate keys,
 /// invalid path segments, or non-string leaves below an object.
-pub fn parse_subtree_json(root: &ConfigPath, json: &str) -> Result<Vec<SubTreeValue>, ClientError> {
+pub fn parse_subtree_json(
+    root: &ConfigPath,
+    json: &str,
+) -> Result<Vec<SubTreeMutationValue>, ClientError> {
     let mut deserializer = serde_json::Deserializer::from_str(json);
     let node = JsonNode::deserialize(&mut deserializer).map_err(|_| invalid_json())?;
     deserializer.end().map_err(|_| invalid_json())?;
@@ -434,7 +577,7 @@ fn insert_json_value(
 fn flatten_json_object(
     root: &ConfigPath,
     object: BTreeMap<String, JsonNode>,
-    values: &mut Vec<SubTreeValue>,
+    values: &mut Vec<SubTreeMutationValue>,
 ) -> Result<(), ClientError> {
     for (name, node) in object {
         let path = root.join_name(name).map_err(|_| invalid_json())?;
@@ -446,16 +589,21 @@ fn flatten_json_object(
 fn flatten_json_node(
     path: &ConfigPath,
     node: JsonNode,
-    values: &mut Vec<SubTreeValue>,
+    values: &mut Vec<SubTreeMutationValue>,
 ) -> Result<(), ClientError> {
     match node {
         JsonNode::String(value) => {
             if value.contains('\0') {
                 return Err(invalid_json());
             }
-            values.push(SubTreeValue {
+            let value = if value == MASKED_SECRET_TEXT {
+                SubTreeMutationContent::PreserveSecret
+            } else {
+                SubTreeMutationContent::Plain(PlainValue::new(value))
+            };
+            values.push(SubTreeMutationValue {
                 path: path.clone(),
-                value: PlainValue::new(value),
+                value,
             });
             Ok(())
         }
@@ -576,8 +724,9 @@ impl fmt::Display for Secret {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigPath, ErrorKind, PROTOCOL_VERSION, PlainValue, Secret, ServiceStatus, SubTreeValue,
-        parse_subtree_json, render_subtree_json,
+        ConfigPath, ErrorKind, MASKED_SECRET_TEXT, MaskedSecret, PROTOCOL_VERSION, PlainValue,
+        RevealedSecret, Secret, SecretInput, ServiceStatus, SubTreeMutationContent,
+        SubTreeMutationValue, SubTreeValue, ValueContent, parse_subtree_json, render_subtree_json,
     };
 
     #[test]
@@ -641,7 +790,14 @@ mod tests {
     fn subtree_value(path: &str, value: &str) -> SubTreeValue {
         SubTreeValue {
             path: ConfigPath::parse(path).unwrap(),
-            value: PlainValue::new(value),
+            value: ValueContent::Plain(PlainValue::new(value)),
+        }
+    }
+
+    fn mutation_value(path: &str, value: &str) -> SubTreeMutationValue {
+        SubTreeMutationValue {
+            path: ConfigPath::parse(path).unwrap(),
+            value: SubTreeMutationContent::Plain(PlainValue::new(value)),
         }
     }
 
@@ -657,14 +813,23 @@ mod tests {
             json,
             "{\n  \"enabled\": \"true\",\n  \"nested\": {\n    \"message\": \"line one\\nline two\"\n  }\n}\n"
         );
-        assert_eq!(parse_subtree_json(&selected, &json).unwrap(), values);
+        assert_eq!(
+            parse_subtree_json(&selected, &json).unwrap(),
+            vec![
+                mutation_value("/apps/api/enabled", "true"),
+                mutation_value("/apps/api/nested/message", "line one\nline two"),
+            ]
+        );
 
         let exact = vec![subtree_value("/apps/api", "value")];
         assert_eq!(
             render_subtree_json(&selected, &exact).unwrap(),
             "\"value\"\n"
         );
-        assert_eq!(parse_subtree_json(&selected, "\"value\"").unwrap(), exact);
+        assert_eq!(
+            parse_subtree_json(&selected, "\"value\"").unwrap(),
+            vec![mutation_value("/apps/api", "value")]
+        );
 
         let same_name_child = vec![subtree_value("/apps/api/api", "child")];
         assert_eq!(
@@ -673,13 +838,13 @@ mod tests {
         );
         assert_eq!(
             parse_subtree_json(&selected, "{\"api\":\"child\"}").unwrap(),
-            same_name_child
+            vec![mutation_value("/apps/api/api", "child")]
         );
 
         let root = ConfigPath::root();
         assert_eq!(
             parse_subtree_json(&root, "{\"apps\":{\"enabled\":\"yes\"}}").unwrap(),
-            vec![subtree_value("/apps/enabled", "yes")]
+            vec![mutation_value("/apps/enabled", "yes")]
         );
         assert_eq!(render_subtree_json(&selected, &[]).unwrap(), "{}\n");
         assert!(parse_subtree_json(&selected, "{}").unwrap().is_empty());
@@ -702,7 +867,7 @@ mod tests {
                 &ConfigPath::root(),
                 &[SubTreeValue {
                     path: ConfigPath::root(),
-                    value: PlainValue::new("invalid-root-value"),
+                    value: ValueContent::Plain(PlainValue::new("invalid-root-value")),
                 }]
             )
             .is_err()
@@ -735,9 +900,35 @@ mod tests {
     }
 
     #[test]
+    fn secret_types_and_json_masks_are_safe_by_construction() {
+        let input = SecretInput::new("secret-sentinel");
+        let revealed = RevealedSecret::new("secret-sentinel");
+        assert_eq!(input.expose(), "secret-sentinel");
+        assert_eq!(revealed.expose(), "secret-sentinel");
+        assert_eq!(format!("{input:?}"), "SecretInput([REDACTED])");
+        assert_eq!(format!("{revealed:?}"), "RevealedSecret([REDACTED])");
+        assert_eq!(MaskedSecret.to_string(), MASKED_SECRET_TEXT);
+
+        let selected = ConfigPath::parse("/apps/api").unwrap();
+        let masked = SubTreeValue {
+            path: ConfigPath::parse("/apps/api/credential").unwrap(),
+            value: ValueContent::Secret(MaskedSecret),
+        };
+        let json = render_subtree_json(&selected, &[masked]).unwrap();
+        assert!(!json.contains("secret-sentinel"));
+        assert_eq!(
+            parse_subtree_json(&selected, &json).unwrap(),
+            vec![SubTreeMutationValue {
+                path: ConfigPath::parse("/apps/api/credential").unwrap(),
+                value: SubTreeMutationContent::PreserveSecret,
+            }]
+        );
+    }
+
+    #[test]
     fn protocol_negotiation_is_exact() {
-        assert!(ServiceStatus::negotiate("1.4.0".into(), PROTOCOL_VERSION.into()).compatible);
-        assert!(!ServiceStatus::negotiate("1.4.0".into(), "v1".into()).compatible);
+        assert!(ServiceStatus::negotiate("1.5.0".into(), PROTOCOL_VERSION.into()).compatible);
+        assert!(!ServiceStatus::negotiate("1.5.0".into(), "v1".into()).compatible);
     }
 
     #[test]

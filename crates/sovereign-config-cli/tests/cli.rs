@@ -20,12 +20,14 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose};
 use serde_json::json;
-use sovereign_config_proto::sovereign::config::v2::{
+use sovereign_config_proto::sovereign::config::v3::{
     DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse,
     GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest, GetVersionResponse,
-    ListValuesRequest, ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
-    ReplaceSubTreeRequest, ReplaceSubTreeResponse, SubTreeValue,
+    ListValuesRequest, ListValuesResponse, ListedValue, MaskedSecret, PutValueRequest,
+    PutValueResponse, ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest,
+    RevealSecretResponse, SubTreeValue, ValueClassification,
     configuration_server::{Configuration, ConfigurationServer},
+    listed_value, put_value_request, sub_tree_mutation_value, sub_tree_value,
     system_server::{System, SystemServer},
 };
 use tempfile::TempDir;
@@ -87,12 +89,12 @@ impl System for MockSystem {
         &self,
         request: Request<GetVersionRequest>,
     ) -> Result<tonic::Response<GetVersionResponse>, Status> {
-        if request.into_inner().protocol_version != "v2" {
+        if request.into_inner().protocol_version != "v3" {
             return Err(Status::failed_precondition("protocol mismatch"));
         }
         Ok(tonic::Response::new(GetVersionResponse {
-            application_version: "1.4.0-test".to_owned(),
-            protocol_version: "v2".to_owned(),
+            application_version: "1.5.0-test".to_owned(),
+            protocol_version: "v3".to_owned(),
         }))
     }
 
@@ -115,7 +117,13 @@ impl System for MockSystem {
 
 #[derive(Clone, Default)]
 struct MockConfiguration {
-    values: Arc<Mutex<HashMap<String, (String, prost_types::Timestamp)>>>,
+    values: Arc<Mutex<HashMap<String, MockStoredValue>>>,
+}
+
+struct MockStoredValue {
+    value: String,
+    created_at: prost_types::Timestamp,
+    secret: bool,
 }
 
 #[tonic::async_trait]
@@ -130,11 +138,20 @@ impl Configuration for MockConfiguration {
         let values = values
             .iter()
             .filter(|(path, _)| path.rsplit_once('/').map_or("", |(parent, _)| parent) == selected)
-            .map(|(path, (value, created_at))| ListedValue {
+            .map(|(path, stored)| ListedValue {
                 path: path.clone(),
-                value: value.clone(),
-                created_at: Some(*created_at),
-                updated_at: Some(*created_at),
+                content: Some(if stored.secret {
+                    listed_value::Content::MaskedSecret(MaskedSecret {})
+                } else {
+                    listed_value::Content::PlainValue(stored.value.clone())
+                }),
+                created_at: Some(stored.created_at),
+                updated_at: Some(stored.created_at),
+                classification: if stored.secret {
+                    ValueClassification::Secret as i32
+                } else {
+                    ValueClassification::Plain as i32
+                },
             })
             .collect();
         Ok(tonic::Response::new(ListValuesResponse {
@@ -159,9 +176,18 @@ impl Configuration for MockConfiguration {
                         .strip_prefix(&path)
                         .is_some_and(|suffix| suffix.starts_with('/'))
             })
-            .map(|(path, (value, _))| SubTreeValue {
+            .map(|(path, stored)| SubTreeValue {
                 path: path.clone(),
-                value: value.clone(),
+                content: Some(if stored.secret {
+                    sub_tree_value::Content::MaskedSecret(MaskedSecret {})
+                } else {
+                    sub_tree_value::Content::PlainValue(stored.value.clone())
+                }),
+                classification: if stored.secret {
+                    ValueClassification::Secret as i32
+                } else {
+                    ValueClassification::Plain as i32
+                },
             })
             .collect::<Vec<_>>();
         subtree.sort_by(|first, second| first.path.cmp(&second.path));
@@ -181,10 +207,19 @@ impl Configuration for MockConfiguration {
         let mut values = self.values.lock().unwrap();
         let created_at = values
             .get(&request.path.to_ascii_lowercase())
-            .map_or(timestamp, |(_, created)| *created);
+            .map_or(timestamp, |stored| stored.created_at);
+        let (value, secret) = match request.content {
+            Some(put_value_request::Content::PlainValue(value)) => (value, false),
+            Some(put_value_request::Content::SecretValue(value)) => (value, true),
+            None => return Err(Status::invalid_argument("missing value")),
+        };
         values.insert(
             request.path.to_ascii_lowercase(),
-            (request.value, created_at),
+            MockStoredValue {
+                value,
+                created_at,
+                secret,
+            },
         );
         Ok(tonic::Response::new(PutValueResponse {
             created_at: Some(created_at),
@@ -204,17 +239,27 @@ impl Configuration for MockConfiguration {
             nanos: 0,
         };
         let mut values = self.values.lock().unwrap();
-        values.retain(|path, _| {
-            !(root == "/"
-                || path == &root
-                || path
-                    .strip_prefix(&root)
-                    .is_some_and(|suffix| suffix.starts_with('/')))
+        values.retain(|path, stored| {
+            stored.secret
+                || !(root == "/"
+                    || path == &root
+                    || path
+                        .strip_prefix(&root)
+                        .is_some_and(|suffix| suffix.starts_with('/')))
         });
         for value in &request.values {
+            let Some(sub_tree_mutation_value::Content::PlainValue(content)) =
+                value.content.as_ref()
+            else {
+                continue;
+            };
             values.insert(
                 value.path.to_ascii_lowercase(),
-                (value.value.clone(), timestamp),
+                MockStoredValue {
+                    value: content.clone(),
+                    created_at: timestamp,
+                    secret: false,
+                },
             );
         }
         Ok(tonic::Response::new(ReplaceSubTreeResponse {
@@ -254,6 +299,22 @@ impl Configuration for MockConfiguration {
             }),
             deleted_count,
         }))
+    }
+
+    async fn reveal_secret(
+        &self,
+        request: Request<RevealSecretRequest>,
+    ) -> Result<tonic::Response<RevealSecretResponse>, Status> {
+        require_access_token(&request)?;
+        let path = request.into_inner().path.to_ascii_lowercase();
+        let values = self.values.lock().unwrap();
+        match values.get(&path) {
+            Some(stored) if stored.secret => Ok(tonic::Response::new(RevealSecretResponse {
+                value: stored.value.clone(),
+            })),
+            Some(_) => Err(Status::failed_precondition("not a secret")),
+            None => Err(Status::not_found("missing")),
+        }
     }
 }
 
@@ -337,6 +398,124 @@ async fn exact_value_commands_use_absolute_paths_within_profile_root_and_hard_de
     let outside_root = run_cli(home.path(), &["get", "/other/feature-flag"]).await;
     assert!(!outside_root.status.success());
     assert!(combined(&outside_root).contains("path is outside the selected profile root"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn secret_commands_mask_preserve_rotate_reveal_and_delete_values() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let connection = connection_url(&services, true, "team/service");
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["profile", "add", "managed"],
+            Some(&format!("{connection}\n")),
+        )
+        .await,
+    );
+
+    let first = "configuration-secret-sentinel-one";
+    let stored = run_cli_with_input(
+        home.path(),
+        &["secret", "put", "/team/service/credential"],
+        Some(first),
+    )
+    .await;
+    assert_success(&stored);
+    assert_eq!(String::from_utf8_lossy(&stored.stdout), "Secret stored\n");
+    assert!(!combined(&stored).contains(first));
+
+    let masked = run_cli(home.path(), &["get", "/team/service/credential"]).await;
+    assert_success(&masked);
+    assert_eq!(String::from_utf8_lossy(&masked.stdout), "********");
+    assert!(!combined(&masked).contains(first));
+    let masked_json = run_cli(home.path(), &["get", "/team/service", "--format", "json"]).await;
+    assert_success(&masked_json);
+    assert_eq!(
+        String::from_utf8_lossy(&masked_json.stdout),
+        "{\n  \"credential\": \"********\"\n}\n"
+    );
+    assert!(!combined(&masked_json).contains(first));
+    let revealed_by_get = run_cli(
+        home.path(),
+        &["get", "/team/service/credential", "--reveal"],
+    )
+    .await;
+    assert_success(&revealed_by_get);
+    assert_eq!(String::from_utf8_lossy(&revealed_by_get.stdout), first);
+    assert!(revealed_by_get.stderr.is_empty());
+    let revealed = run_cli(
+        home.path(),
+        &["secret", "reveal", "/team/service/credential"],
+    )
+    .await;
+    assert_success(&revealed);
+    assert_eq!(String::from_utf8_lossy(&revealed.stdout), first);
+    assert!(revealed.stderr.is_empty());
+
+    let second = "configuration-secret-sentinel-two";
+    let rotated = run_cli_with_input(
+        home.path(),
+        &["secret", "put", "/team/service/credential"],
+        Some(second),
+    )
+    .await;
+    assert_success(&rotated);
+    assert!(!combined(&rotated).contains(second));
+    let sibling =
+        run_cli_with_input(home.path(), &["put", "/team/service/enabled"], Some("true")).await;
+    assert_success(&sibling);
+    let masked_json = run_cli(home.path(), &["get", "/team/service", "--format", "json"]).await;
+    assert_success(&masked_json);
+    assert_eq!(
+        String::from_utf8_lossy(&masked_json.stdout),
+        "{\n  \"credential\": \"********\",\n  \"enabled\": \"true\"\n}\n"
+    );
+    assert!(!combined(&masked_json).contains(second));
+    let json = run_cli_with_input(
+        home.path(),
+        &["put", "/team/service", "--format", "json"],
+        Some("{\"credential\":\"********\",\"enabled\":\"false\"}"),
+    )
+    .await;
+    assert_success(&json);
+    assert!(!combined(&json).contains(second));
+    let revealed_json = run_cli(
+        home.path(),
+        &["get", "/team/service", "--format", "json", "--reveal"],
+    )
+    .await;
+    assert_success(&revealed_json);
+    assert_eq!(
+        String::from_utf8_lossy(&revealed_json.stdout),
+        format!("{{\n  \"credential\": \"{second}\",\n  \"enabled\": \"false\"\n}}\n")
+    );
+    assert!(revealed_json.stderr.is_empty());
+    let revealed = run_cli(
+        home.path(),
+        &["secret", "reveal", "/team/service/credential"],
+    )
+    .await;
+    assert_eq!(String::from_utf8_lossy(&revealed.stdout), second);
+    let sibling = run_cli(home.path(), &["get", "/team/service/enabled"]).await;
+    assert_eq!(String::from_utf8_lossy(&sibling.stdout), "false");
+
+    let deleted = run_cli(
+        home.path(),
+        &["delete", "/team/service/credential", "--yes"],
+    )
+    .await;
+    assert_success(&deleted);
+    assert!(!combined(&deleted).contains(second));
+    let missing = run_cli(
+        home.path(),
+        &["secret", "reveal", "/team/service/credential"],
+    )
+    .await;
+    assert!(!missing.status.success());
+    assert!(combined(&missing).contains("configuration value not found"));
+    assert!(!combined(&missing).contains(second));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -591,7 +770,7 @@ async fn login_status_logout_flow_is_authenticated_private_and_secret_safe() {
     let status = run_cli(home.path(), &["status"]).await;
     assert_success(&status);
     let status_output = combined(&status);
-    assert!(status_output.contains("Service 1.4.0-test (protocol v2)"));
+    assert!(status_output.contains("Service 1.5.0-test (protocol v3)"));
     assert!(status_output.contains("Authentication: logged in"));
     assert_secrets_absent(&status_output);
     assert_eq!(
@@ -973,7 +1152,7 @@ fn version_does_not_require_profile_configuration() {
     assert_success(&output);
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "sovereign-config 1.4.0"
+        "sovereign-config 1.5.0"
     );
 }
 
