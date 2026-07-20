@@ -113,6 +113,11 @@ entries:
         # metadata only: view_token_key is deliberately never granted, so no key is
         # ever readable.
         - authentik_core.view_token
+        # Global so the manager can resolve the browsing group below by name
+        # even once it holds no object-level permission on any managed
+        # account. Grants nothing: group membership carries no permissions
+        # here and authorization is granted directly on the service account.
+        - authentik_core.view_group
 
   - model: authentik_core.group
     state: present
@@ -122,6 +127,16 @@ entries:
       is_superuser: false
       roles:
         - !Find [authentik_rbac.role, [name, sovereign-config-dev-connection-manager]]
+
+  # Purely organizational: every managed connection's service account is added
+  # here so an operator can browse them together in Authentik. Carries no
+  # roles and grants no permissions.
+  - model: authentik_core.group
+    state: present
+    identifiers:
+      name: sovereign-config-dev-connections
+    attrs:
+      is_superuser: false
 
   - model: authentik_rbac.initialpermissions
     state: present

@@ -159,16 +159,19 @@ pub(crate) enum ManagedDependencyCall {
     FindCredentials,
     SetCredential,
     DeleteUser,
+    /// Best-effort: never fails or rolls back connection creation.
+    AssignGroup,
 }
 
 impl ManagedDependencyCall {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::CreateAccount,
         Self::SetAttributes,
         Self::FindUser,
         Self::FindCredentials,
         Self::SetCredential,
         Self::DeleteUser,
+        Self::AssignGroup,
     ];
 
     const fn index(self) -> usize {
@@ -183,6 +186,7 @@ impl ManagedDependencyCall {
             Self::FindCredentials => "find_credentials",
             Self::SetCredential => "set_credential",
             Self::DeleteUser => "delete_user",
+            Self::AssignGroup => "assign_group",
         }
     }
 }
@@ -341,7 +345,7 @@ mod tests {
             rendered
                 .matches("sovereign_config_managed_dependency_total{")
                 .count(),
-            36
+            42
         );
     }
 }

@@ -78,6 +78,10 @@ fn configured_environment(grpc_addr: &str) -> Vec<(&'static str, String)> {
             "sovereign_config_test_grants".to_owned(),
         ),
         (
+            "SOVEREIGN_CONFIG_MANAGER_GROUP",
+            "sovereign-config-test-connections".to_owned(),
+        ),
+        (
             "SOVEREIGN_CONFIG_MANAGER_API_TOKEN",
             MANAGER_SECRET.to_owned(),
         ),
