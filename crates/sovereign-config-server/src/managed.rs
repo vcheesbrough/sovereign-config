@@ -308,13 +308,7 @@ impl ManagedConnectionsService {
         account: &crate::authentik::CreatedServiceAccount,
     ) -> Result<(), Status> {
         let identifiers = match self.admin.find_app_password_identifiers(username).await {
-            Ok(identifiers) => {
-                self.metrics.record_dependency(
-                    ManagedDependencyCall::FindCredentials,
-                    ManagedDependencyOutcome::Ok,
-                );
-                identifiers
-            }
+            Ok(identifiers) => identifiers,
             Err(error) => {
                 self.metrics.record_dependency(
                     ManagedDependencyCall::FindCredentials,
@@ -323,9 +317,20 @@ impl ManagedConnectionsService {
                 return Err(dependency_error());
             }
         };
+        // A successful lookup that does not name exactly one credential is a
+        // dependency failure, not a success: recording it here is what makes
+        // an unreadable or duplicated credential diagnosable from metrics.
         let [credential_identifier] = identifiers.as_slice() else {
+            self.metrics.record_dependency(
+                ManagedDependencyCall::FindCredentials,
+                ManagedDependencyOutcome::Invalid,
+            );
             return Err(dependency_error());
         };
+        self.metrics.record_dependency(
+            ManagedDependencyCall::FindCredentials,
+            ManagedDependencyOutcome::Ok,
+        );
 
         if sqlx::query(
             r"
@@ -900,6 +905,9 @@ mod tests {
         delete_user: Behavior,
         /// Whether a reconciliation lookup should report the account exists.
         user_exists: bool,
+        /// Whether the caller may see the service account's app password,
+        /// reproducing Authentik's token ownership and permission rules.
+        credentials_visible: bool,
         set_credential_delay: Duration,
     }
 
@@ -913,6 +921,7 @@ mod tests {
                 set_credential: Behavior::Ok,
                 delete_user: Behavior::Ok,
                 user_exists: false,
+                credentials_visible: true,
                 set_credential_delay: Duration::ZERO,
             }
         }
@@ -1027,13 +1036,34 @@ mod tests {
         Json(json!({ "results": results })).into_response()
     }
 
-    async fn list_tokens(State(state): State<MockState>) -> Response {
+    /// Mirrors Authentik: results are filtered by the exact `user__username`
+    /// and `intent` query parameters, and a token is only visible when the
+    /// caller may see it. Returning a token regardless of the query would let
+    /// a permission or filter mistake pass unnoticed.
+    async fn list_tokens(
+        State(state): State<MockState>,
+        Query(query): Query<std::collections::HashMap<String, String>>,
+    ) -> Response {
         if let Some(response) =
             apply(&behavior(&state, |script| script.find_credentials.clone())).await
         {
             return response;
         }
-        Json(json!({ "results": [{ "identifier": CREDENTIAL_IDENTIFIER }] })).into_response()
+        let visible = state.script.lock().unwrap().credentials_visible;
+        let created = state.created_users.lock().unwrap().clone();
+        let matches = visible
+            && query
+                .get("intent")
+                .is_some_and(|intent| intent == "app_password")
+            && query
+                .get("user__username")
+                .is_some_and(|username| created.contains(username));
+        let results = if matches {
+            json!([{ "identifier": CREDENTIAL_IDENTIFIER }])
+        } else {
+            json!([])
+        };
+        Json(json!({ "results": results })).into_response()
     }
 
     async fn set_key(
@@ -1118,6 +1148,13 @@ mod tests {
     }
 
     async fn service(mock: &MockAuthentik) -> Option<ManagedConnectionsService> {
+        service_with_metrics(mock, Arc::new(ManagedConnectionMetrics::default())).await
+    }
+
+    async fn service_with_metrics(
+        mock: &MockAuthentik,
+        metrics: Arc<ManagedConnectionMetrics>,
+    ) -> Option<ManagedConnectionsService> {
         let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL").ok()?;
         let database = PgPoolOptions::new()
             .acquire_timeout(Duration::from_secs(5))
@@ -1148,7 +1185,7 @@ mod tests {
                 grants_attribute: GRANTS_ATTRIBUTE.to_owned(),
                 rotation_lease: ROTATION_LEASE,
             },
-            Arc::new(ManagedConnectionMetrics::default()),
+            metrics,
         ))
     }
 
@@ -1484,6 +1521,44 @@ mod tests {
         assert_bounded(&status);
         assert!(rows(&service).await.is_empty());
         assert!(mock.deleted_users().len() > before);
+    }
+
+    /// Regression: in production the manager could create the app password but
+    /// not see it, because Authentik only shows a non-superuser tokens they own
+    /// and the service-account endpoint creates the token with a direct ORM
+    /// call. Discovery returned zero rows and creation failed with an
+    /// unavailable dependency after rolling the account back.
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn unreadable_app_password_rolls_back_and_is_visible_in_metrics() {
+        let mock = mock_authentik().await;
+        let metrics = Arc::new(ManagedConnectionMetrics::default());
+        let Some(service) = service_with_metrics(&mock, Arc::clone(&metrics)).await else {
+            return;
+        };
+        mock.script(|script| script.credentials_visible = false);
+
+        let status = create(&service, "Invisible credential", "/apps/api", &manage("/"))
+            .await
+            .expect_err("an undiscoverable credential must fail creation");
+        assert_bounded(&status);
+
+        // The account must not be left behind with a usable credential.
+        assert!(rows(&service).await.is_empty());
+        assert!(!mock.deleted_users().is_empty());
+
+        // The failure must be attributable from metrics alone, which is what
+        // made the production incident diagnosable.
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                "sovereign_config_managed_dependency_total{call=\"find_credentials\",outcome=\"invalid\"} 1"
+            ),
+            "an unreadable credential must record a bounded dependency failure"
+        );
+        assert!(rendered.contains(
+            "sovereign_config_managed_dependency_total{call=\"set_attributes\",outcome=\"ok\"} 0"
+        ));
     }
 
     #[tokio::test]
