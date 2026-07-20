@@ -178,11 +178,11 @@ impl AuthentikAdminClient {
 
     /// Reports whether the exact managed user still exists, by primary key.
     ///
-    /// Uses the detail endpoint rather than a filtered list because Authentik
-    /// gates list access on holding the permission for at least one object: a
-    /// manager whose last managed account has just been deleted is refused the
-    /// list endpoint outright. Detail routes fall through to the object-level
-    /// check, so this stays usable exactly when reconciliation needs it.
+    /// This is an optimisation for settling an ambiguous deletion quickly, not
+    /// a guarantee. Authentik may refuse the read outright once the manager
+    /// holds no visible managed account, so callers must treat any error as
+    /// "still unknown" and fall back to retrying the deletion, where a
+    /// "not found" answer is the authoritative confirmation.
     pub(crate) async fn user_exists(&self, user_id: i64) -> Result<bool, AdminError> {
         let response = self
             .http
@@ -771,16 +771,15 @@ mod live_tests {
         cleanup(&client, &account).await;
         checks.expect("the manager must complete the managed connection lifecycle");
 
-        // Deletion must be confirmable by primary key, which is how an
-        // ambiguous revocation is settled. The list endpoint deliberately is
-        // not used here: Authentik refuses it once the manager holds no
-        // visible account, which is exactly the moment after a final delete.
-        assert!(
-            !client
-                .user_exists(account.user_id)
-                .await
-                .expect("confirming deletion by primary key must succeed"),
-            "the deleted account must no longer exist"
+        // Revocation confirms deletion by re-attempting it: Authentik
+        // answering "not found" is the confirmation, and it is the only path
+        // that stays available once the manager holds no visible account.
+        // Read-back probes are an optimisation and may legitimately be refused
+        // in that state, so they are deliberately not asserted here.
+        assert_eq!(
+            client.delete_user(account.user_id).await,
+            Err(AdminError::NotFound),
+            "re-deleting the account must confirm it is already gone"
         );
     }
 
