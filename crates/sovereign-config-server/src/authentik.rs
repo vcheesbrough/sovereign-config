@@ -176,33 +176,11 @@ impl AuthentikAdminClient {
         expect_success(response).await.map(|_| ())
     }
 
-    /// Reports whether the exact managed user still exists, by primary key.
-    ///
-    /// This is an optimisation for settling an ambiguous deletion quickly, not
-    /// a guarantee. Authentik may refuse the read outright once the manager
-    /// holds no visible managed account, so callers must treat any error as
-    /// "still unknown" and fall back to retrying the deletion, where a
-    /// "not found" answer is the authoritative confirmation.
-    pub(crate) async fn user_exists(&self, user_id: i64) -> Result<bool, AdminError> {
-        let response = self
-            .http
-            .get(self.endpoint(&format!("/api/v3/core/users/{user_id}/"))?)
-            .bearer_auth(self.api_token.expose())
-            .send()
-            .await
-            .map_err(|error| classify_transport(&error))?;
-        match expect_success(response).await {
-            Ok(_) => Ok(true),
-            Err(AdminError::NotFound) => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-
     /// Locates a user by exact generated username for reconciliation only.
     ///
-    /// Only usable when the manager can still see at least one managed
-    /// account; Authentik refuses the list endpoint otherwise. Callers that
-    /// know the primary key should prefer [`Self::user_exists`].
+    /// Only usable while the manager can still see at least one managed
+    /// account; Authentik refuses user reads outright otherwise. Absence must
+    /// therefore be confirmed through the app password rather than the user.
     pub(crate) async fn find_user_by_username(
         &self,
         username: &str,
@@ -771,15 +749,18 @@ mod live_tests {
         cleanup(&client, &account).await;
         checks.expect("the manager must complete the managed connection lifecycle");
 
-        // Revocation confirms deletion by re-attempting it: Authentik
-        // answering "not found" is the confirmation, and it is the only path
-        // that stays available once the manager holds no visible account.
-        // Read-back probes are an optimisation and may legitimately be refused
-        // in that state, so they are deliberately not asserted here.
-        assert_eq!(
-            client.delete_user(account.user_id).await,
-            Err(AdminError::NotFound),
-            "re-deleting the account must confirm it is already gone"
+        // Absence is confirmed through the app password, not the user.
+        // Authentik refuses user reads and deletes for an account the manager
+        // can no longer see, so those cannot distinguish "gone" from "denied";
+        // the token view is global and cascades with the user, so an empty
+        // result proves no usable credential survives.
+        let remaining = client
+            .find_app_password_identifiers(&username)
+            .await
+            .expect("confirming credential absence must succeed");
+        assert!(
+            remaining.is_empty(),
+            "deleting the account must leave no usable credential"
         );
     }
 

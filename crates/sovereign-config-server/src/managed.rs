@@ -563,26 +563,16 @@ impl ManagedConnectionsService {
                         ManagedDependencyCall::DeleteUser,
                         dependency_outcome(error),
                     );
-                    // A timeout is ambiguous: Authentik may have committed the
-                    // deletion. Probe the exact account by primary key to
-                    // settle it, so revocation is not reported as failed when
-                    // the credential is already gone.
-                    if error == AdminError::Ambiguous {
-                        if self.admin.user_exists(user_id).await != Ok(false) {
-                            self.metrics.record_dependency(
-                                ManagedDependencyCall::FindUser,
-                                ManagedDependencyOutcome::Ambiguous,
-                            );
-                            // The row stays `revoking`; revocation can be
-                            // retried until deletion is confirmed.
-                            return Err(dependency_error());
-                        }
-                        self.metrics.record_dependency(
-                            ManagedDependencyCall::FindUser,
-                            ManagedDependencyOutcome::NotFound,
-                        );
-                    } else {
-                        // The row stays `revoking`; revocation can be retried.
+                    // Deletion may already have happened: Authentik refuses
+                    // rather than reporting "not found" for an account the
+                    // manager can no longer see, and a timeout is ambiguous by
+                    // definition. Settle it by looking for the account's app
+                    // password, which is authoritative because the token view
+                    // is global and Authentik cascades the token with the user.
+                    let username = format!("{USERNAME_PREFIX}{}", connection_id.as_str());
+                    if !self.credential_is_gone(&username).await {
+                        // The row stays `revoking`; revocation can be retried
+                        // until absence is confirmed.
                         return Err(dependency_error());
                     }
                 }
@@ -726,6 +716,37 @@ impl ManagedConnectionsService {
                     dependency_outcome(probe_error),
                 );
                 cleanup_required(connection_id, self).await
+            }
+        }
+    }
+
+    /// Confirms that no app password remains for the exact managed username.
+    ///
+    /// This is the authoritative absence check. Deleting or reading the user
+    /// depends on object permissions that vanish along with the account, so
+    /// Authentik answers those with a refusal rather than "not found". The
+    /// token view is global, and Authentik removes a service account's tokens
+    /// with it, so an empty result proves no usable credential survives.
+    /// Anything other than a definite empty result is treated as unknown.
+    async fn credential_is_gone(&self, username: &str) -> bool {
+        match self.admin.find_app_password_identifiers(username).await {
+            Ok(identifiers) => {
+                self.metrics.record_dependency(
+                    ManagedDependencyCall::FindCredentials,
+                    if identifiers.is_empty() {
+                        ManagedDependencyOutcome::NotFound
+                    } else {
+                        ManagedDependencyOutcome::Ok
+                    },
+                );
+                identifiers.is_empty()
+            }
+            Err(error) => {
+                self.metrics.record_dependency(
+                    ManagedDependencyCall::FindCredentials,
+                    dependency_outcome(error),
+                );
+                false
             }
         }
     }
@@ -916,6 +937,9 @@ mod tests {
         /// Apply the change, then never answer: the caller cannot tell whether
         /// Authentik committed it.
         CommitThenTimeout,
+        /// Apply the change, then refuse, as Authentik does once the caller can
+        /// no longer see the object.
+        CommitThenRefuse,
     }
 
     #[derive(Clone)]
@@ -956,6 +980,8 @@ mod tests {
         created_users: Arc<Mutex<Vec<String>>>,
         deleted_users: Arc<Mutex<Vec<i64>>>,
         patched_attributes: Arc<Mutex<Vec<Value>>>,
+        revoked_usernames: Arc<Mutex<Vec<String>>>,
+        usernames_by_id: Arc<Mutex<std::collections::HashMap<i64, String>>>,
         rotated_keys: Arc<Mutex<Vec<String>>>,
         next_user_id: Arc<AtomicI64>,
     }
@@ -994,7 +1020,7 @@ mod tests {
         match behavior {
             // `CommitThenTimeout` applies the change in the handler itself,
             // so it produces no scripted response here.
-            Behavior::Ok | Behavior::CommitThenTimeout => None,
+            Behavior::Ok | Behavior::CommitThenTimeout | Behavior::CommitThenRefuse => None,
             Behavior::Status(status) => Some((*status, "authentik-body-sentinel").into_response()),
             Behavior::Timeout => {
                 sleep(Duration::from_secs(30)).await;
@@ -1021,6 +1047,11 @@ mod tests {
             .to_owned();
         let user_pk = state.next_user_id.fetch_add(1, Ordering::Relaxed);
         state.created_users.lock().unwrap().push(username.clone());
+        state
+            .usernames_by_id
+            .lock()
+            .unwrap()
+            .insert(user_pk, username.clone());
         Json(json!({
             "username": username,
             "user_uid": format!("uid-{user_pk}"),
@@ -1076,13 +1107,16 @@ mod tests {
         }
         let visible = state.script.lock().unwrap().credentials_visible;
         let created = state.created_users.lock().unwrap().clone();
+        // Authentik removes a service account's tokens along with the account,
+        // so a deleted account must stop yielding a credential.
+        let revoked = state.revoked_usernames.lock().unwrap().clone();
         let matches = visible
             && query
                 .get("intent")
                 .is_some_and(|intent| intent == "app_password")
             && query
                 .get("user__username")
-                .is_some_and(|username| created.contains(username));
+                .is_some_and(|username| created.contains(username) && !revoked.contains(username));
         let results = if matches {
             json!([{ "identifier": CREDENTIAL_IDENTIFIER }])
         } else {
@@ -1125,8 +1159,15 @@ mod tests {
             return response;
         }
         state.deleted_users.lock().unwrap().push(user_id);
+        // Authentik cascades a service account's tokens with the user.
+        if let Some(username) = state.usernames_by_id.lock().unwrap().get(&user_id).cloned() {
+            state.revoked_usernames.lock().unwrap().push(username);
+        }
         if matches!(scripted, Behavior::CommitThenTimeout) {
             sleep(Duration::from_secs(30)).await;
+        }
+        if matches!(scripted, Behavior::CommitThenRefuse) {
+            return (StatusCode::FORBIDDEN, "authentik-body-sentinel").into_response();
         }
         StatusCode::NO_CONTENT.into_response()
     }
@@ -1137,6 +1178,8 @@ mod tests {
             created_users: Arc::new(Mutex::new(Vec::new())),
             deleted_users: Arc::new(Mutex::new(Vec::new())),
             patched_attributes: Arc::new(Mutex::new(Vec::new())),
+            revoked_usernames: Arc::new(Mutex::new(Vec::new())),
+            usernames_by_id: Arc::new(Mutex::new(std::collections::HashMap::new())),
             rotated_keys: Arc::new(Mutex::new(Vec::new())),
             next_user_id: Arc::new(AtomicI64::new(1000)),
         };
@@ -1786,14 +1829,13 @@ mod tests {
         assert!(!mock.deleted_users().is_empty());
     }
 
-    /// An ambiguous deletion is settled by probing the account by primary key,
-    /// so revocation is not reported as failed when Authentik already
-    /// committed the delete. The probe uses the detail endpoint because
-    /// Authentik refuses the list endpoint once the manager holds no visible
-    /// account, which is precisely the state after a final deletion.
+    /// An ambiguous deletion is settled by checking the app password, which is
+    /// authoritative because the token view is global and the token cascades with
+    /// the account, so revocation is not reported as failed when Authentik
+    /// already committed the delete.
     #[tokio::test]
     #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
-    async fn ambiguous_deletion_is_confirmed_by_primary_key() {
+    async fn ambiguous_deletion_is_confirmed_by_credential_absence() {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
         let (connection_id, _) = create(&service, "Ambiguous delete", "/apps/api", &manage("/"))
@@ -1811,6 +1853,61 @@ mod tests {
             .expect("a committed deletion must be confirmed despite the timeout");
 
         assert!(rows(&service).await.is_empty());
+    }
+
+    /// Regression: Authentik refuses user deletes for an account the manager
+    /// can no longer see rather than reporting "not found", so treating only
+    /// "not found" as confirmation left the last connection stuck in
+    /// `revoking` forever. Absence is confirmed through the app password,
+    /// whose view is global and which cascades with the account.
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn revocation_is_confirmed_when_deletion_is_refused_but_the_credential_is_gone() {
+        let mock = mock_authentik().await;
+        let service = service_or_skip!(&mock);
+        let (connection_id, _) = create(&service, "Refused delete", "/apps/api", &manage("/"))
+            .await
+            .expect("create must succeed");
+
+        // Authentik commits the deletion, then refuses every later request
+        // about an account the manager can no longer see.
+        mock.script(|script| script.delete_user = Behavior::CommitThenRefuse);
+        service
+            .revoke_managed_connection(request(
+                RevokeManagedConnectionRequest {
+                    connection_id: connection_id.clone(),
+                },
+                &manage("/"),
+            ))
+            .await
+            .expect("a refused delete with no surviving credential must confirm revocation");
+        assert!(rows(&service).await.is_empty());
+    }
+
+    /// A refusal while the credential still exists must not be reported as a
+    /// successful revocation.
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn revocation_is_not_confirmed_while_the_credential_survives() {
+        let mock = mock_authentik().await;
+        let service = service_or_skip!(&mock);
+        let (connection_id, _) = create(&service, "Surviving", "/apps/api", &manage("/"))
+            .await
+            .expect("create must succeed");
+
+        mock.script(|script| script.delete_user = Behavior::Status(StatusCode::FORBIDDEN));
+        let status = service
+            .revoke_managed_connection(request(
+                RevokeManagedConnectionRequest { connection_id },
+                &manage("/"),
+            ))
+            .await
+            .expect_err("a surviving credential must not be reported as revoked");
+        assert_bounded(&status);
+
+        let rows = rows(&service).await;
+        assert_eq!(rows.len(), 1, "the row must remain for retry");
+        assert_eq!(rows[0].state, "revoking");
     }
 
     #[tokio::test]
