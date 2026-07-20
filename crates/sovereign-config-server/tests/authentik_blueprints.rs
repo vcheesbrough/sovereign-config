@@ -84,10 +84,19 @@ fn assert_connection_manager(entries: &[Value], environment: &Environment<'_>) {
         .iter()
         .map(string)
         .collect::<BTreeSet<_>>();
+    // `view_token` is global because Authentik's service-account endpoint
+    // creates the app password with a direct ORM call, so object-level
+    // permissions never attach and the manager could otherwise not discover or
+    // rotate the credential it just created. It exposes token metadata only —
+    // `view_token_key` stays ungranted, so no key is ever readable.
     assert_eq!(
         permissions,
-        BTreeSet::from(["authentik_core.add_token", "authentik_core.add_user"]),
-        "the manager role must hold only global create permissions"
+        BTreeSet::from([
+            "authentik_core.add_token",
+            "authentik_core.add_user",
+            "authentik_core.view_token",
+        ]),
+        "the manager role must hold only the documented global permissions"
     );
 
     let initial = present_entry(
@@ -150,10 +159,15 @@ fn assert_connection_manager(entries: &[Value], environment: &Environment<'_>) {
         environment.manager_token_variable
     );
 
-    // These must never appear anywhere in the blueprint: viewing a token key
-    // would expose managed app passwords, and the others would let the manager
-    // escalate beyond the objects it creates.
-    let blueprint_text = blueprint_source(environment.blueprint);
+    // These must never be granted: viewing a token key would expose managed app
+    // passwords, and the others would let the manager escalate beyond the
+    // objects it creates. Comments are stripped so documenting *why* a
+    // permission is withheld cannot trip the check.
+    let blueprint_text = blueprint_source(environment.blueprint)
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
     for forbidden in [
         "view_token_key",
         "is_superuser: true",

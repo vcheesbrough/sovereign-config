@@ -106,6 +106,13 @@ entries:
       permissions:
         - authentik_core.add_user
         - authentik_core.add_token
+        # Authentik's service-account endpoint creates the app-password token with a
+        # direct ORM call, so InitialPermissions never attaches to it, and TokenViewSet
+        # only shows a non-superuser tokens they own. Without a global view the manager
+        # cannot discover or rotate the credential it just created. This exposes token
+        # metadata only: view_token_key is deliberately never granted, so no key is
+        # ever readable.
+        - authentik_core.view_token
 
   - model: authentik_core.group
     state: present
