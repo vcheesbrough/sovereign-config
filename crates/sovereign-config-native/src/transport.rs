@@ -3,19 +3,25 @@ use std::{net::IpAddr, time::Duration};
 use async_trait::async_trait;
 use http::Uri;
 use sovereign_config_client::{
-    RpcCode, Transport, ValueTransport, VersionReply, map_rpc_status, timestamp,
+    ManagedConnectionTransport, RpcCode, Transport, ValueTransport, VersionReply, map_rpc_status,
+    timestamp,
 };
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ListedValue, MaskedSecret,
-    PlainValue, PutMetadata, ReplaceMetadata, RevealedSecret, Secret, SecretInput,
-    SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, ValueContent, ValueListing,
-    ValueSubTree,
+    AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl, DeleteMetadata,
+    DisplayName, ListedValue, ManagedConnectionMetadata, ManagedConnectionState, MaskedSecret,
+    PlainValue, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedConnectionUrl,
+    RevealedSecret, Secret, SecretInput, SubTreeMutationContent, SubTreeMutationValue,
+    SubTreeValue, ValueContent, ValueListing, ValueSubTree,
 };
 use sovereign_config_proto::sovereign::config::v3::{
-    DeleteValuesRequest, GetIdentityRequest, GetSubTreeRequest, GetVersionRequest,
-    ListValuesRequest, PreserveSecret, PutValueRequest, ReplaceSubTreeRequest, RevealSecretRequest,
-    SubTreeMutationValue as ProtoSubTreeMutationValue, ValueClassification as ProtoClassification,
-    configuration_client::ConfigurationClient, listed_value, put_value_request,
+    CreateManagedConnectionRequest, DeleteValuesRequest, GetIdentityRequest, GetSubTreeRequest,
+    GetVersionRequest, ListManagedConnectionsRequest, ListValuesRequest,
+    ManagedConnectionMetadata as ProtoManagedConnectionMetadata,
+    ManagedConnectionState as ProtoManagedConnectionState, PreserveSecret, PutValueRequest,
+    ReplaceSubTreeRequest, RevealSecretRequest, RevokeManagedConnectionRequest,
+    RotateManagedConnectionRequest, SubTreeMutationValue as ProtoSubTreeMutationValue,
+    ValueClassification as ProtoClassification, configuration_client::ConfigurationClient,
+    listed_value, managed_connections_client::ManagedConnectionsClient, put_value_request,
     sub_tree_mutation_value, sub_tree_value, system_client::SystemClient,
 };
 use tonic::{
@@ -251,6 +257,133 @@ impl ValueTransport for TonicTransport {
     }
 }
 
+#[async_trait(?Send)]
+impl ManagedConnectionTransport for TonicTransport {
+    async fn list_managed_connections(
+        &self,
+        bearer: &Secret,
+    ) -> Result<Vec<ManagedConnectionMetadata>, ClientError> {
+        let mut client = ManagedConnectionsClient::new(self.channel.clone());
+        let response = client
+            .list_managed_connections(authenticated_request(
+                ListManagedConnectionsRequest {},
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        response
+            .connections
+            .into_iter()
+            .map(managed_metadata)
+            .collect()
+    }
+
+    async fn create_managed_connection(
+        &self,
+        display_name: &DisplayName,
+        root: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ProvisionedManagedConnection, ClientError> {
+        let mut client = ManagedConnectionsClient::new(self.channel.clone());
+        let response = client
+            .create_managed_connection(authenticated_request(
+                CreateManagedConnectionRequest {
+                    display_name: display_name.as_str().to_owned(),
+                    root: root.as_str().to_owned(),
+                },
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        provisioned_connection(response.metadata, &response.connection_url)
+    }
+
+    async fn rotate_managed_connection(
+        &self,
+        connection_id: &ConnectionId,
+        bearer: &Secret,
+    ) -> Result<ProvisionedManagedConnection, ClientError> {
+        let mut client = ManagedConnectionsClient::new(self.channel.clone());
+        let response = client
+            .rotate_managed_connection(authenticated_request(
+                RotateManagedConnectionRequest {
+                    connection_id: connection_id.as_str().to_owned(),
+                },
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        provisioned_connection(response.metadata, &response.connection_url)
+    }
+
+    async fn revoke_managed_connection(
+        &self,
+        connection_id: &ConnectionId,
+        bearer: &Secret,
+    ) -> Result<(), ClientError> {
+        let mut client = ManagedConnectionsClient::new(self.channel.clone());
+        client
+            .revoke_managed_connection(authenticated_request(
+                RevokeManagedConnectionRequest {
+                    connection_id: connection_id.as_str().to_owned(),
+                },
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?;
+        Ok(())
+    }
+}
+
+fn managed_metadata(
+    metadata: ProtoManagedConnectionMetadata,
+) -> Result<ManagedConnectionMetadata, ClientError> {
+    let created_at = metadata.created_at.ok_or_else(invalid_response)?;
+    let updated_at = metadata.updated_at.ok_or_else(invalid_response)?;
+    Ok(ManagedConnectionMetadata {
+        connection_id: ConnectionId::parse(metadata.connection_id)
+            .map_err(|_| invalid_response())?,
+        display_name: DisplayName::parse(metadata.display_name).map_err(|_| invalid_response())?,
+        root: ConfigPath::parse(metadata.root).map_err(|_| invalid_response())?,
+        state: managed_state(metadata.state)?,
+        created_at: timestamp(created_at.seconds, created_at.nanos)?,
+        updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
+    })
+}
+
+fn managed_state(state: i32) -> Result<ManagedConnectionState, ClientError> {
+    match ProtoManagedConnectionState::try_from(state) {
+        Ok(ProtoManagedConnectionState::Provisioning) => Ok(ManagedConnectionState::Provisioning),
+        Ok(ProtoManagedConnectionState::Active) => Ok(ManagedConnectionState::Active),
+        Ok(ProtoManagedConnectionState::RotationUnknown) => {
+            Ok(ManagedConnectionState::RotationUnknown)
+        }
+        Ok(ProtoManagedConnectionState::Revoking) => Ok(ManagedConnectionState::Revoking),
+        Ok(ProtoManagedConnectionState::CleanupRequired) => {
+            Ok(ManagedConnectionState::CleanupRequired)
+        }
+        _ => Err(invalid_response()),
+    }
+}
+
+fn provisioned_connection(
+    metadata: Option<ProtoManagedConnectionMetadata>,
+    connection_url: &str,
+) -> Result<ProvisionedManagedConnection, ClientError> {
+    let metadata = managed_metadata(metadata.ok_or_else(invalid_response)?)?;
+    let connection = ConnectionUrl::parse(connection_url).map_err(|_| invalid_response())?;
+    if connection.client_authentication().is_none() || connection.root() != &metadata.root {
+        return Err(invalid_response());
+    }
+    Ok(ProvisionedManagedConnection {
+        metadata,
+        connection_url: RevealedConnectionUrl::new(connection),
+    })
+}
+
 fn listed_content(
     classification: i32,
     content: Option<listed_value::Content>,
@@ -382,7 +515,9 @@ fn map_status(status: &tonic::Status) -> ClientError {
         Code::FailedPrecondition => RpcCode::FailedPrecondition,
         Code::InvalidArgument => RpcCode::InvalidArgument,
         Code::NotFound => RpcCode::NotFound,
-        Code::Cancelled | Code::DeadlineExceeded | Code::Unavailable => RpcCode::Unavailable,
+        Code::Aborted | Code::Cancelled | Code::DeadlineExceeded | Code::Unavailable => {
+            RpcCode::Unavailable
+        }
         _ => RpcCode::Other,
     })
 }

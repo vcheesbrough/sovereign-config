@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod connection;
+mod managed;
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -13,6 +14,11 @@ pub const PROTOCOL_VERSION: &str = "v3";
 pub const MASKED_SECRET_TEXT: &str = "********";
 
 pub use connection::{ConnectionUrl, ConnectionUrlError};
+pub use managed::{
+    ConnectionId, DisplayName, MAX_CONNECTION_ID_CHARS, MAX_DISPLAY_NAME_CHARS,
+    MIN_CONNECTION_ID_CHARS, ManagedConnectionMetadata, ManagedConnectionState,
+    ProvisionedManagedConnection, RevealedConnectionUrl,
+};
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum PathError {

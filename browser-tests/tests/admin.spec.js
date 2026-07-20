@@ -326,6 +326,94 @@ async function mockApplication(page) {
     if (route.request().resourceType() !== 'document') return route.continue();
     return route.fulfill({ contentType: 'text/html', path: path.join(staticDir, 'index.html') });
   });
+  await page.route('**/connections/**', route => {
+    if (route.request().resourceType() !== 'document') return route.continue();
+    return route.fulfill({ contentType: 'text/html', path: path.join(staticDir, 'index.html') });
+  });
+}
+
+const CONNECTION_ID = 'a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8';
+const APP_PASSWORD_SENTINEL = 'browser-app-password-sentinel';
+
+function connectionUrl(password = APP_PASSWORD_SENTINEL) {
+  const credential = Buffer.from(`sc-managed-${CONNECTION_ID}:${password}`)
+    .toString('base64url');
+  const issuer = encodeURIComponent('https://auth.example.test/application/o/config/');
+  return `https://config.example.test/apps/api#v=1&issuer=${issuer}`
+    + `&client_id=sovereign-config&client_secret=${credential}`;
+}
+
+function connectionMetadata({ id = CONNECTION_ID, name = 'Pipeline reader', root = '/apps/api', state = 2 } = {}) {
+  const instant = timestamp(1700000000);
+  return Buffer.concat([
+    field(1, Buffer.from(id)),
+    field(2, Buffer.from(name)),
+    field(3, Buffer.from(root)),
+    scalarField(4, state),
+    field(5, instant),
+    field(6, instant)
+  ]);
+}
+
+function listConnectionsReply(connections) {
+  return Buffer.concat(connections.map(connection => field(1, connectionMetadata(connection))));
+}
+
+function provisionedReply(url, connection = {}) {
+  return Buffer.concat([
+    field(1, connectionMetadata(connection)),
+    field(2, Buffer.from(url))
+  ]);
+}
+
+/**
+ * Mocks the ManagedConnections service. `script` may override the status or
+ * body of any method to exercise failure and ambiguity paths.
+ */
+async function mockConnections(page, options = {}) {
+  const state = {
+    connections: options.connections || [{}],
+    requests: [],
+    script: options.script || {},
+    rotations: 0
+  };
+  await page.route('**/sovereign.config.v3.ManagedConnections/*', async route => {
+    const method = route.request().url().split('/').pop();
+    const fields = stringFields(route.request().postDataBuffer());
+    state.requests.push({ method, fields });
+    const authorized = route.request().headers().authorization === 'Bearer access-token-two';
+    const reply = (body, status = 0) => route.fulfill({
+      status: 200,
+      headers: { 'content-type': 'application/grpc-web+proto' },
+      body: grpcFrame(body, status)
+    });
+    if (!authorized) return reply(Buffer.alloc(0), 16);
+    const scripted = state.script[method];
+    if (typeof scripted === 'number') return reply(Buffer.alloc(0), scripted);
+    if (typeof scripted === 'function') {
+      const outcome = scripted(state);
+      if (typeof outcome === 'number') return reply(Buffer.alloc(0), outcome);
+      if (outcome) return reply(outcome);
+    }
+    if (method === 'ListManagedConnections') {
+      return reply(listConnectionsReply(state.connections));
+    }
+    if (method === 'CreateManagedConnection') {
+      const created = { name: fields.get(1), root: fields.get(2) };
+      state.connections = [...state.connections, created];
+      return reply(provisionedReply(connectionUrl(), created));
+    }
+    if (method === 'RotateManagedConnection') {
+      state.rotations += 1;
+      return reply(provisionedReply(connectionUrl(`rotated-password-${state.rotations}`)));
+    }
+    if (method === 'RevokeManagedConnection') {
+      state.connections = [];
+      return reply(Buffer.alloc(0));
+    }
+    return reply(Buffer.alloc(0), 2);
+  });
+  return state;
 }
 
 async function mockDiscovery(page) {
@@ -816,7 +904,7 @@ test('path and new-value fields validate on every keystroke', async ({ page }) =
   await expect(page.getByText('No values at this path.')).toBeVisible();
 
   await page.getByRole('button', { name: 'Add value' }).click();
-  const name = page.getByLabel('Name');
+  const name = page.getByLabel('Name', { exact: true });
   await name.fill('bad_name');
   await expect(name).toHaveAttribute('aria-invalid', 'true');
   await expect(page.getByText('Name must contain only letters, numbers, and hyphens')).toBeVisible();
@@ -840,7 +928,7 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
   await expect(page.getByText('No values at this path.')).toBeVisible();
 
   await page.getByRole('button', { name: 'Add value' }).click();
-  await page.getByLabel('Name').fill('Feature-Flag');
+  await page.getByLabel('Name', { exact: true }).fill('Feature-Flag');
   await page.getByLabel('Value', { exact: true }).fill('plain-value-sentinel');
   await page.locator('#new-value-row').getByRole('button', { name: 'Save' }).click();
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
@@ -922,7 +1010,7 @@ test('secret values stay masked, rotate explicitly, and survive JSON edits', asy
   await expect(page.locator('body')).not.toContainText(rotatedSecret);
 
   await page.getByRole('button', { name: 'Add value' }).click();
-  await page.getByLabel('Name').fill('Signing-Key');
+  await page.getByLabel('Name', { exact: true }).fill('Signing-Key');
   await page.getByLabel('Store as secret').check();
   const newSecret = page.getByLabel('Secret value', { exact: true });
   await expect(newSecret).toHaveAttribute('type', 'password');
@@ -958,7 +1046,7 @@ test('secret values stay masked, rotate explicitly, and survive JSON edits', asy
     body: grpcFrame(Buffer.alloc(0), 7)
   }));
   await page.getByRole('button', { name: 'Add value' }).click();
-  await page.getByLabel('Name').fill('failed-value');
+  await page.getByLabel('Name', { exact: true }).fill('failed-value');
   await page.getByLabel('Value', { exact: true }).fill('never-stored');
   await page.locator('#new-value-row').getByRole('button', { name: 'Save' }).click();
   await expect(page.getByText('permission denied', { exact: true })).toBeVisible();
@@ -976,7 +1064,7 @@ test('secret values stay masked, rotate explicitly, and survive JSON edits', asy
   await expect(page.locator('body')).not.toContainText(rotatedSecret);
 
   await page.getByRole('button', { name: 'Add value' }).click();
-  await page.getByLabel('Name').fill('unsubmitted-secret');
+  await page.getByLabel('Name', { exact: true }).fill('unsubmitted-secret');
   await page.getByLabel('Store as secret').check();
   await page.getByLabel('Secret value', { exact: true }).fill(unsubmittedSecret);
   await page.getByRole('link', { name: 'System status' }).click();
@@ -1050,7 +1138,7 @@ test('trailers-only save errors retain their bounded gRPC status', async ({ page
 
   await page.getByRole('link', { name: 'Configuration values' }).click();
   await page.getByRole('button', { name: 'Add value' }).click();
-  await page.getByLabel('Name').fill('foo');
+  await page.getByLabel('Name', { exact: true }).fill('foo');
   await page.getByLabel('Value', { exact: true }).fill('bar');
   await page.getByRole('button', { name: 'Save' }).click();
   await expect(page.getByText('permission denied', { exact: true })).toBeVisible();
@@ -1075,3 +1163,263 @@ for (const contract of transportContract) {
     }
   });
 }
+
+test('managed connections list only manageable roots and are accessible', async ({ page }) => {
+  const connections = await mockConnections(page, {
+    connections: [
+      { id: CONNECTION_ID, name: 'Pipeline reader', root: '/apps/api', state: 2 },
+      { id: 'b1b2c3d4e5f6a7b8b1b2c3d4e5f6a7b8', name: 'Recovering', root: '/apps/web', state: 3 }
+    ]
+  });
+  await openCallback(page);
+  await page.getByRole('link', { name: 'Managed connections' }).click();
+
+  await expect(page.locator('#connection-count')).toHaveText('2 connections');
+  await expect(page.getByRole('rowheader', { name: 'Pipeline reader' })).toBeVisible();
+  await expect(page.getByRole('cell', { name: '/apps/api' })).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'Rotation unknown' })).toBeVisible();
+  // External identities must never reach the browser.
+  await expect(page.locator('body')).not.toContainText('sc-managed-');
+
+  const accessibility = await new AxeBuilder({ page }).analyze();
+  expect(accessibility.violations).toEqual([]);
+  expect(connections.requests.map(request => request.method))
+    .toContain('ListManagedConnections');
+});
+
+test('creating a connection confirms the exact root and reveals the URL once', async ({ page }) => {
+  const connections = await mockConnections(page, { connections: [] });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await page.goto('/connections/');
+
+  await page.getByLabel('Display name').fill('Pipeline reader');
+  await page.getByLabel('Read-only root').fill('/apps/api');
+  await page.getByRole('button', { name: 'Create connection' }).click();
+
+  // The confirmation names the exact root and the read-only grant.
+  const confirmation = page.locator('#create-connection-dialog');
+  await expect(confirmation).toBeVisible();
+  await expect(confirmation).toContainText('/apps/api');
+  await expect(confirmation).toContainText('read-only');
+  await expect(page.locator('#cancel-create-connection')).toBeFocused();
+
+  await confirmation.getByRole('button', { name: 'Create connection' }).click();
+
+  // The result surface opens masked; no secret is in the DOM yet.
+  const result = page.locator('#connection-url-dialog');
+  await expect(result).toBeVisible();
+  await expect(page.locator('#connection-url-mask')).toBeVisible();
+  await expect(page.locator('#revealed-connection-url')).toBeHidden();
+  await expect(page.locator('body')).not.toContainText(APP_PASSWORD_SENTINEL);
+  await expect(page.locator('#reveal-connection-url')).toHaveAttribute('aria-expanded', 'false');
+
+  // Reveal is explicit and keyboard reachable.
+  await expect(page.locator('#reveal-connection-url')).toBeFocused();
+  await page.keyboard.press('Enter');
+  const revealed = page.locator('#revealed-connection-url');
+  await expect(revealed).toBeVisible();
+  await expect(revealed).toHaveAttribute('readonly', '');
+  await expect(revealed).toBeFocused();
+  await expect(page.locator('#reveal-connection-url')).toHaveAttribute('aria-expanded', 'true');
+  expect(await revealed.inputValue()).toContain('client_secret=');
+
+  const created = connections.requests.find(request => request.method === 'CreateManagedConnection');
+  expect(created.fields.get(1)).toBe('Pipeline reader');
+  expect(created.fields.get(2)).toBe('/apps/api');
+});
+
+test('the one-time connection URL is discarded and never persisted', async ({ page }) => {
+  await mockConnections(page, { connections: [] });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await page.goto('/connections/');
+  await page.getByLabel('Display name').fill('Pipeline reader');
+  await page.getByLabel('Read-only root').fill('/apps/api');
+  await page.getByRole('button', { name: 'Create connection' }).click();
+  await page.locator('#confirm-create-connection').click();
+  await page.locator('#reveal-connection-url').click();
+  await expect(page.locator('#revealed-connection-url')).toBeVisible();
+
+  await page.locator('#close-connection-url').click();
+
+  // Closing discards the value from application state and the DOM.
+  await expect(page.locator('#connection-url-dialog')).toBeHidden();
+  expect(await page.locator('#revealed-connection-url').inputValue()).toBe('');
+  await expect(page.locator('body')).not.toContainText(APP_PASSWORD_SENTINEL);
+
+  // The secret must never reach history, storage, or caches.
+  const leaked = await page.evaluate(async sentinel => {
+    const stores = [];
+    for (const storage of [localStorage, sessionStorage]) {
+      for (let index = 0; index < storage.length; index++) {
+        stores.push(String(storage.getItem(storage.key(index))));
+      }
+    }
+    if (globalThis.caches) {
+      for (const key of await caches.keys()) {
+        const cache = await caches.open(key);
+        for (const request of await cache.keys()) stores.push(request.url);
+      }
+    }
+    return {
+      storage: stores.some(entry => entry.includes(sentinel)),
+      url: location.href.includes(sentinel),
+      registrations: Boolean(navigator.serviceWorker
+        && (await navigator.serviceWorker.getRegistrations()).length)
+    };
+  }, APP_PASSWORD_SENTINEL);
+  expect(leaked.storage).toBe(false);
+  expect(leaked.url).toBe(false);
+  expect(leaked.registrations).toBe(false);
+
+  // Reloading must not restore the one-time URL.
+  await page.reload();
+  await expect(page.locator('body')).not.toContainText(APP_PASSWORD_SENTINEL);
+});
+
+test('rotation and revocation confirm destructively and discard secrets', async ({ page }) => {
+  const connections = await mockConnections(page);
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await page.goto('/connections/');
+
+  await page.getByRole('button', { name: 'Rotate credential for Pipeline reader' }).click();
+  const rotateDialog = page.locator('#rotate-connection-dialog');
+  await expect(rotateDialog).toBeVisible();
+  await expect(rotateDialog).toContainText('Pipeline reader');
+  await expect(rotateDialog).toContainText('stops working immediately');
+  // The confirmation must not disclose any credential or provider identity.
+  await expect(rotateDialog).not.toContainText('sc-managed-');
+  await expect(rotateDialog).not.toContainText('client_secret');
+
+  await page.locator('#confirm-rotate-connection').click();
+  await expect(page.locator('#connection-url-dialog')).toBeVisible();
+  await page.locator('#reveal-connection-url').click();
+  expect(await page.locator('#revealed-connection-url').inputValue()).toContain('client_secret=');
+  await page.locator('#close-connection-url').click();
+  expect(await page.locator('#revealed-connection-url').inputValue()).toBe('');
+
+  await page.getByRole('button', { name: 'Revoke Pipeline reader' }).click();
+  const revokeDialog = page.locator('#revoke-connection-dialog');
+  await expect(revokeDialog).toBeVisible();
+  await expect(revokeDialog).toContainText('cannot be restored');
+  await expect(revokeDialog).not.toContainText('sc-managed-');
+  await page.locator('#confirm-revoke-connection').click();
+
+  await expect(page.locator('#connection-state')).toHaveText('Connection revoked');
+  await expect(page.locator('#connection-count')).toHaveText('0 connections');
+  expect(connections.requests.map(request => request.method)).toContain('RotateManagedConnection');
+  expect(connections.requests.map(request => request.method)).toContain('RevokeManagedConnection');
+});
+
+test('cancelling a confirmation restores focus and performs no operation', async ({ page }) => {
+  const connections = await mockConnections(page);
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await page.goto('/connections/');
+
+  await page.getByRole('button', { name: 'Rotate credential for Pipeline reader' }).click();
+  await page.locator('#cancel-rotate-connection').click();
+
+  await expect(page.locator('#rotate-connection-dialog')).toBeHidden();
+  await expect(page.locator('#rotate-connection-0')).toBeFocused();
+  expect(connections.requests.map(request => request.method))
+    .not.toContain('RotateManagedConnection');
+});
+
+test('ambiguous rotation reports a bounded error and returns no URL', async ({ page }) => {
+  await mockConnections(page, { script: { RotateManagedConnection: 14 } });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await page.goto('/connections/');
+
+  await page.getByRole('button', { name: 'Rotate credential for Pipeline reader' }).click();
+  await page.locator('#confirm-rotate-connection').click();
+
+  await expect(page.locator('#error')).toHaveText('service is unavailable');
+  await expect(page.locator('#connection-url-dialog')).toBeHidden();
+  await expect(page.locator('body')).not.toContainText(APP_PASSWORD_SENTINEL);
+  await expect(page.locator('#connections-heading')).toBeFocused();
+});
+
+test('a conflicting rotation reports the bounded in-progress error', async ({ page }) => {
+  await mockConnections(page, { script: { RotateManagedConnection: 10 } });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await page.goto('/connections/');
+
+  await page.getByRole('button', { name: 'Rotate credential for Pipeline reader' }).click();
+  await page.locator('#confirm-rotate-connection').click();
+
+  await expect(page.locator('#error')).toHaveText('service is unavailable');
+  await expect(page.locator('#connection-url-dialog')).toBeHidden();
+});
+
+test('connection inputs validate before any confirmation opens', async ({ page }) => {
+  const connections = await mockConnections(page, { connections: [] });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await page.goto('/connections/');
+
+  await page.getByLabel('Display name').fill('');
+  await page.getByLabel('Read-only root').fill('/apps/api');
+  await page.getByRole('button', { name: 'Create connection' }).click();
+  await expect(page.locator('#create-connection-dialog')).toBeHidden();
+  await expect(page.locator('#connection-name')).toHaveAttribute('aria-invalid', 'true');
+  await expect(page.locator('#connection-name-error')).toBeVisible();
+
+  await page.getByLabel('Display name').fill('Pipeline reader');
+  await page.getByLabel('Read-only root').fill('bad_root');
+  await page.getByRole('button', { name: 'Create connection' }).click();
+  await expect(page.locator('#create-connection-dialog')).toBeHidden();
+  await expect(page.locator('#connection-root')).toHaveAttribute('aria-invalid', 'true');
+
+  expect(connections.requests.map(request => request.method))
+    .not.toContain('CreateManagedConnection');
+});
+
+test('logout discards a revealed connection URL and clears the view', async ({ page }) => {
+  await mockConnections(page, { connections: [] });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await page.goto('/connections/');
+  await page.getByLabel('Display name').fill('Pipeline reader');
+  await page.getByLabel('Read-only root').fill('/apps/api');
+  await page.getByRole('button', { name: 'Create connection' }).click();
+  await page.locator('#confirm-create-connection').click();
+  await page.locator('#reveal-connection-url').click();
+  await expect(page.locator('#revealed-connection-url')).toBeVisible();
+
+  // The modal correctly blocks pointer access to the page behind it, so the
+  // event is dispatched directly to prove the state-clearing path.
+  await page.locator('#logout').dispatchEvent('click');
+
+  await expect(page.locator('#connection-url-dialog')).toBeHidden();
+  expect(await page.locator('#revealed-connection-url').inputValue()).toBe('');
+  await expect(page.locator('#connection-count')).toHaveText('0 connections');
+  await expect(page.locator('body')).not.toContainText(APP_PASSWORD_SENTINEL);
+});
+
+test('the Authentik administration endpoint is absent from browser assets', async ({ page }) => {
+  const responses = [];
+  page.on('response', response => responses.push(response));
+  await mockConnections(page);
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await page.goto('/connections/');
+  await expect(page.locator('#connection-count')).toHaveText('1 connection');
+
+  for (const response of responses) {
+    if (!response.url().startsWith('http://127.0.0.1:8088')) continue;
+    let body;
+    try {
+      body = await response.text();
+    } catch {
+      continue;
+    }
+    expect(body).not.toContain('/api/v3/core/users/');
+    expect(body).not.toContain('manager-api-token');
+    expect(body).not.toContain('set_key');
+  }
+});
