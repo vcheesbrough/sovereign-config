@@ -125,11 +125,11 @@ entries:
       mode: role
       role: !Find [authentik_rbac.role, [name, sovereign-config-connection-manager]]
       permissions:
-        - authentik_core.view_user
-        - authentik_core.change_user
-        - authentik_core.delete_user
-        - authentik_core.view_token
-        - authentik_core.set_token_key
+        - !Find [auth.permission, [codename, view_user], [content_type__app_label, authentik_core]]
+        - !Find [auth.permission, [codename, change_user], [content_type__app_label, authentik_core]]
+        - !Find [auth.permission, [codename, delete_user], [content_type__app_label, authentik_core]]
+        - !Find [auth.permission, [codename, view_token], [content_type__app_label, authentik_core]]
+        - !Find [auth.permission, [codename, set_token_key], [content_type__app_label, authentik_core]]
 
   - model: authentik_core.user
     state: present

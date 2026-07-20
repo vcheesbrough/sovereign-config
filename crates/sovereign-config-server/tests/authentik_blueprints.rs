@@ -97,18 +97,20 @@ fn assert_connection_manager(entries: &[Value], environment: &Environment<'_>) {
     );
     let initial_attrs = mapping(field(initial, "attrs"));
     assert_eq!(string(field(initial_attrs, "mode")), "role");
+    // Initial permissions are resolved to primary keys, so each entry is a
+    // `!Find` on the exact codename within `authentik_core`.
     let object_permissions = sequence(field(initial_attrs, "permissions"))
         .iter()
-        .map(string)
+        .map(found_permission_codename)
         .collect::<BTreeSet<_>>();
     assert_eq!(
         object_permissions,
         BTreeSet::from([
-            "authentik_core.change_user",
-            "authentik_core.delete_user",
-            "authentik_core.set_token_key",
-            "authentik_core.view_token",
-            "authentik_core.view_user",
+            "change_user",
+            "delete_user",
+            "set_token_key",
+            "view_token",
+            "view_user",
         ]),
         "the manager must receive only object-level permissions on what it creates"
     );
@@ -164,6 +166,28 @@ fn assert_connection_manager(entries: &[Value], environment: &Environment<'_>) {
             "blueprint must never reference {forbidden}"
         );
     }
+}
+
+/// Extracts the codename from a `!Find [auth.permission, [codename, X],
+/// [content_type__app_label, authentik_core]]` lookup, asserting the shape.
+fn found_permission_codename(value: &Value) -> &str {
+    let tagged = match value {
+        Value::Tagged(tagged) => tagged,
+        _ => panic!("initial permissions must be resolved with !Find"),
+    };
+    assert_eq!(tagged.tag.to_string(), "!Find");
+    let lookup = sequence(&tagged.value);
+    assert_eq!(string(&lookup[0]), "auth.permission");
+    let codename = sequence(&lookup[1]);
+    assert_eq!(string(&codename[0]), "codename");
+    let scope = sequence(&lookup[2]);
+    assert_eq!(string(&scope[0]), "content_type__app_label");
+    assert_eq!(
+        string(&scope[1]),
+        "authentik_core",
+        "permissions must be scoped to authentik_core so no other app's codename can match"
+    );
+    string(&codename[1])
 }
 
 fn entry_by<'a>(entries: &'a [Value], model: &str, key: &str, value: &str) -> &'a Value {
