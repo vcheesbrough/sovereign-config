@@ -171,9 +171,8 @@ fn assert_connection_manager(entries: &[Value], environment: &Environment<'_>) {
 /// Extracts the codename from a `!Find [auth.permission, [codename, X],
 /// [content_type__app_label, authentik_core]]` lookup, asserting the shape.
 fn found_permission_codename(value: &Value) -> &str {
-    let tagged = match value {
-        Value::Tagged(tagged) => tagged,
-        _ => panic!("initial permissions must be resolved with !Find"),
+    let Value::Tagged(tagged) = value else {
+        panic!("initial permissions must be resolved with !Find")
     };
     assert_eq!(tagged.tag.to_string(), "!Find");
     let lookup = sequence(&tagged.value);
