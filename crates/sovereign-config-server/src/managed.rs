@@ -32,6 +32,7 @@ use sovereign_config_proto::sovereign::config::v3::{
 const CONNECTION_ID_CHARS: usize = 32;
 const APP_PASSWORD_CHARS: usize = 48;
 const USERNAME_PREFIX: &str = "sc-managed-";
+const USERNAME_SLUG_MAX_CHARS: usize = 32;
 
 /// Non-secret settings used to build canonical connection URLs and grants.
 pub(crate) struct ManagedSettings {
@@ -39,10 +40,49 @@ pub(crate) struct ManagedSettings {
     pub(crate) issuer: String,
     pub(crate) client_id: String,
     pub(crate) grants_attribute: String,
+    /// Exact name of the Authentik group each managed service account is
+    /// added to, purely so an operator can browse them together. Best-effort:
+    /// a connection is fully functional whether or not this succeeds.
+    pub(crate) managed_group: String,
     /// How long a rotation marked `rotation_unknown` is assumed to still be in
     /// flight. Must exceed the Authentik client timeout so an expired lease
     /// proves the previous attempt has ended.
     pub(crate) rotation_lease: Duration,
+}
+
+/// Builds the Authentik username for a connection, embedding a slug of the
+/// display name so operators can recognize the account in Authentik, with the
+/// opaque connection ID guaranteeing uniqueness regardless of display-name
+/// collisions. The connection ID alone is used only when the display name
+/// contains no characters that survive slugging.
+fn managed_username(connection_id: &ConnectionId, display_name: &str) -> String {
+    let slug = username_slug(display_name);
+    if slug.is_empty() {
+        format!("{USERNAME_PREFIX}{}", connection_id.as_str())
+    } else {
+        format!("{USERNAME_PREFIX}{slug}-{}", connection_id.as_str())
+    }
+}
+
+/// Lowercases and collapses a display name to `[a-z0-9-]`, bounded to
+/// [`USERNAME_SLUG_MAX_CHARS`] characters with no leading or trailing hyphen.
+fn username_slug(display_name: &str) -> String {
+    let mut slug = String::with_capacity(USERNAME_SLUG_MAX_CHARS);
+    for character in display_name.chars() {
+        let lower = character.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            if slug.len() >= USERNAME_SLUG_MAX_CHARS {
+                break;
+            }
+            slug.push(lower);
+        } else if !slug.is_empty() && !slug.ends_with('-') && slug.len() < USERNAME_SLUG_MAX_CHARS {
+            slug.push('-');
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
 }
 
 pub(crate) struct ManagedConnectionsService {
@@ -180,7 +220,7 @@ impl ManagedConnectionsService {
         }
 
         let connection_id = generate_connection_id()?;
-        let username = format!("{USERNAME_PREFIX}{}", connection_id.as_str());
+        let username = managed_username(&connection_id, display_name.as_str());
         let now = OffsetDateTime::now_utc();
         sqlx::query(
             r"
@@ -364,16 +404,38 @@ impl ManagedConnectionsService {
                     ManagedDependencyCall::SetAttributes,
                     ManagedDependencyOutcome::Ok,
                 );
-                Ok(())
             }
             Err(error) => {
                 self.metrics.record_dependency(
                     ManagedDependencyCall::SetAttributes,
                     dependency_outcome(error),
                 );
-                Err(dependency_error())
+                return Err(dependency_error());
             }
         }
+
+        // Group membership is an operator convenience for browsing accounts in
+        // Authentik; it grants nothing and its failure must never fail or roll
+        // back a connection that is otherwise fully functional.
+        self.assign_managed_group(account.user_id).await;
+        Ok(())
+    }
+
+    async fn assign_managed_group(&self, user_id: i64) {
+        let outcome = match self
+            .admin
+            .find_group_by_name(&self.settings.managed_group)
+            .await
+        {
+            Ok(Some(group_id)) => match self.admin.add_user_to_group(user_id, &group_id).await {
+                Ok(()) => ManagedDependencyOutcome::Ok,
+                Err(error) => dependency_outcome(error),
+            },
+            Ok(None) => ManagedDependencyOutcome::NotFound,
+            Err(error) => dependency_outcome(error),
+        };
+        self.metrics
+            .record_dependency(ManagedDependencyCall::AssignGroup, outcome);
     }
 
     async fn rotate(
@@ -469,7 +531,7 @@ impl ManagedConnectionsService {
             }
         }
 
-        let username = format!("{USERNAME_PREFIX}{}", connection_id.as_str());
+        let username = managed_username(&connection_id, &row.display_name);
         let connection_url = ConnectionUrl::managed(
             &self.settings.public_origin,
             &root,
@@ -524,7 +586,7 @@ impl ManagedConnectionsService {
         } else {
             // The account may never have been created; probe only the
             // exact generated username before declaring it absent.
-            let username = format!("{USERNAME_PREFIX}{}", connection_id.as_str());
+            let username = managed_username(&connection_id, &row.display_name);
             match self.admin.find_user_by_username(&username).await {
                 Ok(found) => {
                     self.metrics.record_dependency(
@@ -569,7 +631,7 @@ impl ManagedConnectionsService {
                     // definition. Settle it by looking for the account's app
                     // password, which is authoritative because the token view
                     // is global and Authentik cascades the token with the user.
-                    let username = format!("{USERNAME_PREFIX}{}", connection_id.as_str());
+                    let username = managed_username(&connection_id, &row.display_name);
                     if !self.credential_is_gone(&username).await {
                         // The row stays `revoking`; revocation can be retried
                         // until absence is confirmed.
@@ -906,7 +968,8 @@ mod tests {
 
     use super::{
         ConnectionRow, ManagedConnectionsService, ManagedSettings, Request, Secret, Status,
-        generate_app_password, generate_connection_id,
+        USERNAME_PREFIX, USERNAME_SLUG_MAX_CHARS, generate_app_password, generate_connection_id,
+        managed_username, username_slug,
     };
     use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
     use crate::authentik::AuthentikAdminClient;
@@ -922,6 +985,8 @@ mod tests {
     const PUBLIC_ORIGIN: &str = "https://config.example.test";
     const ISSUER: &str = "https://auth.example.test/application/o/sovereign-config/";
     const GRANTS_ATTRIBUTE: &str = "sovereign_config_test_grants";
+    const MANAGED_GROUP: &str = "sovereign-config-test-connections";
+    const TEST_GROUP_ID: &str = "11111111-1111-1111-1111-111111111111";
     /// Longer than the mock client timeout so an in-flight rotation is
     /// rejected, but short enough to exercise recovery without a long sleep.
     const ROTATION_LEASE: Duration = Duration::from_millis(800);
@@ -950,11 +1015,15 @@ mod tests {
         find_credentials: Behavior,
         set_credential: Behavior,
         delete_user: Behavior,
+        find_group: Behavior,
+        add_to_group: Behavior,
         /// Whether a reconciliation lookup should report the account exists.
         user_exists: bool,
         /// Whether the caller may see the service account's app password,
         /// reproducing Authentik's token ownership and permission rules.
         credentials_visible: bool,
+        /// Whether the configured browsing group exists in the directory.
+        group_exists: bool,
         set_credential_delay: Duration,
     }
 
@@ -967,8 +1036,11 @@ mod tests {
                 find_credentials: Behavior::Ok,
                 set_credential: Behavior::Ok,
                 delete_user: Behavior::Ok,
+                find_group: Behavior::Ok,
+                add_to_group: Behavior::Ok,
                 user_exists: false,
                 credentials_visible: true,
+                group_exists: true,
                 set_credential_delay: Duration::ZERO,
             }
         }
@@ -983,6 +1055,7 @@ mod tests {
         revoked_usernames: Arc<Mutex<Vec<String>>>,
         usernames_by_id: Arc<Mutex<std::collections::HashMap<i64, String>>>,
         rotated_keys: Arc<Mutex<Vec<String>>>,
+        group_assignments: Arc<Mutex<Vec<(i64, String)>>>,
         next_user_id: Arc<AtomicI64>,
     }
 
@@ -1013,6 +1086,10 @@ mod tests {
 
         fn rotated_keys(&self) -> Vec<String> {
             self.state.rotated_keys.lock().unwrap().clone()
+        }
+
+        fn group_assignments(&self) -> Vec<(i64, String)> {
+            self.state.group_assignments.lock().unwrap().clone()
         }
     }
 
@@ -1061,17 +1138,44 @@ mod tests {
         .into_response()
     }
 
+    /// Handles every PATCH to the user detail endpoint. Real Authentik
+    /// accepts a partial update, so the attribute-setting and group-assignment
+    /// calls share this one route; the body shape distinguishes them, the way
+    /// the real serializer does.
     async fn set_attributes(
         State(state): State<MockState>,
-        Path(_user_id): Path<i64>,
+        Path(user_id): Path<i64>,
         Json(body): Json<Value>,
     ) -> Response {
+        if body.get("groups").is_some() {
+            return assign_group(state, user_id, body).await;
+        }
         if let Some(response) =
             apply(&behavior(&state, |script| script.set_attributes.clone())).await
         {
             return response;
         }
         state.patched_attributes.lock().unwrap().push(body);
+        Json(json!({})).into_response()
+    }
+
+    async fn assign_group(state: MockState, user_id: i64, body: Value) -> Response {
+        if let Some(response) = apply(&behavior(&state, |script| script.add_to_group.clone())).await
+        {
+            return response;
+        }
+        if let Some(group_id) = body
+            .get("groups")
+            .and_then(Value::as_array)
+            .and_then(|groups| groups.first())
+            .and_then(Value::as_str)
+        {
+            state
+                .group_assignments
+                .lock()
+                .unwrap()
+                .push((user_id, group_id.to_owned()));
+        }
         Json(json!({})).into_response()
     }
 
@@ -1119,6 +1223,24 @@ mod tests {
                 .is_some_and(|username| created.contains(username) && !revoked.contains(username));
         let results = if matches {
             json!([{ "identifier": CREDENTIAL_IDENTIFIER }])
+        } else {
+            json!([])
+        };
+        Json(json!({ "results": results })).into_response()
+    }
+
+    /// Serves the group name lookup used for best-effort browsing membership.
+    async fn list_groups(
+        State(state): State<MockState>,
+        Query(query): Query<std::collections::HashMap<String, String>>,
+    ) -> Response {
+        if let Some(response) = apply(&behavior(&state, |script| script.find_group.clone())).await {
+            return response;
+        }
+        let exists = state.script.lock().unwrap().group_exists;
+        let name = query.get("name").cloned().unwrap_or_default();
+        let results = if exists {
+            json!([{ "pk": TEST_GROUP_ID, "name": name }])
         } else {
             json!([])
         };
@@ -1181,6 +1303,7 @@ mod tests {
             revoked_usernames: Arc::new(Mutex::new(Vec::new())),
             usernames_by_id: Arc::new(Mutex::new(std::collections::HashMap::new())),
             rotated_keys: Arc::new(Mutex::new(Vec::new())),
+            group_assignments: Arc::new(Mutex::new(Vec::new())),
             next_user_id: Arc::new(AtomicI64::new(1000)),
         };
         let app = Router::new()
@@ -1192,6 +1315,7 @@ mod tests {
             .route("/api/v3/core/users/", get(list_users))
             .route("/api/v3/core/tokens/", get(list_tokens))
             .route("/api/v3/core/tokens/{identifier}/set_key/", post(set_key))
+            .route("/api/v3/core/groups/", get(list_groups))
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1264,6 +1388,7 @@ mod tests {
                 issuer: ISSUER.to_owned(),
                 client_id: "sovereign-config".to_owned(),
                 grants_attribute: GRANTS_ATTRIBUTE.to_owned(),
+                managed_group: MANAGED_GROUP.to_owned(),
                 rotation_lease: ROTATION_LEASE,
             },
             metrics,
@@ -1345,6 +1470,42 @@ mod tests {
     }
 
     #[test]
+    fn username_slug_embeds_a_recognizable_display_name() {
+        assert_eq!(username_slug("Pipeline reader"), "pipeline-reader");
+        assert_eq!(username_slug("  Extra   Spaces  "), "extra-spaces");
+        assert_eq!(username_slug("MixedCASE123"), "mixedcase123");
+        // Non-ASCII characters are dropped rather than transliterated, and the
+        // surrounding separators collapse to a single hyphen.
+        assert_eq!(username_slug("café → app"), "caf-app");
+        // Truncation must never leave a trailing hyphen.
+        let long = "a-".repeat(40);
+        let slug = username_slug(&long);
+        assert!(slug.len() <= USERNAME_SLUG_MAX_CHARS);
+        assert!(!slug.ends_with('-'));
+        // A display name with no slug-able characters yields an empty slug.
+        assert_eq!(username_slug("★★★"), "");
+    }
+
+    #[test]
+    fn managed_username_is_unique_even_for_identical_display_names() {
+        let first = generate_connection_id().unwrap();
+        let second = generate_connection_id().unwrap();
+
+        let first_username = managed_username(&first, "Pipeline reader");
+        let second_username = managed_username(&second, "Pipeline reader");
+
+        assert_ne!(first_username, second_username);
+        assert!(first_username.contains("pipeline-reader"));
+        assert!(first_username.contains(first.as_str()));
+        assert!(first_username.starts_with(USERNAME_PREFIX));
+
+        // A display name with nothing to slug falls back to the opaque form,
+        // never leaving a dangling separator.
+        let opaque = managed_username(&first, "★★★");
+        assert_eq!(opaque, format!("{USERNAME_PREFIX}{}", first.as_str()));
+    }
+
+    #[test]
     fn generated_identifiers_are_opaque_and_bounded() {
         let first = generate_connection_id().unwrap();
         let second = generate_connection_id().unwrap();
@@ -1421,6 +1582,41 @@ mod tests {
         assert_eq!(
             attributes["goauthentik.io/user/service-account"],
             json!(true)
+        );
+
+        // The new account is added to the configured browsing group.
+        let assignments = mock.group_assignments();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].1, TEST_GROUP_ID);
+    }
+
+    /// Group membership is a pure operator convenience and must never block or
+    /// roll back an otherwise-successful connection, whether the configured
+    /// group cannot be resolved or the assignment itself is rejected.
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn group_assignment_failure_does_not_block_creation() {
+        let mock = mock_authentik().await;
+        let service = service_or_skip!(&mock);
+
+        mock.script(|script| script.group_exists = false);
+        let (connection_id, _) = create(&service, "No group", "/apps/api", &manage("/"))
+            .await
+            .expect("a missing browsing group must not fail creation");
+        assert_eq!(rows(&service).await[0].connection_id, connection_id);
+        assert!(mock.group_assignments().is_empty());
+
+        mock.script(|script| {
+            script.group_exists = true;
+            script.add_to_group = Behavior::Status(StatusCode::FORBIDDEN);
+        });
+        let (connection_id, _) = create(&service, "Rejected group", "/apps/api", &manage("/"))
+            .await
+            .expect("a rejected group assignment must not fail creation");
+        let rows = rows(&service).await;
+        assert!(
+            rows.iter()
+                .any(|row| row.connection_id == connection_id && row.state == "active")
         );
     }
 

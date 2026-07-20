@@ -11,6 +11,7 @@ struct Environment<'a> {
     other_attribute: &'a str,
     manager: &'a str,
     manager_token_variable: &'a str,
+    managed_group: &'a str,
 }
 
 #[test]
@@ -24,6 +25,7 @@ fn blueprints_emit_isolated_granular_grants() {
         other_attribute: "sovereign_config_prod_grants",
         manager: "sovereign-config-dev-connection-manager",
         manager_token_variable: "${AUTHENTIK_SOVEREIGN_CONFIG_DEV_MANAGER_API_TOKEN}",
+        managed_group: "sovereign-config-dev-connections",
     });
     assert_environment(&Environment {
         blueprint: "blueprint.yaml",
@@ -34,6 +36,7 @@ fn blueprints_emit_isolated_granular_grants() {
         other_attribute: "sovereign_config_dev_grants",
         manager: "sovereign-config-connection-manager",
         manager_token_variable: "${AUTHENTIK_SOVEREIGN_CONFIG_MANAGER_API_TOKEN}",
+        managed_group: "sovereign-config-connections",
     });
 }
 
@@ -95,6 +98,7 @@ fn assert_connection_manager(entries: &[Value], environment: &Environment<'_>) {
             "authentik_core.add_token",
             "authentik_core.add_user",
             "authentik_core.view_token",
+            "authentik_core.view_group",
         ]),
         "the manager role must hold only the documented global permissions"
     );
@@ -131,6 +135,22 @@ fn assert_connection_manager(entries: &[Value], environment: &Environment<'_>) {
         field(group_attrs, "roles"),
         environment.manager
     ));
+
+    // The browsing group is a distinct, plain group: no roles, no permissions,
+    // separate from the manager's own RBAC group above.
+    assert_ne!(environment.managed_group, environment.manager);
+    let managed_group = present_entry(entries, "authentik_core.group", environment.managed_group);
+    let managed_group_attrs = mapping(field(managed_group, "attrs"));
+    assert_eq!(
+        field(managed_group_attrs, "is_superuser"),
+        &Value::Bool(false)
+    );
+    assert!(
+        managed_group_attrs
+            .get(Value::String("roles".to_owned()))
+            .is_none(),
+        "the browsing group must carry no roles"
+    );
 
     let user = mapping(entry_by(
         entries,

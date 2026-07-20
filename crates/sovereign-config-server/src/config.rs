@@ -20,6 +20,7 @@ pub(crate) struct ManagedConnectionConfig {
     pub(crate) issuer: String,
     pub(crate) client_id: String,
     pub(crate) grants_attribute: String,
+    pub(crate) managed_group: String,
     pub(crate) api_origin: Url,
     pub(crate) api_token: String,
     pub(crate) timeout: Duration,
@@ -76,6 +77,7 @@ impl Config {
         let grants_attribute = validated_grants_attribute(&required_env(
             "SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE",
         )?)?;
+        let managed_group = validated_group_name(&required_env("SOVEREIGN_CONFIG_MANAGER_GROUP")?)?;
         let api_origin = issuer_api_origin(&issuer_url)?;
         let api_token = required_secret("SOVEREIGN_CONFIG_MANAGER_API_TOKEN")?;
 
@@ -104,6 +106,7 @@ impl Config {
                 issuer,
                 client_id: audience,
                 grants_attribute,
+                managed_group,
                 api_origin,
                 api_token,
                 timeout: MANAGER_TIMEOUT,
@@ -151,6 +154,20 @@ fn validated_grants_attribute(value: &str) -> Result<String> {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
     {
         bail!("SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE is not a permitted attribute name");
+    }
+    Ok(value.to_owned())
+}
+
+/// Validates the exact name of the Authentik group managed service accounts
+/// are added to for browsing. Not a security boundary, so only bounded and
+/// non-empty, matching the shape of a display name rather than an identifier.
+fn validated_group_name(value: &str) -> Result<String> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.chars().count() > 100
+        || value.chars().any(char::is_control)
+    {
+        bail!("SOVEREIGN_CONFIG_MANAGER_GROUP is not a permitted group name");
     }
     Ok(value.to_owned())
 }
@@ -230,7 +247,7 @@ pub(crate) fn required_secret(name: &str) -> Result<String> {
 mod tests {
     use super::{
         issuer_api_origin, required_env, validate_introspection_url, validate_issuer_url,
-        validated_public_origin,
+        validated_group_name, validated_public_origin,
     };
 
     #[test]
@@ -317,6 +334,17 @@ mod tests {
             issuer_api_origin(&issuer).unwrap().as_str(),
             "https://auth.example.test/"
         );
+    }
+
+    #[test]
+    fn group_name_is_bounded_and_trimmed() {
+        assert_eq!(
+            validated_group_name("Sovereign Config Connections").unwrap(),
+            "Sovereign Config Connections"
+        );
+        for invalid in ["", " padded", "padded ", &"x".repeat(101), "line\nbreak"] {
+            assert!(validated_group_name(invalid).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]

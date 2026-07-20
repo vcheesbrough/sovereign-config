@@ -153,6 +153,7 @@ async fn main() -> Result<()> {
         issuer: config.managed.issuer,
         client_id: config.managed.client_id,
         grants_attribute: config.managed.grants_attribute,
+        managed_group: config.managed.managed_group,
         // Comfortably longer than the bounded Authentik call, so an expired
         // lease proves the previous rotation attempt has ended.
         rotation_lease: config.managed.timeout * 6,

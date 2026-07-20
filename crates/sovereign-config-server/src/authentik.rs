@@ -176,6 +176,67 @@ impl AuthentikAdminClient {
         expect_success(response).await.map(|_| ())
     }
 
+    /// Locates a group by exact name, purely to group managed service
+    /// accounts together for browsing in Authentik. Never authorizes
+    /// anything: authorization is granted directly on the service account.
+    pub(crate) async fn find_group_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, AdminError> {
+        #[derive(Deserialize)]
+        struct GroupRecord {
+            pk: String,
+            name: String,
+        }
+        #[derive(Deserialize)]
+        struct GroupListResponse {
+            results: Vec<GroupRecord>,
+        }
+
+        let mut endpoint = self.endpoint("/api/v3/core/groups/")?;
+        endpoint.query_pairs_mut().append_pair("name", name);
+        let response = self
+            .http
+            .get(endpoint)
+            .bearer_auth(self.api_token.expose())
+            .send()
+            .await
+            .map_err(|error| classify_transport(&error))?;
+        let body = expect_success(response).await?;
+        let decoded: GroupListResponse =
+            serde_json::from_slice(&body).map_err(|_| AdminError::Invalid)?;
+        let mut matching = decoded.results.into_iter().filter(|record| {
+            record.name == name
+                && !record.pk.is_empty()
+                && record.pk.len() <= MAX_EXTERNAL_IDENTIFIER_CHARS
+        });
+        let found = matching.next().map(|record| record.pk);
+        if matching.next().is_some() {
+            return Err(AdminError::Invalid);
+        }
+        Ok(found)
+    }
+
+    /// Adds the exact managed service account to one group, replacing any
+    /// existing membership. Safe because the account is freshly created with
+    /// no prior group membership. Best-effort: failure here must never block
+    /// or roll back connection creation.
+    pub(crate) async fn add_user_to_group(
+        &self,
+        user_id: i64,
+        group_id: &str,
+    ) -> Result<(), AdminError> {
+        let response = self
+            .http
+            .patch(self.endpoint(&format!("/api/v3/core/users/{user_id}/"))?)
+            .bearer_auth(self.api_token.expose())
+            .json(&json!({ "groups": [group_id] }))
+            .send()
+            .await
+            .map_err(|error| classify_transport(&error))?;
+        expect_success(response).await.map(|_| ())
+    }
+
     /// Locates a user by exact generated username for reconciliation only.
     ///
     /// Only usable while the manager can still see at least one managed
@@ -643,6 +704,66 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, AdminError::Invalid);
     }
+
+    #[tokio::test]
+    async fn group_lookup_finds_the_exact_name_and_rejects_ambiguity() {
+        const GROUP_ID: &str = "b3f5c2a0-0000-4000-8000-0123456789ab";
+
+        let found = ok_server(
+            json!({"results": [{"pk": GROUP_ID, "name": "sovereign-config-connections"}]})
+                .to_string(),
+        )
+        .await;
+        let group_id = client(&found)
+            .find_group_by_name("sovereign-config-connections")
+            .await
+            .unwrap();
+        assert_eq!(group_id.as_deref(), Some(GROUP_ID));
+        {
+            let hits = found.hits.lock().unwrap();
+            assert_eq!(hits.len(), 1);
+            assert!(hits[0].0.starts_with("/api/v3/core/groups/?"));
+            assert!(hits[0].0.contains("name=sovereign-config-connections"));
+        }
+
+        let missing = ok_server(json!({"results": []}).to_string()).await;
+        assert_eq!(
+            client(&missing)
+                .find_group_by_name("sovereign-config-connections")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let ambiguous = ok_server(
+            json!({"results": [
+                {"pk": GROUP_ID, "name": "sovereign-config-connections"},
+                {"pk": "c3f5c2a0-0000-4000-8000-0123456789ab", "name": "sovereign-config-connections"}
+            ]})
+            .to_string(),
+        )
+        .await;
+        let error = client(&ambiguous)
+            .find_group_by_name("sovereign-config-connections")
+            .await
+            .unwrap_err();
+        assert_eq!(error, AdminError::Invalid);
+    }
+
+    #[tokio::test]
+    async fn group_assignment_patches_the_exact_user_with_the_exact_group() {
+        const GROUP_ID: &str = "b3f5c2a0-0000-4000-8000-0123456789ab";
+        let server = ok_server("{}").await;
+
+        client(&server)
+            .add_user_to_group(42, GROUP_ID)
+            .await
+            .unwrap();
+
+        let hits = server.hits.lock().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "/api/v3/core/users/42/");
+    }
 }
 
 /// End-to-end checks against a real Authentik instance.
@@ -663,6 +784,9 @@ mod live_tests {
     use super::{AdminError, AuthentikAdminClient, CreatedServiceAccount};
 
     const LIVE_TIMEOUT: Duration = Duration::from_secs(15);
+    /// CI only ever runs these tests against the development environment,
+    /// whose blueprint creates this exact browsing group.
+    const DEV_MANAGED_GROUP: &str = "sovereign-config-dev-connections";
 
     fn live_client() -> Option<AuthentikAdminClient> {
         let origin = env::var("SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL").ok()?;
@@ -735,6 +859,22 @@ mod live_tests {
                 .set_credential_secret(&identifiers[0], &Secret::new("live-test-replacement-key"))
                 .await
                 .map_err(|error| format!("rotating the app password failed: {error:?}"))?;
+            // Group membership is best-effort in production, but the manager
+            // must actually be able to resolve and use it against real
+            // Authentik, not only against the mock.
+            let group_id = client
+                .find_group_by_name(DEV_MANAGED_GROUP)
+                .await
+                .map_err(|error| format!("resolving the browsing group failed: {error:?}"))?
+                .ok_or_else(|| {
+                    format!("the {DEV_MANAGED_GROUP} browsing group must exist in this environment")
+                })?;
+            client
+                .add_user_to_group(account.user_id, &group_id)
+                .await
+                .map_err(|error| {
+                    format!("adding the account to the browsing group failed: {error:?}")
+                })?;
             let found = client
                 .find_user_by_username(&username)
                 .await
