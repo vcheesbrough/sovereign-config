@@ -745,15 +745,44 @@ mod live_tests {
         cleanup(&client, &account).await;
         checks.expect("the manager must complete the managed connection lifecycle");
 
-        // Deletion must be confirmable, otherwise revocation cannot complete.
+        // Deletion must be confirmable, otherwise an ambiguous revocation can
+        // never be resolved. The raw status is reported here because the
+        // adapter's bounded classification deliberately discards it, which
+        // makes a live failure hard to act on.
+        let status = raw_user_lookup_status(&username).await;
+        assert_eq!(
+            status,
+            Some(200),
+            "confirming deletion by exact username must succeed, got HTTP {status:?}"
+        );
         assert!(
             client
                 .find_user_by_username(&username)
                 .await
                 .expect("reconciliation must succeed after deletion")
                 .is_none(),
-            "the manager must be able to delete the account it created"
+            "the deleted account must no longer be found"
         );
+    }
+
+    /// Issues the reconciliation lookup directly to surface the HTTP status.
+    /// Only the numeric status is returned, never any response content.
+    async fn raw_user_lookup_status(username: &str) -> Option<u16> {
+        let origin = env::var("SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL").ok()?;
+        let token = env::var("SOVEREIGN_CONFIG_LIVE_AUTHENTIK_TOKEN").ok()?;
+        let mut endpoint: Url = origin.parse().ok()?;
+        endpoint.set_path("/api/v3/core/users/");
+        endpoint.query_pairs_mut().append_pair("username", username);
+        let response = reqwest::Client::builder()
+            .timeout(LIVE_TIMEOUT)
+            .build()
+            .ok()?
+            .get(endpoint)
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .ok()?;
+        Some(response.status().as_u16())
     }
 
     /// Credential discovery must stay scoped to one account even though the
