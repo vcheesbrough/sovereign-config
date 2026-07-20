@@ -104,6 +104,8 @@ steps:
       vars:
         AUTHENTIK_SOVEREIGN_CONFIG_DEV_INTROSPECTION_CLIENT_SECRET:
           from_secret: sovereign_config_dev_oidc_introspection_client_secret
+        AUTHENTIK_SOVEREIGN_CONFIG_DEV_MANAGER_API_TOKEN:
+          from_secret: sovereign_config_dev_manager_api_token
         SOVEREIGN_CONFIG_DEV_BROWSER_REDIRECT_URI: https://sovereign-config-dev.desync.link/auth/callback
         AUTHENTIK_DEV_BRAND_DOMAIN: auth.desync.link
 
@@ -121,7 +123,12 @@ steps:
         VERSION=$$(curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/admin/version/ | sed -n 's/.*"version_current":"\([^"]*\)".*/\1/p')
         test -n "$$VERSION"
         awk -v version="$$VERSION" 'BEGIN { split(version, part, "."); if (part[1] > 2026 || (part[1] == 2026 && part[2] > 5) || (part[1] == 2026 && part[2] == 5 && part[3] >= 2)) exit 0; exit 1 }'
-        curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/schema/ | grep -q 'grant_types'
+        curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/schema/ > /tmp/authentik-schema.json
+        grep -q 'grant_types' /tmp/authentik-schema.json
+        # Surfaces required by managed application connections.
+        grep -q '/core/users/service_account/' /tmp/authentik-schema.json
+        grep -q '/core/tokens/{identifier}/set_key/' /tmp/authentik-schema.json
+        grep -q 'initial_permissions' /tmp/authentik-schema.json
         echo "Validated compatible Authentik $$VERSION"
 
   auto-deploy-dev:
@@ -130,6 +137,9 @@ steps:
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # The manager API token is deliberately file-only, so the deploy writes
+      # it to a host path the daemon can bind-mount as a Compose secret.
+      - /opt/sovereign-config-dev/secrets:/secrets
     environment:
       POSTGRES_PASSWORD:
         from_secret: sovereign_config_dev_postgres_password
@@ -137,10 +147,17 @@ steps:
       OIDC_ISSUER: https://auth.desync.link/application/o/sovereign-config-dev/
       OIDC_INTROSPECTION_CLIENT_SECRET:
         from_secret: sovereign_config_dev_oidc_introspection_client_secret
+      MANAGER_API_TOKEN:
+        from_secret: sovereign_config_dev_manager_api_token
     commands:
       - |
+        umask 077
+        printf '%s' "$$MANAGER_API_TOKEN" > /secrets/manager-api-token
+        chown 10001:10001 /secrets/manager-api-token
+        chmod 0400 /secrets/manager-api-token
+      - |
         ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
-        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL="$$OIDC_INTROSPECTION_URL" SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config-dev/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET_FILE= SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET="$$OIDC_INTROSPECTION_CLIENT_SECRET" docker compose -p sovereign-config-dev up -d --wait --wait-timeout 90 || {
+        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL="$$OIDC_INTROSPECTION_URL" SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config-dev/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET_FILE= SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET="$$OIDC_INTROSPECTION_CLIENT_SECRET" SOVEREIGN_CONFIG_PUBLIC_ORIGIN=https://sovereign-config-dev.desync.link SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE=sovereign_config_dev_grants MANAGER_API_TOKEN_FILE=/opt/sovereign-config-dev/secrets/manager-api-token docker compose -p sovereign-config-dev up -d --wait --wait-timeout 90 || {
           docker compose -p sovereign-config-dev logs --tail 200
           exit 1
         }

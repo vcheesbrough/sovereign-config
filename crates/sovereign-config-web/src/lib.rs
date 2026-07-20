@@ -11,20 +11,27 @@ use js_sys::{Date, Reflect, Uint8Array};
 use prost::Message;
 use sha2::{Digest, Sha256};
 use sovereign_config_client::{
-    AccessTokenProvider, Client, RpcCode, Transport, ValueTransport, VersionReply, map_rpc_status,
-    timestamp,
+    AccessTokenProvider, Client, ManagedConnectionTransport, RpcCode, Transport, ValueTransport,
+    VersionReply, map_rpc_status, timestamp,
 };
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, ListedValue,
-    MaskedSecret, PlainValue, PutMetadata, ReplaceMetadata, RevealedSecret, Secret, SecretInput,
-    SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, Timestamp, ValueContent,
-    ValueListing, ValueSubTree, parse_subtree_json, render_subtree_json,
+    AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl, DeleteMetadata,
+    DisplayName, ErrorKind, ListedValue, ManagedConnectionMetadata, ManagedConnectionState,
+    MaskedSecret, PlainValue, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata,
+    RevealedConnectionUrl, RevealedSecret, Secret, SecretInput, SubTreeMutationContent,
+    SubTreeMutationValue, SubTreeValue, Timestamp, ValueContent, ValueListing, ValueSubTree,
+    parse_subtree_json, render_subtree_json,
 };
 use sovereign_config_proto::sovereign::config::v3::{
-    DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse,
-    GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest, GetVersionResponse,
-    ListValuesRequest, ListValuesResponse, PreserveSecret, PutValueRequest, PutValueResponse,
-    ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest, RevealSecretResponse,
+    CreateManagedConnectionRequest, CreateManagedConnectionResponse, DeleteValuesRequest,
+    DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse, GetSubTreeRequest,
+    GetSubTreeResponse, GetVersionRequest, GetVersionResponse, ListManagedConnectionsRequest,
+    ListManagedConnectionsResponse, ListValuesRequest, ListValuesResponse,
+    ManagedConnectionMetadata as ProtoManagedConnectionMetadata,
+    ManagedConnectionState as ProtoManagedConnectionState, PreserveSecret, PutValueRequest,
+    PutValueResponse, ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest,
+    RevealSecretResponse, RevokeManagedConnectionRequest, RevokeManagedConnectionResponse,
+    RotateManagedConnectionRequest, RotateManagedConnectionResponse,
     SubTreeMutationValue as ProtoSubTreeMutationValue, ValueClassification as ProtoClassification,
     listed_value, put_value_request, sub_tree_mutation_value, sub_tree_value,
 };
@@ -51,6 +58,11 @@ thread_local! {
     static ACTIVE_PATH_OPTION: Cell<Option<usize>> = const { Cell::new(None) };
     static JSON_MODE: Cell<bool> = const { Cell::new(false) };
     static CONFIGURATION_LOAD_GENERATION: Cell<u64> = const { Cell::new(0) };
+    static CONNECTIONS_LOAD_GENERATION: Cell<u64> = const { Cell::new(0) };
+    static CONNECTION_TARGET: RefCell<Option<ConnectionTarget>> = const { RefCell::new(None) };
+    static CONNECTION_URL_SECRET: RefCell<Option<Secret>> = const { RefCell::new(None) };
+    static CONNECTION_URL_RETURN_FOCUS: RefCell<Option<String>> = const { RefCell::new(None) };
+    static CONNECTION_PENDING: Cell<bool> = const { Cell::new(false) };
 }
 
 struct DeleteTarget {
@@ -58,10 +70,17 @@ struct DeleteTarget {
     return_focus: String,
 }
 
+/// The connection selected for a pending rotate or revoke confirmation.
+struct ConnectionTarget {
+    connection_id: ConnectionId,
+    return_focus: String,
+}
+
 #[derive(Clone)]
 enum Route {
     System,
     Configuration(ConfigPath),
+    Connections,
 }
 
 struct MemoryTokens {
@@ -338,6 +357,119 @@ impl ValueTransport for BrowserTransport {
     }
 }
 
+#[async_trait(?Send)]
+impl ManagedConnectionTransport for BrowserTransport {
+    async fn list_managed_connections(
+        &self,
+        bearer: &Secret,
+    ) -> Result<Vec<ManagedConnectionMetadata>, ClientError> {
+        let response: ListManagedConnectionsResponse = grpc_unary(
+            "/sovereign.config.v3.ManagedConnections/ListManagedConnections",
+            &ListManagedConnectionsRequest {},
+            Some(bearer),
+        )
+        .await?;
+        response
+            .connections
+            .into_iter()
+            .map(managed_metadata)
+            .collect()
+    }
+
+    async fn create_managed_connection(
+        &self,
+        display_name: &DisplayName,
+        root: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ProvisionedManagedConnection, ClientError> {
+        let response: CreateManagedConnectionResponse = grpc_unary(
+            "/sovereign.config.v3.ManagedConnections/CreateManagedConnection",
+            &CreateManagedConnectionRequest {
+                display_name: display_name.as_str().to_owned(),
+                root: root.as_str().to_owned(),
+            },
+            Some(bearer),
+        )
+        .await?;
+        provisioned_connection(response.metadata, &response.connection_url)
+    }
+
+    async fn rotate_managed_connection(
+        &self,
+        connection_id: &ConnectionId,
+        bearer: &Secret,
+    ) -> Result<ProvisionedManagedConnection, ClientError> {
+        let response: RotateManagedConnectionResponse = grpc_unary(
+            "/sovereign.config.v3.ManagedConnections/RotateManagedConnection",
+            &RotateManagedConnectionRequest {
+                connection_id: connection_id.as_str().to_owned(),
+            },
+            Some(bearer),
+        )
+        .await?;
+        provisioned_connection(response.metadata, &response.connection_url)
+    }
+
+    async fn revoke_managed_connection(
+        &self,
+        connection_id: &ConnectionId,
+        bearer: &Secret,
+    ) -> Result<(), ClientError> {
+        let _: RevokeManagedConnectionResponse = grpc_unary(
+            "/sovereign.config.v3.ManagedConnections/RevokeManagedConnection",
+            &RevokeManagedConnectionRequest {
+                connection_id: connection_id.as_str().to_owned(),
+            },
+            Some(bearer),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+fn managed_metadata(
+    metadata: ProtoManagedConnectionMetadata,
+) -> Result<ManagedConnectionMetadata, ClientError> {
+    Ok(ManagedConnectionMetadata {
+        connection_id: ConnectionId::parse(metadata.connection_id).map_err(|_| browser_error())?,
+        display_name: DisplayName::parse(metadata.display_name).map_err(|_| browser_error())?,
+        root: ConfigPath::parse(metadata.root).map_err(|_| browser_error())?,
+        state: managed_state(metadata.state)?,
+        created_at: proto_timestamp(metadata.created_at)?,
+        updated_at: proto_timestamp(metadata.updated_at)?,
+    })
+}
+
+fn managed_state(state: i32) -> Result<ManagedConnectionState, ClientError> {
+    match ProtoManagedConnectionState::try_from(state) {
+        Ok(ProtoManagedConnectionState::Provisioning) => Ok(ManagedConnectionState::Provisioning),
+        Ok(ProtoManagedConnectionState::Active) => Ok(ManagedConnectionState::Active),
+        Ok(ProtoManagedConnectionState::RotationUnknown) => {
+            Ok(ManagedConnectionState::RotationUnknown)
+        }
+        Ok(ProtoManagedConnectionState::Revoking) => Ok(ManagedConnectionState::Revoking),
+        Ok(ProtoManagedConnectionState::CleanupRequired) => {
+            Ok(ManagedConnectionState::CleanupRequired)
+        }
+        _ => Err(browser_error()),
+    }
+}
+
+fn provisioned_connection(
+    metadata: Option<ProtoManagedConnectionMetadata>,
+    connection_url: &str,
+) -> Result<ProvisionedManagedConnection, ClientError> {
+    let metadata = managed_metadata(metadata.ok_or_else(browser_error)?)?;
+    let connection = ConnectionUrl::parse(connection_url).map_err(|_| browser_error())?;
+    if connection.client_authentication().is_none() || connection.root() != &metadata.root {
+        return Err(browser_error());
+    }
+    Ok(ProvisionedManagedConnection {
+        metadata,
+        connection_url: RevealedConnectionUrl::new(connection),
+    })
+}
+
 fn listed_content(
     classification: i32,
     content: Option<listed_value::Content>,
@@ -397,6 +529,7 @@ pub fn start() {
                     show_error(error.message());
                 } else if authenticated {
                     load_current_configuration().await;
+                    load_current_connections().await;
                 }
             }
             Err(error) => show_error(error.message()),
@@ -415,10 +548,15 @@ fn install_actions() {
         "configuration-values-link",
         Route::Configuration(ConfigPath::root()),
     );
+    install_route_link(&document, "managed-connections-link", Route::Connections);
     if let Some(browser_window) = window() {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            discard_connection_url();
             render_route(&route_from_location());
-            spawn_local(async { load_current_configuration().await });
+            spawn_local(async {
+                load_current_configuration().await;
+                load_current_connections().await;
+            });
         });
         let _ = browser_window
             .add_event_listener_with_callback("popstate", callback.as_ref().unchecked_ref());
@@ -443,6 +581,8 @@ fn install_actions() {
     if let Some(logout) = document.get_element_by_id("logout") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: web_sys::Event| {
             CONFIGURATION_LOAD_GENERATION.set(CONFIGURATION_LOAD_GENERATION.get().wrapping_add(1));
+            CONNECTIONS_LOAD_GENERATION.set(CONNECTIONS_LOAD_GENERATION.get().wrapping_add(1));
+            discard_connection_url();
             clear_browser_session();
             set_text("auth-value", "Logged out");
             set_hidden("login", false);
@@ -452,12 +592,15 @@ fn install_actions() {
             clear_value_rows();
             set_textarea("json-content", "");
             set_text("value-count", "0 values");
+            clear_connection_rows();
+            set_text("connection-state", "Log in to view connections");
             focus("login");
         });
         let _ = logout.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
         callback.forget();
     }
     install_configuration_actions(&document);
+    install_connections_actions(&document);
 }
 
 fn install_route_link(document: &Document, id: &str, route: Route) {
@@ -834,6 +977,7 @@ fn select_active_path_option() {
 }
 
 fn navigate(route: &Route) {
+    discard_connection_url();
     let url = route_url(route);
     if let Some(window) = window()
         && let Ok(history) = window.history()
@@ -841,15 +985,21 @@ fn navigate(route: &Route) {
         let _ = history.push_state_with_url(&JsValue::NULL, "", Some(&url));
     }
     render_route(route);
-    spawn_local(async { load_current_configuration().await });
+    spawn_local(async {
+        load_current_configuration().await;
+        load_current_connections().await;
+    });
 }
 
 fn render_route(route: &Route) {
     let configuration = matches!(route, Route::Configuration(_));
-    set_hidden("system-page", configuration);
+    let connections = matches!(route, Route::Connections);
+    set_hidden("system-page", configuration || connections);
     set_hidden("configuration-page", !configuration);
-    set_active("system-status-link", !configuration);
+    set_hidden("connections-page", !connections);
+    set_active("system-status-link", !configuration && !connections);
     set_active("configuration-values-link", configuration);
+    set_active("managed-connections-link", connections);
     if let Route::Configuration(path) = route {
         let canonical_url = route_url(route);
         if let Some(window) = window()
@@ -891,6 +1041,9 @@ fn route_from_path(path: &str) -> Route {
     if path == "/configuration" || path == "/configuration/" {
         return Route::Configuration(ConfigPath::root());
     }
+    if path == "/connections" || path == "/connections/" {
+        return Route::Connections;
+    }
     if let Some(relative) = path.strip_prefix("/configuration/")
         && let Ok(path) = ConfigPath::parse_operation(format!("/{relative}"))
     {
@@ -904,6 +1057,7 @@ fn route_url(route: &Route) -> String {
         Route::System => "/".into(),
         Route::Configuration(path) if path.as_str() == "/" => "/configuration/".into(),
         Route::Configuration(path) => format!("/configuration{}", path.as_str()),
+        Route::Connections => "/connections/".into(),
     }
 }
 
@@ -1208,7 +1362,7 @@ async fn reveal_existing_secret(path: ConfigPath, output_id: String, button_id: 
     let generation = CONFIGURATION_LOAD_GENERATION.get();
     let route_path = match route_from_location() {
         Route::Configuration(path) => path,
-        Route::System => return,
+        Route::System | Route::Connections => return,
     };
     clear_error();
     hide_revealed_secret(&output_id, &button_id);
@@ -1219,7 +1373,7 @@ async fn reveal_existing_secret(path: ConfigPath, output_id: String, button_id: 
     .await;
     let current_path = match route_from_location() {
         Route::Configuration(path) => path,
-        Route::System => return,
+        Route::System | Route::Connections => return,
     };
     if generation != CONFIGURATION_LOAD_GENERATION.get() || current_path != route_path {
         return;
@@ -1318,6 +1472,585 @@ fn close_delete_dialog() {
     if let Some(dialog) = element::<HtmlDialogElement>("delete-dialog") {
         dialog.close();
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn install_connections_actions(document: &Document) {
+    if let Some(form) = document.get_element_by_id("connection-form") {
+        let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
+            event.prevent_default();
+            open_create_connection();
+        });
+        let _ = form.add_event_listener_with_callback("submit", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(name) = document.get_element_by_id("connection-name") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            validate_connection_name_field();
+        });
+        let _ = name.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(root) = document.get_element_by_id("connection-root") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            validate_connection_root_field();
+        });
+        let _ = root.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(cancel) = document.get_element_by_id("cancel-create-connection") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            close_dialog("create-connection-dialog");
+            focus("create-connection");
+        });
+        let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(confirm) = document.get_element_by_id("confirm-create-connection") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            spawn_local(async { create_connection().await });
+        });
+        let _ =
+            confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(cancel) = document.get_element_by_id("cancel-rotate-connection") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            cancel_connection_dialog("rotate-connection-dialog");
+        });
+        let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(confirm) = document.get_element_by_id("confirm-rotate-connection") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            spawn_local(async { rotate_connection().await });
+        });
+        let _ =
+            confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(cancel) = document.get_element_by_id("cancel-revoke-connection") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            cancel_connection_dialog("revoke-connection-dialog");
+        });
+        let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(confirm) = document.get_element_by_id("confirm-revoke-connection") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            spawn_local(async { revoke_connection().await });
+        });
+        let _ =
+            confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(reveal) = document.get_element_by_id("reveal-connection-url") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            toggle_connection_url_reveal();
+        });
+        let _ = reveal.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(copy) = document.get_element_by_id("copy-connection-url") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            spawn_local(async { copy_connection_url().await });
+        });
+        let _ = copy.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(close) = document.get_element_by_id("close-connection-url") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            let return_focus = CONNECTION_URL_RETURN_FOCUS.with_borrow_mut(Option::take);
+            discard_connection_url();
+            if let Some(return_focus) = return_focus {
+                focus(&return_focus);
+            }
+        });
+        let _ = close.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(dialog) = document.get_element_by_id("connection-url-dialog") {
+        // The native dialog can also close through Escape; always discard.
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            let return_focus = CONNECTION_URL_RETURN_FOCUS.with_borrow_mut(Option::take);
+            discard_connection_url();
+            if let Some(return_focus) = return_focus {
+                focus(&return_focus);
+            }
+        });
+        let _ = dialog.add_event_listener_with_callback("close", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+}
+
+fn validate_connection_name_field() -> bool {
+    let value = element::<HtmlInputElement>("connection-name").map(|input| input.value());
+    let valid = value
+        .as_deref()
+        .is_some_and(|value| DisplayName::parse(value).is_ok());
+    set_validation(
+        "connection-name",
+        "connection-name-error",
+        if valid {
+            None
+        } else {
+            Some(
+                "enter a display name of at most 100 characters without leading or trailing spaces",
+            )
+        },
+    );
+    valid
+}
+
+fn validate_connection_root_field() -> bool {
+    let value = element::<HtmlInputElement>("connection-root").map(|input| input.value());
+    let valid = value
+        .as_deref()
+        .is_some_and(|value| parse_absolute_path(value).is_ok());
+    set_validation(
+        "connection-root",
+        "connection-root-error",
+        if valid {
+            None
+        } else {
+            Some("path must begin with / and contain only letters, numbers, and hyphens")
+        },
+    );
+    valid
+}
+
+fn open_create_connection() {
+    let name_valid = validate_connection_name_field();
+    let root_valid = validate_connection_root_field();
+    if !name_valid {
+        focus("connection-name");
+        return;
+    }
+    if !root_valid {
+        focus("connection-root");
+        return;
+    }
+    let Some(name) = element::<HtmlInputElement>("connection-name").map(|input| input.value())
+    else {
+        return;
+    };
+    let Some(root) = element::<HtmlInputElement>("connection-root").map(|input| input.value())
+    else {
+        return;
+    };
+    set_text("create-connection-name", &name);
+    set_text("create-connection-root", &root);
+    if let Some(dialog) = element::<HtmlDialogElement>("create-connection-dialog") {
+        let _ = dialog.show_modal();
+        focus("cancel-create-connection");
+    }
+}
+
+fn cancel_connection_dialog(dialog_id: &str) {
+    let return_focus = CONNECTION_TARGET
+        .with_borrow_mut(Option::take)
+        .map(|target| target.return_focus);
+    close_dialog(dialog_id);
+    if let Some(return_focus) = return_focus {
+        focus(&return_focus);
+    }
+}
+
+fn close_dialog(id: &str) {
+    if let Some(dialog) = element::<HtmlDialogElement>(id) {
+        dialog.close();
+    }
+}
+
+async fn create_connection() {
+    if CONNECTION_PENDING.get() {
+        return;
+    }
+    let (Some(name), Some(root)) = (
+        element::<HtmlInputElement>("connection-name").map(|input| input.value()),
+        element::<HtmlInputElement>("connection-root").map(|input| input.value()),
+    ) else {
+        return;
+    };
+    let (Ok(display_name), Ok(root)) = (DisplayName::parse(name), parse_absolute_path(&root))
+    else {
+        close_dialog("create-connection-dialog");
+        return;
+    };
+    CONNECTION_PENDING.set(true);
+    set_button_disabled("confirm-create-connection", true);
+    clear_error();
+    let result = async {
+        let config = app_config()?;
+        value_client(&config)
+            .create_managed_connection(&display_name, &root)
+            .await
+    }
+    .await;
+    set_button_disabled("confirm-create-connection", false);
+    CONNECTION_PENDING.set(false);
+    close_dialog("create-connection-dialog");
+    match result {
+        Ok(provisioned) => {
+            if let Some(input) = element::<HtmlInputElement>("connection-name") {
+                input.set_value("");
+            }
+            set_text("connection-state", "Connection created");
+            load_current_connections().await;
+            open_connection_url_dialog(&provisioned, "create-connection");
+        }
+        Err(error) => {
+            set_text("connection-state", "Error");
+            show_error(error.message());
+            focus("create-connection");
+        }
+    }
+}
+
+async fn rotate_connection() {
+    if CONNECTION_PENDING.get() {
+        return;
+    }
+    let Some(target) = CONNECTION_TARGET.with_borrow_mut(Option::take) else {
+        return;
+    };
+    CONNECTION_PENDING.set(true);
+    set_button_disabled("confirm-rotate-connection", true);
+    clear_error();
+    let result = async {
+        let config = app_config()?;
+        value_client(&config)
+            .rotate_managed_connection(&target.connection_id)
+            .await
+    }
+    .await;
+    set_button_disabled("confirm-rotate-connection", false);
+    CONNECTION_PENDING.set(false);
+    close_dialog("rotate-connection-dialog");
+    match result {
+        Ok(provisioned) => {
+            set_text("connection-state", "Credential rotated");
+            load_current_connections().await;
+            open_connection_url_dialog(&provisioned, "connections-heading");
+        }
+        Err(error) => {
+            // Refresh first: reloading clears the error banner, so the
+            // message must be shown after the new state is rendered.
+            load_current_connections().await;
+            set_text("connection-state", "Error");
+            show_error(error.message());
+            focus("connections-heading");
+        }
+    }
+}
+
+async fn revoke_connection() {
+    if CONNECTION_PENDING.get() {
+        return;
+    }
+    let Some(target) = CONNECTION_TARGET.with_borrow_mut(Option::take) else {
+        return;
+    };
+    CONNECTION_PENDING.set(true);
+    set_button_disabled("confirm-revoke-connection", true);
+    clear_error();
+    let result = async {
+        let config = app_config()?;
+        value_client(&config)
+            .revoke_managed_connection(&target.connection_id)
+            .await
+    }
+    .await;
+    set_button_disabled("confirm-revoke-connection", false);
+    CONNECTION_PENDING.set(false);
+    close_dialog("revoke-connection-dialog");
+    // Refresh first: reloading clears the error banner, so any message must
+    // be shown after the new state is rendered.
+    load_current_connections().await;
+    match result {
+        Ok(()) => {
+            set_text("connection-state", "Connection revoked");
+        }
+        Err(error) => {
+            set_text("connection-state", "Error");
+            show_error(error.message());
+        }
+    }
+    focus("connections-heading");
+}
+
+/// Opens the one-time result surface with the URL masked; the secret lives
+/// only in application memory until the surface closes.
+fn open_connection_url_dialog(provisioned: &ProvisionedManagedConnection, return_focus: &str) {
+    CONNECTION_URL_SECRET.with_borrow_mut(|slot| {
+        *slot = Some(provisioned.connection_url.connection().canonical().clone());
+    });
+    CONNECTION_URL_RETURN_FOCUS.with_borrow_mut(|slot| {
+        *slot = Some(return_focus.to_owned());
+    });
+    hide_connection_url_reveal();
+    set_text("connection-url-status", "");
+    if let Some(dialog) = element::<HtmlDialogElement>("connection-url-dialog") {
+        let _ = dialog.show_modal();
+        focus("reveal-connection-url");
+    }
+}
+
+fn toggle_connection_url_reveal() {
+    if element_is_hidden("revealed-connection-url") {
+        let Some(secret) = CONNECTION_URL_SECRET.with_borrow(std::clone::Clone::clone) else {
+            return;
+        };
+        if let Some(output) = element::<HtmlTextAreaElement>("revealed-connection-url") {
+            output.set_value(secret.expose());
+        }
+        set_hidden("revealed-connection-url", false);
+        set_hidden("connection-url-mask", true);
+        set_text("reveal-connection-url", "Hide");
+        if let Some(button) = window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.get_element_by_id("reveal-connection-url"))
+        {
+            let _ = button.set_attribute("aria-expanded", "true");
+        }
+        focus("revealed-connection-url");
+    } else {
+        hide_connection_url_reveal();
+        focus("reveal-connection-url");
+    }
+}
+
+fn hide_connection_url_reveal() {
+    if let Some(output) = element::<HtmlTextAreaElement>("revealed-connection-url") {
+        output.set_value("");
+    }
+    set_hidden("revealed-connection-url", true);
+    set_hidden("connection-url-mask", false);
+    set_text("reveal-connection-url", "Reveal");
+    if let Some(button) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("reveal-connection-url"))
+    {
+        let _ = button.set_attribute("aria-expanded", "false");
+    }
+}
+
+async fn copy_connection_url() {
+    let Some(secret) = CONNECTION_URL_SECRET.with_borrow(std::clone::Clone::clone) else {
+        return;
+    };
+    let Some(clipboard) = window().map(|window| window.navigator().clipboard()) else {
+        set_text("connection-url-status", "Copy failed");
+        return;
+    };
+    match JsFuture::from(clipboard.write_text(secret.expose())).await {
+        Ok(_) => set_text("connection-url-status", "Copied"),
+        Err(_) => set_text("connection-url-status", "Copy failed"),
+    }
+}
+
+/// Discards the one-time URL from application state and the DOM.
+fn discard_connection_url() {
+    CONNECTION_URL_SECRET.with_borrow_mut(Option::take);
+    hide_connection_url_reveal();
+    set_text("connection-url-status", "");
+    close_dialog("connection-url-dialog");
+}
+
+async fn load_current_connections() {
+    let generation = CONNECTIONS_LOAD_GENERATION.get().wrapping_add(1);
+    CONNECTIONS_LOAD_GENERATION.set(generation);
+    if !matches!(route_from_location(), Route::Connections) {
+        return;
+    }
+    clear_connection_rows();
+    clear_error();
+    set_text("connection-state", "Loading");
+    let result = async {
+        let config = app_config()?;
+        value_client(&config).list_managed_connections().await
+    }
+    .await;
+    if CONNECTIONS_LOAD_GENERATION.get() != generation
+        || !matches!(route_from_location(), Route::Connections)
+    {
+        return;
+    }
+    match result {
+        Ok(connections) => {
+            set_text("connection-state", "Loaded");
+            if let Err(error) = render_connections(&connections) {
+                show_error(error.message());
+            }
+        }
+        Err(error) => {
+            set_text("connection-state", "Error");
+            show_error(error.message());
+        }
+    }
+}
+
+fn render_connections(connections: &[ManagedConnectionMetadata]) -> Result<(), ClientError> {
+    clear_connection_rows();
+    let document = window()
+        .and_then(|window| window.document())
+        .ok_or_else(browser_error)?;
+    let body = document
+        .get_element_by_id("connections-body")
+        .ok_or_else(browser_error)?;
+    for (index, connection) in connections.iter().enumerate() {
+        let row = render_connection_row(&document, connection, index)?;
+        append(&body, &row)?;
+    }
+    let count = connections.len();
+    set_text(
+        "connection-count",
+        &format!("{count} connection{}", if count == 1 { "" } else { "s" }),
+    );
+    set_hidden("empty-connections", count != 0);
+    Ok(())
+}
+
+fn render_connection_row(
+    document: &Document,
+    connection: &ManagedConnectionMetadata,
+    index: usize,
+) -> Result<Element, ClientError> {
+    let row = create_element(document, "tr", None)?;
+    let name = create_element(document, "th", None)?;
+    name.set_attribute("scope", "row")
+        .map_err(|_| browser_error())?;
+    name.set_text_content(Some(connection.display_name.as_str()));
+    append(&row, &name)?;
+    let root = create_element(document, "td", None)?;
+    let root_code = create_element(document, "code", None)?;
+    root_code.set_text_content(Some(connection.root.as_str()));
+    append(&root, &root_code)?;
+    append(&row, &root)?;
+    let state = create_element(document, "td", None)?;
+    state.set_text_content(Some(connection_state_label(connection.state)));
+    append(&row, &state)?;
+
+    let actions_cell = create_element(document, "td", None)?;
+    let actions = create_element(document, "div", Some("row-actions"))?;
+    let rotate_id = format!("rotate-connection-{index}");
+    let rotate = create_button(document, &rotate_id, "Rotate", Some("secondary"))?;
+    rotate
+        .set_attribute(
+            "aria-label",
+            &format!("Rotate credential for {}", connection.display_name.as_str()),
+        )
+        .map_err(|_| browser_error())?;
+    if !matches!(
+        connection.state,
+        ManagedConnectionState::Active | ManagedConnectionState::RotationUnknown
+    ) {
+        rotate
+            .set_attribute("disabled", "")
+            .map_err(|_| browser_error())?;
+    }
+    let rotate_target = connection.connection_id.clone();
+    let rotate_name = connection.display_name.as_str().to_owned();
+    let rotate_root = connection.root.as_str().to_owned();
+    let rotate_focus = rotate_id.clone();
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        open_connection_dialog(
+            "rotate-connection-dialog",
+            "rotate-connection-name",
+            "rotate-connection-root",
+            "cancel-rotate-connection",
+            &rotate_target,
+            &rotate_name,
+            &rotate_root,
+            &rotate_focus,
+        );
+    });
+    rotate
+        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
+    append(&actions, &rotate)?;
+
+    let revoke_id = format!("revoke-connection-{index}");
+    let revoke = create_button(document, &revoke_id, "Revoke", Some("danger"))?;
+    revoke
+        .set_attribute(
+            "aria-label",
+            &format!("Revoke {}", connection.display_name.as_str()),
+        )
+        .map_err(|_| browser_error())?;
+    let revoke_target = connection.connection_id.clone();
+    let revoke_name = connection.display_name.as_str().to_owned();
+    let revoke_root = connection.root.as_str().to_owned();
+    let revoke_focus = revoke_id.clone();
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        open_connection_dialog(
+            "revoke-connection-dialog",
+            "revoke-connection-name",
+            "revoke-connection-root",
+            "cancel-revoke-connection",
+            &revoke_target,
+            &revoke_name,
+            &revoke_root,
+            &revoke_focus,
+        );
+    });
+    revoke
+        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
+    append(&actions, &revoke)?;
+    append(&actions_cell, &actions)?;
+    append(&row, &actions_cell)?;
+    Ok(row)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_connection_dialog(
+    dialog_id: &str,
+    name_id: &str,
+    root_id: &str,
+    cancel_id: &str,
+    connection_id: &ConnectionId,
+    display_name: &str,
+    root: &str,
+    return_focus: &str,
+) {
+    set_text(name_id, display_name);
+    set_text(root_id, root);
+    CONNECTION_TARGET.with_borrow_mut(|target| {
+        *target = Some(ConnectionTarget {
+            connection_id: connection_id.clone(),
+            return_focus: return_focus.to_owned(),
+        });
+    });
+    if let Some(dialog) = element::<HtmlDialogElement>(dialog_id) {
+        let _ = dialog.show_modal();
+        focus(cancel_id);
+    }
+}
+
+const fn connection_state_label(state: ManagedConnectionState) -> &'static str {
+    match state {
+        ManagedConnectionState::Provisioning => "Provisioning",
+        ManagedConnectionState::Active => "Active",
+        ManagedConnectionState::RotationUnknown => "Rotation unknown",
+        ManagedConnectionState::Revoking => "Revoking",
+        ManagedConnectionState::CleanupRequired => "Cleanup required",
+    }
+}
+
+fn clear_connection_rows() {
+    if let Some(body) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("connections-body"))
+    {
+        while let Some(row) = body.last_element_child() {
+            row.remove();
+        }
+    }
+    set_text("connection-count", "0 connections");
+    set_hidden("empty-connections", false);
 }
 
 fn render_listing(listing: &ValueListing) -> Result<(), ClientError> {
@@ -2329,7 +3062,7 @@ fn grpc_status_code(status: u16) -> RpcCode {
         5 => RpcCode::NotFound,
         7 => RpcCode::PermissionDenied,
         9 => RpcCode::FailedPrecondition,
-        14 => RpcCode::Unavailable,
+        10 | 14 => RpcCode::Unavailable,
         16 => RpcCode::Unauthenticated,
         _ => RpcCode::Other,
     }
@@ -2517,6 +3250,23 @@ mod tests {
         let route = route_from_path("/configuration/Apps/API");
         assert_eq!(route_url(&route), "/configuration/apps/api");
         assert!(matches!(route_from_path("/unknown"), Route::System));
+    }
+
+    #[test]
+    fn connection_routes_are_canonical() {
+        assert!(matches!(
+            route_from_path("/connections"),
+            Route::Connections
+        ));
+        assert!(matches!(
+            route_from_path("/connections/"),
+            Route::Connections
+        ));
+        assert_eq!(route_url(&Route::Connections), "/connections/");
+        assert!(matches!(
+            route_from_path("/connections/extra"),
+            Route::System
+        ));
     }
 
     #[test]

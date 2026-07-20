@@ -92,6 +92,70 @@ entries:
       slug: sovereign-config
       provider: !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config]]
 
+  # Isolated identity used only to provision managed application connections.
+  # It may create users and tokens, and administer only the objects it created
+  # (granted per object by the initial-permissions policy below). It is not a
+  # superuser, has no Admin UI access, and cannot read, change, or delete an
+  # unrelated user or token, nor view any token key.
+  - model: authentik_rbac.role
+    state: present
+    identifiers:
+      name: sovereign-config-connection-manager
+    attrs:
+      name: sovereign-config-connection-manager
+      permissions:
+        - authentik_core.add_user
+        - authentik_core.add_token
+
+  - model: authentik_core.group
+    state: present
+    identifiers:
+      name: sovereign-config-connection-manager
+    attrs:
+      is_superuser: false
+      roles:
+        - !Find [authentik_rbac.role, [name, sovereign-config-connection-manager]]
+
+  - model: authentik_rbac.initialpermissions
+    state: present
+    identifiers:
+      name: sovereign-config-connection-manager-objects
+    attrs:
+      name: sovereign-config-connection-manager-objects
+      mode: role
+      role: !Find [authentik_rbac.role, [name, sovereign-config-connection-manager]]
+      permissions:
+        - authentik_core.view_user
+        - authentik_core.change_user
+        - authentik_core.delete_user
+        - authentik_core.view_token
+        - authentik_core.set_token_key
+
+  - model: authentik_core.user
+    state: present
+    identifiers:
+      username: sovereign-config-connection-manager
+    attrs:
+      username: sovereign-config-connection-manager
+      name: Sovereign Config connection manager
+      type: service_account
+      is_active: true
+      path: goauthentik.io/service-accounts
+      groups:
+        - !Find [authentik_core.group, [name, sovereign-config-connection-manager]]
+
+  - model: authentik_core.token
+    state: present
+    identifiers:
+      identifier: sovereign-config-connection-manager-api
+    attrs:
+      identifier: sovereign-config-connection-manager-api
+      intent: api
+      user: !Find [authentik_core.user, [username, sovereign-config-connection-manager]]
+      key: ${AUTHENTIK_SOVEREIGN_CONFIG_MANAGER_API_TOKEN}
+      description: "Sovereign Config managed-connection administration"
+      expiring: false
+
   - model: authentik_core.application
     state: absent
     identifiers:

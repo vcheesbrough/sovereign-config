@@ -18,6 +18,13 @@ service Configuration {
   rpc RevealSecret(RevealSecretRequest) returns (RevealSecretResponse);
 }
 
+service ManagedConnections {
+  rpc ListManagedConnections(ListManagedConnectionsRequest) returns (ListManagedConnectionsResponse);
+  rpc CreateManagedConnection(CreateManagedConnectionRequest) returns (CreateManagedConnectionResponse);
+  rpc RotateManagedConnection(RotateManagedConnectionRequest) returns (RotateManagedConnectionResponse);
+  rpc RevokeManagedConnection(RevokeManagedConnectionRequest) returns (RevokeManagedConnectionResponse);
+}
+
 enum ValueClassification {
   VALUE_CLASSIFICATION_UNSPECIFIED = 0;
   VALUE_CLASSIFICATION_PLAIN = 1;
@@ -112,6 +119,55 @@ message RevealSecretRequest {
 message RevealSecretResponse {
   string value = 1;
 }
+
+enum ManagedConnectionState {
+  MANAGED_CONNECTION_STATE_UNSPECIFIED = 0;
+  MANAGED_CONNECTION_STATE_PROVISIONING = 1;
+  MANAGED_CONNECTION_STATE_ACTIVE = 2;
+  MANAGED_CONNECTION_STATE_ROTATION_UNKNOWN = 3;
+  MANAGED_CONNECTION_STATE_REVOKING = 4;
+  MANAGED_CONNECTION_STATE_CLEANUP_REQUIRED = 5;
+}
+
+message ManagedConnectionMetadata {
+  string connection_id = 1;
+  string display_name = 2;
+  string root = 3;
+  ManagedConnectionState state = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message ListManagedConnectionsRequest {}
+
+message ListManagedConnectionsResponse {
+  repeated ManagedConnectionMetadata connections = 1;
+}
+
+message CreateManagedConnectionRequest {
+  string display_name = 1;
+  string root = 2;
+}
+
+message CreateManagedConnectionResponse {
+  ManagedConnectionMetadata metadata = 1;
+  string connection_url = 2;
+}
+
+message RotateManagedConnectionRequest {
+  string connection_id = 1;
+}
+
+message RotateManagedConnectionResponse {
+  ManagedConnectionMetadata metadata = 1;
+  string connection_url = 2;
+}
+
+message RevokeManagedConnectionRequest {
+  string connection_id = 1;
+}
+
+message RevokeManagedConnectionResponse {}
 
 message GetIdentityRequest {}
 

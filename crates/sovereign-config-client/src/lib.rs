@@ -2,9 +2,10 @@
 
 use async_trait::async_trait;
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, PROTOCOL_VERSION,
-    PlainValue, PutMetadata, ReplaceMetadata, RevealedSecret, Secret, SecretInput, ServiceStatus,
-    SubTreeMutationValue, Timestamp, ValueListing, ValueSubTree,
+    AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata, DisplayName,
+    ErrorKind, ManagedConnectionMetadata, PROTOCOL_VERSION, PlainValue,
+    ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret, Secret,
+    SecretInput, ServiceStatus, SubTreeMutationValue, Timestamp, ValueListing, ValueSubTree,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,8 +98,100 @@ pub trait ValueTransport: Transport {
 }
 
 #[async_trait(?Send)]
+pub trait ManagedConnectionTransport: Transport {
+    async fn list_managed_connections(
+        &self,
+        bearer: &Secret,
+    ) -> Result<Vec<ManagedConnectionMetadata>, ClientError>;
+    async fn create_managed_connection(
+        &self,
+        display_name: &DisplayName,
+        root: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ProvisionedManagedConnection, ClientError>;
+    async fn rotate_managed_connection(
+        &self,
+        connection_id: &ConnectionId,
+        bearer: &Secret,
+    ) -> Result<ProvisionedManagedConnection, ClientError>;
+    async fn revoke_managed_connection(
+        &self,
+        connection_id: &ConnectionId,
+        bearer: &Secret,
+    ) -> Result<(), ClientError>;
+}
+
+#[async_trait(?Send)]
 pub trait AccessTokenProvider {
     async fn access_token(&self) -> Result<Option<Secret>, ClientError>;
+}
+
+impl<T, A> Client<T, A>
+where
+    T: ManagedConnectionTransport,
+    A: AccessTokenProvider,
+{
+    /// Lists safe metadata for connections rooted in manageable paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, authorization, or dependency error.
+    pub async fn list_managed_connections(
+        &self,
+    ) -> Result<Vec<ManagedConnectionMetadata>, ClientError> {
+        let token = self.required_token().await?;
+        self.transport.list_managed_connections(&token).await
+    }
+
+    /// Creates one managed read-only connection and returns its one-time URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, authorization, validation, or
+    /// dependency error; no URL is returned on any failure.
+    pub async fn create_managed_connection(
+        &self,
+        display_name: &DisplayName,
+        root: &ConfigPath,
+    ) -> Result<ProvisionedManagedConnection, ClientError> {
+        let token = self.required_token().await?;
+        self.transport
+            .create_managed_connection(display_name, root, &token)
+            .await
+    }
+
+    /// Rotates one managed connection credential and returns its one-time URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, authorization, validation,
+    /// missing-connection, or dependency error; ambiguous rotation returns an
+    /// error and no URL.
+    pub async fn rotate_managed_connection(
+        &self,
+        connection_id: &ConnectionId,
+    ) -> Result<ProvisionedManagedConnection, ClientError> {
+        let token = self.required_token().await?;
+        self.transport
+            .rotate_managed_connection(connection_id, &token)
+            .await
+    }
+
+    /// Permanently revokes one managed connection without returning a secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, authorization, validation,
+    /// missing-connection, or dependency error.
+    pub async fn revoke_managed_connection(
+        &self,
+        connection_id: &ConnectionId,
+    ) -> Result<(), ClientError> {
+        let token = self.required_token().await?;
+        self.transport
+            .revoke_managed_connection(connection_id, &token)
+            .await
+    }
 }
 
 impl<T, A> Client<T, A>
@@ -194,13 +287,6 @@ where
         let token = self.required_token().await?;
         self.transport.reveal_secret(path, &token).await
     }
-
-    async fn required_token(&self) -> Result<Secret, ClientError> {
-        self.authentication
-            .access_token()
-            .await?
-            .ok_or_else(|| ClientError::new(ErrorKind::Unauthenticated, "authentication required"))
-    }
 }
 
 /// Validates a protobuf timestamp before exposing it to presentation code.
@@ -258,6 +344,13 @@ where
             ClientError::new(ErrorKind::Unauthenticated, "authentication required")
         })?;
         self.transport.get_identity(&token).await
+    }
+
+    async fn required_token(&self) -> Result<Secret, ClientError> {
+        self.authentication
+            .access_token()
+            .await?
+            .ok_or_else(|| ClientError::new(ErrorKind::Unauthenticated, "authentication required"))
     }
 }
 

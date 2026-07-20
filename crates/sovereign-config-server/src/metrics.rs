@@ -78,9 +78,225 @@ impl AuthenticationMetrics {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ManagedOperation {
+    List,
+    Create,
+    Rotate,
+    Revoke,
+}
+
+impl ManagedOperation {
+    const ALL: [Self; 4] = [Self::List, Self::Create, Self::Rotate, Self::Revoke];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Create => "create",
+            Self::Rotate => "rotate",
+            Self::Revoke => "revoke",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ManagedOperationResult {
+    Success,
+    InvalidRequest,
+    Unauthenticated,
+    PermissionDenied,
+    NotFound,
+    Conflict,
+    Storage,
+    Dependency,
+    CleanupRequired,
+    Internal,
+}
+
+impl ManagedOperationResult {
+    const ALL: [Self; 10] = [
+        Self::Success,
+        Self::InvalidRequest,
+        Self::Unauthenticated,
+        Self::PermissionDenied,
+        Self::NotFound,
+        Self::Conflict,
+        Self::Storage,
+        Self::Dependency,
+        Self::CleanupRequired,
+        Self::Internal,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::InvalidRequest => "invalid_request",
+            Self::Unauthenticated => "unauthenticated",
+            Self::PermissionDenied => "permission_denied",
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
+            Self::Storage => "storage_unavailable",
+            Self::Dependency => "dependency_failed",
+            Self::CleanupRequired => "cleanup_required",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ManagedDependencyCall {
+    CreateAccount,
+    SetAttributes,
+    FindUser,
+    FindCredentials,
+    SetCredential,
+    DeleteUser,
+}
+
+impl ManagedDependencyCall {
+    const ALL: [Self; 6] = [
+        Self::CreateAccount,
+        Self::SetAttributes,
+        Self::FindUser,
+        Self::FindCredentials,
+        Self::SetCredential,
+        Self::DeleteUser,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CreateAccount => "create_account",
+            Self::SetAttributes => "set_attributes",
+            Self::FindUser => "find_user",
+            Self::FindCredentials => "find_credentials",
+            Self::SetCredential => "set_credential",
+            Self::DeleteUser => "delete_user",
+        }
+    }
+}
+
+/// Fixed dependency outcomes: `ok` plus the bounded [`crate::authentik::AdminError`] kinds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ManagedDependencyOutcome {
+    Ok,
+    NotFound,
+    Rejected,
+    Unavailable,
+    Ambiguous,
+    Invalid,
+}
+
+impl ManagedDependencyOutcome {
+    const ALL: [Self; 6] = [
+        Self::Ok,
+        Self::NotFound,
+        Self::Rejected,
+        Self::Unavailable,
+        Self::Ambiguous,
+        Self::Invalid,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NotFound => "not_found",
+            Self::Rejected => "rejected",
+            Self::Unavailable => "unavailable",
+            Self::Ambiguous => "ambiguous",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+/// Bounded managed-connection operation and dependency counters.
+///
+/// Labels are fixed enums only: no connection identifier, name, root, username,
+/// credential, URL, or provider response detail can reach a label value.
+#[derive(Default)]
+pub(crate) struct ManagedConnectionMetrics {
+    operations: [[AtomicU64; ManagedOperationResult::ALL.len()]; ManagedOperation::ALL.len()],
+    dependencies:
+        [[AtomicU64; ManagedDependencyOutcome::ALL.len()]; ManagedDependencyCall::ALL.len()],
+}
+
+impl ManagedConnectionMetrics {
+    pub(crate) fn record_operation(
+        &self,
+        operation: ManagedOperation,
+        result: ManagedOperationResult,
+    ) {
+        self.operations[operation.index()][result.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_dependency(
+        &self,
+        call: ManagedDependencyCall,
+        outcome: ManagedDependencyOutcome,
+    ) {
+        self.dependencies[call.index()][outcome.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn render(&self) -> String {
+        let mut output = String::from(
+            "# HELP sovereign_config_managed_connection_operations_total Managed connection operation results.\n\
+             # TYPE sovereign_config_managed_connection_operations_total counter\n",
+        );
+        for operation in ManagedOperation::ALL {
+            for result in ManagedOperationResult::ALL {
+                let value =
+                    self.operations[operation.index()][result.index()].load(Ordering::Relaxed);
+                writeln!(
+                    output,
+                    "sovereign_config_managed_connection_operations_total{{operation=\"{}\",result=\"{}\"}} {value}",
+                    operation.as_str(),
+                    result.as_str(),
+                )
+                .expect("writing metrics to a String cannot fail");
+            }
+        }
+        output.push_str(
+            "# HELP sovereign_config_managed_dependency_total Managed connection Authentik dependency outcomes.\n\
+             # TYPE sovereign_config_managed_dependency_total counter\n",
+        );
+        for call in ManagedDependencyCall::ALL {
+            for outcome in ManagedDependencyOutcome::ALL {
+                let value =
+                    self.dependencies[call.index()][outcome.index()].load(Ordering::Relaxed);
+                writeln!(
+                    output,
+                    "sovereign_config_managed_dependency_total{{call=\"{}\",outcome=\"{}\"}} {value}",
+                    call.as_str(),
+                    outcome.as_str(),
+                )
+                .expect("writing metrics to a String cannot fail");
+            }
+        }
+        output
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AuthenticationMetrics, AuthenticationResult};
+    use super::{
+        AuthenticationMetrics, AuthenticationResult, ManagedConnectionMetrics,
+        ManagedDependencyCall, ManagedDependencyOutcome, ManagedOperation, ManagedOperationResult,
+    };
 
     #[test]
     fn metrics_use_only_bounded_result_labels() {
@@ -96,6 +312,36 @@ mod tests {
                 .matches("sovereign_config_authentication_total{")
                 .count(),
             7
+        );
+    }
+
+    #[test]
+    fn managed_metrics_use_only_bounded_fixed_labels() {
+        let metrics = ManagedConnectionMetrics::default();
+        metrics.record_operation(ManagedOperation::Create, ManagedOperationResult::Success);
+        metrics.record_dependency(
+            ManagedDependencyCall::SetCredential,
+            ManagedDependencyOutcome::Ambiguous,
+        );
+        let rendered = metrics.render();
+
+        assert!(rendered.contains(
+            "sovereign_config_managed_connection_operations_total{operation=\"create\",result=\"success\"} 1"
+        ));
+        assert!(rendered.contains(
+            "sovereign_config_managed_dependency_total{call=\"set_credential\",outcome=\"ambiguous\"} 1"
+        ));
+        assert_eq!(
+            rendered
+                .matches("sovereign_config_managed_connection_operations_total{")
+                .count(),
+            40
+        );
+        assert_eq!(
+            rendered
+                .matches("sovereign_config_managed_dependency_total{")
+                .count(),
+            36
         );
     }
 }

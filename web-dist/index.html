@@ -5,12 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#10211b">
     <title>Sovereign Config</title>
-    <link rel="stylesheet" href="/style-4cdc3201850c435b.css" integrity="sha384-yu1woeCvAgEIOXIAvb8cemlTMspoNNClcDcgAuIR7p2EtxdnQ0cFQRaMc76u1JnS"/>
+    <link rel="stylesheet" href="/style-55c4090972bef8a5.css" integrity="sha384-wxWO85QpnEUJhF3wV07C/yrBrmIa2OgS93ojb8eh6Qp9hfc7bY/LU9klmKNpVjlt"/>
     <script src="/app-config.js"></script>
     
 <script type="module">
-import init, * as bindings from '/sovereign-config-web-36b1a074d3ae6dc5.js';
-const wasm = await init({ module_or_path: '/sovereign-config-web-36b1a074d3ae6dc5_bg.wasm' });
+import init, * as bindings from '/sovereign-config-web-2bd2aace171031d1.js';
+const wasm = await init({ module_or_path: '/sovereign-config-web-2bd2aace171031d1_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -19,7 +19,7 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-  <link rel="modulepreload" href="/sovereign-config-web-36b1a074d3ae6dc5.js" crossorigin="anonymous" integrity="sha384-r/VF3yuS1zYdyiKGnR1tL5Nldzr3R1oY1iBW1ar0Ze8t7K/ulURg/BioIRQUawOM"><link rel="preload" href="/sovereign-config-web-36b1a074d3ae6dc5_bg.wasm" crossorigin="anonymous" integrity="sha384-mI0aWoKV7yqSaWx+ilnVfSxqp9R2uPTok6gmFs8rKyqKChQ4yTTcxS21d/PvU9Gl" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/sovereign-config-web-2bd2aace171031d1.js" crossorigin="anonymous" integrity="sha384-xJd0onqMBv8FAvAUZYChKGzD+SEe05BCR5JfP/MDj6N3iiBbPcI6ABcv7GCDkcWw"><link rel="preload" href="/sovereign-config-web-2bd2aace171031d1_bg.wasm" crossorigin="anonymous" integrity="sha384-qGmdANTBPlsvAjK8jRkRKquI+n5m4O/Cnx42k3FiwE2q/zz7hnpIrnllV9UpZ2UX" as="fetch" type="application/wasm"></head>
   <body>
     <header>
       <a id="brand-link" class="brand" href="/" aria-label="Sovereign Config home">
@@ -35,6 +35,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       <nav aria-label="Administration">
         <a id="system-status-link" href="/">System status</a>
         <a id="configuration-values-link" href="/configuration/">Configuration values</a>
+        <a id="managed-connections-link" href="/connections/">Managed connections</a>
       </nav>
       <main id="main">
         <p id="error" class="error" role="alert" hidden></p>
@@ -145,8 +146,89 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             </div>
           </div>
         </div>
+
+        <div id="connections-page" class="page" hidden>
+          <div class="page-heading configuration-heading">
+            <div>
+              <p class="eyebrow">Configuration</p>
+              <h1>Managed connections</h1>
+            </div>
+            <p id="connection-state" class="status-text" aria-live="polite">Loading</p>
+          </div>
+
+          <form id="connection-form" class="path-form" novalidate>
+            <label for="connection-name">Display name</label>
+            <input id="connection-name" type="text" autocomplete="off" spellcheck="false" maxlength="100" aria-describedby="connection-name-error">
+            <p id="connection-name-error" class="field-error" aria-live="polite" hidden></p>
+            <label for="connection-root">Read-only root</label>
+            <div class="field-command">
+              <input id="connection-root" type="text" autocomplete="off" spellcheck="false" required value="/" aria-describedby="connection-root-error">
+              <button id="create-connection" type="submit">Create connection</button>
+            </div>
+            <p id="connection-root-error" class="field-error" aria-live="polite" hidden></p>
+          </form>
+
+          <div class="grid-toolbar">
+            <div>
+              <h2 id="connections-heading" tabindex="-1">Connections</h2>
+              <p id="connection-count" class="status-text">0 connections</p>
+            </div>
+          </div>
+
+          <div class="table-scroll">
+            <table aria-labelledby="connections-heading">
+              <thead>
+                <tr>
+                  <th scope="col">Name</th>
+                  <th scope="col">Root</th>
+                  <th scope="col">State</th>
+                  <th scope="col"><span class="visually-hidden">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="connections-body"></tbody>
+            </table>
+          </div>
+          <p id="empty-connections" class="empty-state" hidden>No managed connections for paths you can manage.</p>
+        </div>
       </main>
     </div>
+    <dialog id="create-connection-dialog" aria-labelledby="create-connection-title">
+      <h2 id="create-connection-title">Create this read-only connection?</h2>
+      <p><span id="create-connection-name" class="dialog-name"></span> will receive permanent read-only access to <code id="create-connection-root"></code> and nothing else. The connection URL is shown exactly once.</p>
+      <div class="actions">
+        <button id="cancel-create-connection" class="secondary" type="button">Cancel</button>
+        <button id="confirm-create-connection" type="button">Create connection</button>
+      </div>
+    </dialog>
+    <dialog id="rotate-connection-dialog" aria-labelledby="rotate-connection-title">
+      <h2 id="rotate-connection-title">Rotate this connection credential?</h2>
+      <p>The current URL for <span id="rotate-connection-name" class="dialog-name"></span> (<code id="rotate-connection-root"></code>) stops working immediately. The replacement URL is shown exactly once.</p>
+      <div class="actions">
+        <button id="cancel-rotate-connection" class="secondary" type="button">Cancel</button>
+        <button id="confirm-rotate-connection" class="danger" type="button">Rotate</button>
+      </div>
+    </dialog>
+    <dialog id="revoke-connection-dialog" aria-labelledby="revoke-connection-title">
+      <h2 id="revoke-connection-title">Permanently revoke this connection?</h2>
+      <p><span id="revoke-connection-name" class="dialog-name"></span> (<code id="revoke-connection-root"></code>) loses access immediately. A revoked connection cannot be restored.</p>
+      <div class="actions">
+        <button id="cancel-revoke-connection" class="secondary" type="button">Cancel</button>
+        <button id="confirm-revoke-connection" class="danger" type="button">Revoke</button>
+      </div>
+    </dialog>
+    <dialog id="connection-url-dialog" aria-labelledby="connection-url-title">
+      <h2 id="connection-url-title">One-time connection URL</h2>
+      <p id="connection-url-hint">This URL contains the connection credential and cannot be shown again. Store it now; a lost URL must be replaced by rotation.</p>
+      <p id="connection-url-mask" class="secret-mask" aria-label="Connection URL is hidden">********</p>
+      <label class="visually-hidden" for="revealed-connection-url">Revealed connection URL</label>
+      <textarea id="revealed-connection-url" class="revealed-connection-url" rows="4" readonly hidden aria-describedby="connection-url-hint"></textarea>
+      <p id="connection-url-status" class="status-text" aria-live="polite"></p>
+      <div class="actions">
+        <button id="reveal-connection-url" class="secondary" type="button" aria-controls="revealed-connection-url" aria-expanded="false">Reveal</button>
+        <button id="copy-connection-url" class="secondary" type="button">Copy</button>
+        <button id="close-connection-url" type="button">Close</button>
+      </div>
+    </dialog>
     <dialog id="delete-dialog" aria-labelledby="delete-title">
       <h2 id="delete-title">Permanently delete this value?</h2>
       <p><code id="delete-path"></code> will be removed immediately. This operation cannot be undone.</p>
@@ -155,5 +237,134 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         <button id="confirm-delete" class="danger" type="button">Delete</button>
       </div>
     </dialog>
-  </body>
+  <script>"use strict";
+
+(function () {
+
+    const address = '{{__TRUNK_ADDRESS__}}';
+    const base = '{{__TRUNK_WS_BASE__}}';
+    let protocol = '';
+    protocol =
+        protocol
+            ? protocol
+            : window.location.protocol === 'https:'
+                ? 'wss'
+                : 'ws';
+    const url = protocol + '://' + address + base + '.well-known/trunk/ws';
+
+    class Overlay {
+        constructor() {
+            // create an overlay
+            this._overlay = document.createElement("div");
+            const style = this._overlay.style;
+            style.height = "100vh";
+            style.width = "100vw";
+            style.position = "fixed";
+            style.top = "0";
+            style.left = "0";
+            style.backgroundColor = "rgba(222, 222, 222, 0.5)";
+            style.fontFamily = "sans-serif";
+            // not sure that's the right approach
+            style.zIndex = "1000000";
+            style.backdropFilter = "blur(1rem)";
+
+            const container = document.createElement("div");
+            // center it
+            container.style.position = "absolute";
+            container.style.top = "30%";
+            container.style.left = "15%";
+            container.style.maxWidth = "85%";
+
+            this._title = document.createElement("div");
+            this._title.innerText = "Build failure";
+            this._title.style.paddingBottom = "2rem";
+            this._title.style.fontSize = "2.5rem";
+
+            this._message = document.createElement("div");
+            this._message.style.whiteSpace = "pre-wrap";
+
+            const icon= document.createElement("div");
+            icon.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" fill="#dc3545" viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>';
+            this._title.prepend(icon);
+
+            container.append(this._title, this._message);
+            this._overlay.append(container);
+
+            this._inject();
+            window.setInterval(() => {
+                this._inject();
+            }, 250);
+        }
+
+        set reason(reason) {
+            this._message.textContent = reason;
+        }
+
+        _inject() {
+            if (!this._overlay.isConnected) {
+                // prepend it
+                document.body?.prepend(this._overlay);
+            }
+        }
+
+    }
+
+    class Client {
+        constructor(url) {
+            this.url = url;
+            this.poll_interval = 5000;
+            this._overlay = null;
+        }
+
+        start() {
+            const ws = new WebSocket(this.url);
+            ws.onmessage = (ev) => {
+                const msg = JSON.parse(ev.data);
+                switch (msg.type) {
+                    case "reload":
+                        this.reload();
+                        break;
+                    case "buildFailure":
+                        this.buildFailure(msg.data)
+                        break;
+                }
+            };
+            ws.onclose = () => this.onclose();
+        }
+
+        onclose() {
+            window.setTimeout(
+                () => {
+                    // when we successfully reconnect, we'll force a
+                    // reload (since we presumably lost connection to
+                    // trunk due to it being killed, so it will have
+                    // rebuilt on restart)
+                    const ws = new WebSocket(this.url);
+                    ws.onopen = () => window.location.reload();
+                    ws.onclose = () => this.onclose();
+                },
+                this.poll_interval);
+        }
+
+        reload() {
+            window.location.reload();
+        }
+
+        buildFailure({reason}) {
+            // also log the console
+            console.error("Build failed:", reason);
+
+            console.debug("Overlay", this._overlay);
+
+            if (!this._overlay) {
+                this._overlay = new Overlay();
+            }
+            this._overlay.reason = reason;
+        }
+    }
+
+    new Client(url).start();
+
+})()
+</script></body>
 </html>
