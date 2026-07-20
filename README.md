@@ -10,7 +10,7 @@ Create the secret files in an operator-controlled directory. The PostgreSQL pass
 
 `POSTGRES_PASSWORD_SECRET_FILE` points to the file containing only the PostgreSQL password. `DATABASE_URL_FILE` points to the file containing the complete private-network URL, for example `postgresql://sovereign_config:<password>@postgres:5432/sovereign_config`. `OIDC_INTROSPECTION_CLIENT_SECRET_FILE` points to the file containing only the matching Authentik introspection provider's client secret. `MANAGER_API_TOKEN_FILE` points to the file containing only the dedicated Authentik connection-manager API token used to provision managed application connections. Never commit these files.
 
-Unlike the other secrets, the connection-manager API token has no inline environment fallback: it is read only from a regular, non-symlinked, single-line file owned by UID `10001` with mode `0400`, and startup fails with a redacted error when it is missing or unsafe.
+Each of these secrets may instead be supplied directly through its environment variable — `SOVEREIGN_CONFIG_DATABASE_URL`, `SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET`, and `SOVEREIGN_CONFIG_MANAGER_API_TOKEN` — which takes precedence over the matching `_FILE` variable. This suits an external secret manager that injects values into the environment. Startup fails with a redacted error when a required secret is absent through both routes.
 
 Set the required deployment inputs and start the stack:
 

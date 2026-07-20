@@ -1,5 +1,3 @@
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::process::{Command, Output};
 
 const SECRET: &str = "startup-redaction-sentinel-4d9a9fd8";
@@ -41,14 +39,6 @@ fn database_url() -> String {
     format!("postgresql://sovereign_config:{SECRET}@127.0.0.1:1/sovereign_config")
 }
 
-fn write_manager_secret(directory: &Path, mode: u32) -> String {
-    let path = directory.join("manager-api-token");
-    std::fs::write(&path, format!("{MANAGER_SECRET}\n")).expect("secret file must be writable");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
-        .expect("secret file mode must be settable");
-    path.to_string_lossy().into_owned()
-}
-
 fn authentication_environment() -> [(&'static str, String); 5] {
     [
         (
@@ -74,10 +64,7 @@ fn authentication_environment() -> [(&'static str, String); 5] {
     ]
 }
 
-fn configured_environment(
-    grpc_addr: &str,
-    manager_token_file: String,
-) -> Vec<(&'static str, String)> {
+fn configured_environment(grpc_addr: &str) -> Vec<(&'static str, String)> {
     let mut environment = vec![
         ("SOVEREIGN_CONFIG_DATABASE_URL", database_url()),
         ("SOVEREIGN_CONFIG_GRPC_ADDR", grpc_addr.to_owned()),
@@ -91,8 +78,8 @@ fn configured_environment(
             "sovereign_config_test_grants".to_owned(),
         ),
         (
-            "SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE",
-            manager_token_file,
+            "SOVEREIGN_CONFIG_MANAGER_API_TOKEN",
+            MANAGER_SECRET.to_owned(),
         ),
     ];
     environment.extend(authentication_environment());
@@ -101,52 +88,38 @@ fn configured_environment(
 
 #[test]
 fn invalid_configuration_does_not_expose_database_credentials() {
-    let directory = tempfile::tempdir().expect("temporary directory must be creatable");
-    let manager_token_file = write_manager_secret(directory.path(), 0o400);
-    let output = run_server(&configured_environment(
-        "not-a-socket-address",
-        manager_token_file,
-    ));
+    let output = run_server(&configured_environment("not-a-socket-address"));
 
     assert_secret_is_redacted(&output);
 }
 
 #[test]
 fn database_startup_failure_does_not_expose_database_credentials() {
-    let directory = tempfile::tempdir().expect("temporary directory must be creatable");
-    let manager_token_file = write_manager_secret(directory.path(), 0o400);
-    let output = run_server(&configured_environment(
-        "127.0.0.1:50051",
-        manager_token_file,
-    ));
+    let output = run_server(&configured_environment("127.0.0.1:50051"));
 
     assert_secret_is_redacted(&output);
 }
 
 #[test]
-fn unsafe_manager_secret_file_fails_startup_without_echoing_values() {
-    let directory = tempfile::tempdir().expect("temporary directory must be creatable");
-    let manager_token_file = write_manager_secret(directory.path(), 0o644);
-    let output = run_server(&configured_environment(
-        "127.0.0.1:50051",
-        manager_token_file,
-    ));
+fn missing_manager_credential_fails_startup_without_echoing_values() {
+    let environment = configured_environment("127.0.0.1:50051")
+        .into_iter()
+        .filter(|(name, _)| *name != "SOVEREIGN_CONFIG_MANAGER_API_TOKEN")
+        .collect::<Vec<_>>();
+    let output = run_server(&environment);
 
     assert_secret_is_redacted(&output);
 }
 
 #[test]
-fn missing_manager_secret_file_fails_startup_without_echoing_values() {
-    let directory = tempfile::tempdir().expect("temporary directory must be creatable");
-    let manager_token_file = directory
-        .path()
-        .join("missing")
-        .to_string_lossy()
-        .into_owned();
-    let output = run_server(&configured_environment(
-        "127.0.0.1:50051",
-        manager_token_file,
-    ));
+fn invalid_public_origin_fails_startup_without_echoing_values() {
+    let mut environment = configured_environment("127.0.0.1:50051");
+    for entry in &mut environment {
+        if entry.0 == "SOVEREIGN_CONFIG_PUBLIC_ORIGIN" {
+            entry.1 = "https://config.example.test/nested/path".to_owned();
+        }
+    }
+    let output = run_server(&environment);
 
     assert_secret_is_redacted(&output);
 }
