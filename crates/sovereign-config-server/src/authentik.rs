@@ -176,7 +176,33 @@ impl AuthentikAdminClient {
         expect_success(response).await.map(|_| ())
     }
 
+    /// Reports whether the exact managed user still exists, by primary key.
+    ///
+    /// Uses the detail endpoint rather than a filtered list because Authentik
+    /// gates list access on holding the permission for at least one object: a
+    /// manager whose last managed account has just been deleted is refused the
+    /// list endpoint outright. Detail routes fall through to the object-level
+    /// check, so this stays usable exactly when reconciliation needs it.
+    pub(crate) async fn user_exists(&self, user_id: i64) -> Result<bool, AdminError> {
+        let response = self
+            .http
+            .get(self.endpoint(&format!("/api/v3/core/users/{user_id}/"))?)
+            .bearer_auth(self.api_token.expose())
+            .send()
+            .await
+            .map_err(|error| classify_transport(&error))?;
+        match expect_success(response).await {
+            Ok(_) => Ok(true),
+            Err(AdminError::NotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Locates a user by exact generated username for reconciliation only.
+    ///
+    /// Only usable when the manager can still see at least one managed
+    /// account; Authentik refuses the list endpoint otherwise. Callers that
+    /// know the primary key should prefer [`Self::user_exists`].
     pub(crate) async fn find_user_by_username(
         &self,
         username: &str,
@@ -745,44 +771,17 @@ mod live_tests {
         cleanup(&client, &account).await;
         checks.expect("the manager must complete the managed connection lifecycle");
 
-        // Deletion must be confirmable, otherwise an ambiguous revocation can
-        // never be resolved. The raw status is reported here because the
-        // adapter's bounded classification deliberately discards it, which
-        // makes a live failure hard to act on.
-        let status = raw_user_lookup_status(&username).await;
-        assert_eq!(
-            status,
-            Some(200),
-            "confirming deletion by exact username must succeed, got HTTP {status:?}"
-        );
+        // Deletion must be confirmable by primary key, which is how an
+        // ambiguous revocation is settled. The list endpoint deliberately is
+        // not used here: Authentik refuses it once the manager holds no
+        // visible account, which is exactly the moment after a final delete.
         assert!(
-            client
-                .find_user_by_username(&username)
+            !client
+                .user_exists(account.user_id)
                 .await
-                .expect("reconciliation must succeed after deletion")
-                .is_none(),
-            "the deleted account must no longer be found"
+                .expect("confirming deletion by primary key must succeed"),
+            "the deleted account must no longer exist"
         );
-    }
-
-    /// Issues the reconciliation lookup directly to surface the HTTP status.
-    /// Only the numeric status is returned, never any response content.
-    async fn raw_user_lookup_status(username: &str) -> Option<u16> {
-        let origin = env::var("SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL").ok()?;
-        let token = env::var("SOVEREIGN_CONFIG_LIVE_AUTHENTIK_TOKEN").ok()?;
-        let mut endpoint: Url = origin.parse().ok()?;
-        endpoint.set_path("/api/v3/core/users/");
-        endpoint.query_pairs_mut().append_pair("username", username);
-        let response = reqwest::Client::builder()
-            .timeout(LIVE_TIMEOUT)
-            .build()
-            .ok()?
-            .get(endpoint)
-            .bearer_auth(token.trim())
-            .send()
-            .await
-            .ok()?;
-        Some(response.status().as_u16())
     }
 
     /// Credential discovery must stay scoped to one account even though the

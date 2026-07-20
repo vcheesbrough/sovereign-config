@@ -563,8 +563,28 @@ impl ManagedConnectionsService {
                         ManagedDependencyCall::DeleteUser,
                         dependency_outcome(error),
                     );
-                    // The row stays `revoking`; revocation can be retried.
-                    return Err(dependency_error());
+                    // A timeout is ambiguous: Authentik may have committed the
+                    // deletion. Probe the exact account by primary key to
+                    // settle it, so revocation is not reported as failed when
+                    // the credential is already gone.
+                    if error == AdminError::Ambiguous {
+                        if self.admin.user_exists(user_id).await != Ok(false) {
+                            self.metrics.record_dependency(
+                                ManagedDependencyCall::FindUser,
+                                ManagedDependencyOutcome::Ambiguous,
+                            );
+                            // The row stays `revoking`; revocation can be
+                            // retried until deletion is confirmed.
+                            return Err(dependency_error());
+                        }
+                        self.metrics.record_dependency(
+                            ManagedDependencyCall::FindUser,
+                            ManagedDependencyOutcome::NotFound,
+                        );
+                    } else {
+                        // The row stays `revoking`; revocation can be retried.
+                        return Err(dependency_error());
+                    }
                 }
             }
         }
@@ -893,6 +913,9 @@ mod tests {
         Timeout,
         /// Succeed at the transport level but return an unexpected payload.
         Body(String),
+        /// Apply the change, then never answer: the caller cannot tell whether
+        /// Authentik committed it.
+        CommitThenTimeout,
     }
 
     #[derive(Clone)]
@@ -969,7 +992,9 @@ mod tests {
 
     async fn apply(behavior: &Behavior) -> Option<Response> {
         match behavior {
-            Behavior::Ok => None,
+            // `CommitThenTimeout` applies the change in the handler itself,
+            // so it produces no scripted response here.
+            Behavior::Ok | Behavior::CommitThenTimeout => None,
             Behavior::Status(status) => Some((*status, "authentik-body-sentinel").into_response()),
             Behavior::Timeout => {
                 sleep(Duration::from_secs(30)).await;
@@ -1084,12 +1109,25 @@ mod tests {
         Json(json!({})).into_response()
     }
 
+    /// Serves the detail probe used to confirm deletion by primary key.
+    #[allow(clippy::unused_async)]
+    async fn get_user(State(state): State<MockState>, Path(user_id): Path<i64>) -> Response {
+        let deleted = state.deleted_users.lock().unwrap().contains(&user_id);
+        if deleted {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Json(json!({ "pk": user_id, "username": "sc-managed-probe" })).into_response()
+    }
+
     async fn delete_user(State(state): State<MockState>, Path(user_id): Path<i64>) -> Response {
-        if let Some(response) = apply(&behavior(&state, |script| script.delete_user.clone())).await
-        {
+        let scripted = behavior(&state, |script| script.delete_user.clone());
+        if let Some(response) = apply(&scripted).await {
             return response;
         }
         state.deleted_users.lock().unwrap().push(user_id);
+        if matches!(scripted, Behavior::CommitThenTimeout) {
+            sleep(Duration::from_secs(30)).await;
+        }
         StatusCode::NO_CONTENT.into_response()
     }
 
@@ -1106,7 +1144,7 @@ mod tests {
             .route("/api/v3/core/users/service_account/", post(create_account))
             .route(
                 "/api/v3/core/users/{user_id}/",
-                patch(set_attributes).delete(delete_user),
+                patch(set_attributes).delete(delete_user).get(get_user),
             )
             .route("/api/v3/core/users/", get(list_users))
             .route("/api/v3/core/tokens/", get(list_tokens))
@@ -1746,6 +1784,33 @@ mod tests {
             .expect("retried revocation must succeed");
         assert!(rows(&service).await.is_empty());
         assert!(!mock.deleted_users().is_empty());
+    }
+
+    /// An ambiguous deletion is settled by probing the account by primary key,
+    /// so revocation is not reported as failed when Authentik already
+    /// committed the delete. The probe uses the detail endpoint because
+    /// Authentik refuses the list endpoint once the manager holds no visible
+    /// account, which is precisely the state after a final deletion.
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn ambiguous_deletion_is_confirmed_by_primary_key() {
+        let mock = mock_authentik().await;
+        let service = service_or_skip!(&mock);
+        let (connection_id, _) = create(&service, "Ambiguous delete", "/apps/api", &manage("/"))
+            .await
+            .expect("create must succeed");
+
+        // Authentik commits the deletion but the response never arrives.
+        mock.script(|script| script.delete_user = Behavior::CommitThenTimeout);
+        service
+            .revoke_managed_connection(request(
+                RevokeManagedConnectionRequest { connection_id },
+                &manage("/"),
+            ))
+            .await
+            .expect("a committed deletion must be confirmed despite the timeout");
+
+        assert!(rows(&service).await.is_empty());
     }
 
     #[tokio::test]
