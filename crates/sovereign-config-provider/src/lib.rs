@@ -56,7 +56,15 @@
 //! The underlying transport is `!Send`; drive [`Provider::connect`] and
 //! [`Provider::load`] on the task owning the runtime (a current-thread runtime,
 //! or `spawn_local`/`LocalSet`), not on a `Send`-bound `tokio::spawn`.
+//!
+//! # `config` integration
+//!
+//! Enable the optional `config` feature for `SovereignConfigSource`, a
+//! [`config`](https://docs.rs/config) source that loads the managed subtree when
+//! the configuration is built.
 
+#[cfg(feature = "config")]
+mod config_source;
 mod error;
 mod mapping;
 mod token;
@@ -70,6 +78,8 @@ use sovereign_config_core::{
 };
 use sovereign_config_native::TonicTransport;
 
+#[cfg(feature = "config")]
+pub use config_source::SovereignConfigSource;
 pub use error::ProviderError;
 use mapping::subtree_to_json;
 use token::ManagedTokenProvider;

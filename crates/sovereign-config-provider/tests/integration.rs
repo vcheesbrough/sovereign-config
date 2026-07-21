@@ -333,6 +333,54 @@ async fn load_json_returns_the_revealed_subtree_as_json() {
     assert_eq!(harness.mock.reveal_requests.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(feature = "config")]
+#[tokio::test]
+async fn config_source_layers_the_managed_subtree() {
+    use config::Config;
+    use sovereign_config_provider::SovereignConfigSource;
+
+    let harness = Harness::start(Arc::new(MockState::happy())).await;
+    let url = harness.url.clone();
+
+    // The source blocks internally, so run the builder off the async runtime
+    // thread; the mock servers keep running on this test's runtime meanwhile.
+    let config = tokio::task::spawn_blocking(move || {
+        Config::builder()
+            .add_source(SovereignConfigSource::from_url(url))
+            .build()
+            .unwrap()
+            .try_deserialize::<AppConfig>()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        config,
+        AppConfig {
+            feature: "on".to_owned(),
+            database: Database {
+                url: "postgres://localhost/app".to_owned(),
+                password: "app-password-sentinel".to_owned(),
+            },
+        }
+    );
+    assert_eq!(harness.mock.reveal_requests.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "config")]
+#[test]
+fn config_source_debug_does_not_leak_the_url() {
+    use sovereign_config_provider::SovereignConfigSource;
+
+    let source = SovereignConfigSource::from_url(
+        "https://config.example.test/apps/api#v=1&client_secret=super-secret-sentinel",
+    );
+    let rendered = format!("{source:?}");
+    assert!(!rendered.contains("super-secret-sentinel"));
+    assert!(!rendered.contains("config.example.test"));
+}
+
 #[tokio::test]
 async fn each_load_reacquires_token_and_rereads_without_cache() {
     let harness = Harness::start(Arc::new(MockState::happy())).await;
