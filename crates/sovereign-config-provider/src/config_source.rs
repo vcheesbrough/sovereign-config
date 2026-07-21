@@ -146,14 +146,16 @@ where
             )));
         }
         let contents = read_file(path).map_err(|error| {
+            // Never echo the path value: a misconfigured `_FILE` could hold the
+            // secret URL itself. The OS error does not contain the path.
             ConfigError::Message(format!(
-                "`{URL_FILE_VAR}` points to `{path}`, which could not be read: {error}"
+                "`{URL_FILE_VAR}` points to a file that could not be read: {error}"
             ))
         })?;
         let value = contents.trim();
         if value.is_empty() {
             return Err(ConfigError::Message(format!(
-                "the connection URL file `{path}` referenced by `{URL_FILE_VAR}` is empty"
+                "the file referenced by `{URL_FILE_VAR}` is empty"
             )));
         }
         return Ok(value.to_owned());
@@ -278,16 +280,18 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_url_file_reports_the_path_and_cause() {
+    fn unreadable_url_file_reports_the_cause_without_the_path() {
         let message = resolve_connection_url(
-            Some("/missing".to_owned()),
+            Some("/run/secrets/managed-url".to_owned()),
             || Ok(None),
             |_| Err(Error::new(ErrorKind::NotFound, "no such file")),
         )
         .unwrap_err()
         .to_string();
-        assert!(message.contains("/missing"));
+        assert!(message.contains(URL_FILE_VAR));
         assert!(message.contains("could not be read"));
+        // The path value is redacted: it could be a misconfigured secret URL.
+        assert!(!message.contains("/run/secrets/managed-url"));
     }
 
     #[test]

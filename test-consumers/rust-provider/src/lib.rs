@@ -10,10 +10,20 @@ use serde::Deserialize;
 use sovereign_config_provider::{Provider, ProviderError};
 
 /// A representative application configuration loaded from a managed root.
+///
+/// Field names match Sovereign Config path segments, which are lowercase ASCII
+/// letters, digits, and `-` only — never `_` — so nested structs mirror the
+/// path hierarchy (`<root>/feature`, `<root>/database/url`, …).
+#[derive(Debug, Deserialize)]
+pub struct Database {
+    pub url: String,
+    pub password: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
-    pub database_url: String,
-    pub feature_flag: String,
+    pub feature: String,
+    pub database: Database,
 }
 
 /// Connects with a managed connection URL and loads typed configuration.

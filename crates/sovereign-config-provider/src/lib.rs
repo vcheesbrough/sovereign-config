@@ -13,10 +13,18 @@
 //! use serde::Deserialize;
 //! use sovereign_config_provider::{Provider, ProviderError};
 //!
+//! // Field names are Sovereign Config path segments (lowercase, digits, `-`;
+//! // never `_`), so nested structs mirror the path hierarchy.
+//! #[derive(Deserialize)]
+//! struct Database {
+//!     url: String,
+//!     password: String,
+//! }
+//!
 //! #[derive(Deserialize)]
 //! struct AppConfig {
-//!     database_url: String,
-//!     feature_flag: String,
+//!     feature: String,
+//!     database: Database,
 //! }
 //!
 //! # async fn example(url: &str) -> Result<(), ProviderError> {
