@@ -372,7 +372,7 @@ impl Configuration for ConfigurationService {
         request: Request<DeleteValuesRequest>,
     ) -> Result<Response<DeleteValuesResponse>, Status> {
         let recurse = request.get_ref().recurse;
-        let path = authorize(&request, &[Permission::Manage], recurse)?;
+        let path = authorize(&request, &[Permission::Write], recurse)?;
         let mut transaction = self
             .database
             .begin()
@@ -932,13 +932,53 @@ mod tests {
             ["/tests/exact/alpha", "/tests/exact/nested/beta"]
         );
 
-        let exact_delete = service
+        let manage_only_exact_delete_denied = service
             .delete_values(request(
                 DeleteValuesRequest {
                     path: "/tests/exact/alpha".into(),
                     recurse: false,
                 },
                 &[Permission::Manage],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            manage_only_exact_delete_denied.code(),
+            Code::PermissionDenied
+        );
+        let read_only_exact_delete_denied = service
+            .delete_values(request(
+                DeleteValuesRequest {
+                    path: "/tests/exact/alpha".into(),
+                    recurse: false,
+                },
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(read_only_exact_delete_denied.code(), Code::PermissionDenied);
+        let manage_only_recursive_delete_denied = service
+            .delete_values(request(
+                DeleteValuesRequest {
+                    path: "/tests/exact".into(),
+                    recurse: true,
+                },
+                &[Permission::Manage],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            manage_only_recursive_delete_denied.code(),
+            Code::PermissionDenied
+        );
+
+        let exact_delete = service
+            .delete_values(request(
+                DeleteValuesRequest {
+                    path: "/tests/exact/alpha".into(),
+                    recurse: false,
+                },
+                &[Permission::Write],
             ))
             .await
             .unwrap()
@@ -950,7 +990,7 @@ mod tests {
                     path: "/tests/exact".into(),
                     recurse: true,
                 },
-                &[Permission::Manage],
+                &[Permission::Write],
             ))
             .await
             .unwrap()
@@ -975,7 +1015,7 @@ mod tests {
                     path: "/tests/exact".into(),
                     recurse: true,
                 },
-                &[Permission::Manage],
+                &[Permission::Write],
             ))
             .await
             .unwrap_err();
@@ -1317,7 +1357,7 @@ mod tests {
                     recurse: false,
                 },
                 "/tests/secrets",
-                &[Permission::Manage],
+                &[Permission::Write],
             ))
             .await
             .unwrap();
