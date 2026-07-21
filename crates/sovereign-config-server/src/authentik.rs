@@ -801,6 +801,22 @@ mod live_tests {
         )
     }
 
+    /// An elevated client used only to create and clean up disposable canary
+    /// objects that the manager under test must be denied access to. Never
+    /// used to exercise the manager's own restricted behavior.
+    fn live_admin_client() -> Option<AuthentikAdminClient> {
+        let origin = env::var("SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL").ok()?;
+        let token = env::var("SOVEREIGN_CONFIG_LIVE_AUTHENTIK_ADMIN_TOKEN").ok()?;
+        if origin.trim().is_empty() || token.trim().is_empty() {
+            return None;
+        }
+        let origin: Url = origin.parse().expect("live Authentik URL must be valid");
+        Some(
+            AuthentikAdminClient::new(origin, Secret::new(token.trim()), LIVE_TIMEOUT)
+                .expect("live Authentik admin client must build"),
+        )
+    }
+
     /// A disposable username that cannot collide with a managed connection.
     fn disposable_username(suffix: &str) -> String {
         let mut bytes = [0_u8; 8];
@@ -953,27 +969,50 @@ mod live_tests {
     }
 
     /// The manager must not be able to act on an object it did not create.
+    ///
+    /// Uses a disposable canary rather than a real object: verifying a denial
+    /// by attempting a live, mutating delete against a precious, irreplaceable
+    /// object (e.g. the bootstrap administrator) would make the very
+    /// permission regression this test exists to catch also the mechanism
+    /// that destroys that object. The canary is created and, regardless of
+    /// outcome, cleaned up with a separate, more-privileged credential that
+    /// the manager under test never has access to.
     #[tokio::test]
-    #[ignore = "requires SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL and _TOKEN"]
+    #[ignore = "requires SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL, _TOKEN, and _ADMIN_TOKEN"]
     async fn live_manager_cannot_touch_unrelated_objects() {
-        let Some(client) = live_client() else {
+        let (Some(client), Some(admin)) = (live_client(), live_admin_client()) else {
             return;
         };
-
-        // The bootstrap administrator is user 1 and is never manager-created.
-        let denied = client.delete_user(1).await;
-        assert!(
-            matches!(denied, Err(AdminError::NotFound | AdminError::Rejected)),
-            "deleting an unrelated user must be denied, got {denied:?}"
-        );
-
-        let missing = client
-            .find_app_password_identifiers("sc-livetest-nonexistent-account")
+        let canary_username = disposable_username("canary");
+        let canary = admin
+            .create_service_account(&canary_username)
             .await
-            .expect("a scoped lookup for an unknown account must succeed");
-        assert!(
-            missing.is_empty(),
-            "an unknown account must yield no credentials"
-        );
+            .expect("the admin credential must be able to create a canary account");
+
+        let checks = async {
+            let denied = client.delete_user(canary.user_id).await;
+            if !matches!(denied, Err(AdminError::NotFound | AdminError::Rejected)) {
+                return Err(format!(
+                    "deleting an unrelated user must be denied, got {denied:?}"
+                ));
+            }
+
+            let missing = client
+                .find_app_password_identifiers("sc-livetest-nonexistent-account")
+                .await
+                .map_err(|error| {
+                    format!("a scoped lookup for an unknown account failed: {error:?}")
+                })?;
+            if !missing.is_empty() {
+                return Err("an unknown account must yield no credentials".to_owned());
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+
+        // Cleanup uses the admin credential: the manager must never be relied
+        // on to delete an object it was just proven unable to delete.
+        let _ = admin.delete_user(canary.user_id).await;
+        checks.expect("the manager must be denied access to an object it did not create");
     }
 }

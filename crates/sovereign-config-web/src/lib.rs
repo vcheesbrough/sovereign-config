@@ -1696,8 +1696,15 @@ async fn create_connection() {
                 input.set_value("");
             }
             set_text("connection-state", "Connection created");
+            let generation = CONNECTIONS_LOAD_GENERATION.get();
             load_current_connections().await;
-            open_connection_url_dialog(&provisioned, "create-connection");
+            // If the generation advanced by more than this reload's own
+            // bump, a concurrent logout or navigation happened while it was
+            // in flight; opening the one-time URL dialog now would resurrect
+            // a credential after the user has already left.
+            if CONNECTIONS_LOAD_GENERATION.get() == generation.wrapping_add(1) {
+                open_connection_url_dialog(&provisioned, "create-connection");
+            }
         }
         Err(error) => {
             set_text("connection-state", "Error");
@@ -1730,8 +1737,14 @@ async fn rotate_connection() {
     match result {
         Ok(provisioned) => {
             set_text("connection-state", "Credential rotated");
+            let generation = CONNECTIONS_LOAD_GENERATION.get();
             load_current_connections().await;
-            open_connection_url_dialog(&provisioned, "connections-heading");
+            // Same ordering hazard as create: a concurrent logout or
+            // navigation while the reload was in flight must suppress the
+            // one-time URL dialog rather than resurrect it afterward.
+            if CONNECTIONS_LOAD_GENERATION.get() == generation.wrapping_add(1) {
+                open_connection_url_dialog(&provisioned, "connections-heading");
+            }
         }
         Err(error) => {
             // Refresh first: reloading clears the error banner, so the

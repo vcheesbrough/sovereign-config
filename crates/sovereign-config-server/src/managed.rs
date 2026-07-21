@@ -12,6 +12,7 @@ use sovereign_config_core::{
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
+use tokio::time::sleep;
 use tonic::{Request, Response, Status};
 
 use crate::auth::{AuthenticatedPrincipal, Permission};
@@ -33,6 +34,14 @@ const CONNECTION_ID_CHARS: usize = 32;
 const APP_PASSWORD_CHARS: usize = 48;
 const USERNAME_PREFIX: &str = "sc-managed-";
 const USERNAME_SLUG_MAX_CHARS: usize = 32;
+/// How many times to re-probe for a possibly-delayed create before giving up
+/// on finding it. A single immediate probe cannot distinguish "never
+/// created" from "the original request is still processing".
+const CREATE_RECONCILIATION_ATTEMPTS: u32 = 3;
+/// Delay between reconciliation probes, giving a slow-but-still-processing
+/// original create request a bounded chance to land before every retry is
+/// exhausted.
+const CREATE_RECONCILIATION_DELAY: Duration = Duration::from_millis(500);
 
 /// Non-secret settings used to build canonical connection URLs and grants.
 pub(crate) struct ManagedSettings {
@@ -321,10 +330,19 @@ impl ManagedConnectionsService {
         };
 
         let row = match self
-            .transition_state(connection_id, ManagedConnectionState::Active)
+            .transition_state(
+                connection_id,
+                ManagedConnectionState::Provisioning,
+                ManagedConnectionState::Active,
+            )
             .await
         {
-            Ok(row) => row,
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return Err(self
+                    .compensate_created_account(connection_id, account.user_id, internal_error())
+                    .await);
+            }
             Err(status) => {
                 return Err(self
                     .compensate_created_account(connection_id, account.user_id, status)
@@ -438,53 +456,71 @@ impl ManagedConnectionsService {
             .record_dependency(ManagedDependencyCall::AssignGroup, outcome);
     }
 
+    /// Locks the row, validates it is rotatable, and transitions it to
+    /// `rotation_unknown` before the external call so an interruption is
+    /// always represented as an ambiguous rotation.
+    async fn begin_rotation(
+        &self,
+        connection_id: &ConnectionId,
+        request: &Request<RotateManagedConnectionRequest>,
+    ) -> Result<(ConnectionRow, ConfigPath), Status> {
+        let principal = principal(request)?;
+        let mut transaction = self.begin().await?;
+        let row = self
+            .lock_manageable(&mut transaction, connection_id, principal)
+            .await?;
+        let root = ConfigPath::parse(&row.root).map_err(|_| internal_error())?;
+        let state = ManagedConnectionState::parse(&row.state).map_err(|_| internal_error())?;
+        // `rotation_unknown` marks both an in-flight rotation and an
+        // ambiguous outcome. Re-entering is safe only once the lease has
+        // expired, which proves the *client* side of no earlier attempt
+        // can still be waiting; otherwise two rotations would overwrite
+        // each other's key and both report a URL as current.
+        //
+        // Residual risk (accepted, not closed): the lease bounds how long
+        // our own client waits for a response, not how long Authentik may
+        // keep processing a request whose response we already gave up on.
+        // If the original `set_key` call is slow enough to land after a
+        // later successful retry, it can silently overwrite the key again
+        // and invalidate the URL just returned to the caller. Closing this
+        // fully would need a precondition or idempotency mechanism on
+        // Authentik's `set_key` endpoint that does not currently exist;
+        // until then this narrow race is a known, accepted gap rather than
+        // a guarantee.
+        let recoverable = state == ManagedConnectionState::RotationUnknown
+            && OffsetDateTime::now_utc() - row.updated_at >= self.settings.rotation_lease;
+        if !(state == ManagedConnectionState::Active || recoverable) {
+            return Err(conflict_error());
+        }
+        if row.credential_identifier.is_none() {
+            return Err(conflict_error());
+        }
+        sqlx::query(
+            r"
+            UPDATE managed_connections
+            SET state = 'rotation_unknown', updated_at = $2
+            WHERE connection_id = $1
+            ",
+        )
+        .bind(connection_id.as_str())
+        .bind(OffsetDateTime::now_utc())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| storage_unavailable())?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| storage_unavailable())?;
+        Ok((row, root))
+    }
+
     async fn rotate(
         &self,
         request: &Request<RotateManagedConnectionRequest>,
     ) -> Result<RotateManagedConnectionResponse, Status> {
         let connection_id = ConnectionId::parse(request.get_ref().connection_id.clone())
             .map_err(|_| invalid_request())?;
-        let (row, root) = {
-            let principal = principal(request)?;
-            let mut transaction = self.begin().await?;
-            let row = self
-                .lock_manageable(&mut transaction, &connection_id, principal)
-                .await?;
-            let root = ConfigPath::parse(&row.root).map_err(|_| internal_error())?;
-            let state = ManagedConnectionState::parse(&row.state).map_err(|_| internal_error())?;
-            // `rotation_unknown` marks both an in-flight rotation and an
-            // ambiguous outcome. Re-entering is safe only once the lease has
-            // expired, which proves no earlier attempt can still be running;
-            // otherwise two rotations would overwrite each other's key and
-            // both report a URL as current.
-            let recoverable = state == ManagedConnectionState::RotationUnknown
-                && OffsetDateTime::now_utc() - row.updated_at >= self.settings.rotation_lease;
-            if !(state == ManagedConnectionState::Active || recoverable) {
-                return Err(conflict_error());
-            }
-            if row.credential_identifier.is_none() {
-                return Err(conflict_error());
-            }
-            // The row transitions before the external call so an interruption
-            // is always represented as an ambiguous rotation.
-            sqlx::query(
-                r"
-                UPDATE managed_connections
-                SET state = 'rotation_unknown', updated_at = $2
-                WHERE connection_id = $1
-                ",
-            )
-            .bind(connection_id.as_str())
-            .bind(OffsetDateTime::now_utc())
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| storage_unavailable())?;
-            transaction
-                .commit()
-                .await
-                .map_err(|_| storage_unavailable())?;
-            (row, root)
-        };
+        let (row, root) = self.begin_rotation(&connection_id, request).await?;
 
         let credential_identifier = row
             .credential_identifier
@@ -512,7 +548,11 @@ impl ManagedConnectionsService {
                     // credential is still current.
                     AdminError::Rejected | AdminError::Unavailable => {
                         let _ = self
-                            .transition_state(&connection_id, ManagedConnectionState::Active)
+                            .transition_state(
+                                &connection_id,
+                                ManagedConnectionState::RotationUnknown,
+                                ManagedConnectionState::Active,
+                            )
                             .await;
                     }
                     // The token is gone; only revocation can clean this up.
@@ -520,6 +560,7 @@ impl ManagedConnectionsService {
                         let _ = self
                             .transition_state(
                                 &connection_id,
+                                ManagedConnectionState::RotationUnknown,
                                 ManagedConnectionState::CleanupRequired,
                             )
                             .await;
@@ -541,9 +582,21 @@ impl ManagedConnectionsService {
             &replacement,
         )
         .map_err(|_| internal_error())?;
-        let row = self
-            .transition_state(&connection_id, ManagedConnectionState::Active)
-            .await?;
+        // If a concurrent revoke already claimed the row (it is no longer
+        // `rotation_unknown`), the replacement credential was still applied
+        // externally, but the row is being torn down; reporting this
+        // rotation's URL as current would hand out a credential that is
+        // about to be revoked.
+        let Some(row) = self
+            .transition_state(
+                &connection_id,
+                ManagedConnectionState::RotationUnknown,
+                ManagedConnectionState::Active,
+            )
+            .await?
+        else {
+            return Err(dependency_error());
+        };
         Ok(RotateManagedConnectionResponse {
             metadata: Some(proto_metadata(&row)?),
             connection_url: connection_url.canonical().expose().to_owned(),
@@ -600,7 +653,15 @@ impl ManagedConnectionsService {
                         ManagedDependencyCall::FindUser,
                         dependency_outcome(error),
                     );
-                    return Err(dependency_error());
+                    // The lookup may be refused for an account the manager
+                    // can no longer see rather than reporting it missing.
+                    // Settle it via the app password, which is authoritative
+                    // because the token view is global and cascades with
+                    // the account.
+                    if !self.credential_is_gone(&username).await {
+                        return Err(dependency_error());
+                    }
+                    None
                 }
             }
         };
@@ -613,24 +674,21 @@ impl ManagedConnectionsService {
                         ManagedDependencyOutcome::Ok,
                     );
                 }
-                // Confirmed absence counts as a completed revocation.
-                Err(AdminError::NotFound) => {
-                    self.metrics.record_dependency(
-                        ManagedDependencyCall::DeleteUser,
-                        ManagedDependencyOutcome::NotFound,
-                    );
-                }
                 Err(error) => {
                     self.metrics.record_dependency(
                         ManagedDependencyCall::DeleteUser,
                         dependency_outcome(error),
                     );
-                    // Deletion may already have happened: Authentik refuses
-                    // rather than reporting "not found" for an account the
-                    // manager can no longer see, and a timeout is ambiguous by
-                    // definition. Settle it by looking for the account's app
-                    // password, which is authoritative because the token view
-                    // is global and Authentik cascades the token with the user.
+                    // Deletion may already have happened: Authentik refuses,
+                    // or reports "not found", rather than reporting "not
+                    // found" consistently for an account the manager can no
+                    // longer see (the live RBAC test exercises both), and a
+                    // timeout is ambiguous by definition. Settle it by
+                    // looking for the account's app password, which is
+                    // authoritative because the token view is global and
+                    // Authentik cascades the token with the user. Trusting
+                    // `NotFound` on its own would let a lost delete
+                    // permission orphan a still-live credential.
                     let username = managed_username(&connection_id, &row.display_name);
                     if !self.credential_is_gone(&username).await {
                         // The row stays `revoking`; revocation can be retried
@@ -685,27 +743,33 @@ impl ManagedConnectionsService {
         Ok(row)
     }
 
+    /// Compare-and-set transition: only moves the row when it is still in
+    /// `expected_state`. Returns `None` (rather than an error) when a
+    /// concurrent operation already moved the row, so callers can decide
+    /// whether that is a no-op or a failure without a spurious error being
+    /// mistaken for a storage fault.
     async fn transition_state(
         &self,
         connection_id: &ConnectionId,
+        expected_state: ManagedConnectionState,
         state: ManagedConnectionState,
-    ) -> Result<ConnectionRow, Status> {
+    ) -> Result<Option<ConnectionRow>, Status> {
         sqlx::query_as::<_, ConnectionRow>(
             r"
             UPDATE managed_connections
-            SET state = $2, updated_at = $3
-            WHERE connection_id = $1
+            SET state = $3, updated_at = $4
+            WHERE connection_id = $1 AND state = $2
             RETURNING connection_id, display_name, root, provider_user_id,
                       credential_identifier, state, created_at, updated_at
             ",
         )
         .bind(connection_id.as_str())
+        .bind(expected_state.as_str())
         .bind(state.as_str())
         .bind(OffsetDateTime::now_utc())
         .fetch_optional(&self.database)
         .await
-        .map_err(|_| storage_unavailable())?
-        .ok_or_else(internal_error)
+        .map_err(|_| storage_unavailable())
     }
 
     /// Deletes the created service account and metadata row after a failed
@@ -748,38 +812,58 @@ impl ManagedConnectionsService {
         username: &str,
         error: AdminError,
     ) -> Status {
-        if error != AdminError::Ambiguous {
-            // The account was definitively not created.
+        // `Invalid` covers two cases the adapter cannot tell apart: a garbled
+        // 2xx that Authentik never really committed, and a 2xx that Authentik
+        // did commit but whose fields failed this server's own strict
+        // validation. Since the second case is a real, live account, `Invalid`
+        // must be reconciled the same way as `Ambiguous` rather than assumed
+        // definitively absent.
+        if !matches!(error, AdminError::Ambiguous | AdminError::Invalid) {
+            // Only a transport-level rejection or unavailability is
+            // definitive: the request could not have been applied.
             let _ = self.delete_row(connection_id).await;
             return dependency_error();
         }
         // Authentik may have committed the account; probe only the exact
-        // generated username and remove only the matching managed account.
-        match self.admin.find_user_by_username(username).await {
-            Ok(Some(user)) => {
-                self.metrics.record_dependency(
-                    ManagedDependencyCall::FindUser,
-                    ManagedDependencyOutcome::Ok,
-                );
-                self.compensate_created_account(connection_id, user.user_id, dependency_error())
-                    .await
+        // generated username and remove only the matching managed account. A
+        // single immediate probe cannot distinguish "never created" from "the
+        // original request is still processing", so retry with a bounded
+        // delay before concluding absence. Even after every retry, retain a
+        // `cleanup_required` row rather than deleting it: a create that lands
+        // after the last retry can then still be found and revoked, instead
+        // of being silently orphaned with no record anywhere.
+        for attempt in 0..CREATE_RECONCILIATION_ATTEMPTS {
+            if attempt > 0 {
+                sleep(CREATE_RECONCILIATION_DELAY).await;
             }
-            Ok(None) => {
-                self.metrics.record_dependency(
-                    ManagedDependencyCall::FindUser,
-                    ManagedDependencyOutcome::Ok,
-                );
-                let _ = self.delete_row(connection_id).await;
-                dependency_error()
-            }
-            Err(probe_error) => {
-                self.metrics.record_dependency(
-                    ManagedDependencyCall::FindUser,
-                    dependency_outcome(probe_error),
-                );
-                cleanup_required(connection_id, self).await
+            match self.admin.find_user_by_username(username).await {
+                Ok(Some(user)) => {
+                    self.metrics.record_dependency(
+                        ManagedDependencyCall::FindUser,
+                        ManagedDependencyOutcome::Ok,
+                    );
+                    return self
+                        .compensate_created_account(connection_id, user.user_id, dependency_error())
+                        .await;
+                }
+                Ok(None) => {
+                    self.metrics.record_dependency(
+                        ManagedDependencyCall::FindUser,
+                        ManagedDependencyOutcome::Ok,
+                    );
+                    // Not found on this attempt; keep retrying rather than
+                    // concluding absence from a single probe.
+                }
+                Err(probe_error) => {
+                    self.metrics.record_dependency(
+                        ManagedDependencyCall::FindUser,
+                        dependency_outcome(probe_error),
+                    );
+                    return cleanup_required(connection_id, self).await;
+                }
             }
         }
+        cleanup_required(connection_id, self).await
     }
 
     /// Confirms that no app password remains for the exact managed username.
@@ -827,7 +911,11 @@ async fn cleanup_required(
     service: &ManagedConnectionsService,
 ) -> Status {
     let _ = service
-        .transition_state(connection_id, ManagedConnectionState::CleanupRequired)
+        .transition_state(
+            connection_id,
+            ManagedConnectionState::Provisioning,
+            ManagedConnectionState::CleanupRequired,
+        )
         .await;
     Status::unavailable(CLEANUP_MESSAGE)
 }
@@ -1005,6 +1093,9 @@ mod tests {
         /// Apply the change, then refuse, as Authentik does once the caller can
         /// no longer see the object.
         CommitThenRefuse,
+        /// Apply the change, then report "not found", as Authentik does for
+        /// an object the caller has lost visibility into after it is gone.
+        CommitThenNotFound,
     }
 
     #[derive(Clone)]
@@ -1025,6 +1116,10 @@ mod tests {
         /// Whether the configured browsing group exists in the directory.
         group_exists: bool,
         set_credential_delay: Duration,
+        /// Delay applied before the account is registered in the mock,
+        /// modeling a create request that has not yet committed in
+        /// Authentik while the client is still waiting for a response.
+        create_account_delay: Duration,
     }
 
     impl Default for Script {
@@ -1042,6 +1137,7 @@ mod tests {
                 credentials_visible: true,
                 group_exists: true,
                 set_credential_delay: Duration::ZERO,
+                create_account_delay: Duration::ZERO,
             }
         }
     }
@@ -1097,7 +1193,10 @@ mod tests {
         match behavior {
             // `CommitThenTimeout` applies the change in the handler itself,
             // so it produces no scripted response here.
-            Behavior::Ok | Behavior::CommitThenTimeout | Behavior::CommitThenRefuse => None,
+            Behavior::Ok
+            | Behavior::CommitThenTimeout
+            | Behavior::CommitThenRefuse
+            | Behavior::CommitThenNotFound => None,
             Behavior::Status(status) => Some((*status, "authentik-body-sentinel").into_response()),
             Behavior::Timeout => {
                 sleep(Duration::from_secs(30)).await;
@@ -1112,6 +1211,8 @@ mod tests {
     }
 
     async fn create_account(State(state): State<MockState>, Json(body): Json<Value>) -> Response {
+        let delay = state.script.lock().unwrap().create_account_delay;
+        sleep(delay).await;
         if let Some(response) =
             apply(&behavior(&state, |script| script.create_account.clone())).await
         {
@@ -1290,6 +1391,9 @@ mod tests {
         }
         if matches!(scripted, Behavior::CommitThenRefuse) {
             return (StatusCode::FORBIDDEN, "authentik-body-sentinel").into_response();
+        }
+        if matches!(scripted, Behavior::CommitThenNotFound) {
+            return (StatusCode::NOT_FOUND, "authentik-body-sentinel").into_response();
         }
         StatusCode::NO_CONTENT.into_response()
     }
@@ -1878,6 +1982,80 @@ mod tests {
         assert_eq!(rows[0].state, "cleanup_required");
     }
 
+    /// Regression: a 2xx create response that fails this server's own strict
+    /// validation (not a transport failure) must be reconciled the same way
+    /// as a timeout, because Authentik may genuinely have committed the
+    /// account even though the response body did not pass validation.
+    /// Treating it as definitively absent would orphan a live credential.
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn invalid_create_response_reconciles_a_genuinely_created_account() {
+        let mock = mock_authentik().await;
+        let service = service_or_skip!(&mock);
+
+        // The response is valid JSON but fails strict validation (username
+        // mismatch), while the account was actually created.
+        mock.script(|script| {
+            script.create_account = Behavior::Body(
+                json!({
+                    "username": "not-the-requested-username",
+                    "user_uid": "uid-mismatch",
+                    "user_pk": 4242,
+                    "token": APP_PASSWORD_SENTINEL,
+                })
+                .to_string(),
+            );
+            script.user_exists = true;
+        });
+        let status = create(&service, "Invalid response", "/apps/api", &manage("/"))
+            .await
+            .expect_err("an invalid create response must not return a URL");
+        assert_bounded(&status);
+        assert_eq!(
+            mock.deleted_users(),
+            [4242],
+            "the genuinely created account must be reconciled and deleted"
+        );
+        assert!(rows(&service).await.is_empty());
+    }
+
+    /// Regression: a single reconciliation probe cannot distinguish "the
+    /// account was never created" from "Authentik is still processing the
+    /// original request". If every retry finds nothing, the row must be kept
+    /// as `cleanup_required` rather than deleted, so a create that lands
+    /// after the last retry can still be found (via revoke) instead of being
+    /// silently orphaned with no record anywhere in Sovereign Config.
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn exhausted_reconciliation_retains_a_cleanup_required_row_instead_of_deleting_it() {
+        let mock = mock_authentik().await;
+        let service = service_or_skip!(&mock);
+
+        // The account genuinely never existed, and every reconciliation probe
+        // confirms that consistently.
+        mock.script(|script| {
+            script.create_account = Behavior::Timeout;
+            script.user_exists = false;
+        });
+        let status = create(&service, "Never created", "/apps/api", &manage("/"))
+            .await
+            .expect_err("an unresolved create must not return a URL");
+        assert_eq!(status.message(), "managed connection requires cleanup");
+        assert_bounded(&status);
+
+        let rows = rows(&service).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "the row must be retained, not deleted, when absence cannot be confirmed"
+        );
+        assert_eq!(rows[0].state, "cleanup_required");
+        assert!(
+            mock.deleted_users().is_empty(),
+            "nothing was found to delete"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
     async fn rotation_replaces_the_credential_and_recovers_from_ambiguity() {
@@ -1985,6 +2163,95 @@ mod tests {
         let rows = rows(&service).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, "active");
+    }
+
+    /// Regression: rotation moves the row to `rotation_unknown` and releases
+    /// its lock before the slow external call, so a concurrent revoke can
+    /// claim and delete the row in between. The rotation's later write-back
+    /// must not resurrect a row a revoke already claimed.
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn a_concurrent_revoke_is_not_undone_by_a_slow_rotation_write_back() {
+        let mock = mock_authentik().await;
+        let service = service_or_skip!(&mock);
+        let (connection_id, _) = create(&service, "Raced", "/apps/api", &manage("/"))
+            .await
+            .expect("create must succeed");
+        mock.script(|script| script.set_credential_delay = Duration::from_millis(120));
+
+        let rotation = service.rotate_managed_connection(request(
+            RotateManagedConnectionRequest {
+                connection_id: connection_id.clone(),
+            },
+            &manage("/"),
+        ));
+
+        // Give rotation time to move the row to `rotation_unknown` and
+        // release its lock before the revoke starts.
+        sleep(Duration::from_millis(40)).await;
+        service
+            .revoke_managed_connection(request(
+                RevokeManagedConnectionRequest {
+                    connection_id: connection_id.clone(),
+                },
+                &manage("/"),
+            ))
+            .await
+            .expect("revocation must succeed even while a rotation is in flight");
+
+        let status = rotation
+            .await
+            .expect_err("rotation must not resurrect a row a concurrent revoke already claimed");
+        assert_bounded(&status);
+
+        // The revoke's own deletion already completed; the rotation
+        // write-back must not have recreated or reactivated the row.
+        assert!(rows(&service).await.is_empty());
+    }
+
+    /// Regression: a revoke targeting a still-`provisioning` row (its create
+    /// call has not yet committed in Authentik) finds no account to delete
+    /// and removes the row as if nothing existed. The account that create
+    /// goes on to create moments later must not be left orphaned: the CAS
+    /// guard on the final `transition_state` call must notice its row is
+    /// gone and route create's own compensation to delete it.
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn a_revoke_racing_an_in_flight_create_does_not_orphan_the_account() {
+        let mock = mock_authentik().await;
+        let service = service_or_skip!(&mock);
+        mock.script(|script| script.create_account_delay = Duration::from_millis(120));
+        let principal = manage("/");
+
+        let create_future = create(&service, "Racing", "/apps/api", &principal);
+
+        let revoke_future = async {
+            // The row is inserted before the delayed create call returns;
+            // give it time to land, then target it before create finishes.
+            sleep(Duration::from_millis(30)).await;
+            let connection_id = rows(&service)
+                .await
+                .into_iter()
+                .find(|row| row.state == "provisioning")
+                .expect("the row must be visible before the delayed create call returns")
+                .connection_id;
+            service
+                .revoke_managed_connection(request(
+                    RevokeManagedConnectionRequest { connection_id },
+                    &principal,
+                ))
+                .await
+        };
+
+        let (created, revoked) = tokio::join!(create_future, revoke_future);
+
+        created.expect_err("create must fail once its row disappears underneath it");
+        revoked.expect("revoke racing a not-yet-committed create must still succeed");
+        assert!(rows(&service).await.is_empty());
+        assert!(
+            !mock.deleted_users().is_empty(),
+            "the account created after the race must be cleaned up rather than orphaned"
+        );
     }
 
     #[tokio::test]
@@ -2115,7 +2382,9 @@ mod tests {
             .await
             .expect("create must succeed");
 
-        mock.script(|script| script.delete_user = Behavior::Status(StatusCode::NOT_FOUND));
+        // Authentik commits the deletion, then reports "not found" for an
+        // account the manager can no longer see.
+        mock.script(|script| script.delete_user = Behavior::CommitThenNotFound);
         service
             .revoke_managed_connection(request(
                 RevokeManagedConnectionRequest { connection_id },
@@ -2123,6 +2392,75 @@ mod tests {
             ))
             .await
             .expect("confirmed absence must count as revoked");
+
+        assert!(rows(&service).await.is_empty());
+    }
+
+    /// Regression: Authentik masks a *denied* delete as "not found" the same
+    /// way it masks a denied read. Trusting `NotFound` on its own would let a
+    /// lost delete permission orphan a still-live credential with no record
+    /// left to retry revocation.
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn revocation_is_not_confirmed_when_a_denied_delete_is_masked_as_not_found() {
+        let mock = mock_authentik().await;
+        let service = service_or_skip!(&mock);
+        let (connection_id, _) = create(&service, "Denied", "/apps/api", &manage("/"))
+            .await
+            .expect("create must succeed");
+
+        // No cascading deletion: the account and its credential survive.
+        mock.script(|script| script.delete_user = Behavior::Status(StatusCode::NOT_FOUND));
+        let status = service
+            .revoke_managed_connection(request(
+                RevokeManagedConnectionRequest { connection_id },
+                &manage("/"),
+            ))
+            .await
+            .expect_err("a surviving credential must not be reported as revoked");
+        assert_bounded(&status);
+
+        let rows = rows(&service).await;
+        assert_eq!(rows.len(), 1, "the row must remain for retry");
+        assert_eq!(rows[0].state, "revoking");
+    }
+
+    /// Regression: a row with no `provider_user_id` (left by an exhausted
+    /// create reconciliation) must not get stuck forever just because the
+    /// user lookup itself is refused; confirm absence through the app
+    /// password before giving up, the same way a failed delete already does.
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn revocation_confirms_absence_via_credential_when_the_user_lookup_is_refused() {
+        let mock = mock_authentik().await;
+        let service = service_or_skip!(&mock);
+
+        // The account genuinely never existed, so no `provider_user_id` was
+        // ever recorded.
+        mock.script(|script| {
+            script.create_account = Behavior::Timeout;
+            script.user_exists = false;
+        });
+        create(&service, "Never created", "/apps/api", &manage("/"))
+            .await
+            .expect_err("an unresolved create must not return a URL");
+        let connection_id = rows(&service)
+            .await
+            .into_iter()
+            .next()
+            .expect("the cleanup_required row must be retained")
+            .connection_id;
+
+        // The user lookup itself is refused, as Authentik does for an
+        // account the manager can no longer see.
+        mock.script(|script| script.find_user = Behavior::Status(StatusCode::FORBIDDEN));
+        service
+            .revoke_managed_connection(request(
+                RevokeManagedConnectionRequest { connection_id },
+                &manage("/"),
+            ))
+            .await
+            .expect("a refused lookup with no surviving credential must confirm revocation");
 
         assert!(rows(&service).await.is_empty());
     }

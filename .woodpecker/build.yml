@@ -144,6 +144,11 @@ steps:
       SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL: https://auth.desync.link/
       SOVEREIGN_CONFIG_LIVE_AUTHENTIK_TOKEN:
         from_secret: sovereign_config_dev_manager_api_token
+      # Elevated credential used only to create and clean up a disposable
+      # canary object for the "manager cannot touch objects it didn't create"
+      # test; never used to act as the manager under test.
+      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_ADMIN_TOKEN:
+        from_secret: authentik_api_token
     volumes:
       - sovereign-config-cargo-registry:/usr/local/cargo/registry
       - sovereign-config-cargo-git:/usr/local/cargo/git
