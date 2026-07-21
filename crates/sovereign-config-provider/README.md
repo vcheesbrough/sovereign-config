@@ -78,7 +78,7 @@ fn main() {
         .add_source(File::with_name("examples/settings"))
         // Add in the managed Sovereign Config subtree; it connects, authenticates,
         // reads, and reveals its secrets when `build()` runs.
-        .add_source(SovereignConfigSource::from_url_env("APP_CONFIG_URL"))
+        .add_source(SovereignConfigSource::initialise_from_default_environment())
         // Add in settings from the environment (with a prefix of APP)
         // Eg.. `APP_DEBUG=1 ./target/app` would set the `debug` key
         .add_source(Environment::with_prefix("APP"))
@@ -101,9 +101,18 @@ is stored as text, `config`'s type coercion turns string leaves into the target
 type — a stored `"10"` into a `u32`, `"true"` into a `bool` — when you deserialize
 into your own `#[derive(Deserialize)]` struct instead of a `HashMap`.
 
-`SovereignConfigSource::from_url_env` reads the *connection URL* from the named
-environment variable at build time (the configuration values still come from the
-Sovereign Config subtree); `SovereignConfigSource::from_url` takes a URL directly.
+Constructors, all resolving the *connection URL* at build time (the configuration
+values always come from the Sovereign Config subtree):
+
+- `initialise_from_default_environment()` — the standard deployment entry point.
+  It first checks `SOVEREIGN_CONFIG_ACCESS_URL_FILE`; if set, the file at that
+  path is read and its trimmed contents are the URL (suited to secret managers
+  that mount the URL as a file). Otherwise it uses `SOVEREIGN_CONFIG_ACCESS_URL`
+  directly. If neither is set, building fails with an error naming both
+  variables.
+- `from_url_env(var)` — reads the URL from a custom environment variable.
+- `from_url(url)` — takes a URL directly.
+
 `collect` performs blocking network I/O on a dedicated internal thread, so
 `build()` is safe from both synchronous and asynchronous contexts. The source's
 `Debug` output never prints the URL.
