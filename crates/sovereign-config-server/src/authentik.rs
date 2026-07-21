@@ -784,9 +784,17 @@ mod live_tests {
     use super::{AdminError, AuthentikAdminClient, CreatedServiceAccount};
 
     const LIVE_TIMEOUT: Duration = Duration::from_secs(15);
-    /// CI only ever runs these tests against the development environment,
-    /// whose blueprint creates this exact browsing group.
-    const DEV_MANAGED_GROUP: &str = "sovereign-config-dev-connections";
+    /// Default browsing group when the environment does not name one — the
+    /// development blueprint creates this exact group.
+    const DEFAULT_MANAGED_GROUP: &str = "sovereign-config-dev-connections";
+
+    /// The browsing group the live lifecycle test must resolve, taken from the
+    /// deploying environment so a production promotion validates the production
+    /// group (`sovereign-config-connections`) rather than the development one.
+    fn live_managed_group() -> String {
+        env::var("SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP")
+            .unwrap_or_else(|_| DEFAULT_MANAGED_GROUP.to_owned())
+    }
 
     fn live_client() -> Option<AuthentikAdminClient> {
         let origin = env::var("SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL").ok()?;
@@ -878,12 +886,13 @@ mod live_tests {
             // Group membership is best-effort in production, but the manager
             // must actually be able to resolve and use it against real
             // Authentik, not only against the mock.
+            let managed_group = live_managed_group();
             let group_id = client
-                .find_group_by_name(DEV_MANAGED_GROUP)
+                .find_group_by_name(&managed_group)
                 .await
                 .map_err(|error| format!("resolving the browsing group failed: {error:?}"))?
                 .ok_or_else(|| {
-                    format!("the {DEV_MANAGED_GROUP} browsing group must exist in this environment")
+                    format!("the {managed_group} browsing group must exist in this environment")
                 })?;
             client
                 .add_user_to_group(account.user_id, &group_id)
