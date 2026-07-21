@@ -1,7 +1,13 @@
 # Step DAG: compute-version → build-server ┐
 # workspace-validation ∥ browser-validation ┴→ publish-dev-image →
-# validate-authentik-version → apply-authentik-blueprint-auto-dev →
-# auto-deploy-dev → tag-release-auto-dev.
+# validate-authentik-version ┬→ (push) apply-authentik-blueprint-auto-dev →
+#                            │           validate-authentik-manager-live →
+#                            │           auto-deploy-dev → tag-release-auto-dev
+#                            └→ (manual, main) apply-authentik-blueprint-prod →
+#                                        validate-authentik-manager-live-prod →
+#                                        deploy-prod.
+# A push auto-deploys dev; a manual run on main promotes the same built image to
+# production. The shared build/validate/publish prefix runs for both.
 when:
   - event: [push, manual]
 
@@ -94,6 +100,8 @@ steps:
   apply-authentik-blueprint-auto-dev:
     depends_on:
       - validate-authentik-version
+    when:
+      - event: push
     pull: true
     image: ghcr.io/vcheesbrough/woodpecker-plugin-authentik-blueprint:v0.2.0@sha256:9f262c4390205b5629e9af7560f4e492f0155395a429153703ba351206d9d975
     settings:
@@ -140,6 +148,8 @@ steps:
   validate-authentik-manager-live:
     depends_on:
       - apply-authentik-blueprint-auto-dev
+    when:
+      - event: push
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
     environment:
       CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
@@ -161,6 +171,8 @@ steps:
   auto-deploy-dev:
     depends_on:
       - validate-authentik-manager-live
+    when:
+      - event: push
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -193,6 +205,97 @@ steps:
       major_minor_source: cargo
       github_token:
         from_secret: github_token
+
+  # Production is a manual promotion of the already-built, environment-neutral
+  # image, and only from main. The dev deploy chain above is gated to push, so a
+  # manual run performs a production deployment and never also redeploys dev. The
+  # shared build/validate/publish steps run for this manual pipeline too, so the
+  # image and Authentik version are validated before production is touched.
+  apply-authentik-blueprint-prod:
+    depends_on:
+      - validate-authentik-version
+    # TEMPORARY (card #262): also allow a manual prod promotion from this
+    # iteration branch to smoke-test the production deploy before merge. Revert
+    # to `branch: main` (drop feat/iteration-9-prod-environment) before merging.
+    when:
+      - event: manual
+        branch: [main, feat/iteration-9-prod-environment]
+    pull: true
+    image: ghcr.io/vcheesbrough/woodpecker-plugin-authentik-blueprint:v0.2.0@sha256:9f262c4390205b5629e9af7560f4e492f0155395a429153703ba351206d9d975
+    settings:
+      api_url: https://auth.desync.link
+      api_token:
+        from_secret: authentik_api_token
+      file: authentik/blueprint.yaml
+      instance_name: sovereign-config
+      timeout_seconds: 900
+      vars:
+        AUTHENTIK_SOVEREIGN_CONFIG_INTROSPECTION_CLIENT_SECRET:
+          from_secret: sovereign_config_prod_oidc_introspection_client_secret
+        AUTHENTIK_SOVEREIGN_CONFIG_MANAGER_API_TOKEN:
+          from_secret: sovereign_config_prod_manager_api_token
+        SOVEREIGN_CONFIG_BROWSER_REDIRECT_URI: https://sovereign-config.desync.link/auth/callback
+        AUTHENTIK_BRAND_DOMAIN: auth.desync.link
+
+  # Mirrors validate-authentik-manager-live for production: exercises the
+  # connection manager against the real Authentik RBAC surface after the
+  # production blueprint applies, gating the deployment so a broken permission
+  # model cannot reach the running production service.
+  validate-authentik-manager-live-prod:
+    depends_on:
+      - apply-authentik-blueprint-prod
+    # TEMPORARY (card #262): also allow a manual prod promotion from this
+    # iteration branch to smoke-test the production deploy before merge. Revert
+    # to `branch: main` (drop feat/iteration-9-prod-environment) before merging.
+    when:
+      - event: manual
+        branch: [main, feat/iteration-9-prod-environment]
+    image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
+    environment:
+      CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
+      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL: https://auth.desync.link/
+      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_TOKEN:
+        from_secret: sovereign_config_prod_manager_api_token
+      # Elevated credential used only to create and clean up a disposable canary
+      # object for the "manager cannot touch objects it didn't create" test;
+      # never used to act as the manager under test.
+      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_ADMIN_TOKEN:
+        from_secret: authentik_api_token
+    volumes:
+      - sovereign-config-cargo-registry:/usr/local/cargo/registry
+      - sovereign-config-cargo-git:/usr/local/cargo/git
+      - sovereign-config-contract-target:/woodpecker/cache/sovereign-config-target
+    commands:
+      - cargo test --package sovereign-config-server live_ -- --ignored --test-threads=1
+
+  deploy-prod:
+    depends_on:
+      - validate-authentik-manager-live-prod
+    # TEMPORARY (card #262): also allow a manual prod promotion from this
+    # iteration branch to smoke-test the production deploy before merge. Revert
+    # to `branch: main` (drop feat/iteration-9-prod-environment) before merging.
+    when:
+      - event: manual
+        branch: [main, feat/iteration-9-prod-environment]
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      POSTGRES_PASSWORD:
+        from_secret: sovereign_config_prod_postgres_password
+      OIDC_INTROSPECTION_URL: https://auth.desync.link/application/o/introspect/
+      OIDC_ISSUER: https://auth.desync.link/application/o/sovereign-config/
+      OIDC_INTROSPECTION_CLIENT_SECRET:
+        from_secret: sovereign_config_prod_oidc_introspection_client_secret
+      MANAGER_API_TOKEN:
+        from_secret: sovereign_config_prod_manager_api_token
+    commands:
+      - |
+        ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
+        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=prod SOVEREIGN_CONFIG_HOST=sovereign-config.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-production POSTGRES_DATA_VOLUME=sovereign-config-production-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL="$$OIDC_INTROSPECTION_URL" SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET_FILE= SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET="$$OIDC_INTROSPECTION_CLIENT_SECRET" SOVEREIGN_CONFIG_PUBLIC_ORIGIN=https://sovereign-config.desync.link SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE=sovereign_config_prod_grants SOVEREIGN_CONFIG_MANAGER_GROUP=sovereign-config-connections SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE= SOVEREIGN_CONFIG_MANAGER_API_TOKEN="$$MANAGER_API_TOKEN" docker compose -p sovereign-config-prod up -d --wait --wait-timeout 90 || {
+          docker compose -p sovereign-config-prod logs --tail 200
+          exit 1
+        }
 
 services:
   postgres-test:
