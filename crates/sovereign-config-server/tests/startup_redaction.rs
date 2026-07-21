@@ -2,6 +2,7 @@ use std::process::{Command, Output};
 
 const SECRET: &str = "startup-redaction-sentinel-4d9a9fd8";
 const INTROSPECTION_SECRET: &str = "introspection-redaction-sentinel-a91c5e72";
+const MANAGER_SECRET: &str = "manager-redaction-sentinel-e3b7c1f4";
 
 fn run_server(environment: &[(&str, String)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sovereign-config-server"));
@@ -27,6 +28,10 @@ fn assert_secret_is_redacted(output: &Output) {
     assert!(
         !output.contains(INTROSPECTION_SECRET),
         "startup output exposed the introspection credential: {output}"
+    );
+    assert!(
+        !output.contains(MANAGER_SECRET),
+        "startup output exposed the manager credential: {output}"
     );
 }
 
@@ -64,6 +69,22 @@ fn configured_environment(grpc_addr: &str) -> Vec<(&'static str, String)> {
         ("SOVEREIGN_CONFIG_DATABASE_URL", database_url()),
         ("SOVEREIGN_CONFIG_GRPC_ADDR", grpc_addr.to_owned()),
         ("SOVEREIGN_CONFIG_METRICS_ADDR", "127.0.0.1:9090".to_owned()),
+        (
+            "SOVEREIGN_CONFIG_PUBLIC_ORIGIN",
+            "https://config.example.test".to_owned(),
+        ),
+        (
+            "SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE",
+            "sovereign_config_test_grants".to_owned(),
+        ),
+        (
+            "SOVEREIGN_CONFIG_MANAGER_GROUP",
+            "sovereign-config-test-connections".to_owned(),
+        ),
+        (
+            "SOVEREIGN_CONFIG_MANAGER_API_TOKEN",
+            MANAGER_SECRET.to_owned(),
+        ),
     ];
     environment.extend(authentication_environment());
     environment
@@ -79,6 +100,30 @@ fn invalid_configuration_does_not_expose_database_credentials() {
 #[test]
 fn database_startup_failure_does_not_expose_database_credentials() {
     let output = run_server(&configured_environment("127.0.0.1:50051"));
+
+    assert_secret_is_redacted(&output);
+}
+
+#[test]
+fn missing_manager_credential_fails_startup_without_echoing_values() {
+    let environment = configured_environment("127.0.0.1:50051")
+        .into_iter()
+        .filter(|(name, _)| *name != "SOVEREIGN_CONFIG_MANAGER_API_TOKEN")
+        .collect::<Vec<_>>();
+    let output = run_server(&environment);
+
+    assert_secret_is_redacted(&output);
+}
+
+#[test]
+fn invalid_public_origin_fails_startup_without_echoing_values() {
+    let mut environment = configured_environment("127.0.0.1:50051");
+    for entry in &mut environment {
+        if entry.0 == "SOVEREIGN_CONFIG_PUBLIC_ORIGIN" {
+            entry.1 = "https://config.example.test/nested/path".to_owned();
+        }
+    }
+    let output = run_server(&environment);
 
     assert_secret_is_redacted(&output);
 }

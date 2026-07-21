@@ -20,6 +20,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose};
 use serde_json::json;
+use sovereign_config_core::{ConfigPath, ConnectionUrl, Secret};
 use sovereign_config_proto::sovereign::config::v3::{
     DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse,
     GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest, GetVersionResponse,
@@ -58,6 +59,7 @@ struct OidcState {
     poll_count: AtomicUsize,
     refresh_count: AtomicUsize,
     managed_count: AtomicUsize,
+    managed_credential: Mutex<String>,
     reject_refresh: AtomicBool,
     reject_managed: AtomicBool,
     unavailable: AtomicBool,
@@ -1068,6 +1070,129 @@ async fn managed_authentication_rejection_is_bounded_and_never_creates_token_sta
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn core_managed_connection_urls_round_trip_the_stdin_profile_flow() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let url = core_managed_url(&services, "/team/service", "app-password-sentinel");
+
+    let add = run_cli_with_input(
+        home.path(),
+        &["profile", "add", "pipeline"],
+        Some(&format!("{url}\n")),
+    )
+    .await;
+    assert_success(&add);
+    let put = run_cli_with_input(
+        home.path(),
+        &["put", "/team/service/flag"],
+        Some("managed-flow-value"),
+    )
+    .await;
+    assert_success(&put);
+    let get = run_cli(home.path(), &["get", "/team/service/flag"]).await;
+    assert_success(&get);
+    assert_eq!(String::from_utf8_lossy(&get.stdout), "managed-flow-value");
+
+    assert!(credential_files(home.path()).is_empty());
+    for output in [&add, &put, &get] {
+        let output = combined(output);
+        assert_secrets_absent(&output);
+        assert!(
+            !output.contains(&url),
+            "connection URL appeared in command output"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rotated_managed_credentials_require_a_profile_update_with_the_new_url() {
+    let services = start_services(DeviceResult::Success).await;
+    "pipeline:rotation-new-password-sentinel"
+        .clone_into(&mut services.oidc_state.managed_credential.lock().unwrap());
+    let home = TempDir::new().unwrap();
+    let superseded_url =
+        core_managed_url(&services, "/team/service", "rotation-old-password-sentinel");
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["profile", "add", "pipeline"],
+            Some(&format!("{superseded_url}\n")),
+        )
+        .await,
+    );
+
+    let rejected = run_cli(home.path(), &["get", "/team/service/flag"]).await;
+    assert!(!rejected.status.success());
+    let rejected_output = combined(&rejected);
+    assert!(rejected_output.contains("managed authentication failed"));
+    for sentinel in [
+        "rotation-old-password-sentinel",
+        "rotation-new-password-sentinel",
+    ] {
+        assert!(
+            !rejected_output.contains(sentinel),
+            "credential appeared in command output"
+        );
+    }
+
+    let config = home.path().join("sovereign-config/config.toml");
+    assert_eq!(
+        fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(config.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+
+    let rotated_url =
+        core_managed_url(&services, "/team/service", "rotation-new-password-sentinel");
+    let update = run_cli_with_input(
+        home.path(),
+        &["profile", "update", "pipeline"],
+        Some(&format!("{rotated_url}\n")),
+    )
+    .await;
+    assert_success(&update);
+
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["put", "/team/service/flag"],
+            Some("rotated-flow-value"),
+        )
+        .await,
+    );
+    let get = run_cli(home.path(), &["get", "/team/service/flag"]).await;
+    assert_success(&get);
+    assert_eq!(String::from_utf8_lossy(&get.stdout), "rotated-flow-value");
+    assert!(credential_files(home.path()).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoked_managed_credentials_fail_authentication_once_without_retrying() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    add_profile(home.path(), &services, "pipeline", true).await;
+    services
+        .oidc_state
+        .reject_managed
+        .store(true, Ordering::SeqCst);
+
+    let revoked = run_cli(home.path(), &["get", "/team/service/flag"]).await;
+    assert!(!revoked.status.success());
+    let output = combined(&revoked);
+    assert!(output.contains("managed authentication failed"));
+    assert_secrets_absent(&output);
+    assert_eq!(services.oidc_state.managed_count.load(Ordering::SeqCst), 1);
+    assert!(credential_files(home.path()).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn denied_device_login_fails_without_exposing_credentials() {
     assert_login_failure(DeviceResult::Denied, "device login denied").await;
 }
@@ -1152,7 +1277,7 @@ fn version_does_not_require_profile_configuration() {
     assert_success(&output);
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "sovereign-config 1.5.0"
+        "sovereign-config 1.6.0"
     );
 }
 
@@ -1166,6 +1291,7 @@ async fn start_services(device_result: DeviceResult) -> TestServices {
         poll_count: AtomicUsize::new(0),
         refresh_count: AtomicUsize::new(0),
         managed_count: AtomicUsize::new(0),
+        managed_credential: Mutex::new(MANAGED_CREDENTIAL.to_owned()),
         reject_refresh: AtomicBool::new(false),
         reject_managed: AtomicBool::new(false),
         unavailable: AtomicBool::new(false),
@@ -1289,7 +1415,8 @@ async fn token(
         }
         Some("client_credentials") => {
             state.managed_count.fetch_add(1, Ordering::SeqCst);
-            let expected = general_purpose::STANDARD.encode(MANAGED_CREDENTIAL);
+            let expected =
+                general_purpose::STANDARD.encode(&*state.managed_credential.lock().unwrap());
             let valid = form.get("client_secret").map(String::as_str) == Some(expected.as_str())
                 && form.get("client_id").map(String::as_str) == Some("sovereign-config")
                 && form.get("scope").map(String::as_str) == Some("sovereign-config");
@@ -1366,6 +1493,21 @@ fn connection_url(services: &TestServices, managed: bool, root: &str) -> String 
         );
     }
     format!("{}/{root}#{}", services.endpoint, fragment.finish())
+}
+
+fn core_managed_url(services: &TestServices, root: &str, app_password: &str) -> String {
+    ConnectionUrl::managed(
+        &services.endpoint,
+        &ConfigPath::parse(root).unwrap(),
+        &services.issuer,
+        "sovereign-config",
+        "pipeline",
+        &Secret::new(app_password),
+    )
+    .unwrap()
+    .canonical()
+    .expose()
+    .to_owned()
 }
 
 fn credential_files(home: &Path) -> Vec<PathBuf> {

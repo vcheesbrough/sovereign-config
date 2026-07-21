@@ -24,6 +24,7 @@
       <nav aria-label="Administration">
         <a id="system-status-link" href="/">System status</a>
         <a id="configuration-values-link" href="/configuration/">Configuration values</a>
+        <a id="managed-connections-link" href="/connections/">Managed connections</a>
       </nav>
       <main id="main">
         <p id="error" class="error" role="alert" hidden></p>
@@ -134,8 +135,89 @@
             </div>
           </div>
         </div>
+
+        <div id="connections-page" class="page" hidden>
+          <div class="page-heading configuration-heading">
+            <div>
+              <p class="eyebrow">Configuration</p>
+              <h1>Managed connections</h1>
+            </div>
+            <p id="connection-state" class="status-text" aria-live="polite">Loading</p>
+          </div>
+
+          <form id="connection-form" class="path-form" novalidate>
+            <label for="connection-name">Display name</label>
+            <input id="connection-name" type="text" autocomplete="off" spellcheck="false" maxlength="100" aria-describedby="connection-name-error">
+            <p id="connection-name-error" class="field-error" aria-live="polite" hidden></p>
+            <label for="connection-root">Read-only root</label>
+            <div class="field-command">
+              <input id="connection-root" type="text" autocomplete="off" spellcheck="false" required value="/" aria-describedby="connection-root-error">
+              <button id="create-connection" type="submit">Create connection</button>
+            </div>
+            <p id="connection-root-error" class="field-error" aria-live="polite" hidden></p>
+          </form>
+
+          <div class="grid-toolbar">
+            <div>
+              <h2 id="connections-heading" tabindex="-1">Connections</h2>
+              <p id="connection-count" class="status-text">0 connections</p>
+            </div>
+          </div>
+
+          <div class="table-scroll">
+            <table aria-labelledby="connections-heading">
+              <thead>
+                <tr>
+                  <th scope="col">Name</th>
+                  <th scope="col">Root</th>
+                  <th scope="col">State</th>
+                  <th scope="col"><span class="visually-hidden">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="connections-body"></tbody>
+            </table>
+          </div>
+          <p id="empty-connections" class="empty-state" hidden>No managed connections for paths you can manage.</p>
+        </div>
       </main>
     </div>
+    <dialog id="create-connection-dialog" aria-labelledby="create-connection-title">
+      <h2 id="create-connection-title">Create this read-only connection?</h2>
+      <p><span id="create-connection-name" class="dialog-name"></span> will receive permanent read-only access to <code id="create-connection-root"></code> and nothing else. The connection URL is shown exactly once.</p>
+      <div class="actions">
+        <button id="cancel-create-connection" class="secondary" type="button">Cancel</button>
+        <button id="confirm-create-connection" type="button">Create connection</button>
+      </div>
+    </dialog>
+    <dialog id="rotate-connection-dialog" aria-labelledby="rotate-connection-title">
+      <h2 id="rotate-connection-title">Rotate this connection credential?</h2>
+      <p>The current URL for <span id="rotate-connection-name" class="dialog-name"></span> (<code id="rotate-connection-root"></code>) stops working immediately. The replacement URL is shown exactly once.</p>
+      <div class="actions">
+        <button id="cancel-rotate-connection" class="secondary" type="button">Cancel</button>
+        <button id="confirm-rotate-connection" class="danger" type="button">Rotate</button>
+      </div>
+    </dialog>
+    <dialog id="revoke-connection-dialog" aria-labelledby="revoke-connection-title">
+      <h2 id="revoke-connection-title">Permanently revoke this connection?</h2>
+      <p><span id="revoke-connection-name" class="dialog-name"></span> (<code id="revoke-connection-root"></code>) loses access immediately. A revoked connection cannot be restored.</p>
+      <div class="actions">
+        <button id="cancel-revoke-connection" class="secondary" type="button">Cancel</button>
+        <button id="confirm-revoke-connection" class="danger" type="button">Revoke</button>
+      </div>
+    </dialog>
+    <dialog id="connection-url-dialog" aria-labelledby="connection-url-title">
+      <h2 id="connection-url-title">One-time connection URL</h2>
+      <p id="connection-url-hint">This URL contains the connection credential and cannot be shown again. Store it now; a lost URL must be replaced by rotation.</p>
+      <p id="connection-url-mask" class="secret-mask" aria-label="Connection URL is hidden">********</p>
+      <label class="visually-hidden" for="revealed-connection-url">Revealed connection URL</label>
+      <textarea id="revealed-connection-url" class="revealed-connection-url" rows="6" readonly hidden aria-describedby="connection-url-hint"></textarea>
+      <p id="connection-url-status" class="status-text" aria-live="polite"></p>
+      <div class="actions">
+        <button id="reveal-connection-url" class="secondary" type="button" aria-controls="revealed-connection-url" aria-expanded="false">Reveal</button>
+        <button id="copy-connection-url" class="secondary" type="button">Copy</button>
+        <button id="close-connection-url" type="button">Close</button>
+      </div>
+    </dialog>
     <dialog id="delete-dialog" aria-labelledby="delete-title">
       <h2 id="delete-title">Permanently delete this value?</h2>
       <p><code id="delete-path"></code> will be removed immediately. This operation cannot be undone.</p>

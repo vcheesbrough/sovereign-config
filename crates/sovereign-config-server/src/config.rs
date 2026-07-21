@@ -1,9 +1,10 @@
-use std::{env, fs, net::SocketAddr, time::Duration};
+use std::{env, fs, net::IpAddr, net::SocketAddr, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
 
 const INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(3);
+const MANAGER_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct Config {
     pub(crate) database_url: String,
@@ -11,6 +12,18 @@ pub(crate) struct Config {
     pub(crate) metrics_addr: SocketAddr,
     pub(crate) authentication: AuthenticationConfig,
     pub(crate) web: WebConfig,
+    pub(crate) managed: ManagedConnectionConfig,
+}
+
+pub(crate) struct ManagedConnectionConfig {
+    pub(crate) public_origin: String,
+    pub(crate) issuer: String,
+    pub(crate) client_id: String,
+    pub(crate) grants_attribute: String,
+    pub(crate) managed_group: String,
+    pub(crate) api_origin: Url,
+    pub(crate) api_token: String,
+    pub(crate) timeout: Duration,
 }
 
 pub(crate) struct WebConfig {
@@ -54,10 +67,19 @@ impl Config {
         let issuer_url = issuer
             .parse::<Url>()
             .context("SOVEREIGN_CONFIG_OIDC_ISSUER must be a valid URL")?;
-        validate_issuer_url(&issuer_url)?;
+        validate_issuer_url(&issuer, &issuer_url)?;
         let audience = required_identifier("SOVEREIGN_CONFIG_OIDC_AUDIENCE")?;
         let introspection_client_id =
             required_identifier("SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID")?;
+
+        let public_origin =
+            validated_public_origin(&required_env("SOVEREIGN_CONFIG_PUBLIC_ORIGIN")?)?;
+        let grants_attribute = validated_grants_attribute(&required_env(
+            "SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE",
+        )?)?;
+        let managed_group = validated_group_name(&required_env("SOVEREIGN_CONFIG_MANAGER_GROUP")?)?;
+        let api_origin = issuer_api_origin(&issuer_url)?;
+        let api_token = required_secret("SOVEREIGN_CONFIG_MANAGER_API_TOKEN")?;
 
         Ok(Self {
             database_url,
@@ -76,11 +98,88 @@ impl Config {
                 timeout: INTROSPECTION_TIMEOUT,
             },
             web: WebConfig {
+                issuer: issuer.clone(),
+                client_id: audience.clone(),
+            },
+            managed: ManagedConnectionConfig {
+                public_origin,
                 issuer,
                 client_id: audience,
+                grants_attribute,
+                managed_group,
+                api_origin,
+                api_token,
+                timeout: MANAGER_TIMEOUT,
             },
         })
     }
+}
+
+/// Validates the exact canonical public origin used for generated URLs.
+///
+/// The origin must be HTTPS (or numeric-loopback HTTP for tests only) with no
+/// userinfo, path other than `/`, query, or fragment.
+fn validated_public_origin(value: &str) -> Result<String> {
+    let url = value
+        .parse::<Url>()
+        .context("SOVEREIGN_CONFIG_PUBLIC_ORIGIN must be a valid URL")?;
+    let loopback_http = url.scheme() == "http"
+        && url
+            .host_str()
+            .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
+            .is_some_and(|address| address.is_loopback());
+    if !(url.scheme() == "https" || loopback_http)
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("SOVEREIGN_CONFIG_PUBLIC_ORIGIN is not a permitted canonical origin");
+    }
+    let canonical = url.origin().ascii_serialization();
+    if value.trim_end_matches('/') != canonical {
+        bail!("SOVEREIGN_CONFIG_PUBLIC_ORIGIN is not a permitted canonical origin");
+    }
+    Ok(canonical)
+}
+
+/// Validates the environment-specific user attribute holding managed grants.
+fn validated_grants_attribute(value: &str) -> Result<String> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        bail!("SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE is not a permitted attribute name");
+    }
+    Ok(value.to_owned())
+}
+
+/// Validates the exact name of the Authentik group managed service accounts
+/// are added to for browsing. Not a security boundary, so only bounded and
+/// non-empty, matching the shape of a display name rather than an identifier.
+fn validated_group_name(value: &str) -> Result<String> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.chars().count() > 100
+        || value.chars().any(char::is_control)
+    {
+        bail!("SOVEREIGN_CONFIG_MANAGER_GROUP is not a permitted group name");
+    }
+    Ok(value.to_owned())
+}
+
+/// Derives the Authentik administration origin from the configured issuer so
+/// the API origin always matches the issuer origin exactly.
+fn issuer_api_origin(issuer: &Url) -> Result<Url> {
+    issuer
+        .origin()
+        .ascii_serialization()
+        .parse::<Url>()
+        .context("SOVEREIGN_CONFIG_OIDC_ISSUER origin is not a permitted API origin")
 }
 
 fn validate_introspection_url(url: &Url) -> Result<()> {
@@ -98,7 +197,11 @@ fn validate_introspection_url(url: &Url) -> Result<()> {
     Ok(())
 }
 
-fn validate_issuer_url(url: &Url) -> Result<()> {
+/// Rejects issuers that are valid URLs but not in the exact canonical form
+/// `ConnectionUrl::managed` requires when it later reparses the same string:
+/// accepting a non-canonical issuer here would only surface as a failure
+/// after Authentik has already been mutated by a create or rotate.
+fn validate_issuer_url(raw: &str, url: &Url) -> Result<()> {
     if url.scheme() != "https"
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -109,6 +212,9 @@ fn validate_issuer_url(url: &Url) -> Result<()> {
         || !url.path().ends_with('/')
     {
         bail!("SOVEREIGN_CONFIG_OIDC_ISSUER is not a permitted issuer URL");
+    }
+    if url.as_str() != raw {
+        bail!("SOVEREIGN_CONFIG_OIDC_ISSUER must be in canonical form (expected {url})");
     }
     Ok(())
 }
@@ -146,7 +252,10 @@ pub(crate) fn required_secret(name: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{required_env, validate_introspection_url, validate_issuer_url};
+    use super::{
+        issuer_api_origin, required_env, validate_introspection_url, validate_issuer_url,
+        validated_group_name, validated_public_origin,
+    };
 
     #[test]
     fn required_env_rejects_missing_values() {
@@ -196,23 +305,77 @@ mod tests {
     }
 
     #[test]
+    fn public_origin_requires_an_exact_canonical_origin() {
+        assert_eq!(
+            validated_public_origin("https://config.example.test").unwrap(),
+            "https://config.example.test"
+        );
+        assert_eq!(
+            validated_public_origin("https://config.example.test/").unwrap(),
+            "https://config.example.test"
+        );
+        assert_eq!(
+            validated_public_origin("http://127.0.0.1:50051").unwrap(),
+            "http://127.0.0.1:50051"
+        );
+        for invalid in [
+            "http://config.example.test",
+            "https://config.example.test/path",
+            "https://config.example.test?query=1",
+            "https://config.example.test#fragment",
+            "https://user@config.example.test",
+            "https://CONFIG.example.test",
+            "https://config.example.test:443",
+            "not-a-url",
+        ] {
+            assert!(validated_public_origin(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn api_origin_is_derived_from_the_issuer_origin() {
+        let issuer = "https://auth.example.test/application/o/sovereign-config/"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            issuer_api_origin(&issuer).unwrap().as_str(),
+            "https://auth.example.test/"
+        );
+    }
+
+    #[test]
+    fn group_name_is_bounded_and_trimmed() {
+        assert_eq!(
+            validated_group_name("Sovereign Config Connections").unwrap(),
+            "Sovereign Config Connections"
+        );
+        for invalid in ["", " padded", "padded ", &"x".repeat(101), "line\nbreak"] {
+            assert!(validated_group_name(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn issuer_requires_an_https_per_provider_url() {
-        assert!(
-            validate_issuer_url(
-                &"https://example.test/application/o/sovereign-config/"
-                    .parse()
-                    .unwrap()
-            )
-            .is_ok()
+        let canonical = "https://example.test/application/o/sovereign-config/";
+        assert!(validate_issuer_url(canonical, &canonical.parse().unwrap()).is_ok());
+        let no_provider_path = "https://example.test/";
+        assert!(validate_issuer_url(no_provider_path, &no_provider_path.parse().unwrap()).is_err());
+        let insecure = "http://example.test/application/o/sovereign-config/";
+        assert!(validate_issuer_url(insecure, &insecure.parse().unwrap()).is_err());
+    }
+
+    /// Regression: a valid-but-non-canonical issuer must be rejected at
+    /// startup rather than accepted and later fail managed URL generation
+    /// after Authentik has already been mutated by a create or rotate.
+    #[test]
+    fn issuer_must_already_be_in_canonical_form() {
+        let raw = "HTTPS://Example.test:443/application/o/sovereign-config/";
+        let url: reqwest::Url = raw.parse().unwrap();
+        assert_ne!(
+            url.as_str(),
+            raw,
+            "the test issuer must actually be non-canonical"
         );
-        assert!(validate_issuer_url(&"https://example.test/".parse().unwrap()).is_err());
-        assert!(
-            validate_issuer_url(
-                &"http://example.test/application/o/sovereign-config/"
-                    .parse()
-                    .unwrap()
-            )
-            .is_err()
-        );
+        assert!(validate_issuer_url(raw, &url).is_err());
     }
 }

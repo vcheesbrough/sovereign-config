@@ -6,9 +6,11 @@ Sovereign Config is a self-hosted, gRPC-first configuration service. This reposi
 
 The production Compose stack contains only PostgreSQL and Sovereign Config. It publishes no application, PostgreSQL, metrics, logging, or tracing ports. Traefik must provide the external `proxy-backend` network and is the only supported ingress. The operator must pre-create the external PostgreSQL volume named by `POSTGRES_DATA_VOLUME` on encrypted storage; Compose deliberately refuses to create a default volume. All backup and staging storage must be encrypted too. Sovereign Config does not add application-level encryption or manage an application encryption key: PostgreSQL volume and backup encryption are the release boundary.
 
-Create the secret files in an operator-controlled directory. The PostgreSQL password file is read by the PostgreSQL entrypoint and should be owned by `root:root` with mode `0400`. The database URL and Authentik introspection client secret files are read by Sovereign Config's fixed UID `10001` and must be owned by `10001:10001` with mode `0400`. Compose preserves host ownership for these file-backed secrets.
+Create the secret files in an operator-controlled directory. The PostgreSQL password file is read by the PostgreSQL entrypoint and should be owned by `root:root` with mode `0400`. The database URL, Authentik introspection client secret, and connection-manager API token files are read by Sovereign Config's fixed UID `10001` and must be owned by `10001:10001` with mode `0400`. Compose preserves host ownership for these file-backed secrets.
 
-`POSTGRES_PASSWORD_SECRET_FILE` points to the file containing only the PostgreSQL password. `DATABASE_URL_FILE` points to the file containing the complete private-network URL, for example `postgresql://sovereign_config:<password>@postgres:5432/sovereign_config`. `OIDC_INTROSPECTION_CLIENT_SECRET_FILE` points to the file containing only the matching Authentik introspection provider's client secret. Never commit these files.
+`POSTGRES_PASSWORD_SECRET_FILE` points to the file containing only the PostgreSQL password. `DATABASE_URL_FILE` points to the file containing the complete private-network URL, for example `postgresql://sovereign_config:<password>@postgres:5432/sovereign_config`. `OIDC_INTROSPECTION_CLIENT_SECRET_FILE` points to the file containing only the matching Authentik introspection provider's client secret. `MANAGER_API_TOKEN_FILE` points to the file containing only the dedicated Authentik connection-manager API token used to provision managed application connections. Never commit these files.
+
+Each of these secrets may instead be supplied directly through its environment variable — `SOVEREIGN_CONFIG_DATABASE_URL`, `SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET`, and `SOVEREIGN_CONFIG_MANAGER_API_TOKEN` — which takes precedence over the matching `_FILE` variable. This suits an external secret manager that injects values into the environment. Startup fails with a redacted error when a required secret is absent through both routes.
 
 Set the required deployment inputs and start the stack:
 
@@ -21,12 +23,18 @@ export POSTGRES_DATA_VOLUME='sovereign-config-production-db'
 export POSTGRES_PASSWORD_SECRET_FILE="$HOME/.config/sovereign-config/postgres-password"
 export DATABASE_URL_FILE="$HOME/.config/sovereign-config/database-url"
 export OIDC_INTROSPECTION_CLIENT_SECRET_FILE="$HOME/.config/sovereign-config/oidc-introspection-client-secret"
+export MANAGER_API_TOKEN_FILE="$HOME/.config/sovereign-config/manager-api-token"
 export SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL='https://<authentik-host>/application/o/introspect/'
 export SOVEREIGN_CONFIG_OIDC_ISSUER='https://<authentik-host>/application/o/sovereign-config/'
 export SOVEREIGN_CONFIG_OIDC_AUDIENCE='sovereign-config'
 export SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID='sovereign-config-introspection'
+export SOVEREIGN_CONFIG_PUBLIC_ORIGIN='https://config.example.internal'
+export SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE='sovereign_config_prod_grants'
+export SOVEREIGN_CONFIG_MANAGER_GROUP='sovereign-config-connections'
 docker compose up -d
 ```
+
+`SOVEREIGN_CONFIG_PUBLIC_ORIGIN` is the exact canonical HTTPS origin embedded in generated connection URLs. It must carry no userinfo, no path other than `/`, no query, and no fragment; numeric-loopback HTTP is accepted only in tests. `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE` names the environment-specific Authentik user attribute that carries managed grants, matching the scope mapping in that environment's blueprint. `SOVEREIGN_CONFIG_MANAGER_GROUP` names the Authentik group each managed connection's service account is added to purely so an operator can browse them together; it grants no permissions and must match a plain group entry in that environment's blueprint. The Authentik administration origin is derived from `SOVEREIGN_CONFIG_OIDC_ISSUER`, so the API and issuer origins can never diverge.
 
 `SOVEREIGN_CONFIG_IMAGE_TAG` selects the published Zot image; it defaults to `local` for local builds. `SOVEREIGN_CONFIG_ENV` labels metrics and logs and defaults to `dev`. PostgreSQL is pinned by digest. The service starts only after PostgreSQL reports healthy.
 
@@ -136,6 +144,20 @@ The introspection endpoint must use HTTPS and cannot contain credentials, a quer
 ### Credential rotation
 
 Authentik supports one client secret per introspection provider, so rotation has a short fail-closed maintenance window. Remove traffic, update the environment's secret source, apply that environment's blueprint, redeploy Sovereign Config with the same new secret, verify an authenticated request and unauthenticated `System.GetVersion`, then restore traffic. During the interval between blueprint application and redeployment, protected requests fail with `UNAVAILABLE`; no prior credential or authorization result is used.
+
+Rotating the connection-manager API token is narrower: update the environment's blueprint secret and the `MANAGER_API_TOKEN_FILE` contents together, apply the blueprint, then redeploy. Only managed-connection operations are affected while the two disagree; configuration reads and writes continue through the separate introspection credential. Verify by listing managed connections after redeployment.
+
+### Managed application connections
+
+A caller holding `manage` on a configuration root can provision a named, read-only machine connection from the administration UI. Sovereign Config creates a dedicated Authentik service account whose only grant is `{"prefix": "<root>", "permissions": ["read"]}`, discovers its single non-expiring app password, and returns one canonical version-1 connection URL. The unchanged CLI accepts that URL on stdin through `profile add`/`profile update` and uses client credentials to read only the encoded root.
+
+The complete URL is a secret and is returned exactly once, by creation and by successful rotation. Sovereign Config stores only non-secret lifecycle metadata — the opaque connection ID, display name, canonical root, opaque Authentik identifiers, and bounded state — and can never re-reveal a URL. A lost URL must be replaced by rotation, which invalidates the previous URL immediately.
+
+An interrupted rotation is reported as ambiguous: no URL is returned, the connection is marked `rotation_unknown`, and the previous URL is never claimed to be still valid. A further rotation is refused while the earlier attempt could still be in flight, then permitted once that lease expires so the credential can be overwritten with a known fresh value. Revocation deletes the Authentik service account and removes the metadata row only after deletion is confirmed by the app password's absence, since Authentik denies at the permission layer before object lookup once the manager holds no remaining visible account, so "gone" and "not permitted" cannot be told apart on the user object itself; a partial failure stays visible as recoverable state rather than silently orphaning a usable credential.
+
+Each service account's Authentik username embeds a slug of its display name so an operator can recognize it directly in Authentik, with the opaque connection ID appended to guarantee uniqueness even when two connections share a display name. It is also added to the configured `SOVEREIGN_CONFIG_MANAGER_GROUP` group purely for browsing; group membership carries no permissions, and its failure is best-effort and never blocks or rolls back a connection.
+
+The connection-manager identity is isolated from the introspection credential and from the browser. It holds global `add_user`, `add_token`, `view_token`, and `view_group` — no key or user content is exposed by any of these, only metadata needed to discover and label an account it created — plus object-level `view`/`change`/`delete` on the users and `set_key` on the tokens it creates. It is not a superuser, cannot view any token key, and cannot touch unrelated Authentik objects. Browser code reaches only same-origin gRPC-Web; the Authentik administration endpoint and token are absent from every browser response and built asset.
 
 ## Upgrade
 
