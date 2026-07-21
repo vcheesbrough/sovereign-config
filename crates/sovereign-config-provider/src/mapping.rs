@@ -1,32 +1,42 @@
 use std::collections::BTreeMap;
 
-use serde_json::{Map, Value};
 use sovereign_config_core::{ConfigPath, RevealedSecret, SubTreeValue, ValueContent};
 
 use crate::error::ProviderError;
 
-/// Builds a nested JSON tree keyed by path segments relative to `root`, using
-/// each leaf's real text.
+/// A format-neutral nested configuration tree.
+///
+/// The wire protocol returns a flat collection of (absolute-path, value) pairs;
+/// [`build_tree`] nests them once, and each output format transcodes from this
+/// enum (JSON via [`tree_to_json`], `config::Value` in the `config` feature).
+/// Keeping the nesting logic here means no output format re-implements it.
+pub(crate) enum Tree {
+    Leaf(String),
+    Node(BTreeMap<String, Tree>),
+}
+
+/// Nests the revealed subtree into a [`Tree`] keyed by path segments relative to
+/// `root`, using each leaf's real text.
 ///
 /// `Plain` leaves use their exposed text; `Secret` leaves use the caller-supplied
 /// revealed plaintext keyed by exact path. Every secret leaf in `values` must
 /// have a matching entry in `revealed`.
 ///
-/// This is deliberately distinct from `sovereign_config_core::render_subtree_json`,
-/// which masks secrets via `ValueContent::display_text()` for CLI/UI display. A
-/// facade assembling real application configuration needs the unmasked values.
+/// This deliberately uses real, unmasked values, unlike
+/// `sovereign_config_core::render_subtree_json`, which masks secrets via
+/// `ValueContent::display_text()` for CLI/UI display.
 ///
 /// # Errors
 ///
 /// Returns [`ProviderError::InvalidConversion`] for a path outside `root`, a
-/// value/object collision on one JSON node, or a secret leaf missing its
-/// revealed plaintext. The error never names the offending path or value.
-pub(crate) fn subtree_to_json(
+/// value/object collision on one node, or a secret leaf missing its revealed
+/// plaintext. The error never names the offending path or value.
+pub(crate) fn build_tree(
     root: &ConfigPath,
     values: &[SubTreeValue],
     revealed: &BTreeMap<ConfigPath, RevealedSecret>,
-) -> Result<Value, ProviderError> {
-    let mut object = Map::new();
+) -> Result<Tree, ProviderError> {
+    let mut object = BTreeMap::new();
     let mut exact = None;
     for value in values {
         if value.path.as_str() == "/" || !value.path.is_at_or_below(root) {
@@ -43,9 +53,22 @@ pub(crate) fn subtree_to_json(
         insert(&mut object, &segments, text)?;
     }
     match exact {
-        Some(text) if object.is_empty() => Ok(Value::String(text)),
+        Some(text) if object.is_empty() => Ok(Tree::Leaf(text)),
         Some(_) => Err(ProviderError::InvalidConversion),
-        None => Ok(Value::Object(object)),
+        None => Ok(Tree::Node(object)),
+    }
+}
+
+/// Transcodes a [`Tree`] into a `serde_json::Value` for `load`/`load_json`.
+pub(crate) fn tree_to_json(tree: Tree) -> serde_json::Value {
+    match tree {
+        Tree::Leaf(text) => serde_json::Value::String(text),
+        Tree::Node(children) => serde_json::Value::Object(
+            children
+                .into_iter()
+                .map(|(key, value)| (key, tree_to_json(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -80,7 +103,7 @@ fn relative_segments(root: &ConfigPath, path: &ConfigPath) -> Result<Vec<String>
 }
 
 fn insert(
-    object: &mut Map<String, Value>,
+    object: &mut BTreeMap<String, Tree>,
     segments: &[String],
     value: String,
 ) -> Result<(), ProviderError> {
@@ -88,18 +111,15 @@ fn insert(
         return Err(ProviderError::InvalidConversion);
     };
     if remaining.is_empty() {
-        if object
-            .insert(segment.clone(), Value::String(value))
-            .is_some()
-        {
+        if object.insert(segment.clone(), Tree::Leaf(value)).is_some() {
             return Err(ProviderError::InvalidConversion);
         }
         return Ok(());
     }
     let entry = object
         .entry(segment.clone())
-        .or_insert_with(|| Value::Object(Map::new()));
-    let Value::Object(child) = entry else {
+        .or_insert_with(|| Tree::Node(BTreeMap::new()));
+    let Tree::Node(child) = entry else {
         return Err(ProviderError::InvalidConversion);
     };
     insert(child, remaining, value)
@@ -115,7 +135,16 @@ mod tests {
         ConfigPath, MaskedSecret, PlainValue, RevealedSecret, SubTreeValue, ValueContent,
     };
 
-    use super::{ProviderError, subtree_to_json};
+    use super::{ProviderError, build_tree, tree_to_json};
+
+    /// Builds the tree and transcodes it to JSON, as `load`/`load_json` do.
+    fn subtree_to_json(
+        root: &ConfigPath,
+        values: &[SubTreeValue],
+        revealed: &BTreeMap<ConfigPath, RevealedSecret>,
+    ) -> Result<Value, ProviderError> {
+        build_tree(root, values, revealed).map(tree_to_json)
+    }
 
     fn path(value: &str) -> ConfigPath {
         ConfigPath::parse(value).unwrap()

@@ -9,6 +9,7 @@ use std::fmt;
 
 use config::{ConfigError, Map, Source, Value, ValueKind};
 
+use crate::mapping::Tree;
 use crate::{Provider, ProviderError};
 
 /// Environment variable naming a file whose contents are the connection URL.
@@ -105,9 +106,11 @@ impl SovereignConfigSource {
 /// Resolves the connection URL from the standard deployment environment.
 fn resolve_default_environment() -> Result<String, ConfigError> {
     let url_file = optional_env(URL_FILE_VAR)?;
-    resolve_connection_url(url_file, || optional_env(URL_VAR), |path| {
-        std::fs::read_to_string(path)
-    })
+    resolve_connection_url(
+        url_file,
+        || optional_env(URL_VAR),
+        |path| std::fs::read_to_string(path),
+    )
 }
 
 /// Reads an environment variable, mapping absence to `None` and invalid UTF-8
@@ -158,7 +161,9 @@ where
     if let Some(url) = url()? {
         let value = url.trim();
         if value.is_empty() {
-            return Err(ConfigError::Message(format!("`{URL_VAR}` is set but empty")));
+            return Err(ConfigError::Message(format!(
+                "`{URL_VAR}` is set but empty"
+            )));
         }
         return Ok(value.to_owned());
     }
@@ -183,15 +188,15 @@ impl Source for SovereignConfigSource {
 
     fn collect(&self) -> Result<Map<String, Value>, ConfigError> {
         let url = self.resolve_url()?;
-        let json = load_blocking(url).map_err(|error| ConfigError::Foreign(Box::new(error)))?;
-        match json {
-            serde_json::Value::Object(object) => Ok(object
+        let tree = load_blocking(url).map_err(|error| ConfigError::Foreign(Box::new(error)))?;
+        match tree {
+            Tree::Node(children) => Ok(children
                 .into_iter()
-                .map(|(key, value)| (key, json_to_value(value)))
+                .map(|(key, value)| (key, tree_to_value(value)))
                 .collect()),
-            // A subtree root is a JSON object; an exact scalar root has no
+            // A subtree root nests into a table; an exact scalar root has no
             // configuration table to layer.
-            _ => Err(ConfigError::Message(
+            Tree::Leaf(_) => Err(ConfigError::Message(
                 "Sovereign Config connection root is not a configuration table".to_owned(),
             )),
         }
@@ -203,7 +208,7 @@ impl Source for SovereignConfigSource {
 /// Using a separate thread means the caller's runtime (if any) is never nested
 /// and never required to drive this work, so `build()` is safe from both sync
 /// and async contexts.
-fn load_blocking(url: String) -> Result<serde_json::Value, ProviderError> {
+fn load_blocking(url: String) -> Result<Tree, ProviderError> {
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -211,24 +216,23 @@ fn load_blocking(url: String) -> Result<serde_json::Value, ProviderError> {
             .map_err(|_| ProviderError::Unavailable)?;
         runtime.block_on(async move {
             let provider = Provider::connect(&url).await?;
-            provider.load::<serde_json::Value>().await
+            provider.load_tree().await
         })
     })
     .join()
     .map_err(|_| ProviderError::Internal)?
 }
 
-fn json_to_value(json: serde_json::Value) -> Value {
-    let kind = match json {
-        serde_json::Value::String(text) => ValueKind::String(text),
-        serde_json::Value::Object(object) => ValueKind::Table(
-            object
+/// Transcodes the format-neutral tree straight into `config::Value` — no JSON.
+fn tree_to_value(tree: Tree) -> Value {
+    let kind = match tree {
+        Tree::Leaf(text) => ValueKind::String(text),
+        Tree::Node(children) => ValueKind::Table(
+            children
                 .into_iter()
-                .map(|(key, value)| (key, json_to_value(value)))
+                .map(|(key, value)| (key, tree_to_value(value)))
                 .collect(),
         ),
-        // `subtree_to_json` only ever emits strings and nested objects.
-        _ => ValueKind::Nil,
     };
     Value::new(None, kind)
 }
@@ -300,9 +304,10 @@ mod tests {
 
     #[test]
     fn empty_url_file_variable_is_rejected() {
-        let message = resolve_connection_url(Some("   ".to_owned()), || Ok(None), |_| unreachable!())
-            .unwrap_err()
-            .to_string();
+        let message =
+            resolve_connection_url(Some("   ".to_owned()), || Ok(None), |_| unreachable!())
+                .unwrap_err()
+                .to_string();
         assert!(message.contains("is set but empty"));
     }
 
