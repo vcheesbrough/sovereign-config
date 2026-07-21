@@ -372,6 +372,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "config"
+version = "0.15.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b85f248a4de22d204ceabc6299d89d2c70fbd7f09fea53c06c852369652d8139"
+dependencies = [
+ "pathdiff",
+ "serde_core",
+ "winnow",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1373,6 +1384,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2251,7 +2268,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-cli"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2274,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-client"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "async-trait",
  "sovereign-config-core",
@@ -2283,7 +2300,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-core"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "base64",
  "serde",
@@ -2294,7 +2311,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-native"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -2316,7 +2333,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-proto"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -2326,8 +2343,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovereign-config-provider"
+version = "1.8.0"
+dependencies = [
+ "async-trait",
+ "axum 0.8.9",
+ "config",
+ "serde",
+ "serde_json",
+ "sovereign-config-client",
+ "sovereign-config-core",
+ "sovereign-config-native",
+ "sovereign-config-proto",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "sovereign-config-rust-consumer"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "async-trait",
  "sovereign-config-client",
@@ -2336,8 +2372,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovereign-config-rust-provider-consumer"
+version = "1.8.0"
+dependencies = [
+ "serde",
+ "sovereign-config-provider",
+ "tokio",
+]
+
+[[package]]
 name = "sovereign-config-server"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -2370,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-web"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -3512,6 +3557,9 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "wit-bindgen"
