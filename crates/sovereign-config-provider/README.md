@@ -51,6 +51,66 @@ async fn load(connection_url: &str) -> Result<AppConfig, ProviderError> {
 }
 ```
 
+### Layering with the `config` crate
+
+The provider pairs naturally with [`config`](https://docs.rs/config): load the
+managed subtree once, then add it as one layer in a `config` builder alongside
+file defaults and environment overrides. Every Sovereign Config leaf is stored
+as text, so `config`'s type coercion turns string leaves like `"10"` or `"true"`
+into the numbers and booleans your type expects.
+
+Use [`Provider::load_json`] so your application needs no `serde_json` dependency
+of its own — it returns the subtree as a JSON string ready for
+`File::from_str`.
+
+Consumer `Cargo.toml`:
+
+```toml
+[dependencies]
+sovereign-config-provider = { git = "https://github.com/vcheesbrough/sovereign-config", tag = "<version>" }
+config = "0.15"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+```rust,no_run
+use config::{Config, Environment, File, FileFormat};
+use serde::Deserialize;
+use sovereign_config_provider::Provider;
+
+#[derive(Deserialize)]
+struct Database {
+    url: String,
+    password: String,       // secret-classified, revealed transparently
+    max_connections: u32,   // coerced by `config` from the stored "10"
+}
+
+#[derive(Deserialize)]
+struct AppConfig {
+    feature_enabled: bool,  // coerced by `config` from the stored "true"
+    database: Database,
+}
+
+async fn load(connection_url: &str) -> Result<AppConfig, Box<dyn std::error::Error>> {
+    // 1. Load the managed subtree once, as a JSON layer (all leaves are strings).
+    let provider = Provider::connect(connection_url).await?;
+    let sovereign = provider.load_json().await?;
+
+    // 2. Compose it: file defaults < Sovereign Config < process environment.
+    let settings = Config::builder()
+        .add_source(File::with_name("config/defaults").required(false))
+        .add_source(File::from_str(&sovereign, FileFormat::Json))
+        .add_source(Environment::with_prefix("APP").separator("__"))
+        .build()?;
+
+    Ok(settings.try_deserialize()?)
+}
+```
+
+`config` is the consumer's own dependency; the provider does not pull it in. The
+loaded JSON contains real (revealed) secret values, so keep it in memory and out
+of logs — do not print or persist the string returned by `load_json`.
+
 ### Secret injection
 
 The connection URL is itself a secret (its fragment carries an encoded app

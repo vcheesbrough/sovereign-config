@@ -313,6 +313,27 @@ async fn loads_typed_configuration_including_revealed_secrets() {
 }
 
 #[tokio::test]
+async fn load_json_returns_the_revealed_subtree_as_json() {
+    let harness = Harness::start(Arc::new(MockState::happy())).await;
+    let provider = Provider::connect(&harness.url).await.unwrap();
+    let json = provider.load_json().await.unwrap();
+
+    // A downstream `config`-crate layer parses exactly this text.
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        parsed,
+        json!({
+            "feature": "on",
+            "database": {
+                "url": "postgres://localhost/app",
+                "password": "app-password-sentinel",
+            },
+        })
+    );
+    assert_eq!(harness.mock.reveal_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn each_load_reacquires_token_and_rereads_without_cache() {
     let harness = Harness::start(Arc::new(MockState::happy())).await;
     let provider = Provider::connect(&harness.url).await.unwrap();
