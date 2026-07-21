@@ -1,14 +1,19 @@
-# Step DAG: compute-version → build-server ┐
-# workspace-validation ∥ browser-validation ┴→ publish-dev-image →
-# validate-authentik-version ┬→ (push) apply-authentik-blueprint-auto-dev →
-#                            │           validate-authentik-manager-live →
-#                            │           auto-deploy-dev → tag-release-auto-dev
-#                            └→ (deploy→prod) apply-authentik-blueprint-prod →
-#                                        validate-authentik-manager-live-prod →
-#                                        deploy-prod.
-# A push auto-deploys dev; a `deployment` event targeting prod (Woodpecker's
-# Deploy/promote feature, from main) promotes the same built image to
-# production. The shared build/validate/publish prefix runs for both.
+# Two entry points that share only compute-version and validate-authentik-version:
+#
+# push (dev): compute-version → build-server → publish-dev-image
+#   (workspace-validation ∥ browser-validation also gate publish) →
+#   apply-authentik-blueprint-auto-dev → validate-authentik-manager-live →
+#   auto-deploy-dev → tag-release-auto-dev.
+#
+# deployment (prod promotion, from main): compute-version *reuses* the tag the
+#   dev push already built, published, and tagged — it does not build, publish,
+#   or push a new git tag → validate-authentik-version →
+#   apply-authentik-blueprint-prod → validate-authentik-manager-live-prod →
+#   deploy-prod, which deploys that same image tag.
+#
+# So build/publish and the dev deploy chain are push-only; the prod chain is
+# deployment-only; only compute-version and validate-authentik-version run on
+# both. A promotion never rebuilds or re-tags.
 when:
   - event: [push, deployment]
 
@@ -25,6 +30,8 @@ steps:
 
   workspace-validation:
     depends_on: []
+    when:
+      - event: push
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
     environment:
       CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
@@ -46,6 +53,8 @@ steps:
 
   browser-validation:
     depends_on: []
+    when:
+      - event: push
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -67,6 +76,8 @@ steps:
   build-server:
     depends_on:
       - compute-version
+    when:
+      - event: push
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -82,6 +93,8 @@ steps:
       - build-server
       - workspace-validation
       - browser-validation
+    when:
+      - event: push
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -101,6 +114,7 @@ steps:
   apply-authentik-blueprint-auto-dev:
     depends_on:
       - validate-authentik-version
+      - publish-dev-image
     when:
       - event: push
     pull: true
@@ -120,9 +134,12 @@ steps:
         SOVEREIGN_CONFIG_DEV_BROWSER_REDIRECT_URI: https://sovereign-config-dev.desync.link/auth/callback
         AUTHENTIK_DEV_BRAND_DOMAIN: auth.desync.link
 
+  # Runs on both push and deployment: a cheap curl gate that protects the dev
+  # blueprint apply on push and the prod blueprint apply on a promotion. Depends
+  # only on compute-version so it does not hinge on the push-only publish step.
   validate-authentik-version:
     depends_on:
-      - publish-dev-image
+      - compute-version
     image: docker.io/curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
     environment:
       AUTHENTIK_API_TOKEN:
