@@ -3,13 +3,14 @@
 # validate-authentik-version ┬→ (push) apply-authentik-blueprint-auto-dev →
 #                            │           validate-authentik-manager-live →
 #                            │           auto-deploy-dev → tag-release-auto-dev
-#                            └→ (manual, main) apply-authentik-blueprint-prod →
+#                            └→ (deploy→prod) apply-authentik-blueprint-prod →
 #                                        validate-authentik-manager-live-prod →
 #                                        deploy-prod.
-# A push auto-deploys dev; a manual run on main promotes the same built image to
+# A push auto-deploys dev; a `deployment` event targeting prod (Woodpecker's
+# Deploy/promote feature, from main) promotes the same built image to
 # production. The shared build/validate/publish prefix runs for both.
 when:
-  - event: [push, manual]
+  - event: [push, deployment]
 
 steps:
   compute-version:
@@ -206,19 +207,21 @@ steps:
       github_token:
         from_secret: github_token
 
-  # Production is a manual promotion of the already-built, environment-neutral
-  # image, and only from main. The dev deploy chain above is gated to push, so a
-  # manual run performs a production deployment and never also redeploys dev. The
-  # shared build/validate/publish steps run for this manual pipeline too, so the
-  # image and Authentik version are validated before production is touched.
+  # Production is a promotion of the already-built, environment-neutral image,
+  # triggered by a `deployment` event targeting prod (only from main). The dev
+  # deploy chain above is gated to push, so a promotion deploys production and
+  # never also redeploys dev. The shared build/validate/publish steps run for
+  # this deployment pipeline too, so the image and Authentik version are
+  # validated before production is touched.
   apply-authentik-blueprint-prod:
     depends_on:
       - validate-authentik-version
-    # TEMPORARY (card #262): also allow a manual prod promotion from this
-    # iteration branch to smoke-test the production deploy before merge. Revert
-    # to `branch: main` (drop feat/iteration-9-prod-environment) before merging.
+    # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
+    # the `prod` environment. TEMPORARY (card #262): also allow this from the
+    # iteration branch to smoke-test before merge; drop
+    # feat/iteration-9-prod-environment (leaving main) before merging.
     when:
-      - event: manual
+      - event: deployment
         branch: [main, feat/iteration-9-prod-environment]
     pull: true
     image: ghcr.io/vcheesbrough/woodpecker-plugin-authentik-blueprint:v0.2.0@sha256:9f262c4390205b5629e9af7560f4e492f0155395a429153703ba351206d9d975
@@ -244,11 +247,12 @@ steps:
   validate-authentik-manager-live-prod:
     depends_on:
       - apply-authentik-blueprint-prod
-    # TEMPORARY (card #262): also allow a manual prod promotion from this
-    # iteration branch to smoke-test the production deploy before merge. Revert
-    # to `branch: main` (drop feat/iteration-9-prod-environment) before merging.
+    # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
+    # the `prod` environment. TEMPORARY (card #262): also allow this from the
+    # iteration branch to smoke-test before merge; drop
+    # feat/iteration-9-prod-environment (leaving main) before merging.
     when:
-      - event: manual
+      - event: deployment
         branch: [main, feat/iteration-9-prod-environment]
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
     environment:
@@ -271,11 +275,12 @@ steps:
   deploy-prod:
     depends_on:
       - validate-authentik-manager-live-prod
-    # TEMPORARY (card #262): also allow a manual prod promotion from this
-    # iteration branch to smoke-test the production deploy before merge. Revert
-    # to `branch: main` (drop feat/iteration-9-prod-environment) before merging.
+    # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
+    # the `prod` environment. TEMPORARY (card #262): also allow this from the
+    # iteration branch to smoke-test before merge; drop
+    # feat/iteration-9-prod-environment (leaving main) before merging.
     when:
-      - event: manual
+      - event: deployment
         branch: [main, feat/iteration-9-prod-environment]
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:

@@ -1,7 +1,8 @@
 //! Guards the deployment-trigger policy encoded in `.woodpecker/build.yml`:
-//! production is a manual promotion, and a manual run never also redeploys
-//! development. This is the lowest-layer check for card #262 — the pipeline
-//! file is not otherwise exercised by any test.
+//! production runs only on a `deployment` event (Woodpecker's Deploy/promote to
+//! prod), never on push; development deploys only on push, so a production
+//! promotion never also redeploys it. This is the lowest-layer check for card
+//! #262 — the pipeline file is not otherwise exercised by any test.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -60,7 +61,7 @@ fn when_conditions(step: &Value) -> Vec<Condition> {
 }
 
 #[test]
-fn production_steps_deploy_manually_from_permitted_branches() {
+fn production_steps_deploy_to_prod_from_permitted_branches() {
     let permitted: BTreeSet<String> = PROD_BRANCHES.iter().map(|&b| b.to_owned()).collect();
     for name in [
         "apply-authentik-blueprint-prod",
@@ -71,8 +72,8 @@ fn production_steps_deploy_manually_from_permitted_branches() {
         assert!(
             conditions
                 .iter()
-                .all(|c| c.events == BTreeSet::from(["manual".to_owned()])),
-            "{name} must only ever run on a manual event, never on push"
+                .all(|c| c.events == BTreeSet::from(["deployment".to_owned()])),
+            "{name} must only ever run on a deployment event, never on push"
         );
         let branches: BTreeSet<String> = conditions
             .iter()
