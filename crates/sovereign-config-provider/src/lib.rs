@@ -161,10 +161,11 @@ impl Provider {
 
     /// The canonical configuration root this connection is confined to.
     ///
+    /// Returned as a string slice so consumers depend only on this crate.
     /// Not secret; safe to log or include in diagnostics.
     #[must_use]
-    pub fn root(&self) -> &ConfigPath {
-        &self.root
+    pub fn root(&self) -> &str {
+        self.root.as_str()
     }
 }
 
