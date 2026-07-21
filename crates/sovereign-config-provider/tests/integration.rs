@@ -346,7 +346,9 @@ async fn load_does_not_coerce_string_leaves_to_typed_fields() {
     let mut state = MockState::happy();
     state.plain.clear();
     state.secrets.clear();
-    state.plain.insert("/apps/api/port".to_owned(), "8080".to_owned());
+    state
+        .plain
+        .insert("/apps/api/port".to_owned(), "8080".to_owned());
     let harness = Harness::start(Arc::new(state)).await;
     let provider = Provider::connect(&harness.url).await.unwrap();
 
@@ -371,7 +373,9 @@ async fn config_source_coerces_string_leaves_to_typed_fields() {
     let mut state = MockState::happy();
     state.plain.clear();
     state.secrets.clear();
-    state.plain.insert("/apps/api/port".to_owned(), "8080".to_owned());
+    state
+        .plain
+        .insert("/apps/api/port".to_owned(), "8080".to_owned());
     state
         .plain
         .insert("/apps/api/enabled".to_owned(), "true".to_owned());
