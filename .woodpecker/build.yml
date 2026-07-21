@@ -245,7 +245,7 @@ steps:
     depends_on: []
     when:
       - event: deployment
-        branch: [main, feat/iteration-9-prod-environment]
+        branch: main
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     environment:
       GITHUB_TOKEN:
@@ -279,7 +279,7 @@ steps:
       - resolve-release-tag
     when:
       - event: deployment
-        branch: [main, feat/iteration-9-prod-environment]
+        branch: main
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -303,12 +303,10 @@ steps:
     depends_on:
       - validate-authentik-version
     # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
-    # the `prod` environment. TEMPORARY (card #262): also allow this from the
-    # iteration branch to smoke-test before merge; drop
-    # feat/iteration-9-prod-environment (leaving main) before merging.
+    # the `prod` environment, only from main.
     when:
       - event: deployment
-        branch: [main, feat/iteration-9-prod-environment]
+        branch: main
     pull: true
     image: ghcr.io/vcheesbrough/woodpecker-plugin-authentik-blueprint:v0.2.0@sha256:9f262c4390205b5629e9af7560f4e492f0155395a429153703ba351206d9d975
     settings:
@@ -334,12 +332,10 @@ steps:
     depends_on:
       - apply-authentik-blueprint-prod
     # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
-    # the `prod` environment. TEMPORARY (card #262): also allow this from the
-    # iteration branch to smoke-test before merge; drop
-    # feat/iteration-9-prod-environment (leaving main) before merging.
+    # the `prod` environment, only from main.
     when:
       - event: deployment
-        branch: [main, feat/iteration-9-prod-environment]
+        branch: main
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
     environment:
       CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
@@ -363,12 +359,10 @@ steps:
       - validate-authentik-manager-live-prod
       - verify-image
     # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
-    # the `prod` environment. TEMPORARY (card #262): also allow this from the
-    # iteration branch to smoke-test before merge; drop
-    # feat/iteration-9-prod-environment (leaving main) before merging.
+    # the `prod` environment, only from main.
     when:
       - event: deployment
-        branch: [main, feat/iteration-9-prod-environment]
+        branch: main
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
