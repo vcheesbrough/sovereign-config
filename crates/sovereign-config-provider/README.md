@@ -53,47 +53,32 @@ async fn load(connection_url: &str) -> Result<AppConfig, ProviderError> {
 
 ### Layering with the `config` crate
 
-The provider pairs naturally with [`config`](https://docs.rs/config): load the
-managed subtree once, then add it as one layer in a `config` builder alongside
-file defaults and environment overrides. Every Sovereign Config leaf is stored
-as text, so `config`'s type coercion turns string leaves like `"10"` or `"true"`
-into the numbers and booleans your type expects.
-
-Use [`Provider::load_json`] so your application needs no `serde_json` dependency
-of its own — it returns the subtree as a JSON string ready for
-`File::from_str`.
+Enable the optional `config` feature to get a [`config`](https://docs.rs/config)
+source that loads the managed subtree *when the configuration is built* — the
+application never initialises the provider itself. `SovereignConfigSource` slots
+in as one ordinary layer alongside files and environment variables.
 
 Consumer `Cargo.toml`:
 
 ```toml
 [dependencies]
-sovereign-config-provider = { git = "https://github.com/vcheesbrough/sovereign-config", tag = "<version>" }
+sovereign-config-provider = { git = "https://github.com/vcheesbrough/sovereign-config", tag = "<version>", features = ["config"] }
 config = "0.15"
-serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ```rust,no_run
 use std::collections::HashMap;
 
-use config::{Config, Environment, File, FileFormat};
-use sovereign_config_provider::Provider;
+use config::{Config, Environment, File};
+use sovereign_config_provider::SovereignConfigSource;
 
-#[tokio::main]
-async fn main() {
-    // Load the managed subtree from Sovereign Config once, as a JSON layer.
-    let sovereign = Provider::connect(&std::env::var("APP_CONFIG_URL").unwrap())
-        .await
-        .unwrap()
-        .load_json()
-        .await
-        .unwrap();
-
+fn main() {
     let settings = Config::builder()
         // Add in `./examples/settings.toml`
         .add_source(File::with_name("examples/settings"))
-        // Add in the managed Sovereign Config subtree
-        .add_source(File::from_str(&sovereign, FileFormat::Json))
+        // Add in the managed Sovereign Config subtree; it connects, authenticates,
+        // reads, and reveals its secrets when `build()` runs.
+        .add_source(SovereignConfigSource::from_env("APP_CONFIG_URL"))
         // Add in settings from the environment (with a prefix of APP)
         // Eg.. `APP_DEBUG=1 ./target/app` would set the `debug` key
         .add_source(Environment::with_prefix("APP"))
@@ -111,14 +96,22 @@ async fn main() {
 ```
 
 Sources are layered in order, so Sovereign Config overrides the file defaults and
-the environment overrides Sovereign Config. For nested or strongly typed
-configuration, deserialize into your own `#[derive(Deserialize)]` struct instead
-of a `HashMap`; `config` then coerces string leaves — a stored `"10"` into a
-`u32`, `"true"` into a `bool`.
+the environment overrides Sovereign Config. Because every Sovereign Config leaf
+is stored as text, `config`'s type coercion turns string leaves into the target
+type — a stored `"10"` into a `u32`, `"true"` into a `bool` — when you deserialize
+into your own `#[derive(Deserialize)]` struct instead of a `HashMap`.
 
-`config` is the consumer's own dependency; the provider does not pull it in. The
-loaded JSON contains real (revealed) secret values, so keep it in memory and out
-of logs — do not print or persist the string returned by `load_json`.
+`SovereignConfigSource::from_env` reads the URL from the named environment
+variable at build time; `SovereignConfigSource::from_url` takes a URL directly.
+`collect` performs blocking network I/O on a dedicated internal thread, so
+`build()` is safe from both synchronous and asynchronous contexts. The source's
+`Debug` output never prints the URL.
+
+If you would rather load the subtree yourself — for example to add it as an
+in-memory JSON layer without the feature — [`Provider::load_json`] returns the
+revealed subtree as a JSON string ready for `config::File::from_str`. Either way
+the loaded configuration contains real secret values, so keep it in memory and
+out of logs.
 
 ### Secret injection
 
