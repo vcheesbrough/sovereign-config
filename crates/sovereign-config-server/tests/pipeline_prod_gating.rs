@@ -87,11 +87,15 @@ fn production_steps_deploy_to_prod_from_permitted_branches() {
 }
 
 #[test]
-fn development_deploy_chain_runs_on_push_only() {
-    // Gating the dev chain to `push` is what makes a manual (production) run not
-    // also redeploy development. If any of these ever accept `manual`, a
-    // production promotion would silently touch development too.
+fn build_and_dev_deploy_steps_run_on_push_only() {
+    // Everything that builds, publishes, tags, or deploys dev is push-only, so a
+    // production promotion (a deployment event) never rebuilds the image, never
+    // republishes or re-tags, and never touches development.
     for name in [
+        "workspace-validation",
+        "browser-validation",
+        "build-server",
+        "publish-dev-image",
         "apply-authentik-blueprint-auto-dev",
         "validate-authentik-manager-live",
         "auto-deploy-dev",
@@ -103,9 +107,34 @@ fn development_deploy_chain_runs_on_push_only() {
                 && conditions
                     .iter()
                     .all(|c| c.events == BTreeSet::from(["push".to_owned()])),
-            "{name} must be push-only so a manual production run never touches it"
+            "{name} must be push-only so a production promotion never touches it"
         );
     }
+}
+
+#[test]
+fn tag_resolution_and_authentik_check_run_on_both_events() {
+    // These two steps carry no `when`, so they run on both push and deployment.
+    // On a promotion, compute-version (compute mode) reuses the tag the dev push
+    // already built — it does not increment — so deploy-prod deploys the exact
+    // same image tag; validate-authentik-version gates the blueprint apply on
+    // both events.
+    let pipeline = pipeline();
+    for name in ["compute-version", "validate-authentik-version"] {
+        assert!(
+            step(&pipeline, name).get("when").is_none(),
+            "{name} must carry no `when` so it runs on both push and deployment"
+        );
+    }
+    let mode = step(&pipeline, "compute-version")
+        .get("settings")
+        .and_then(|settings| settings.get("mode"))
+        .and_then(Value::as_str);
+    assert_eq!(
+        mode,
+        Some("compute"),
+        "compute-version must use compute mode, which reuses the per-commit tag on a promotion"
+    );
 }
 
 #[test]
