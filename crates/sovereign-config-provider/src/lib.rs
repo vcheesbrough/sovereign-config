@@ -81,7 +81,7 @@ use sovereign_config_native::TonicTransport;
 #[cfg(feature = "config")]
 pub use config_source::SovereignConfigSource;
 pub use error::ProviderError;
-use mapping::subtree_to_json;
+use mapping::{Tree, build_tree, tree_to_json};
 use token::ManagedTokenProvider;
 
 /// A read-only handle to one managed configuration subtree.
@@ -152,7 +152,7 @@ impl Provider {
     /// - [`ProviderError::InvalidConversion`] — the subtree could not be
     ///   converted into `T`.
     pub async fn load<T: DeserializeOwned>(&self) -> Result<T, ProviderError> {
-        let json = self.load_value().await?;
+        let json = tree_to_json(self.load_tree().await?);
         serde_json::from_value(json).map_err(|_| ProviderError::InvalidConversion)
     }
 
@@ -174,13 +174,17 @@ impl Provider {
     /// Returns the same bounded, redacted [`ProviderError`] set as
     /// [`Provider::load`].
     pub async fn load_json(&self) -> Result<String, ProviderError> {
-        let json = self.load_value().await?;
+        let json = tree_to_json(self.load_tree().await?);
         serde_json::to_string_pretty(&json).map_err(|_| ProviderError::InvalidConversion)
     }
 
     /// Acquires one fresh token, reads the subtree, reveals every secret leaf,
-    /// and assembles the real values into a JSON tree relative to the root.
-    async fn load_value(&self) -> Result<serde_json::Value, ProviderError> {
+    /// and nests the real values into a format-neutral tree relative to the root.
+    ///
+    /// This is the shared load path: `load`/`load_json` transcode the tree to
+    /// JSON, while the `config` source transcodes it to `config::Value` — neither
+    /// re-reads nor re-nests, and the `config` path never touches JSON.
+    pub(crate) async fn load_tree(&self) -> Result<Tree, ProviderError> {
         let token = self
             .token
             .access_token()
@@ -194,7 +198,7 @@ impl Provider {
                 revealed.insert(value.path.clone(), secret);
             }
         }
-        subtree_to_json(&self.root, &subtree.values, &revealed)
+        build_tree(&self.root, &subtree.values, &revealed)
     }
 
     /// The canonical configuration root this connection is confined to.
