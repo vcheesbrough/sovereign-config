@@ -42,6 +42,8 @@ Cargo supplies the `major.minor` release line. After a successful development de
 
 The development deployment is verified by calling `System.GetVersion` through the public gRPC endpoint after Woodpecker completes. gRPC health and `System.GetVersion` are the only RPCs that do not require authentication.
 
+Production is deployed by **manually running the pipeline on `main`**. The development deploy chain is gated to `push`, so a manual run does not redeploy development: it applies the production Authentik blueprint (`authentik/blueprint.yaml`), validates the production connection manager against live Authentik, and promotes the same environment-neutral image already built and published for that commit onto the production stack (`sovereign-config.desync.link`, container `sovereign-config-production`, compose project `sovereign-config-prod`). Before the first promotion the operator provides the production Woodpecker secrets `sovereign_config_prod_postgres_password`, `sovereign_config_prod_oidc_introspection_client_secret`, and `sovereign_config_prod_manager_api_token`, the pre-created encrypted `sovereign-config-production-db` volume, and DNS/Traefik for the production host. No new tag is cut for a production promotion; the deployed version is the tag already computed on the dev push.
+
 Build release images only for linux/amd64 with `docker build --platform linux/amd64 --tag sovereign-config:local .`.
 Woodpecker reuses Cargo dependency and compilation caches across validation and server-image builds.
 

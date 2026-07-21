@@ -69,7 +69,7 @@ impl MockState {
             "app-password-sentinel".to_owned(),
         );
         Self {
-            application_version: "1.8.0".to_owned(),
+            application_version: "2.0.0".to_owned(),
             protocol_version: "v3".to_owned(),
             token_ok: true,
             subtree: SubtreeOutcome::Ok,
