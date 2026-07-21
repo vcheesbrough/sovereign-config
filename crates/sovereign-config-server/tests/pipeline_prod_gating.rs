@@ -27,6 +27,17 @@ fn step<'a>(pipeline: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("step {name} should exist"))
 }
 
+/// All of a step's `commands` joined into one string for substring assertions.
+fn commands_text(step: &Value) -> String {
+    step.get("commands")
+        .and_then(Value::as_sequence)
+        .expect("step should have commands")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// A single `when` condition, with its `event` and `branch` fields each
 /// normalised to a set (either may be a YAML scalar or sequence; `branch` may
 /// be absent, meaning "any branch").
@@ -64,6 +75,8 @@ fn when_conditions(step: &Value) -> Vec<Condition> {
 fn production_steps_deploy_to_prod_from_permitted_branches() {
     let permitted: BTreeSet<String> = PROD_BRANCHES.iter().map(|&b| b.to_owned()).collect();
     for name in [
+        "resolve-release-tag",
+        "verify-image",
         "apply-authentik-blueprint-prod",
         "validate-authentik-manager-live-prod",
         "deploy-prod",
@@ -88,10 +101,12 @@ fn production_steps_deploy_to_prod_from_permitted_branches() {
 
 #[test]
 fn build_and_dev_deploy_steps_run_on_push_only() {
-    // Everything that builds, publishes, tags, or deploys dev is push-only, so a
-    // production promotion (a deployment event) never rebuilds the image, never
-    // republishes or re-tags, and never touches development.
+    // Everything that allocates a version, builds, publishes, tags, or deploys
+    // dev is push-only, so a production promotion (a deployment event) never
+    // mints a new version, never rebuilds or republishes the image, and never
+    // touches development.
     for name in [
+        "compute-version",
         "workspace-validation",
         "browser-validation",
         "build-server",
@@ -113,27 +128,43 @@ fn build_and_dev_deploy_steps_run_on_push_only() {
 }
 
 #[test]
-fn tag_resolution_and_authentik_check_run_on_both_events() {
-    // These two steps carry no `when`, so they run on both push and deployment.
-    // On a promotion, compute-version (compute mode) reuses the tag the dev push
-    // already built — it does not increment — so deploy-prod deploys the exact
-    // same image tag; validate-authentik-version gates the blueprint apply on
-    // both events.
+fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
     let pipeline = pipeline();
-    for name in ["compute-version", "validate-authentik-version"] {
-        assert!(
-            step(&pipeline, name).get("when").is_none(),
-            "{name} must carry no `when` so it runs on both push and deployment"
-        );
-    }
-    let mode = step(&pipeline, "compute-version")
-        .get("settings")
-        .and_then(|settings| settings.get("mode"))
-        .and_then(Value::as_str);
+    // compute-version (mode compute) allocates the next semver; it must be
+    // push-only. On a deployment it would mint the *next* patch — an unbuilt tag
+    // — and deploy-prod would pull an image that was never published.
     assert_eq!(
-        mode,
+        step(&pipeline, "compute-version")
+            .get("settings")
+            .and_then(|settings| settings.get("mode"))
+            .and_then(Value::as_str),
         Some("compute"),
-        "compute-version must use compute mode, which reuses the per-commit tag on a promotion"
+        "compute-version allocates, so it must stay push-only (asserted above)"
+    );
+    // The deployment resolves the commit's already-built tag instead of
+    // allocating, and verify-image proves the artifact exists rather than
+    // rebuilding — so deploy-prod deploys the exact image the push already
+    // published. Guard that both read/write `.release-tag` on the deploy path.
+    let resolve = step(&pipeline, "resolve-release-tag");
+    let resolve_cmd = commands_text(resolve);
+    assert!(
+        resolve_cmd.contains("git tag --points-at HEAD") && resolve_cmd.contains("> .release-tag"),
+        "resolve-release-tag must resolve the commit's git tag into .release-tag, not allocate"
+    );
+    let verify_cmd = commands_text(step(&pipeline, "verify-image"));
+    assert!(
+        verify_cmd.contains("docker pull")
+            && verify_cmd.contains("registry.desync.link/sovereign-config:")
+            && !verify_cmd.contains("docker build"),
+        "verify-image must pull the already-published image and never build"
+    );
+    // validate-authentik-version has no `when`, so it still gates both the dev
+    // and prod blueprint applies.
+    assert!(
+        step(&pipeline, "validate-authentik-version")
+            .get("when")
+            .is_none(),
+        "validate-authentik-version must run on both push and deployment"
     );
 }
 
@@ -158,15 +189,14 @@ fn production_blueprint_applies_the_production_environment() {
 #[test]
 fn production_deploy_targets_the_production_environment() {
     let pipeline = pipeline();
-    let command = step(&pipeline, "deploy-prod")
-        .get("commands")
-        .and_then(Value::as_sequence)
-        .and_then(|commands| commands.first())
-        .and_then(Value::as_str)
-        .expect("deploy-prod needs a command");
+    let command = commands_text(step(&pipeline, "deploy-prod"));
     assert!(command.contains("SOVEREIGN_CONFIG_ENV=prod"));
     assert!(command.contains("SOVEREIGN_CONFIG_HOST=sovereign-config.desync.link"));
     assert!(command.contains("docker compose -p sovereign-config-prod"));
+    // It deploys the resolved, already-built tag and pulls it rather than
+    // relying on a locally built image (there is no build on the deploy path).
+    assert!(command.contains("SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag)"));
+    assert!(command.contains("--pull always"));
     // A production deploy must never touch the development stack.
     assert!(!command.contains("sovereign-config-dev"));
 }
