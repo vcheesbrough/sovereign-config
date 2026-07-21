@@ -78,7 +78,7 @@ fn main() {
         .add_source(File::with_name("examples/settings"))
         // Add in the managed Sovereign Config subtree; it connects, authenticates,
         // reads, and reveals its secrets when `build()` runs.
-        .add_source(SovereignConfigSource::from_env("APP_CONFIG_URL"))
+        .add_source(SovereignConfigSource::from_url_env("APP_CONFIG_URL"))
         // Add in settings from the environment (with a prefix of APP)
         // Eg.. `APP_DEBUG=1 ./target/app` would set the `debug` key
         .add_source(Environment::with_prefix("APP"))
@@ -101,8 +101,9 @@ is stored as text, `config`'s type coercion turns string leaves into the target
 type — a stored `"10"` into a `u32`, `"true"` into a `bool` — when you deserialize
 into your own `#[derive(Deserialize)]` struct instead of a `HashMap`.
 
-`SovereignConfigSource::from_env` reads the URL from the named environment
-variable at build time; `SovereignConfigSource::from_url` takes a URL directly.
+`SovereignConfigSource::from_url_env` reads the *connection URL* from the named
+environment variable at build time (the configuration values still come from the
+Sovereign Config subtree); `SovereignConfigSource::from_url` takes a URL directly.
 `collect` performs blocking network I/O on a dedicated internal thread, so
 `build()` is safe from both synchronous and asynchronous contexts. The source's
 `Debug` output never prints the URL.

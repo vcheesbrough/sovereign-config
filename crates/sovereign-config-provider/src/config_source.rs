@@ -26,7 +26,7 @@ use crate::{Provider, ProviderError};
 ///
 /// let settings = Config::builder()
 ///     .add_source(File::with_name("config/settings").required(false))
-///     .add_source(SovereignConfigSource::from_env("APP_CONFIG_URL"))
+///     .add_source(SovereignConfigSource::from_url_env("APP_CONFIG_URL"))
 ///     .add_source(Environment::with_prefix("APP"))
 ///     .build()
 ///     .unwrap();
@@ -67,8 +67,11 @@ impl SovereignConfigSource {
 
     /// Builds a source that reads the managed connection URL from the named
     /// environment variable when the configuration is built.
+    ///
+    /// Only the connection URL comes from the environment; the configuration
+    /// values are still read from the Sovereign Config subtree.
     #[must_use]
-    pub fn from_env(variable: impl Into<String>) -> Self {
+    pub fn from_url_env(variable: impl Into<String>) -> Self {
         Self {
             connection: Connection::Env(variable.into()),
         }
