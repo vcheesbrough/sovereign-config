@@ -9,10 +9,8 @@ use std::path::Path;
 
 use serde_yaml::Value;
 
-/// Branches temporarily permitted to trigger a manual production promotion, on
-/// top of `main`. TEMPORARY (card #262): drop `feat/iteration-9-prod-environment`
-/// here and in `.woodpecker/build.yml` before merging, leaving `main` only.
-const PROD_BRANCHES: &[&str] = &["main", "feat/iteration-9-prod-environment"];
+/// The only branch permitted to trigger a production promotion.
+const PROD_BRANCHES: &[&str] = &["main"];
 
 fn pipeline() -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.woodpecker/build.yml");
