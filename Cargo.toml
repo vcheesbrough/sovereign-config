@@ -5,14 +5,16 @@ members = [
   "crates/sovereign-config-core",
   "crates/sovereign-config-native",
   "crates/sovereign-config-proto",
+  "crates/sovereign-config-provider",
   "crates/sovereign-config-server",
   "crates/sovereign-config-web",
   "test-consumers/rust-client",
+  "test-consumers/rust-provider",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
 rust-version = "1.94"
 license = "PolyForm-Noncommercial-1.0.0"

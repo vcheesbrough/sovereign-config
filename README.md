@@ -159,6 +159,10 @@ Each service account's Authentik username embeds a slug of its display name so a
 
 The connection-manager identity is isolated from the introspection credential and from the browser. It holds global `add_user`, `add_token`, `view_token`, and `view_group` — no key or user content is exposed by any of these, only metadata needed to discover and label an account it created — plus object-level `view`/`change`/`delete` on the users and `set_key` on the tokens it creates. It is not a superuser, cannot view any token key, and cannot touch unrelated Authentik objects. Browser code reaches only same-origin gRPC-Web; the Authentik administration endpoint and token are absent from every browser response and built asset.
 
+## Application provider
+
+`sovereign-config-provider` is an ergonomic Rust facade for consuming a managed connection from application code: it parses the version-1 connection URL, obtains a fresh client-credentials token, reads only the encoded subtree over native gRPC, transparently reveals secret leaves, and deserializes the result into a `serde` type. It is a thin layer over the shared core/client/native crates and adds no new URL format, authentication, or transport. It is distributed as tagged workspace source only — there is no provider container or prebuilt library artifact — and must be built from the same tag as the server. See `crates/sovereign-config-provider/README.md` for the API, error surface, and the no-cache/no-retry contract.
+
 ## Upgrade
 
 1. Stop Sovereign Config traffic through Traefik, stop the old Sovereign Config container while leaving PostgreSQL running, and verify no v2 server process remains before migration or v3 writes.
