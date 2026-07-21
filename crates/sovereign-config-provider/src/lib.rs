@@ -140,6 +140,14 @@ impl Provider {
     /// deserializes it. Nothing is cached across or within calls; no step is
     /// retried.
     ///
+    /// Every stored value is text, and this method deserializes **strictly** —
+    /// it does not coerce a leaf like `"8080"` into a numeric or boolean field.
+    /// `T` therefore maps cleanly only when its leaves are `String`-shaped. For a
+    /// typed `T` (integers, booleans, …), enable the `config` feature and load
+    /// through `SovereignConfigSource`, or hand [`Provider::load_json`] to the
+    /// [`config`](https://docs.rs/config) crate, both of which coerce string
+    /// leaves to the target type.
+    ///
     /// # Errors
     ///
     /// Returns a bounded, redacted [`ProviderError`]:
