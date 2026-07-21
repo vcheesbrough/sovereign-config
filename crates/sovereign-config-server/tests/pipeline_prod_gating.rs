@@ -36,12 +36,13 @@ fn commands_text(step: &Value) -> String {
         .join("\n")
 }
 
-/// A single `when` condition, with its `event` and `branch` fields each
-/// normalised to a set (either may be a YAML scalar or sequence; `branch` may
-/// be absent, meaning "any branch").
+/// A single `when` condition. `event` and `branch` are each normalised to a set
+/// (either may be a YAML scalar or sequence; `branch` may be absent, meaning
+/// "any branch"). `evaluate` is the optional CEL guard expression.
 struct Condition {
     events: BTreeSet<String>,
     branches: BTreeSet<String>,
+    evaluate: Option<String>,
 }
 
 fn strings(value: &Value) -> BTreeSet<String> {
@@ -65,6 +66,10 @@ fn when_conditions(step: &Value) -> Vec<Condition> {
         .map(|condition| Condition {
             events: strings(condition.get("event").expect("`when` needs an event")),
             branches: condition.get("branch").map(strings).unwrap_or_default(),
+            evaluate: condition
+                .get("evaluate")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         })
         .collect()
 }
@@ -85,6 +90,14 @@ fn production_steps_deploy_to_prod_from_permitted_branches() {
                 .iter()
                 .all(|c| c.events == BTreeSet::from(["deployment".to_owned()])),
             "{name} must only ever run on a deployment event, never on push"
+        );
+        // Restrict to the prod deploy target so a deployment with any other
+        // (or mistyped) target from main cannot run the prod chain.
+        assert!(
+            conditions
+                .iter()
+                .all(|c| c.evaluate.as_deref() == Some("CI_PIPELINE_DEPLOY_TARGET == \"prod\"")),
+            "{name} must be guarded by the prod deploy-target evaluate expression"
         );
         let branches: BTreeSet<String> = conditions
             .iter()
@@ -149,6 +162,19 @@ fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
         resolve_cmd.contains("git tag --points-at HEAD") && resolve_cmd.contains("> .release-tag"),
         "resolve-release-tag must resolve the commit's git tag into .release-tag, not allocate"
     );
+    // The deploy path must not install packages at runtime; git comes from a
+    // digest-pinned image instead (repo policy: pin by digest, no undeclared fetch).
+    assert!(
+        !resolve_cmd.contains("apk add"),
+        "resolve-release-tag must not install git at runtime; use a digest-pinned git image"
+    );
+    assert!(
+        resolve
+            .get("image")
+            .and_then(Value::as_str)
+            .is_some_and(|image| image.contains("alpine/git:") && image.contains("@sha256:")),
+        "resolve-release-tag must use a digest-pinned git image"
+    );
     let verify_cmd = commands_text(step(&pipeline, "verify-image"));
     assert!(
         verify_cmd.contains("docker pull")
@@ -197,4 +223,21 @@ fn production_deploy_targets_the_production_environment() {
     assert!(command.contains("--pull always"));
     // A production deploy must never touch the development stack.
     assert!(!command.contains("sovereign-config-dev"));
+}
+
+#[test]
+fn prod_live_manager_check_validates_the_production_group() {
+    // The live lifecycle test resolves the browsing group named by
+    // SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP; the prod gate must point it at the
+    // production group so it actually validates prod, not the dev group.
+    let pipeline = pipeline();
+    let env = step(&pipeline, "validate-authentik-manager-live-prod")
+        .get("environment")
+        .expect("prod live-manager step needs environment");
+    assert_eq!(
+        env.get("SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP")
+            .and_then(Value::as_str),
+        Some("sovereign-config-connections"),
+        "the prod live-manager gate must validate the production browsing group"
+    );
 }

@@ -178,6 +178,7 @@ steps:
     environment:
       CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
       SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL: https://auth.desync.link/
+      SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP: sovereign-config-dev-connections
       SOVEREIGN_CONFIG_LIVE_AUTHENTIK_TOKEN:
         from_secret: sovereign_config_dev_manager_api_token
       # Elevated credential used only to create and clean up a disposable
@@ -246,13 +247,15 @@ steps:
     when:
       - event: deployment
         branch: main
-    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
+    # Digest-pinned image that already ships git — no runtime package install on
+    # the deploy path (repo policy: pin by digest, no undeclared outbound fetch).
+    image: docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
     environment:
       GITHUB_TOKEN:
         from_secret: github_token
     commands:
       - |
-        apk add --no-cache git >/dev/null
         git config --global --add safe.directory '*'
         # Fast path: a semver tag already on HEAD from the clone.
         RELEASE_TAG=$$(git tag --points-at HEAD 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$$' | sort -V | tail -1)
@@ -280,6 +283,7 @@ steps:
     when:
       - event: deployment
         branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -307,6 +311,7 @@ steps:
     when:
       - event: deployment
         branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
     pull: true
     image: ghcr.io/vcheesbrough/woodpecker-plugin-authentik-blueprint:v0.2.0@sha256:9f262c4390205b5629e9af7560f4e492f0155395a429153703ba351206d9d975
     settings:
@@ -336,10 +341,12 @@ steps:
     when:
       - event: deployment
         branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
     environment:
       CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
       SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL: https://auth.desync.link/
+      SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP: sovereign-config-connections
       SOVEREIGN_CONFIG_LIVE_AUTHENTIK_TOKEN:
         from_secret: sovereign_config_prod_manager_api_token
       # Elevated credential used only to create and clean up a disposable canary
@@ -363,6 +370,7 @@ steps:
     when:
       - event: deployment
         branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
