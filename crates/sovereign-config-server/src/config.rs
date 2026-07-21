@@ -67,7 +67,7 @@ impl Config {
         let issuer_url = issuer
             .parse::<Url>()
             .context("SOVEREIGN_CONFIG_OIDC_ISSUER must be a valid URL")?;
-        validate_issuer_url(&issuer_url)?;
+        validate_issuer_url(&issuer, &issuer_url)?;
         let audience = required_identifier("SOVEREIGN_CONFIG_OIDC_AUDIENCE")?;
         let introspection_client_id =
             required_identifier("SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID")?;
@@ -197,7 +197,11 @@ fn validate_introspection_url(url: &Url) -> Result<()> {
     Ok(())
 }
 
-fn validate_issuer_url(url: &Url) -> Result<()> {
+/// Rejects issuers that are valid URLs but not in the exact canonical form
+/// `ConnectionUrl::managed` requires when it later reparses the same string:
+/// accepting a non-canonical issuer here would only surface as a failure
+/// after Authentik has already been mutated by a create or rotate.
+fn validate_issuer_url(raw: &str, url: &Url) -> Result<()> {
     if url.scheme() != "https"
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -208,6 +212,9 @@ fn validate_issuer_url(url: &Url) -> Result<()> {
         || !url.path().ends_with('/')
     {
         bail!("SOVEREIGN_CONFIG_OIDC_ISSUER is not a permitted issuer URL");
+    }
+    if url.as_str() != raw {
+        bail!("SOVEREIGN_CONFIG_OIDC_ISSUER must be in canonical form (expected {url})");
     }
     Ok(())
 }
@@ -349,22 +356,26 @@ mod tests {
 
     #[test]
     fn issuer_requires_an_https_per_provider_url() {
-        assert!(
-            validate_issuer_url(
-                &"https://example.test/application/o/sovereign-config/"
-                    .parse()
-                    .unwrap()
-            )
-            .is_ok()
+        let canonical = "https://example.test/application/o/sovereign-config/";
+        assert!(validate_issuer_url(canonical, &canonical.parse().unwrap()).is_ok());
+        let no_provider_path = "https://example.test/";
+        assert!(validate_issuer_url(no_provider_path, &no_provider_path.parse().unwrap()).is_err());
+        let insecure = "http://example.test/application/o/sovereign-config/";
+        assert!(validate_issuer_url(insecure, &insecure.parse().unwrap()).is_err());
+    }
+
+    /// Regression: a valid-but-non-canonical issuer must be rejected at
+    /// startup rather than accepted and later fail managed URL generation
+    /// after Authentik has already been mutated by a create or rotate.
+    #[test]
+    fn issuer_must_already_be_in_canonical_form() {
+        let raw = "HTTPS://Example.test:443/application/o/sovereign-config/";
+        let url: reqwest::Url = raw.parse().unwrap();
+        assert_ne!(
+            url.as_str(),
+            raw,
+            "the test issuer must actually be non-canonical"
         );
-        assert!(validate_issuer_url(&"https://example.test/".parse().unwrap()).is_err());
-        assert!(
-            validate_issuer_url(
-                &"http://example.test/application/o/sovereign-config/"
-                    .parse()
-                    .unwrap()
-            )
-            .is_err()
-        );
+        assert!(validate_issuer_url(raw, &url).is_err());
     }
 }

@@ -377,6 +377,7 @@ async function mockConnections(page, options = {}) {
     script: options.script || {},
     rotations: 0
   };
+  let delayedList;
   await page.route('**/sovereign.config.v3.ManagedConnections/*', async route => {
     const method = route.request().url().split('/').pop();
     const fields = stringFields(route.request().postDataBuffer());
@@ -396,6 +397,11 @@ async function mockConnections(page, options = {}) {
       if (outcome) return reply(outcome);
     }
     if (method === 'ListManagedConnections') {
+      if (delayedList) {
+        const delay = delayedList;
+        delayedList = undefined;
+        await delay.promise;
+      }
       return reply(listConnectionsReply(state.connections));
     }
     if (method === 'CreateManagedConnection') {
@@ -413,6 +419,12 @@ async function mockConnections(page, options = {}) {
     }
     return reply(Buffer.alloc(0), 2);
   });
+  state.delayNextList = () => {
+    let release;
+    const promise = new Promise(resolve => { release = resolve; });
+    delayedList = { promise };
+    return release;
+  };
   return state;
 }
 
@@ -1398,6 +1410,34 @@ test('logout discards a revealed connection URL and clears the view', async ({ p
   await expect(page.locator('#connection-url-dialog')).toBeHidden();
   expect(await page.locator('#revealed-connection-url').inputValue()).toBe('');
   await expect(page.locator('#connection-count')).toHaveText('0 connections');
+  await expect(page.locator('body')).not.toContainText(APP_PASSWORD_SENTINEL);
+});
+
+// Regression: a create that succeeds while the user logs out before its own
+// reload of the connections list resolves must not resurrect the one-time
+// URL dialog once that reload finally completes.
+test('a logout while create is still reloading connections suppresses the URL dialog', async ({ page }) => {
+  const connections = await mockConnections(page, { connections: [] });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await page.goto('/connections/');
+  await expect(page.locator('#connection-count')).toHaveText('0 connections');
+
+  await page.getByLabel('Display name').fill('Pipeline reader');
+  await page.getByLabel('Read-only root').fill('/apps/api');
+  await page.getByRole('button', { name: 'Create connection' }).click();
+
+  const releaseList = connections.delayNextList();
+  await page.locator('#confirm-create-connection').click();
+
+  // Create has succeeded; its own reload of the connections list is now
+  // blocked. Log out before that reload completes.
+  await page.locator('#logout').dispatchEvent('click');
+  releaseList();
+
+  // The dialog must not resurrect the just-provisioned credential after
+  // logout, even though the reload that unblocks it finishes afterward.
+  await expect(page.locator('#connection-url-dialog')).toBeHidden();
   await expect(page.locator('body')).not.toContainText(APP_PASSWORD_SENTINEL);
 });
 
