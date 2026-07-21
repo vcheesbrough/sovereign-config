@@ -30,6 +30,13 @@ pub async fn load_config(url: &str) -> Result<AppConfig, ProviderError> {
     Provider::connect(url).await?.load().await
 }
 
+/// The connection's root is a plain `&str`, so reading it needs no Sovereign
+/// Config core/client/native type — only this crate.
+#[must_use]
+pub fn connected_root(provider: &Provider) -> &str {
+    provider.root()
+}
+
 #[cfg(test)]
 mod tests {
     use super::load_config;
