@@ -92,6 +92,92 @@ entries:
       slug: sovereign-config-dev
       provider: !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config-dev]]
 
+  # Isolated identity used only to provision managed application connections.
+  # It may create users and tokens, and administer only the objects it created
+  # (granted per object by the initial-permissions policy below). It is not a
+  # superuser, has no Admin UI access, and cannot read, change, or delete an
+  # unrelated user or token, nor view any token key.
+  - model: authentik_rbac.role
+    state: present
+    identifiers:
+      name: sovereign-config-dev-connection-manager
+    attrs:
+      name: sovereign-config-dev-connection-manager
+      permissions:
+        - authentik_core.add_user
+        - authentik_core.add_token
+        # Authentik's service-account endpoint creates the app-password token with a
+        # direct ORM call, so InitialPermissions never attaches to it, and TokenViewSet
+        # only shows a non-superuser tokens they own. Without a global view the manager
+        # cannot discover or rotate the credential it just created. This exposes token
+        # metadata only: view_token_key is deliberately never granted, so no key is
+        # ever readable.
+        - authentik_core.view_token
+        # Global so the manager can resolve the browsing group below by name
+        # even once it holds no object-level permission on any managed
+        # account. Grants nothing: group membership carries no permissions
+        # here and authorization is granted directly on the service account.
+        - authentik_core.view_group
+
+  - model: authentik_core.group
+    state: present
+    identifiers:
+      name: sovereign-config-dev-connection-manager
+    attrs:
+      is_superuser: false
+      roles:
+        - !Find [authentik_rbac.role, [name, sovereign-config-dev-connection-manager]]
+
+  # Purely organizational: every managed connection's service account is added
+  # here so an operator can browse them together in Authentik. Carries no
+  # roles and grants no permissions.
+  - model: authentik_core.group
+    state: present
+    identifiers:
+      name: sovereign-config-dev-connections
+    attrs:
+      is_superuser: false
+
+  - model: authentik_rbac.initialpermissions
+    state: present
+    identifiers:
+      name: sovereign-config-dev-connection-manager-objects
+    attrs:
+      name: sovereign-config-dev-connection-manager-objects
+      mode: role
+      role: !Find [authentik_rbac.role, [name, sovereign-config-dev-connection-manager]]
+      permissions:
+        - !Find [auth.permission, [codename, view_user], [content_type__app_label, authentik_core]]
+        - !Find [auth.permission, [codename, change_user], [content_type__app_label, authentik_core]]
+        - !Find [auth.permission, [codename, delete_user], [content_type__app_label, authentik_core]]
+        - !Find [auth.permission, [codename, view_token], [content_type__app_label, authentik_core]]
+        - !Find [auth.permission, [codename, set_token_key], [content_type__app_label, authentik_core]]
+
+  - model: authentik_core.user
+    state: present
+    identifiers:
+      username: sovereign-config-dev-connection-manager
+    attrs:
+      username: sovereign-config-dev-connection-manager
+      name: Sovereign Config development connection manager
+      type: service_account
+      is_active: true
+      path: goauthentik.io/service-accounts
+      groups:
+        - !Find [authentik_core.group, [name, sovereign-config-dev-connection-manager]]
+
+  - model: authentik_core.token
+    state: present
+    identifiers:
+      identifier: sovereign-config-dev-connection-manager-api
+    attrs:
+      identifier: sovereign-config-dev-connection-manager-api
+      intent: api
+      user: !Find [authentik_core.user, [username, sovereign-config-dev-connection-manager]]
+      key: ${AUTHENTIK_SOVEREIGN_CONFIG_DEV_MANAGER_API_TOKEN}
+      description: "Sovereign Config development managed-connection administration"
+      expiring: false
+
   - model: authentik_core.application
     state: absent
     identifiers:

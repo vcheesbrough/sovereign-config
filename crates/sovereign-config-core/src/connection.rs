@@ -86,6 +86,42 @@ impl ConnectionUrl {
         })
     }
 
+    /// Builds the canonical version-1 managed connection URL from validated parts.
+    ///
+    /// The emitted URL uses the exact field ordering, percent encoding, and
+    /// unpadded `Base64URL` credential encoding produced by [`ConnectionUrl::parse`],
+    /// and is guaranteed to round-trip through the parser by construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error when the public origin, root, issuer, client ID,
+    /// username, or app password would not form a canonical connection URL.
+    pub fn managed(
+        public_origin: &str,
+        root: &ConfigPath,
+        issuer: &str,
+        client_id: &str,
+        username: &str,
+        app_password: &Secret,
+    ) -> Result<Self, ConnectionUrlError> {
+        let origin = Url::parse(public_origin).map_err(|_| ConnectionUrlError)?;
+        if origin.path() != "/" || origin.fragment().is_some() {
+            return Err(ConnectionUrlError);
+        }
+        validate_endpoint(&origin)?;
+        let endpoint = origin.origin().ascii_serialization();
+        if endpoint != public_origin.trim_end_matches('/') {
+            return Err(ConnectionUrlError);
+        }
+        if username.contains(':') {
+            return Err(ConnectionUrlError);
+        }
+        let credential = format!("{username}:{}", app_password.expose());
+        let client_secret = general_purpose::URL_SAFE_NO_PAD.encode(credential);
+        let serialized = serialize(&endpoint, root, issuer, client_id, Some(&client_secret));
+        Self::parse(&serialized)
+    }
+
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
@@ -297,6 +333,86 @@ mod tests {
             "https://config.example.test/#v=1&issuer=https%3A%2F%2Fauth.example.test%2F&client_id=client&client_secret=YWJj",
         ] {
             assert!(ConnectionUrl::parse(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn managed_constructor_round_trips_through_the_parser() {
+        let issuer = "https://auth.example.test/application/o/config/";
+        for root in ["/", "/apps", "/apps/api"] {
+            let root = crate::ConfigPath::parse(root).unwrap();
+            let connection = ConnectionUrl::managed(
+                "https://config.example.test",
+                &root,
+                issuer,
+                "sovereign-config",
+                "generated-username",
+                &crate::Secret::new("app-password-sentinel~!*'()"),
+            )
+            .unwrap();
+            let reparsed = ConnectionUrl::parse(connection.canonical().expose()).unwrap();
+            assert_eq!(reparsed.root().as_str(), root.as_str());
+            assert_eq!(reparsed.issuer(), issuer);
+            assert_eq!(
+                reparsed.client_authentication().unwrap().expose(),
+                general_purpose::STANDARD.encode("generated-username:app-password-sentinel~!*'()")
+            );
+            assert!(!connection.to_string().contains("app-password-sentinel"));
+        }
+    }
+
+    #[test]
+    fn managed_constructor_rejects_noncanonical_parts() {
+        let root = crate::ConfigPath::parse("/apps").unwrap();
+        let issuer = "https://auth.example.test/application/o/config/";
+        for (origin, issuer, username, password) in [
+            ("https://config.example.test/path", issuer, "user", "pass"),
+            (
+                "https://config.example.test?query=1",
+                issuer,
+                "user",
+                "pass",
+            ),
+            ("https://config.example.test#frag", issuer, "user", "pass"),
+            (
+                "https://user:pw@config.example.test",
+                issuer,
+                "user",
+                "pass",
+            ),
+            ("http://config.example.test", issuer, "user", "pass"),
+            ("https://CONFIG.example.test", issuer, "user", "pass"),
+            ("https://config.example.test:443", issuer, "user", "pass"),
+            ("not a url", issuer, "user", "pass"),
+            (
+                "https://config.example.test",
+                "https://auth.example.test/application/o/config",
+                "user",
+                "pass",
+            ),
+            (
+                "https://config.example.test",
+                "http://auth.example.test/application/o/config/",
+                "user",
+                "pass",
+            ),
+            ("https://config.example.test", issuer, "user:name", "pass"),
+            ("https://config.example.test", issuer, "", "pass"),
+            ("https://config.example.test", issuer, "user", ""),
+            ("https://config.example.test", issuer, "user", "pass\nword"),
+        ] {
+            assert!(
+                ConnectionUrl::managed(
+                    origin,
+                    &root,
+                    issuer,
+                    "sovereign-config",
+                    username,
+                    &crate::Secret::new(password),
+                )
+                .is_err(),
+                "accepted origin={origin} issuer={issuer} username={username}"
+            );
         }
     }
 

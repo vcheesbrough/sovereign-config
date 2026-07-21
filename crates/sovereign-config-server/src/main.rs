@@ -1,5 +1,7 @@
 mod auth;
+mod authentik;
 mod config;
+mod managed;
 mod metrics;
 mod values;
 mod web;
@@ -19,12 +21,15 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use auth::{Authenticator, grpc_authentication_layer};
+use authentik::AuthentikAdminClient;
 use config::{Config, required_env};
-use metrics::AuthenticationMetrics;
-use sovereign_config_core::PROTOCOL_VERSION;
+use managed::{ManagedConnectionsService, ManagedSettings};
+use metrics::{AuthenticationMetrics, ManagedConnectionMetrics};
+use sovereign_config_core::{PROTOCOL_VERSION, Secret};
 use sovereign_config_proto::sovereign::config::v3::{
     GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
     configuration_server::ConfigurationServer,
+    managed_connections_server::ManagedConnectionsServer,
     system_server::{System, SystemServer},
 };
 use values::ConfigurationService;
@@ -44,6 +49,7 @@ const fn application_version(release_version: Option<&str>) -> &str {
 struct AppState {
     database: PgPool,
     authentication_metrics: Arc<AuthenticationMetrics>,
+    managed_metrics: Arc<ManagedConnectionMetrics>,
 }
 
 #[derive(Clone, Default)]
@@ -90,8 +96,9 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         Ok(_) => (
             StatusCode::OK,
             format!(
-                "sovereign_config_up 1\n{}",
-                state.authentication_metrics.render()
+                "sovereign_config_up 1\n{}{}",
+                state.authentication_metrics.render(),
+                state.managed_metrics.render()
             ),
         ),
         Err(error) => {
@@ -99,8 +106,9 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
-                    "sovereign_config_up 0\n{}",
-                    state.authentication_metrics.render()
+                    "sovereign_config_up 0\n{}{}",
+                    state.authentication_metrics.render(),
+                    state.managed_metrics.render()
                 ),
             )
         }
@@ -134,6 +142,22 @@ async fn main() -> Result<()> {
     let web_assets = WebAssetsLayer::new(&config.web);
     let authenticator = Authenticator::new(config.authentication)?;
     let authentication_metrics = Arc::new(AuthenticationMetrics::default());
+    let managed_metrics = Arc::new(ManagedConnectionMetrics::default());
+    let managed_admin = AuthentikAdminClient::new(
+        config.managed.api_origin.clone(),
+        Secret::new(config.managed.api_token),
+        config.managed.timeout,
+    )?;
+    let managed_settings = ManagedSettings {
+        public_origin: config.managed.public_origin,
+        issuer: config.managed.issuer,
+        client_id: config.managed.client_id,
+        grants_attribute: config.managed.grants_attribute,
+        managed_group: config.managed.managed_group,
+        // Comfortably longer than the bounded Authentik call, so an expired
+        // lease proves the previous rotation attempt has ended.
+        rotation_lease: config.managed.timeout * 6,
+    };
     let database = PgPoolOptions::new()
         .acquire_timeout(Duration::from_secs(5))
         .connect(&config.database_url)
@@ -147,6 +171,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         database,
         authentication_metrics: Arc::clone(&authentication_metrics),
+        managed_metrics: Arc::clone(&managed_metrics),
     };
     let metrics_app = Router::new()
         .route("/metrics", get(metrics))
@@ -168,6 +193,9 @@ async fn main() -> Result<()> {
     health_reporter
         .set_serving::<ConfigurationServer<ConfigurationService>>()
         .await;
+    health_reporter
+        .set_serving::<ManagedConnectionsServer<ManagedConnectionsService>>()
+        .await;
 
     info!(grpc_addr = %config.grpc_addr, metrics_addr = %config.metrics_addr, protocol_version = PROTOCOL_VERSION, "sovereign-config started");
     Server::builder()
@@ -182,6 +210,14 @@ async fn main() -> Result<()> {
         .add_service(ConfigurationServer::new(ConfigurationService::new(
             state.database.clone(),
         )))
+        .add_service(ManagedConnectionsServer::new(
+            ManagedConnectionsService::new(
+                state.database.clone(),
+                managed_admin,
+                managed_settings,
+                managed_metrics,
+            ),
+        ))
         .serve_with_shutdown(config.grpc_addr, shutdown_signal())
         .await
         .context("gRPC server terminated")

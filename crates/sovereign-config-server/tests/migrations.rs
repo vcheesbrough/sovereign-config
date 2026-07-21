@@ -25,7 +25,7 @@ async fn connect_when_ready(database_url: &str) -> PgPool {
 
 async fn reset_schema(pool: &PgPool, context: &str) {
     sqlx::query(
-        "DROP TABLE IF EXISTS configuration_values, schema_metadata, _sqlx_migrations CASCADE",
+        "DROP TABLE IF EXISTS configuration_values, managed_connections, schema_metadata, _sqlx_migrations CASCADE",
     )
     .execute(pool)
     .await
@@ -67,6 +67,51 @@ async fn classification_is_explicit_and_constrained(pool: &PgPool) {
 
     assert!(invalid.is_err());
     assert!(omitted.is_err());
+}
+
+async fn managed_connection_constraints_are_enforced(pool: &PgPool) {
+    let valid = sqlx::query(
+        "INSERT INTO managed_connections (connection_id, display_name, root, state, created_at, updated_at) VALUES ('abcdefghij0123456789abcdefghij01', 'Pipeline reader', '/apps/api', 'provisioning', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .execute(pool)
+    .await;
+    let global_root = sqlx::query(
+        "INSERT INTO managed_connections (connection_id, display_name, root, state, created_at, updated_at) VALUES ('abcdefghij0123456789abcdefghij02', 'Global reader', '/', 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .execute(pool)
+    .await;
+    let invalid_id = sqlx::query(
+        "INSERT INTO managed_connections (connection_id, display_name, root, state, created_at, updated_at) VALUES ('UPPER', 'name', '/', 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .execute(pool)
+    .await;
+    let invalid_state = sqlx::query(
+        "INSERT INTO managed_connections (connection_id, display_name, root, state, created_at, updated_at) VALUES ('abcdefghij0123456789abcdefghij03', 'name', '/', 'revoked', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .execute(pool)
+    .await;
+    let invalid_root = sqlx::query(
+        "INSERT INTO managed_connections (connection_id, display_name, root, state, created_at, updated_at) VALUES ('abcdefghij0123456789abcdefghij04', 'name', 'unrooted', 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .execute(pool)
+    .await;
+    let padded_name = sqlx::query(
+        "INSERT INTO managed_connections (connection_id, display_name, root, state, created_at, updated_at) VALUES ('abcdefghij0123456789abcdefghij05', ' padded', '/', 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .execute(pool)
+    .await;
+
+    assert!(valid.is_ok());
+    assert!(global_root.is_ok());
+    assert!(invalid_id.is_err());
+    assert!(invalid_state.is_err());
+    assert!(invalid_root.is_err());
+    assert!(padded_name.is_err());
+
+    sqlx::query("DELETE FROM managed_connections")
+        .execute(pool)
+        .await
+        .expect("managed connection cleanup must succeed");
 }
 
 #[tokio::test]
@@ -202,10 +247,56 @@ async fn migrations_are_repeatable_against_postgresql() {
     .fetch_one(&pool)
     .await
     .expect("configuration value schema must be readable");
-    assert_eq!(applied_migrations, 4);
+    let managed_connection_columns: Vec<String> = sqlx::query_scalar(
+        r"
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'managed_connections'
+        ORDER BY column_name
+        ",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("managed connection schema must be readable");
+    // The metadata table must never gain a credential, secret, or URL column.
+    assert_eq!(
+        managed_connection_columns,
+        [
+            "connection_id",
+            "created_at",
+            "credential_identifier",
+            "display_name",
+            "provider_user_id",
+            "provider_user_uid",
+            "root",
+            "state",
+            "updated_at",
+        ]
+    );
+    let credential_columns: i64 = sqlx::query_scalar(
+        r"
+        SELECT COUNT(*)
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND (
+            column_name LIKE '%url%'
+            OR column_name LIKE '%password%'
+            OR column_name LIKE '%secret%'
+            OR column_name LIKE '%key%'
+            OR column_name LIKE '%token%'
+          )
+        ",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("credential column inventory must be readable");
+    assert_eq!(applied_migrations, 5);
     assert_eq!(metadata_rows, 1);
     assert_eq!(authorization_tables, 0);
     assert_eq!(value_columns, 5);
+    assert_eq!(credential_columns, 0);
     rooted_path_constraint_accepts_only_rooted_values(&pool).await;
     classification_is_explicit_and_constrained(&pool).await;
+    managed_connection_constraints_are_enforced(&pool).await;
 }

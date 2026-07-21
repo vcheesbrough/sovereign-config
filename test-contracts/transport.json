@@ -4,6 +4,7 @@
   { "grpc_status": 5, "error_kind": "NotFound", "message": "configuration value not found" },
   { "grpc_status": 7, "error_kind": "PermissionDenied", "message": "permission denied" },
   { "grpc_status": 9, "error_kind": "IncompatibleProtocol", "message": "service protocol is incompatible" },
+  { "grpc_status": 10, "error_kind": "Unavailable", "message": "service is unavailable" },
   { "grpc_status": 14, "error_kind": "Unavailable", "message": "service is unavailable" },
   { "grpc_status": 16, "error_kind": "Unauthenticated", "message": "authentication required" },
   { "grpc_status": 2, "error_kind": "Internal", "message": "request failed" }
