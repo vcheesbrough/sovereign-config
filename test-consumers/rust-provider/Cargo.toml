@@ -1,0 +1,18 @@
+[package]
+name = "sovereign-config-rust-provider-consumer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+sovereign-config-provider = { path = "../../crates/sovereign-config-provider" }
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

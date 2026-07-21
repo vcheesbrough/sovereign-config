@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-cli"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-client"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "async-trait",
  "sovereign-config-core",
@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-core"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "base64",
  "serde",
@@ -2294,7 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-native"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -2316,7 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-proto"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -2326,8 +2326,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovereign-config-provider"
+version = "1.8.0"
+dependencies = [
+ "async-trait",
+ "axum 0.8.9",
+ "serde",
+ "serde_json",
+ "sovereign-config-client",
+ "sovereign-config-core",
+ "sovereign-config-native",
+ "sovereign-config-proto",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "sovereign-config-rust-consumer"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "async-trait",
  "sovereign-config-client",
@@ -2336,8 +2354,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovereign-config-rust-provider-consumer"
+version = "1.8.0"
+dependencies = [
+ "serde",
+ "sovereign-config-provider",
+ "tokio",
+]
+
+[[package]]
 name = "sovereign-config-server"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -2370,7 +2397,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-web"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "async-trait",
  "base64",
