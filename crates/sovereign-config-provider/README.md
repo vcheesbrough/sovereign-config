@@ -101,8 +101,8 @@ is stored as text, `config`'s type coercion turns string leaves into the target
 type — a stored `"10"` into a `u32`, `"true"` into a `bool` — when you deserialize
 into your own `#[derive(Deserialize)]` struct instead of a `HashMap`.
 
-Constructors, all resolving the *connection URL* at build time (the configuration
-values always come from the Sovereign Config subtree):
+Two constructors, both resolving the *connection URL* at build time (the
+configuration values always come from the Sovereign Config subtree):
 
 - `initialise_from_default_environment()` — the standard deployment entry point.
   It first checks `SOVEREIGN_CONFIG_ACCESS_URL_FILE`; if set, the file at that
@@ -110,8 +110,8 @@ values always come from the Sovereign Config subtree):
   that mount the URL as a file). Otherwise it uses `SOVEREIGN_CONFIG_ACCESS_URL`
   directly. If neither is set, building fails with an error naming both
   variables.
-- `from_url_env(var)` — reads the URL from a custom environment variable.
-- `from_url(url)` — takes a URL directly.
+- `initialise_from_url(url)` — takes a URL you already hold, from a custom
+  environment variable or any other source.
 
 `collect` performs blocking network I/O on a dedicated internal thread, so
 `build()` is safe from both synchronous and asynchronous contexts. The source's

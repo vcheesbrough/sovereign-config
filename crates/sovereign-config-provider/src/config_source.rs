@@ -31,7 +31,7 @@ const URL_VAR: &str = "SOVEREIGN_CONFIG_ACCESS_URL";
 ///
 /// let settings = Config::builder()
 ///     .add_source(File::with_name("config/settings").required(false))
-///     .add_source(SovereignConfigSource::from_url_env("APP_CONFIG_URL"))
+///     .add_source(SovereignConfigSource::initialise_from_default_environment())
 ///     .add_source(Environment::with_prefix("APP"))
 ///     .build()
 ///     .unwrap();
@@ -58,28 +58,17 @@ pub struct SovereignConfigSource {
 #[derive(Clone)]
 enum Connection {
     Url(String),
-    Env(String),
     DefaultEnvironment,
 }
 
 impl SovereignConfigSource {
-    /// Builds a source from a literal managed connection URL.
+    /// Builds a source from a managed connection URL you already hold — for
+    /// example one read from a custom environment variable or another secret
+    /// source.
     #[must_use]
-    pub fn from_url(url: impl Into<String>) -> Self {
+    pub fn initialise_from_url(url: impl Into<String>) -> Self {
         Self {
             connection: Connection::Url(url.into()),
-        }
-    }
-
-    /// Builds a source that reads the managed connection URL from the named
-    /// environment variable when the configuration is built.
-    ///
-    /// Only the connection URL comes from the environment; the configuration
-    /// values are still read from the Sovereign Config subtree.
-    #[must_use]
-    pub fn from_url_env(variable: impl Into<String>) -> Self {
-        Self {
-            connection: Connection::Env(variable.into()),
         }
     }
 
@@ -108,11 +97,6 @@ impl SovereignConfigSource {
     fn resolve_url(&self) -> Result<String, ConfigError> {
         match &self.connection {
             Connection::Url(url) => Ok(url.clone()),
-            Connection::Env(variable) => std::env::var(variable).map_err(|_| {
-                ConfigError::Message(format!(
-                    "environment variable `{variable}` is not set or not valid UTF-8"
-                ))
-            }),
             Connection::DefaultEnvironment => resolve_default_environment(),
         }
     }
