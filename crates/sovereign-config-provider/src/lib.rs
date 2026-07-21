@@ -142,6 +142,35 @@ impl Provider {
     /// - [`ProviderError::InvalidConversion`] — the subtree could not be
     ///   converted into `T`.
     pub async fn load<T: DeserializeOwned>(&self) -> Result<T, ProviderError> {
+        let json = self.load_value().await?;
+        serde_json::from_value(json).map_err(|_| ProviderError::InvalidConversion)
+    }
+
+    /// Loads the connection's permitted subtree as a JSON string.
+    ///
+    /// Identical to [`Provider::load`] in what it reads and reveals, but returns
+    /// the subtree serialized as pretty JSON instead of deserializing it. This is
+    /// the ergonomic entry point for a layered configuration builder such as the
+    /// [`config`](https://docs.rs/config) crate — hand the string to
+    /// `File::from_str(.., FileFormat::Json)` as one source. Consumers using this
+    /// need no `serde_json` dependency of their own.
+    ///
+    /// The returned string contains the real, revealed configuration values
+    /// (including secrets), so treat it as sensitive: never log it or place it in
+    /// diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded, redacted [`ProviderError`] set as
+    /// [`Provider::load`].
+    pub async fn load_json(&self) -> Result<String, ProviderError> {
+        let json = self.load_value().await?;
+        serde_json::to_string_pretty(&json).map_err(|_| ProviderError::InvalidConversion)
+    }
+
+    /// Acquires one fresh token, reads the subtree, reveals every secret leaf,
+    /// and assembles the real values into a JSON tree relative to the root.
+    async fn load_value(&self) -> Result<serde_json::Value, ProviderError> {
         let token = self
             .token
             .access_token()
@@ -155,8 +184,7 @@ impl Provider {
                 revealed.insert(value.path.clone(), secret);
             }
         }
-        let json = subtree_to_json(&self.root, &subtree.values, &revealed)?;
-        serde_json::from_value(json).map_err(|_| ProviderError::InvalidConversion)
+        subtree_to_json(&self.root, &subtree.values, &revealed)
     }
 
     /// The canonical configuration root this connection is confined to.
