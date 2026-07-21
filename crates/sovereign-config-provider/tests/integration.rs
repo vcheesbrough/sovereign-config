@@ -333,6 +333,71 @@ async fn load_json_returns_the_revealed_subtree_as_json() {
     assert_eq!(harness.mock.reveal_requests.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn load_does_not_coerce_string_leaves_to_typed_fields() {
+    // Every stored leaf is text, and `load` deserializes strictly through
+    // serde_json, which does not turn `"8080"` into a `u16`.
+    #[derive(Debug, Deserialize)]
+    struct Typed {
+        #[allow(dead_code)]
+        port: u16,
+    }
+
+    let mut state = MockState::happy();
+    state.plain.clear();
+    state.secrets.clear();
+    state.plain.insert("/apps/api/port".to_owned(), "8080".to_owned());
+    let harness = Harness::start(Arc::new(state)).await;
+    let provider = Provider::connect(&harness.url).await.unwrap();
+
+    let result = provider.load::<Typed>().await;
+    assert!(matches!(result, Err(ProviderError::InvalidConversion)));
+}
+
+#[cfg(feature = "config")]
+#[tokio::test]
+async fn config_source_coerces_string_leaves_to_typed_fields() {
+    use config::Config;
+    use sovereign_config_provider::SovereignConfigSource;
+
+    // The same string leaves that `load` rejects deserialize cleanly through
+    // `config`, which coerces `"8080"` -> u16 and `"true"` -> bool.
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
+    struct Typed {
+        port: u16,
+        enabled: bool,
+    }
+
+    let mut state = MockState::happy();
+    state.plain.clear();
+    state.secrets.clear();
+    state.plain.insert("/apps/api/port".to_owned(), "8080".to_owned());
+    state
+        .plain
+        .insert("/apps/api/enabled".to_owned(), "true".to_owned());
+    let harness = Harness::start(Arc::new(state)).await;
+    let url = harness.url.clone();
+
+    let typed = tokio::task::spawn_blocking(move || {
+        Config::builder()
+            .add_source(SovereignConfigSource::initialise_from_url(url))
+            .build()
+            .unwrap()
+            .try_deserialize::<Typed>()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        typed,
+        Typed {
+            port: 8080,
+            enabled: true,
+        }
+    );
+}
+
 #[cfg(feature = "config")]
 #[tokio::test]
 async fn config_source_layers_the_managed_subtree() {

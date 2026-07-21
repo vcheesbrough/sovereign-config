@@ -123,6 +123,24 @@ revealed subtree as a JSON string ready for `config::File::from_str`. Either way
 the loaded configuration contains real secret values, so keep it in memory and
 out of logs.
 
+### Typed values and coercion
+
+Sovereign Config stores every value as text — there are no stored numbers,
+booleans, or arrays (a deliberate design choice). Which load path you use decides
+how those strings become typed fields:
+
+- **`SovereignConfigSource` / `Provider::load_json` + `config`** — `config`
+  coerces string leaves to the target type: `"8080"` → `u16`, `"true"` → `bool`,
+  `"3.5"` → `f64`. This is the path to use for typed configuration structs.
+- **`Provider::load::<T>()`** — deserializes *strictly* through `serde_json`,
+  which does **not** coerce. A leaf `"8080"` will not fit a `u16` field; that
+  returns `ProviderError::InvalidConversion`. Use `load::<T>()` for
+  `String`-shaped configuration, or parse the strings yourself.
+
+Arrays/sequences are not representable: nested paths form tables, not lists, and
+`config` will not split a string into a `Vec`. Encode a sequence as a single
+string value and parse it in your application if you need one.
+
 ### Secret injection
 
 The connection URL is itself a secret (its fragment carries an encoded app
