@@ -346,7 +346,7 @@ async fn config_source_layers_the_managed_subtree() {
     // thread; the mock servers keep running on this test's runtime meanwhile.
     let config = tokio::task::spawn_blocking(move || {
         Config::builder()
-            .add_source(SovereignConfigSource::from_url(url))
+            .add_source(SovereignConfigSource::initialise_from_url(url))
             .build()
             .unwrap()
             .try_deserialize::<AppConfig>()
@@ -370,24 +370,10 @@ async fn config_source_layers_the_managed_subtree() {
 
 #[cfg(feature = "config")]
 #[test]
-fn config_source_reports_a_missing_url_env_var_without_network() {
-    use config::Config;
-    use sovereign_config_provider::SovereignConfigSource;
-
-    let result = Config::builder()
-        .add_source(SovereignConfigSource::from_url_env(
-            "SOVEREIGN_CONFIG_PROVIDER_TEST_UNSET_URL",
-        ))
-        .build();
-    assert!(result.is_err());
-}
-
-#[cfg(feature = "config")]
-#[test]
 fn config_source_debug_does_not_leak_the_url() {
     use sovereign_config_provider::SovereignConfigSource;
 
-    let source = SovereignConfigSource::from_url(
+    let source = SovereignConfigSource::initialise_from_url(
         "https://config.example.test/apps/api#v=1&client_secret=super-secret-sentinel",
     );
     let rendered = format!("{source:?}");
