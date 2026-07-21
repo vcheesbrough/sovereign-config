@@ -115,6 +115,7 @@ tbody th { font-weight: 700; }
 .revealed-connection-url { width: 100%; margin: 0 0 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
 .dialog-name { font-weight: 750; overflow-wrap: anywhere; }
 dialog { width: min(480px, calc(100% - 32px)); padding: 24px; color: #18201d; background: #fff; border: 1px solid #8d9a94; border-radius: 6px; }
+#connection-url-dialog { width: min(720px, calc(100% - 32px)); }
 dialog::backdrop { background: rgb(16 33 27 / 55%); }
 dialog p { margin: 12px 0 24px; line-height: 1.5; }
 dialog code { overflow-wrap: anywhere; }
