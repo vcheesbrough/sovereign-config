@@ -389,7 +389,11 @@ steps:
         }
 
 services:
+  # Only the push pipeline's workspace-validation uses a database; the
+  # deployment (promotion) path touches no Postgres, so don't start this there.
   postgres-test:
+    when:
+      - event: push
     image: docker.io/library/postgres@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4
     environment:
       POSTGRES_DB: sovereign_config_test
