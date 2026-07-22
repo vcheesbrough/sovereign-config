@@ -71,6 +71,13 @@ chmod 0755 "$staged"
 # existing binary never observes a partially written file.
 mv -f "$staged" "$bindir/$BINARY_NAME"
 
+# Confirm the installed binary actually runs before reporting success, so a
+# zero exit always means a working CLI (not, for example, an unrunnable noexec
+# mount or an architecture mismatch).
+if ! "$bindir/$BINARY_NAME" --version; then
+    fail "installed ${BINARY_NAME} could not be executed from ${bindir}"
+fi
+
 echo "install-${BINARY_NAME}: installed ${BINARY_NAME} ${RELEASE_VERSION} to ${bindir}/${BINARY_NAME}" >&2
 
 case ":${PATH}:" in
@@ -78,5 +85,4 @@ case ":${PATH}:" in
     *) echo "install-${BINARY_NAME}: note: ${bindir} is not on your PATH" >&2 ;;
 esac
 
-"$bindir/$BINARY_NAME" --version || true
 exit 0
