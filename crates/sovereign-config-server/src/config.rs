@@ -29,8 +29,6 @@ pub(crate) struct ManagedConnectionConfig {
 pub(crate) struct WebConfig {
     pub(crate) issuer: String,
     pub(crate) client_id: String,
-    /// Canonical public origin used to render absolute download commands.
-    pub(crate) public_origin: String,
     /// Optional directory of prebuilt installer artifacts to serve under
     /// `/dist`. Absent in local runs that ship no installers.
     pub(crate) dist_dir: Option<PathBuf>,
@@ -109,7 +107,6 @@ impl Config {
             web: WebConfig {
                 issuer: issuer.clone(),
                 client_id: audience.clone(),
-                public_origin: public_origin.clone(),
                 dist_dir,
             },
             managed: ManagedConnectionConfig {

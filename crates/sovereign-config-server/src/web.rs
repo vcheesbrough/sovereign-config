@@ -27,11 +27,11 @@ struct Assets;
 /// Prebuilt installer artifacts served unauthenticated under `/dist`, loaded
 /// into memory once at startup so serving stays synchronous. Keyed by file
 /// name; slashes never appear in a key, so `/dist/<name>` lookups cannot
-/// traverse out of the configured directory.
+/// traverse out of the configured directory. A synthesized `manifest.json`
+/// describes the installers for the single-page app's Downloads view.
 #[derive(Default)]
 struct DistCatalog {
     files: BTreeMap<String, Arc<[u8]>>,
-    downloads_page: Arc<[u8]>,
 }
 
 #[derive(Clone)]
@@ -47,7 +47,7 @@ impl WebAssetsLayer {
         let client_id = serde_json::to_string(&config.client_id).expect("client id must serialize");
         let index = Assets::get("index.html").expect("embedded administration index must exist");
         let loader_hash = inline_module_hash(index.data.as_ref());
-        let dist = load_dist_catalog(config.dist_dir.as_deref(), &config.public_origin);
+        let dist = load_dist_catalog(config.dist_dir.as_deref());
         Self {
             app_config: format!(
                 "globalThis.SOVEREIGN_CONFIG={{issuer:{issuer},clientId:{client_id}}};"
@@ -63,11 +63,27 @@ impl WebAssetsLayer {
     }
 }
 
-/// Loads every regular file in `dir` into memory and renders the downloads page
-/// listing the installer scripts it found. A configured-but-unreadable
-/// directory yields an empty catalog rather than failing startup: installer
-/// distribution is secondary to serving the API and UI.
-fn load_dist_catalog(dir: Option<&Path>, public_origin: &str) -> DistCatalog {
+/// One installer as described to the Downloads single-page view.
+#[derive(serde::Serialize)]
+struct InstallerManifestEntry {
+    file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checksum: Option<String>,
+    size: usize,
+}
+
+#[derive(serde::Serialize)]
+struct InstallerManifest {
+    installers: Vec<InstallerManifestEntry>,
+}
+
+/// Loads every regular file in `dir` into memory and synthesizes a
+/// `manifest.json` describing the installer scripts it found. A
+/// configured-but-unreadable directory yields only an empty manifest rather
+/// than failing startup: installer distribution is secondary to serving the API
+/// and UI. The manifest always exists so the Downloads view can render a
+/// definitive "no installers" state.
+fn load_dist_catalog(dir: Option<&Path>) -> DistCatalog {
     let mut files = BTreeMap::new();
     if let Some(dir) = dir
         && let Ok(entries) = fs::read_dir(dir)
@@ -81,76 +97,31 @@ fn load_dist_catalog(dir: Option<&Path>, public_origin: &str) -> DistCatalog {
             }
         }
     }
-    let downloads_page = render_downloads_page(&files, public_origin)
-        .into_bytes()
-        .into();
-    DistCatalog {
-        files,
-        downloads_page,
-    }
-}
-
-/// Renders a CSP-clean (no inline script or style) HTML page listing each
-/// installer, its checksum, and an exact self-cleaning download-then-run
-/// command. Installer scripts are `install-*.sh`; their `.sha256` companions
-/// are linked but not listed as separate downloads.
-fn render_downloads_page(files: &BTreeMap<String, Arc<[u8]>>, public_origin: &str) -> String {
-    let mut page = String::from(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <title>Sovereign Config downloads</title>\n</head>\n<body>\n\
-         <h1>Sovereign Config downloads</h1>\n",
+    let manifest = render_manifest(&files);
+    files.insert(
+        "manifest.json".to_owned(),
+        Arc::<[u8]>::from(manifest.into_bytes()),
     );
-    let installers: Vec<&String> = files
-        .keys()
-        .filter(|name| name.starts_with("install-") && has_extension(name, "sh"))
-        .collect();
-    if installers.is_empty() {
-        page.push_str("<p>No installers are published by this server.</p>\n");
-    } else {
-        page.push_str(
-            "<p>Download the installer, then run it. The command below downloads to a temporary \
-             directory that is removed afterwards.</p>\n",
-        );
-        for name in installers {
-            let href = format!("/dist/{name}");
-            let command = format!(
-                "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; \
-                 curl -fsSL \"{public_origin}{href}\" -o \"$d/installer.sh\" && sh \"$d/installer.sh\"'"
-            );
-            page.push_str("<section>\n<h2><code>");
-            page.push_str(&html_escape(name));
-            page.push_str("</code></h2>\n<p><a href=\"");
-            page.push_str(&html_escape(&href));
-            page.push_str("\">Download installer</a>");
-            let checksum = format!("{name}.sha256");
-            if files.contains_key(&checksum) {
-                page.push_str(" &middot; <a href=\"");
-                page.push_str(&html_escape(&format!("/dist/{checksum}")));
-                page.push_str("\">sha256</a>");
-            }
-            page.push_str("</p>\n<pre><code>");
-            page.push_str(&html_escape(&command));
-            page.push_str("</code></pre>\n</section>\n");
-        }
-    }
-    page.push_str("</body>\n</html>\n");
-    page
+    DistCatalog { files }
 }
 
-fn html_escape(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            other => escaped.push(other),
-        }
-    }
-    escaped
+/// Builds the installer manifest JSON. Installer scripts are `install-*.sh`;
+/// each entry links its `.sha256` companion when present and reports its size.
+fn render_manifest(files: &BTreeMap<String, Arc<[u8]>>) -> String {
+    let installers = files
+        .iter()
+        .filter(|(name, _)| name.starts_with("install-") && has_extension(name, "sh"))
+        .map(|(name, bytes)| {
+            let checksum = format!("{name}.sha256");
+            InstallerManifestEntry {
+                file: name.clone(),
+                checksum: files.contains_key(&checksum).then_some(checksum),
+                size: bytes.len(),
+            }
+        })
+        .collect();
+    serde_json::to_string(&InstallerManifest { installers })
+        .unwrap_or_else(|_| "{\"installers\":[]}".to_owned())
 }
 
 fn has_extension(name: &str, extension: &str) -> bool {
@@ -159,12 +130,14 @@ fn has_extension(name: &str, extension: &str) -> bool {
         .is_some_and(|found| found.eq_ignore_ascii_case(extension))
 }
 
-/// Content type for a served installer artifact, chosen by extension.
+/// Content type for a served `/dist` artifact, chosen by extension.
 fn dist_content_type(name: &str) -> &'static str {
     if has_extension(name, "sh") {
         "application/x-shellscript; charset=utf-8"
     } else if has_extension(name, "sha256") {
         "text/plain; charset=utf-8"
+    } else if has_extension(name, "json") {
+        "application/json; charset=utf-8"
     } else {
         "application/octet-stream"
     }
@@ -215,14 +188,6 @@ where
             asset_response(
                 self.app_config.as_ref(),
                 "text/javascript; charset=utf-8",
-                false,
-                head,
-                &self.content_security_policy,
-            )
-        } else if path == "downloads" || path == "downloads/" {
-            asset_response(
-                self.dist.downloads_page.as_ref(),
-                "text/html; charset=utf-8",
                 false,
                 head,
                 &self.content_security_policy,
@@ -296,9 +261,10 @@ fn asset_response(
     response
 }
 
-/// Serves an installer artifact as an attachment. Names carry the release
-/// version, so the bytes at a given path never change and may be cached
-/// immutably.
+/// Serves a `/dist` artifact. Installer scripts carry the release version in
+/// their name, so their bytes never change and are cached immutably and offered
+/// as a download; the synthesized `manifest.json` shares a stable URL with
+/// deploy-specific content, so it is never cached and served inline.
 fn download_response(
     bytes: &[u8],
     content_type: &str,
@@ -317,14 +283,20 @@ fn download_response(
         HeaderValue::from_str(content_type)
             .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
     );
-    if let Ok(disposition) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\"")) {
+    if has_extension(name, "sh")
+        && let Ok(disposition) = HeaderValue::from_str(&format!("attachment; filename=\"{name}\""))
+    {
         response
             .headers_mut()
             .insert(CONTENT_DISPOSITION, disposition);
     }
     response.headers_mut().insert(
         CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=31536000, immutable"),
+        HeaderValue::from_static(if has_extension(name, "json") {
+            "no-store"
+        } else {
+            "public, max-age=31536000, immutable"
+        }),
     );
     response
         .headers_mut()
@@ -378,7 +350,6 @@ mod tests {
         let layer = WebAssetsLayer::new(&WebConfig {
             issuer: "https://auth.example.test/application/o/browser/".into(),
             client_id: "browser".into(),
-            public_origin: "https://config.example.test".into(),
             dist_dir: None,
         });
         let inner = service_fn(|_: Request<()>| async {
@@ -447,7 +418,6 @@ mod tests {
         let layer = WebAssetsLayer::new(&WebConfig {
             issuer: "https://auth.example.test/application/o/browser/".into(),
             client_id: "browser".into(),
-            public_origin: "https://config.example.test".into(),
             dist_dir: Some(dir.path().to_path_buf()),
         });
         (dir, layer)
@@ -525,57 +495,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn downloads_page_lists_installer_with_absolute_curl_command() {
-        use http::header::CONTENT_TYPE;
+    async fn manifest_lists_the_installer_with_checksum_and_size() {
+        use http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 
         let (_dir, layer) = dist_layer();
         let response = layer
             .layer(passthrough!())
-            .oneshot(Request::get("/downloads").body(()).unwrap())
+            .oneshot(Request::get("/dist/manifest.json").body(()).unwrap())
             .await
             .unwrap();
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),
-            "text/html; charset=utf-8"
+            "application/json; charset=utf-8"
         );
-        let page = String::from_utf8(body_bytes(response).await).unwrap();
-        assert!(
-            page.contains(INSTALLER_NAME),
-            "page must name the installer"
-        );
-        assert!(
-            page.contains(&format!(
-                "https://config.example.test/dist/{INSTALLER_NAME}"
-            )),
-            "page must present the absolute download URL"
-        );
-        assert!(
-            page.contains("mktemp -d") && page.contains("rm -rf"),
-            "page must present the self-cleaning temp-dir command"
-        );
-        assert!(
-            page.contains(&format!("/dist/{INSTALLER_NAME}.sha256")),
-            "page must link the checksum"
-        );
+        // A stable URL with deploy-specific content is served inline, uncached.
+        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+        assert!(response.headers().get(CONTENT_DISPOSITION).is_none());
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        let entry = &manifest["installers"][0];
+        assert_eq!(entry["file"], INSTALLER_NAME);
+        assert_eq!(entry["checksum"], format!("{INSTALLER_NAME}.sha256"));
+        assert_eq!(entry["size"], "#!/bin/sh\necho installer\n".len());
     }
 
     #[tokio::test]
-    async fn downloads_page_is_empty_without_a_dist_directory() {
+    async fn manifest_is_empty_without_a_dist_directory() {
         let layer = WebAssetsLayer::new(&WebConfig {
             issuer: "https://auth.example.test/application/o/browser/".into(),
             client_id: "browser".into(),
-            public_origin: "https://config.example.test".into(),
             dist_dir: None,
         });
+        let response = layer
+            .layer(passthrough!())
+            .oneshot(Request::get("/dist/manifest.json").body(()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(manifest["installers"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn downloads_path_falls_through_to_the_single_page_app() {
+        use http::header::CONTENT_TYPE;
+
+        // `/downloads` is a client-side route: the server returns the SPA shell
+        // (index.html), and the app renders the Downloads view.
+        let (_dir, layer) = dist_layer();
         let response = layer
             .layer(passthrough!())
             .oneshot(Request::get("/downloads").body(()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
-        let page = String::from_utf8(body_bytes(response).await).unwrap();
-        assert!(page.contains("No installers are published"));
+        assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/html");
     }
 }
