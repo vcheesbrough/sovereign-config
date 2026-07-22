@@ -1490,6 +1490,8 @@ test('downloads page lists the published installer with a run command', async ({
     .toHaveAttribute('href', `/dist/${INSTALLER}.sha256`);
   await expect(page.getByText(/curl -fsSL/)).toBeVisible();
   await expect(page.getByText(/mktemp -d/)).toBeVisible();
+  // The command aborts on a failed download rather than running a partial file.
+  await expect(page.getByText(/set -e/)).toBeVisible();
   await expect(page.getByRole('button', { name: 'Copy command' })).toBeVisible();
 
   const accessibility = await new AxeBuilder({ page }).analyze();

@@ -5,12 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#10211b">
     <title>Sovereign Config</title>
-    <link rel="stylesheet" href="/style-a9a7bce86652919a.css" integrity="sha384-tB9pfYy9kGiOJ79sh4PbyqsOhdC7/g7PVPyL9ttt76nG8o4MS7T9ppOM0XOUud5V"/>
+    <link rel="stylesheet" href="/style-38623b8be723b00.css" integrity="sha384-+UOveH4Gn9Jiqo75X2W5Gg7JYTR08PgaFTbXgRVbmkpZZYhhJN4pDOssAe4qO6tJ"/>
     <script src="/app-config.js"></script>
     
 <script type="module">
-import init, * as bindings from '/sovereign-config-web-af9c723c98c45303.js';
-const wasm = await init({ module_or_path: '/sovereign-config-web-af9c723c98c45303_bg.wasm' });
+import init, * as bindings from '/sovereign-config-web-5beddad6f1e879b5.js';
+const wasm = await init({ module_or_path: '/sovereign-config-web-5beddad6f1e879b5_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -19,7 +19,7 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-  <link rel="modulepreload" href="/sovereign-config-web-af9c723c98c45303.js" crossorigin="anonymous" integrity="sha384-WNwW8QPjT7JbjneRYyVCllWoK5bnuJaVwZS+FC8VQthT9yjB1XGaDW+cMxJjwXbe"><link rel="preload" href="/sovereign-config-web-af9c723c98c45303_bg.wasm" crossorigin="anonymous" integrity="sha384-NRm8rZDNS66EmPeMV8GbEsSzKyMlSChJv5q4qhO7W+9ktXaGBvnAaoKezDyGikHs" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/sovereign-config-web-5beddad6f1e879b5.js" crossorigin="anonymous" integrity="sha384-Pf2WjB4nreYRLfOkVoZHDDPV3vtEtbYiKGxlwySZnKlbK+RCXTeQZupGbYugPHgf"><link rel="preload" href="/sovereign-config-web-5beddad6f1e879b5_bg.wasm" crossorigin="anonymous" integrity="sha384-kIiM9TVHHl3jSJ4WqyfzO1FQ8PFk6OjLzH6MPof2IUvkyZ+mnL6qbfaazr7i0Ww0" as="fetch" type="application/wasm"></head>
   <body>
     <header>
       <a id="brand-link" class="brand" href="/" aria-label="Sovereign Config home">
@@ -36,6 +36,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         <a id="system-status-link" href="/">System status</a>
         <a id="configuration-values-link" href="/configuration/">Configuration values</a>
         <a id="managed-connections-link" href="/connections/">Managed connections</a>
+        <a id="downloads-link" href="/downloads">Downloads</a>
       </nav>
       <main id="main">
         <p id="error" class="error" role="alert" hidden></p>
@@ -189,6 +190,19 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             </table>
           </div>
           <p id="empty-connections" class="empty-state" hidden>No managed connections for paths you can manage.</p>
+        </div>
+
+        <div id="downloads-page" class="page" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Tools</p>
+              <h1>Downloads</h1>
+            </div>
+            <p id="downloads-state" class="status-text" aria-live="polite">Loading</p>
+          </div>
+          <p class="downloads-intro">Install the command-line client for this server. The binary is built from this server's release, so it stays protocol-compatible. Download the installer, then run it &mdash; the command below downloads to a temporary directory that is removed afterwards.</p>
+          <div id="downloads-list" class="downloads-list"></div>
+          <p id="empty-downloads" class="empty-state" hidden>No installers are published by this server.</p>
         </div>
       </main>
     </div>
