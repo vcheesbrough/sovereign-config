@@ -108,6 +108,50 @@ async fn managed_connection_constraints_are_enforced(pool: &PgPool) {
     assert!(invalid_root.is_err());
     assert!(padded_name.is_err());
 
+    // A row inserted without the permissions column defaults to read-only.
+    let backfilled: String = sqlx::query_scalar(
+        "SELECT permissions FROM managed_connections WHERE connection_id = 'abcdefghij0123456789abcdefghij01'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("default permissions must be readable");
+    assert_eq!(backfilled, "read");
+
+    // Every canonical non-empty subset is accepted.
+    for permissions in [
+        "read",
+        "write",
+        "manage",
+        "read,write",
+        "read,manage",
+        "write,manage",
+        "read,write,manage",
+    ] {
+        let accepted = sqlx::query(
+            "INSERT INTO managed_connections (connection_id, display_name, root, state, permissions, created_at, updated_at) VALUES ('permsaccepted0123456789abcdefghi', 'name', '/', 'active', $1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(permissions)
+        .execute(pool)
+        .await;
+        assert!(accepted.is_ok(), "{permissions} must be accepted");
+        sqlx::query("DELETE FROM managed_connections WHERE connection_id = 'permsaccepted0123456789abcdefghi'")
+            .execute(pool)
+            .await
+            .expect("permission fixture cleanup must succeed");
+    }
+
+    // An unknown permission, an empty set, and a non-canonical order are all
+    // rejected by the CHECK constraint.
+    for permissions in ["", "admin", "write,read", "read,read"] {
+        let rejected = sqlx::query(
+            "INSERT INTO managed_connections (connection_id, display_name, root, state, permissions, created_at, updated_at) VALUES ('permsrejected0123456789abcdefghi', 'name', '/', 'active', $1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(permissions)
+        .execute(pool)
+        .await;
+        assert!(rejected.is_err(), "{permissions:?} must be rejected");
+    }
+
     sqlx::query("DELETE FROM managed_connections")
         .execute(pool)
         .await
@@ -267,6 +311,7 @@ async fn migrations_are_repeatable_against_postgresql() {
             "created_at",
             "credential_identifier",
             "display_name",
+            "permissions",
             "provider_user_id",
             "provider_user_uid",
             "root",
@@ -291,7 +336,7 @@ async fn migrations_are_repeatable_against_postgresql() {
     .fetch_one(&pool)
     .await
     .expect("credential column inventory must be readable");
-    assert_eq!(applied_migrations, 5);
+    assert_eq!(applied_migrations, 6);
     assert_eq!(metadata_rows, 1);
     assert_eq!(authorization_tables, 0);
     assert_eq!(value_columns, 5);
