@@ -97,6 +97,13 @@ thead th:nth-child(1) { width: 24%; }
 thead th:nth-child(2) { width: 42%; }
 thead th:nth-child(3) { width: 18%; }
 thead th:nth-child(4) { width: 16%; }
+/* The connections table has a fifth (Actions) column; give it an explicit
+   share so the actions column does not collapse and overflow the row. */
+.connections-table thead th:nth-child(1) { width: 22%; }
+.connections-table thead th:nth-child(2) { width: 29%; }
+.connections-table thead th:nth-child(3) { width: 18%; }
+.connections-table thead th:nth-child(4) { width: 14%; }
+.connections-table thead th:nth-child(5) { width: 17%; }
 tbody tr:last-child > * { border-bottom: 0; }
 tbody th { font-weight: 700; }
 .value-name { display: block; overflow-wrap: anywhere; }
