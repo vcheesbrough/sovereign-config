@@ -1218,10 +1218,12 @@ fn build_download_card(
 
     // A readable multi-line form. Newlines inside the single-quoted `sh -c`
     // script separate statements; the trailing `\` continues the long curl line.
-    // It stays a self-cleaning subshell so the temp directory is always removed.
+    // `set -e` aborts on any failure (so a failed download never runs a partial
+    // installer), and the trap keeps it a self-cleaning subshell.
     let url = format!("{origin}/dist/{}", entry.file);
     let command = [
         "sh -c '".to_owned(),
+        "  set -e".to_owned(),
         "  d=$(mktemp -d)".to_owned(),
         "  trap \"rm -rf \\\"$d\\\"\" EXIT".to_owned(),
         format!("  curl -fsSL \"{url}\" \\"),
