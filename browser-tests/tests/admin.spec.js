@@ -1490,6 +1490,7 @@ test('downloads page lists the published installer with a run command', async ({
     .toHaveAttribute('href', `/dist/${INSTALLER}.sha256`);
   await expect(page.getByText(/curl -fsSL/)).toBeVisible();
   await expect(page.getByText(/mktemp -d/)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Copy command' })).toBeVisible();
 
   const accessibility = await new AxeBuilder({ page }).analyze();
   expect(accessibility.violations).toEqual([]);
