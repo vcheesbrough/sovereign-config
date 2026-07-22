@@ -17,7 +17,8 @@ set -eu
 # Must match PAYLOAD_MARKER in installer-header.sh.
 PAYLOAD_MARKER="__SOVEREIGN_CONFIG_PAYLOAD_MARKER__"
 
-script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+CDPATH=''
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 header="${script_dir}/installer-header.sh"
 
 binary=""
@@ -36,13 +37,10 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-for required in binary name version output; do
-    eval "value=\${$required}"
-    if [ -z "$value" ]; then
-        echo "make-installer: --$required is required" >&2
-        exit 2
-    fi
-done
+[ -n "$binary" ] || { echo "make-installer: --binary is required" >&2; exit 2; }
+[ -n "$name" ] || { echo "make-installer: --name is required" >&2; exit 2; }
+[ -n "$version" ] || { echo "make-installer: --version is required" >&2; exit 2; }
+[ -n "$output" ] || { echo "make-installer: --output is required" >&2; exit 2; }
 
 [ -f "$binary" ] || { echo "make-installer: binary not found: $binary" >&2; exit 1; }
 [ -f "$header" ] || { echo "make-installer: header template not found: $header" >&2; exit 1; }
