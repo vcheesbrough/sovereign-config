@@ -91,6 +91,7 @@ fn load_dist_catalog(dir: Option<&Path>) -> DistCatalog {
         for entry in entries.flatten() {
             if entry.file_type().is_ok_and(|kind| kind.is_file())
                 && let Some(name) = entry.file_name().to_str().map(str::to_owned)
+                && is_installer_artifact(&name)
                 && let Ok(bytes) = fs::read(entry.path())
             {
                 files.insert(name, Arc::<[u8]>::from(bytes));
@@ -122,6 +123,14 @@ fn render_manifest(files: &BTreeMap<String, Arc<[u8]>>) -> String {
         .collect();
     serde_json::to_string(&InstallerManifest { installers })
         .unwrap_or_else(|_| "{\"installers\":[]}".to_owned())
+}
+
+/// Only published installer artifacts are served under `/dist`: the installer
+/// scripts and their checksum companions. Anything else in the configured
+/// directory is ignored, so a mispointed directory or a stray secret/config
+/// file cannot become publicly downloadable.
+fn is_installer_artifact(name: &str) -> bool {
+    name.starts_with("install-") && (has_extension(name, "sh") || name.ends_with(".sh.sha256"))
 }
 
 fn has_extension(name: &str, extension: &str) -> bool {
@@ -520,6 +529,44 @@ mod tests {
         assert_eq!(entry["file"], INSTALLER_NAME);
         assert_eq!(entry["checksum"], format!("{INSTALLER_NAME}.sha256"));
         assert_eq!(entry["size"], "#!/bin/sh\necho installer\n".len());
+    }
+
+    #[tokio::test]
+    async fn stray_dist_files_are_not_served_or_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(INSTALLER_NAME), b"#!/bin/sh\n").unwrap();
+        // Not an installer artifact — must be ignored, not served.
+        std::fs::write(dir.path().join("secret.env"), b"TOKEN=super-secret\n").unwrap();
+        let layer = WebAssetsLayer::new(&WebConfig {
+            issuer: "https://auth.example.test/application/o/browser/".into(),
+            client_id: "browser".into(),
+            dist_dir: Some(dir.path().to_path_buf()),
+        });
+
+        let stray = layer
+            .clone()
+            .layer(passthrough!())
+            .oneshot(Request::get("/dist/secret.env").body(()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(stray.status(), http::StatusCode::NOT_FOUND);
+
+        let manifest_response = layer
+            .layer(passthrough!())
+            .oneshot(Request::get("/dist/manifest.json").body(()).unwrap())
+            .await
+            .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&body_bytes(manifest_response).await).unwrap();
+        let listed = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            !listed.contains("secret.env"),
+            "stray file must not be listed"
+        );
+        assert!(
+            listed.contains(INSTALLER_NAME),
+            "installer must still be listed"
+        );
     }
 
     #[tokio::test]
