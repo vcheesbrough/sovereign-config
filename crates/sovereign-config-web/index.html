@@ -25,6 +25,7 @@
         <a id="system-status-link" href="/">System status</a>
         <a id="configuration-values-link" href="/configuration/">Configuration values</a>
         <a id="managed-connections-link" href="/connections/">Managed connections</a>
+        <a id="downloads-link" href="/downloads">Downloads</a>
       </nav>
       <main id="main">
         <p id="error" class="error" role="alert" hidden></p>
@@ -178,6 +179,19 @@
             </table>
           </div>
           <p id="empty-connections" class="empty-state" hidden>No managed connections for paths you can manage.</p>
+        </div>
+
+        <div id="downloads-page" class="page" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Tools</p>
+              <h1>Downloads</h1>
+            </div>
+            <p id="downloads-state" class="status-text" aria-live="polite">Loading</p>
+          </div>
+          <p class="downloads-intro">Install the command-line client for this server. The binary is built from this server's release, so it stays protocol-compatible. Download the installer, then run it &mdash; the command below downloads to a temporary directory that is removed afterwards.</p>
+          <div id="downloads-list" class="downloads-list"></div>
+          <p id="empty-downloads" class="empty-state" hidden>No installers are published by this server.</p>
         </div>
       </main>
     </div>

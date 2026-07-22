@@ -118,6 +118,7 @@ fn build_and_dev_deploy_steps_run_on_push_only() {
     // touches development.
     for name in [
         "compute-version",
+        "shellcheck",
         "workspace-validation",
         "browser-validation",
         "build-server",
