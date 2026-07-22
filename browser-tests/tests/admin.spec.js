@@ -154,6 +154,32 @@ function repeatedMessages(frame, number) {
   return (messageFields(frame, 5).get(number) || []).map(nestedStringFields);
 }
 
+// Decodes a repeated varint field, accepting both packed (wire type 2, a
+// single length-delimited chunk — how prost encodes repeated enums) and
+// unpacked (wire type 0, one entry per value) encodings.
+function decodeRepeatedVarints(values) {
+  const out = [];
+  for (const value of values) {
+    if (Buffer.isBuffer(value)) {
+      let offset = 0;
+      while (offset < value.length) {
+        const [decoded, next] = readVarint(value, offset);
+        out.push(decoded);
+        offset = next;
+      }
+    } else {
+      out.push(value);
+    }
+  }
+  return out;
+}
+
+// The permission enums selected for field 3 of a captured
+// CreateManagedConnection request, in the order they were sent.
+function requestPermissions(request) {
+  return decodeRepeatedVarints(messageFields(request.body, 5).get(3) || []);
+}
+
 function parentPath(path) {
   const split = path.lastIndexOf('/');
   return split <= 0 ? '/' : path.slice(0, split);
@@ -343,7 +369,7 @@ function connectionUrl(password = APP_PASSWORD_SENTINEL) {
     + `&client_id=sovereign-config&client_secret=${credential}`;
 }
 
-function connectionMetadata({ id = CONNECTION_ID, name = 'Pipeline reader', root = '/apps/api', state = 2 } = {}) {
+function connectionMetadata({ id = CONNECTION_ID, name = 'Pipeline reader', root = '/apps/api', state = 2, permissions = [1] } = {}) {
   const instant = timestamp(1700000000);
   return Buffer.concat([
     field(1, Buffer.from(id)),
@@ -351,7 +377,8 @@ function connectionMetadata({ id = CONNECTION_ID, name = 'Pipeline reader', root
     field(3, Buffer.from(root)),
     scalarField(4, state),
     field(5, instant),
-    field(6, instant)
+    field(6, instant),
+    ...permissions.map(permission => scalarField(7, permission))
   ]);
 }
 
@@ -380,8 +407,9 @@ async function mockConnections(page, options = {}) {
   let delayedList;
   await page.route('**/sovereign.config.v3.ManagedConnections/*', async route => {
     const method = route.request().url().split('/').pop();
-    const fields = stringFields(route.request().postDataBuffer());
-    state.requests.push({ method, fields });
+    const body = route.request().postDataBuffer();
+    const fields = stringFields(body);
+    state.requests.push({ method, fields, body });
     const authorized = route.request().headers().authorization === 'Bearer access-token-two';
     const reply = (body, status = 0) => route.fulfill({
       status: 200,
@@ -405,7 +433,12 @@ async function mockConnections(page, options = {}) {
       return reply(listConnectionsReply(state.connections));
     }
     if (method === 'CreateManagedConnection') {
-      const created = { name: fields.get(1), root: fields.get(2) };
+      const permissions = requestPermissions({ body });
+      const created = {
+        name: fields.get(1),
+        root: fields.get(2),
+        ...(permissions.length ? { permissions } : {})
+      };
       state.connections = [...state.connections, created];
       return reply(provisionedReply(connectionUrl(), created));
     }
@@ -1184,7 +1217,7 @@ test('managed connections list only manageable roots and are accessible', async 
     ]
   });
   await openCallback(page);
-  await page.getByRole('link', { name: 'Managed connections' }).click();
+  await page.getByRole('link', { name: 'Access URLs' }).click();
 
   await expect(page.locator('#connection-count')).toHaveText('2 connections');
   await expect(page.getByRole('rowheader', { name: 'Pipeline reader' })).toBeVisible();
@@ -1206,17 +1239,19 @@ test('creating a connection confirms the exact root and reveals the URL once', a
   await page.goto('/connections/');
 
   await page.getByLabel('Display name').fill('Pipeline reader');
-  await page.getByLabel('Read-only root').fill('/apps/api');
-  await page.getByRole('button', { name: 'Create connection' }).click();
+  await page.getByLabel('Root').fill('/apps/api');
+  // Read is selected by default; also grant write for this URL.
+  await page.getByLabel('Write').check();
+  await page.getByRole('button', { name: 'Create access URL' }).click();
 
-  // The confirmation names the exact root and the read-only grant.
+  // The confirmation names the exact root and the selected grant.
   const confirmation = page.locator('#create-connection-dialog');
   await expect(confirmation).toBeVisible();
   await expect(confirmation).toContainText('/apps/api');
-  await expect(confirmation).toContainText('read-only');
+  await expect(confirmation).toContainText('read and write');
   await expect(page.locator('#cancel-create-connection')).toBeFocused();
 
-  await confirmation.getByRole('button', { name: 'Create connection' }).click();
+  await confirmation.getByRole('button', { name: 'Create access URL' }).click();
 
   // The result surface opens masked; no secret is in the DOM yet.
   const result = page.locator('#connection-url-dialog');
@@ -1239,6 +1274,12 @@ test('creating a connection confirms the exact root and reveals the URL once', a
   const created = connections.requests.find(request => request.method === 'CreateManagedConnection');
   expect(created.fields.get(1)).toBe('Pipeline reader');
   expect(created.fields.get(2)).toBe('/apps/api');
+  // Field 3 carries the selected permission enums (READ=1, WRITE=2).
+  expect(requestPermissions(created)).toEqual([1, 2]);
+
+  // The listed row shows the granted permissions.
+  await page.locator('#close-connection-url').click();
+  await expect(page.getByRole('cell', { name: 'Read, Write', exact: true })).toBeVisible();
 });
 
 test('the one-time connection URL is discarded and never persisted', async ({ page }) => {
@@ -1247,8 +1288,8 @@ test('the one-time connection URL is discarded and never persisted', async ({ pa
   await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
   await page.goto('/connections/');
   await page.getByLabel('Display name').fill('Pipeline reader');
-  await page.getByLabel('Read-only root').fill('/apps/api');
-  await page.getByRole('button', { name: 'Create connection' }).click();
+  await page.getByLabel('Root').fill('/apps/api');
+  await page.getByRole('button', { name: 'Create access URL' }).click();
   await page.locator('#confirm-create-connection').click();
   await page.locator('#reveal-connection-url').click();
   await expect(page.locator('#revealed-connection-url')).toBeVisible();
@@ -1375,20 +1416,63 @@ test('connection inputs validate before any confirmation opens', async ({ page }
   await page.goto('/connections/');
 
   await page.getByLabel('Display name').fill('');
-  await page.getByLabel('Read-only root').fill('/apps/api');
-  await page.getByRole('button', { name: 'Create connection' }).click();
+  await page.getByLabel('Root').fill('/apps/api');
+  await page.getByRole('button', { name: 'Create access URL' }).click();
   await expect(page.locator('#create-connection-dialog')).toBeHidden();
   await expect(page.locator('#connection-name')).toHaveAttribute('aria-invalid', 'true');
   await expect(page.locator('#connection-name-error')).toBeVisible();
 
   await page.getByLabel('Display name').fill('Pipeline reader');
-  await page.getByLabel('Read-only root').fill('bad_root');
-  await page.getByRole('button', { name: 'Create connection' }).click();
+  await page.getByLabel('Root').fill('bad_root');
+  await page.getByRole('button', { name: 'Create access URL' }).click();
   await expect(page.locator('#create-connection-dialog')).toBeHidden();
   await expect(page.locator('#connection-root')).toHaveAttribute('aria-invalid', 'true');
 
   expect(connections.requests.map(request => request.method))
     .not.toContain('CreateManagedConnection');
+});
+
+test('creating an access URL requires at least one permission', async ({ page }) => {
+  const connections = await mockConnections(page, { connections: [] });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await page.goto('/connections/');
+
+  await page.getByLabel('Display name').fill('Pipeline reader');
+  await page.getByLabel('Root').fill('/apps/api');
+  // Clear the default Read selection so nothing is granted.
+  await page.getByLabel('Read').uncheck();
+  await page.getByRole('button', { name: 'Create access URL' }).click();
+
+  await expect(page.locator('#create-connection-dialog')).toBeHidden();
+  await expect(page.locator('#connection-permissions-error')).toBeVisible();
+  expect(connections.requests.map(request => request.method))
+    .not.toContain('CreateManagedConnection');
+
+  // Selecting Manage alone unblocks creation and grants exactly that.
+  await page.getByLabel('Manage').check();
+  await page.getByRole('button', { name: 'Create access URL' }).click();
+  const confirmation = page.locator('#create-connection-dialog');
+  await expect(confirmation).toBeVisible();
+  await expect(confirmation).toContainText('manage');
+  await confirmation.getByRole('button', { name: 'Create access URL' }).click();
+
+  await expect(page.locator('#connection-url-dialog')).toBeVisible();
+  const created = connections.requests.find(request => request.method === 'CreateManagedConnection');
+  expect(requestPermissions(created)).toEqual([3]);
+});
+
+test('the access URLs view is renamed and lists granted permissions', async ({ page }) => {
+  await mockConnections(page, {
+    connections: [{ name: 'Pipeline reader', root: '/apps/api', permissions: [1, 2, 3] }]
+  });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await page.goto('/connections/');
+
+  await expect(page.getByRole('link', { name: 'Access URLs' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Access URLs' })).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'Read, Write, Manage', exact: true })).toBeVisible();
 });
 
 test('logout discards a revealed connection URL and clears the view', async ({ page }) => {
@@ -1397,8 +1481,8 @@ test('logout discards a revealed connection URL and clears the view', async ({ p
   await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
   await page.goto('/connections/');
   await page.getByLabel('Display name').fill('Pipeline reader');
-  await page.getByLabel('Read-only root').fill('/apps/api');
-  await page.getByRole('button', { name: 'Create connection' }).click();
+  await page.getByLabel('Root').fill('/apps/api');
+  await page.getByRole('button', { name: 'Create access URL' }).click();
   await page.locator('#confirm-create-connection').click();
   await page.locator('#reveal-connection-url').click();
   await expect(page.locator('#revealed-connection-url')).toBeVisible();
@@ -1424,8 +1508,8 @@ test('a logout while create is still reloading connections suppresses the URL di
   await expect(page.locator('#connection-count')).toHaveText('0 connections');
 
   await page.getByLabel('Display name').fill('Pipeline reader');
-  await page.getByLabel('Read-only root').fill('/apps/api');
-  await page.getByRole('button', { name: 'Create connection' }).click();
+  await page.getByLabel('Root').fill('/apps/api');
+  await page.getByRole('button', { name: 'Create access URL' }).click();
 
   const releaseList = connections.delayNextList();
   await page.locator('#confirm-create-connection').click();

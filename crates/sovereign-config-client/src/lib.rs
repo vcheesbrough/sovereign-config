@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use sovereign_config_core::{
     AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata, DisplayName,
-    ErrorKind, ManagedConnectionMetadata, PROTOCOL_VERSION, PlainValue,
+    ErrorKind, ManagedConnectionMetadata, ManagedPermissions, PROTOCOL_VERSION, PlainValue,
     ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret, Secret,
     SecretInput, ServiceStatus, SubTreeMutationValue, Timestamp, ValueListing, ValueSubTree,
 };
@@ -107,6 +107,7 @@ pub trait ManagedConnectionTransport: Transport {
         &self,
         display_name: &DisplayName,
         root: &ConfigPath,
+        permissions: &ManagedPermissions,
         bearer: &Secret,
     ) -> Result<ProvisionedManagedConnection, ClientError>;
     async fn rotate_managed_connection(
@@ -143,7 +144,8 @@ where
         self.transport.list_managed_connections(&token).await
     }
 
-    /// Creates one managed read-only connection and returns its one-time URL.
+    /// Creates one managed connection with the selected permissions on its
+    /// root and returns its one-time URL.
     ///
     /// # Errors
     ///
@@ -153,10 +155,11 @@ where
         &self,
         display_name: &DisplayName,
         root: &ConfigPath,
+        permissions: &ManagedPermissions,
     ) -> Result<ProvisionedManagedConnection, ClientError> {
         let token = self.required_token().await?;
         self.transport
-            .create_managed_connection(display_name, root, &token)
+            .create_managed_connection(display_name, root, permissions, &token)
             .await
     }
 
