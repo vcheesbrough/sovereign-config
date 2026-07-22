@@ -1,14 +1,16 @@
 //! Managed application connection lifecycle service.
 //!
 //! Implements the `ManagedConnections` gRPC service: listing safe metadata,
-//! and creating, rotating, and revoking read-only machine connections whose
-//! credentials live only in Authentik. Sovereign Config persists non-secret
-//! lifecycle metadata and returns each connection URL exactly once.
+//! and creating, rotating, and revoking machine connections whose credentials
+//! live only in Authentik. Each connection carries an operator-selected
+//! permission set (read/write/manage) on its root. Sovereign Config persists
+//! non-secret lifecycle metadata and returns each connection URL exactly once.
 
 use std::{sync::Arc, time::Duration};
 
 use sovereign_config_core::{
-    ConnectionId, ConnectionUrl, DisplayName, ManagedConnectionState, Secret,
+    ConnectionId, ConnectionUrl, DisplayName, ManagedConnectionState, ManagedPermission,
+    ManagedPermissions, Secret,
 };
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
@@ -109,8 +111,19 @@ struct ConnectionRow {
     provider_user_id: Option<i64>,
     credential_identifier: Option<String>,
     state: String,
+    permissions: String,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
+}
+
+/// Maps a selected managed permission onto the server authorization
+/// permission used for the anti-escalation check on the connection root.
+const fn required_permission(permission: ManagedPermission) -> Permission {
+    match permission {
+        ManagedPermission::Read => Permission::Read,
+        ManagedPermission::Write => Permission::Write,
+        ManagedPermission::Manage => Permission::Manage,
+    }
 }
 
 #[tonic::async_trait]
@@ -195,7 +208,7 @@ impl ManagedConnectionsService {
         let rows = sqlx::query_as::<_, ConnectionRow>(
             r"
             SELECT connection_id, display_name, root, provider_user_id,
-                   credential_identifier, state, created_at, updated_at
+                   credential_identifier, state, permissions, created_at, updated_at
             FROM managed_connections
             ORDER BY created_at, connection_id
             ",
@@ -222,7 +235,18 @@ impl ManagedConnectionsService {
             .map_err(|_| invalid_request())?;
         let root =
             ConfigPath::parse_selection(&request.get_ref().root).map_err(|_| invalid_request())?;
-        if !principal.allows(&root, Permission::Manage) {
+        // A non-empty selection is required; an empty or malformed set is a
+        // client error, never a silent default.
+        let permissions = ManagedPermissions::from_proto(&request.get_ref().permissions)
+            .map_err(|_| invalid_request())?;
+        // Using the feature at all requires Manage on the root, and no access
+        // URL may be granted a permission the caller does not itself hold on
+        // that root — a manage-only principal cannot mint a write-capable URL.
+        if !principal.allows(&root, Permission::Manage)
+            || permissions
+                .iter()
+                .any(|permission| !principal.allows(&root, required_permission(permission)))
+        {
             return Err(Status::permission_denied(
                 "configuration operation is not permitted",
             ));
@@ -234,19 +258,20 @@ impl ManagedConnectionsService {
         sqlx::query(
             r"
             INSERT INTO managed_connections
-                (connection_id, display_name, root, state, created_at, updated_at)
-            VALUES ($1, $2, $3, 'provisioning', $4, $4)
+                (connection_id, display_name, root, state, permissions, created_at, updated_at)
+            VALUES ($1, $2, $3, 'provisioning', $4, $5, $5)
             ",
         )
         .bind(connection_id.as_str())
         .bind(display_name.as_str())
         .bind(root.as_str())
+        .bind(permissions.as_storage())
         .bind(now)
         .execute(&self.database)
         .await
         .map_err(|_| storage_unavailable())?;
 
-        self.provision_inserted(&connection_id, &username, &root)
+        self.provision_inserted(&connection_id, &username, &root, &permissions)
             .await
     }
 
@@ -257,6 +282,7 @@ impl ManagedConnectionsService {
         connection_id: &ConnectionId,
         username: &str,
         root: &ConfigPath,
+        permissions: &ManagedPermissions,
     ) -> Result<CreateManagedConnectionResponse, Status> {
         let account = match self.admin.create_service_account(username).await {
             Ok(account) => {
@@ -300,7 +326,7 @@ impl ManagedConnectionsService {
         }
 
         match self
-            .configure_account(connection_id, username, root, &account)
+            .configure_account(connection_id, username, root, permissions, &account)
             .await
         {
             Ok(()) => {}
@@ -357,12 +383,13 @@ impl ManagedConnectionsService {
     }
 
     /// Discovers the single app-password credential, records its identifier,
-    /// and patches the exact read-only grant plus managed marker.
+    /// and patches the exact selected grant plus managed marker.
     async fn configure_account(
         &self,
         connection_id: &ConnectionId,
         username: &str,
         root: &ConfigPath,
+        permissions: &ManagedPermissions,
         account: &crate::authentik::CreatedServiceAccount,
     ) -> Result<(), Status> {
         let identifiers = match self.admin.find_app_password_identifiers(username).await {
@@ -414,6 +441,7 @@ impl ManagedConnectionsService {
                 connection_id.as_str(),
                 &self.settings.grants_attribute,
                 root.as_str(),
+                &permissions.grant_tokens(),
             )
             .await
         {
@@ -725,7 +753,7 @@ impl ManagedConnectionsService {
         let row = sqlx::query_as::<_, ConnectionRow>(
             r"
             SELECT connection_id, display_name, root, provider_user_id,
-                   credential_identifier, state, created_at, updated_at
+                   credential_identifier, state, permissions, created_at, updated_at
             FROM managed_connections
             WHERE connection_id = $1
             FOR UPDATE
@@ -760,7 +788,7 @@ impl ManagedConnectionsService {
             SET state = $3, updated_at = $4
             WHERE connection_id = $1 AND state = $2
             RETURNING connection_id, display_name, root, provider_user_id,
-                      credential_identifier, state, created_at, updated_at
+                      credential_identifier, state, permissions, created_at, updated_at
             ",
         )
         .bind(connection_id.as_str())
@@ -931,11 +959,13 @@ fn principal<T>(request: &Request<T>) -> Result<&AuthenticatedPrincipal, Status>
 #[allow(clippy::result_large_err)]
 fn proto_metadata(row: &ConnectionRow) -> Result<ProtoManagedConnectionMetadata, Status> {
     let state = ManagedConnectionState::parse(&row.state).map_err(|_| internal_error())?;
+    let permissions = ManagedPermissions::parse(&row.permissions).map_err(|_| internal_error())?;
     Ok(ProtoManagedConnectionMetadata {
         connection_id: row.connection_id.clone(),
         display_name: row.display_name.clone(),
         root: row.root.clone(),
         state: proto_state(state) as i32,
+        permissions: permissions.to_proto(),
         created_at: Some(to_proto_timestamp(row.created_at)?),
         updated_at: Some(to_proto_timestamp(row.updated_at)?),
     })
@@ -1050,7 +1080,7 @@ mod tests {
     };
     use reqwest::Url;
     use serde_json::{Value, json};
-    use sovereign_config_core::ConnectionUrl;
+    use sovereign_config_core::{ConnectionUrl, ManagedPermission};
     use sqlx::postgres::PgPoolOptions;
     use tokio::{net::TcpListener, task::JoinHandle, time::sleep};
 
@@ -1446,8 +1476,14 @@ mod tests {
         }
     }
 
-    fn manage(prefix: &str) -> AuthenticatedPrincipal {
-        principal(&[(prefix, &[Permission::Manage])])
+    /// A fully-authorized operator (read + write + manage) scoped to `prefix`
+    /// — the common fixture for lifecycle tests, which need to both use the
+    /// feature (Manage on the root) and grant the permissions they request.
+    fn operator(prefix: &str) -> AuthenticatedPrincipal {
+        principal(&[(
+            prefix,
+            &[Permission::Read, Permission::Write, Permission::Manage],
+        )])
     }
 
     fn request<T>(message: T, principal: &AuthenticatedPrincipal) -> Request<T> {
@@ -1503,7 +1539,7 @@ mod tests {
         sqlx::query_as::<_, ConnectionRow>(
             r"
             SELECT connection_id, display_name, root, provider_user_id,
-                   credential_identifier, state, created_at, updated_at
+                   credential_identifier, state, permissions, created_at, updated_at
             FROM managed_connections
             ORDER BY created_at, connection_id
             ",
@@ -1519,11 +1555,22 @@ mod tests {
         root: &str,
         principal: &AuthenticatedPrincipal,
     ) -> Result<(String, String), Status> {
+        create_with(service, name, root, &[ManagedPermission::Read], principal).await
+    }
+
+    async fn create_with(
+        service: &ManagedConnectionsService,
+        name: &str,
+        root: &str,
+        permissions: &[ManagedPermission],
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<(String, String), Status> {
         let response = service
             .create_managed_connection(request(
                 CreateManagedConnectionRequest {
                     display_name: name.to_owned(),
                     root: root.to_owned(),
+                    permissions: permissions.iter().map(|p| p.as_proto()).collect(),
                 },
                 principal,
             ))
@@ -1640,7 +1687,7 @@ mod tests {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
 
-        let (connection_id, url) = create(&service, "Pipeline reader", "/apps/api", &manage("/"))
+        let (connection_id, url) = create(&service, "Pipeline reader", "/apps/api", &operator("/"))
             .await
             .expect("create must succeed");
 
@@ -1655,6 +1702,7 @@ mod tests {
         assert_eq!(rows[0].connection_id, connection_id);
         assert_eq!(rows[0].state, "active");
         assert_eq!(rows[0].root, "/apps/api");
+        assert_eq!(rows[0].permissions, "read");
         assert_eq!(
             rows[0].credential_identifier.as_deref(),
             Some(CREDENTIAL_IDENTIFIER)
@@ -1694,6 +1742,131 @@ mod tests {
         assert_eq!(assignments[0].1, TEST_GROUP_ID);
     }
 
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn selected_permissions_flow_to_the_grant_row_and_metadata() {
+        // Each non-empty subset the operator selects must be reflected exactly:
+        // in the Authentik grant JSON, the persisted row, and the listed
+        // metadata — canonically ordered, no more and no less.
+        for (requested, tokens, proto) in [
+            (
+                vec![ManagedPermission::Write],
+                json!(["write"]),
+                vec![ManagedPermission::Write.as_proto()],
+            ),
+            (
+                // Deliberately out of order and duplicated on the wire.
+                vec![
+                    ManagedPermission::Manage,
+                    ManagedPermission::Read,
+                    ManagedPermission::Read,
+                ],
+                json!(["read", "manage"]),
+                vec![
+                    ManagedPermission::Read.as_proto(),
+                    ManagedPermission::Manage.as_proto(),
+                ],
+            ),
+            (
+                vec![
+                    ManagedPermission::Read,
+                    ManagedPermission::Write,
+                    ManagedPermission::Manage,
+                ],
+                json!(["read", "write", "manage"]),
+                vec![
+                    ManagedPermission::Read.as_proto(),
+                    ManagedPermission::Write.as_proto(),
+                    ManagedPermission::Manage.as_proto(),
+                ],
+            ),
+        ] {
+            let mock = mock_authentik().await;
+            let service = service_or_skip!(&mock);
+
+            let (connection_id, _) = create_with(
+                &service,
+                "Selected",
+                "/apps/api",
+                &requested,
+                &operator("/"),
+            )
+            .await
+            .expect("create must succeed");
+
+            // Grant JSON carries exactly the selected permissions.
+            let patched = mock.patched_attributes();
+            assert_eq!(patched.len(), 1);
+            assert_eq!(
+                patched[0]["attributes"][GRANTS_ATTRIBUTE],
+                json!([{ "prefix": "/apps/api", "permissions": tokens }])
+            );
+
+            // Listed metadata echoes the same set in canonical order.
+            let listed = service
+                .list_managed_connections(request(ListManagedConnectionsRequest {}, &operator("/")))
+                .await
+                .expect("list must succeed")
+                .into_inner();
+            let metadata = listed
+                .connections
+                .iter()
+                .find(|connection| connection.connection_id == connection_id)
+                .expect("created connection must be listed");
+            assert_eq!(metadata.permissions, proto);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn create_rejects_an_empty_permission_selection() {
+        let mock = mock_authentik().await;
+        let service = service_or_skip!(&mock);
+
+        let status = create_with(&service, "Empty", "/apps/api", &[], &operator("/"))
+            .await
+            .expect_err("an empty permission selection must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_bounded(&status);
+        assert!(rows(&service).await.is_empty());
+        assert!(mock.patched_attributes().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn create_cannot_grant_a_permission_the_caller_lacks() {
+        let mock = mock_authentik().await;
+        let service = service_or_skip!(&mock);
+
+        // A principal that can manage and read the root, but cannot write it,
+        // must not be able to mint a write-capable access URL.
+        let manage_and_read = principal(&[("/apps/api", &[Permission::Read, Permission::Manage])]);
+        let status = create_with(
+            &service,
+            "Escalation",
+            "/apps/api",
+            &[ManagedPermission::Read, ManagedPermission::Write],
+            &manage_and_read,
+        )
+        .await
+        .expect_err("granting write without holding write must be denied");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_bounded(&status);
+        assert!(rows(&service).await.is_empty());
+        assert!(mock.patched_attributes().is_empty());
+
+        // The permissions it does hold are still grantable.
+        create_with(
+            &service,
+            "Permitted",
+            "/apps/api",
+            &[ManagedPermission::Read, ManagedPermission::Manage],
+            &manage_and_read,
+        )
+        .await
+        .expect("granting only held permissions must succeed");
+    }
+
     /// Group membership is a pure operator convenience and must never block or
     /// roll back an otherwise-successful connection, whether the configured
     /// group cannot be resolved or the assignment itself is rejected.
@@ -1704,7 +1877,7 @@ mod tests {
         let service = service_or_skip!(&mock);
 
         mock.script(|script| script.group_exists = false);
-        let (connection_id, _) = create(&service, "No group", "/apps/api", &manage("/"))
+        let (connection_id, _) = create(&service, "No group", "/apps/api", &operator("/"))
             .await
             .expect("a missing browsing group must not fail creation");
         assert_eq!(rows(&service).await[0].connection_id, connection_id);
@@ -1714,7 +1887,7 @@ mod tests {
             script.group_exists = true;
             script.add_to_group = Behavior::Status(StatusCode::FORBIDDEN);
         });
-        let (connection_id, _) = create(&service, "Rejected group", "/apps/api", &manage("/"))
+        let (connection_id, _) = create(&service, "Rejected group", "/apps/api", &operator("/"))
             .await
             .expect("a rejected group assignment must not fail creation");
         let rows = rows(&service).await;
@@ -1731,15 +1904,15 @@ mod tests {
         let service = service_or_skip!(&mock);
 
         // Exact root and ancestor grants both authorize creation.
-        create(&service, "Exact", "/apps/api", &manage("/apps/api"))
+        create(&service, "Exact", "/apps/api", &operator("/apps/api"))
             .await
             .expect("exact root must authorize");
-        create(&service, "Ancestor", "/apps/web", &manage("/apps"))
+        create(&service, "Ancestor", "/apps/web", &operator("/apps"))
             .await
             .expect("ancestor root must authorize");
 
         // A sibling grant and read/write without manage must not.
-        let sibling = create(&service, "Sibling", "/apps/api", &manage("/apps/other")).await;
+        let sibling = create(&service, "Sibling", "/apps/api", &operator("/apps/other")).await;
         let status = sibling.expect_err("sibling grant must be denied");
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
         assert_bounded(&status);
@@ -1754,7 +1927,7 @@ mod tests {
         let scoped = service
             .list_managed_connections(request(
                 ListManagedConnectionsRequest {},
-                &manage("/apps/web"),
+                &operator("/apps/web"),
             ))
             .await
             .expect("list must succeed")
@@ -1763,7 +1936,7 @@ mod tests {
         assert_eq!(scoped.connections[0].root, "/apps/web");
 
         let global = service
-            .list_managed_connections(request(ListManagedConnectionsRequest {}, &manage("/")))
+            .list_managed_connections(request(ListManagedConnectionsRequest {}, &operator("/")))
             .await
             .expect("list must succeed")
             .into_inner();
@@ -1775,7 +1948,7 @@ mod tests {
     async fn unmanageable_and_missing_connections_are_indistinguishable() {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
-        let (connection_id, _) = create(&service, "Scoped", "/apps/api", &manage("/"))
+        let (connection_id, _) = create(&service, "Scoped", "/apps/api", &operator("/"))
             .await
             .expect("create must succeed");
         let unknown = "0123456789abcdef0123456789abcdef";
@@ -1786,7 +1959,7 @@ mod tests {
                     RotateManagedConnectionRequest {
                         connection_id: id.to_owned(),
                     },
-                    &manage("/apps/other"),
+                    &operator("/apps/other"),
                 ))
                 .await
                 .expect_err("non-manageable rotate must fail");
@@ -1798,7 +1971,7 @@ mod tests {
                     RevokeManagedConnectionRequest {
                         connection_id: id.to_owned(),
                     },
-                    &manage("/apps/other"),
+                    &operator("/apps/other"),
                 ))
                 .await
                 .expect_err("non-manageable revoke must fail");
@@ -1812,7 +1985,7 @@ mod tests {
     async fn invalid_and_unauthenticated_requests_are_rejected_before_any_call() {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
-        let global = manage("/");
+        let global = operator("/");
 
         for (name, root) in [
             ("", "/apps"),
@@ -1859,7 +2032,7 @@ mod tests {
 
         // Account creation refused outright: nothing to compensate.
         mock.script(|script| script.create_account = Behavior::Status(StatusCode::FORBIDDEN));
-        let status = create(&service, "Refused", "/apps/api", &manage("/"))
+        let status = create(&service, "Refused", "/apps/api", &operator("/"))
             .await
             .expect_err("refused creation must fail");
         assert_bounded(&status);
@@ -1879,9 +2052,14 @@ mod tests {
                 script.create_account = Behavior::Ok;
                 script.find_credentials = Behavior::Body(body);
             });
-            let status = create(&service, "Ambiguous credential", "/apps/api", &manage("/"))
-                .await
-                .expect_err("ambiguous credential discovery must fail");
+            let status = create(
+                &service,
+                "Ambiguous credential",
+                "/apps/api",
+                &operator("/"),
+            )
+            .await
+            .expect_err("ambiguous credential discovery must fail");
             assert_bounded(&status);
             assert!(rows(&service).await.is_empty(), "row must be rolled back");
             assert!(
@@ -1896,7 +2074,7 @@ mod tests {
             script.set_attributes = Behavior::Status(StatusCode::FORBIDDEN);
         });
         let before = mock.deleted_users().len();
-        let status = create(&service, "Patch failure", "/apps/api", &manage("/"))
+        let status = create(&service, "Patch failure", "/apps/api", &operator("/"))
             .await
             .expect_err("failed grant patch must fail");
         assert_bounded(&status);
@@ -1919,9 +2097,14 @@ mod tests {
         };
         mock.script(|script| script.credentials_visible = false);
 
-        let status = create(&service, "Invisible credential", "/apps/api", &manage("/"))
-            .await
-            .expect_err("an undiscoverable credential must fail creation");
+        let status = create(
+            &service,
+            "Invisible credential",
+            "/apps/api",
+            &operator("/"),
+        )
+        .await
+        .expect_err("an undiscoverable credential must fail creation");
         assert_bounded(&status);
 
         // The account must not be left behind with a usable credential.
@@ -1953,7 +2136,7 @@ mod tests {
             script.create_account = Behavior::Timeout;
             script.user_exists = true;
         });
-        let status = create(&service, "Ambiguous", "/apps/api", &manage("/"))
+        let status = create(&service, "Ambiguous", "/apps/api", &operator("/"))
             .await
             .expect_err("ambiguous creation must not return a URL");
         assert_bounded(&status);
@@ -1972,7 +2155,7 @@ mod tests {
             script.user_exists = true;
             script.delete_user = Behavior::Status(StatusCode::INTERNAL_SERVER_ERROR);
         });
-        let status = create(&service, "Unrecoverable", "/apps/api", &manage("/"))
+        let status = create(&service, "Unrecoverable", "/apps/api", &operator("/"))
             .await
             .expect_err("unrecoverable compensation must fail");
         assert_eq!(status.message(), "managed connection requires cleanup");
@@ -2007,7 +2190,7 @@ mod tests {
             );
             script.user_exists = true;
         });
-        let status = create(&service, "Invalid response", "/apps/api", &manage("/"))
+        let status = create(&service, "Invalid response", "/apps/api", &operator("/"))
             .await
             .expect_err("an invalid create response must not return a URL");
         assert_bounded(&status);
@@ -2037,7 +2220,7 @@ mod tests {
             script.create_account = Behavior::Timeout;
             script.user_exists = false;
         });
-        let status = create(&service, "Never created", "/apps/api", &manage("/"))
+        let status = create(&service, "Never created", "/apps/api", &operator("/"))
             .await
             .expect_err("an unresolved create must not return a URL");
         assert_eq!(status.message(), "managed connection requires cleanup");
@@ -2061,7 +2244,7 @@ mod tests {
     async fn rotation_replaces_the_credential_and_recovers_from_ambiguity() {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
-        let (connection_id, first_url) = create(&service, "Rotating", "/apps/api", &manage("/"))
+        let (connection_id, first_url) = create(&service, "Rotating", "/apps/api", &operator("/"))
             .await
             .expect("create must succeed");
         let rotate_request = || {
@@ -2069,7 +2252,7 @@ mod tests {
                 RotateManagedConnectionRequest {
                     connection_id: connection_id.clone(),
                 },
-                &manage("/"),
+                &operator("/"),
             )
         };
 
@@ -2130,7 +2313,7 @@ mod tests {
     async fn concurrent_rotation_never_issues_two_current_credentials() {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
-        let (connection_id, _) = create(&service, "Concurrent", "/apps/api", &manage("/"))
+        let (connection_id, _) = create(&service, "Concurrent", "/apps/api", &operator("/"))
             .await
             .expect("create must succeed");
         mock.script(|script| script.set_credential_delay = Duration::from_millis(120));
@@ -2139,13 +2322,13 @@ mod tests {
             RotateManagedConnectionRequest {
                 connection_id: connection_id.clone(),
             },
-            &manage("/"),
+            &operator("/"),
         ));
         let second = service.rotate_managed_connection(request(
             RotateManagedConnectionRequest {
                 connection_id: connection_id.clone(),
             },
-            &manage("/"),
+            &operator("/"),
         ));
         let (first, second) = tokio::join!(first, second);
 
@@ -2174,7 +2357,7 @@ mod tests {
     async fn a_concurrent_revoke_is_not_undone_by_a_slow_rotation_write_back() {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
-        let (connection_id, _) = create(&service, "Raced", "/apps/api", &manage("/"))
+        let (connection_id, _) = create(&service, "Raced", "/apps/api", &operator("/"))
             .await
             .expect("create must succeed");
         mock.script(|script| script.set_credential_delay = Duration::from_millis(120));
@@ -2183,7 +2366,7 @@ mod tests {
             RotateManagedConnectionRequest {
                 connection_id: connection_id.clone(),
             },
-            &manage("/"),
+            &operator("/"),
         ));
 
         // Give rotation time to move the row to `rotation_unknown` and
@@ -2194,7 +2377,7 @@ mod tests {
                 RevokeManagedConnectionRequest {
                     connection_id: connection_id.clone(),
                 },
-                &manage("/"),
+                &operator("/"),
             ))
             .await
             .expect("revocation must succeed even while a rotation is in flight");
@@ -2221,7 +2404,7 @@ mod tests {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
         mock.script(|script| script.create_account_delay = Duration::from_millis(120));
-        let principal = manage("/");
+        let principal = operator("/");
 
         let create_future = create(&service, "Racing", "/apps/api", &principal);
 
@@ -2259,7 +2442,7 @@ mod tests {
     async fn revocation_confirms_deletion_before_removing_metadata() {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
-        let (connection_id, _) = create(&service, "Revoked", "/apps/api", &manage("/"))
+        let (connection_id, _) = create(&service, "Revoked", "/apps/api", &operator("/"))
             .await
             .expect("create must succeed");
         let revoke_request = || {
@@ -2267,7 +2450,7 @@ mod tests {
                 RevokeManagedConnectionRequest {
                     connection_id: connection_id.clone(),
                 },
-                &manage("/"),
+                &operator("/"),
             )
         };
 
@@ -2301,7 +2484,7 @@ mod tests {
     async fn ambiguous_deletion_is_confirmed_by_credential_absence() {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
-        let (connection_id, _) = create(&service, "Ambiguous delete", "/apps/api", &manage("/"))
+        let (connection_id, _) = create(&service, "Ambiguous delete", "/apps/api", &operator("/"))
             .await
             .expect("create must succeed");
 
@@ -2310,7 +2493,7 @@ mod tests {
         service
             .revoke_managed_connection(request(
                 RevokeManagedConnectionRequest { connection_id },
-                &manage("/"),
+                &operator("/"),
             ))
             .await
             .expect("a committed deletion must be confirmed despite the timeout");
@@ -2328,7 +2511,7 @@ mod tests {
     async fn revocation_is_confirmed_when_deletion_is_refused_but_the_credential_is_gone() {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
-        let (connection_id, _) = create(&service, "Refused delete", "/apps/api", &manage("/"))
+        let (connection_id, _) = create(&service, "Refused delete", "/apps/api", &operator("/"))
             .await
             .expect("create must succeed");
 
@@ -2340,7 +2523,7 @@ mod tests {
                 RevokeManagedConnectionRequest {
                     connection_id: connection_id.clone(),
                 },
-                &manage("/"),
+                &operator("/"),
             ))
             .await
             .expect("a refused delete with no surviving credential must confirm revocation");
@@ -2354,7 +2537,7 @@ mod tests {
     async fn revocation_is_not_confirmed_while_the_credential_survives() {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
-        let (connection_id, _) = create(&service, "Surviving", "/apps/api", &manage("/"))
+        let (connection_id, _) = create(&service, "Surviving", "/apps/api", &operator("/"))
             .await
             .expect("create must succeed");
 
@@ -2362,7 +2545,7 @@ mod tests {
         let status = service
             .revoke_managed_connection(request(
                 RevokeManagedConnectionRequest { connection_id },
-                &manage("/"),
+                &operator("/"),
             ))
             .await
             .expect_err("a surviving credential must not be reported as revoked");
@@ -2378,7 +2561,7 @@ mod tests {
     async fn revocation_treats_a_confirmed_absent_account_as_revoked() {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
-        let (connection_id, _) = create(&service, "Already gone", "/apps/api", &manage("/"))
+        let (connection_id, _) = create(&service, "Already gone", "/apps/api", &operator("/"))
             .await
             .expect("create must succeed");
 
@@ -2388,7 +2571,7 @@ mod tests {
         service
             .revoke_managed_connection(request(
                 RevokeManagedConnectionRequest { connection_id },
-                &manage("/"),
+                &operator("/"),
             ))
             .await
             .expect("confirmed absence must count as revoked");
@@ -2405,7 +2588,7 @@ mod tests {
     async fn revocation_is_not_confirmed_when_a_denied_delete_is_masked_as_not_found() {
         let mock = mock_authentik().await;
         let service = service_or_skip!(&mock);
-        let (connection_id, _) = create(&service, "Denied", "/apps/api", &manage("/"))
+        let (connection_id, _) = create(&service, "Denied", "/apps/api", &operator("/"))
             .await
             .expect("create must succeed");
 
@@ -2414,7 +2597,7 @@ mod tests {
         let status = service
             .revoke_managed_connection(request(
                 RevokeManagedConnectionRequest { connection_id },
-                &manage("/"),
+                &operator("/"),
             ))
             .await
             .expect_err("a surviving credential must not be reported as revoked");
@@ -2441,7 +2624,7 @@ mod tests {
             script.create_account = Behavior::Timeout;
             script.user_exists = false;
         });
-        create(&service, "Never created", "/apps/api", &manage("/"))
+        create(&service, "Never created", "/apps/api", &operator("/"))
             .await
             .expect_err("an unresolved create must not return a URL");
         let connection_id = rows(&service)
@@ -2457,7 +2640,7 @@ mod tests {
         service
             .revoke_managed_connection(request(
                 RevokeManagedConnectionRequest { connection_id },
-                &manage("/"),
+                &operator("/"),
             ))
             .await
             .expect("a refused lookup with no surviving credential must confirm revocation");

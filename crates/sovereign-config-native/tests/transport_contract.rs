@@ -2,8 +2,9 @@ use serde::Deserialize;
 use sovereign_config_client::{ManagedConnectionTransport, Transport, ValueTransport};
 use sovereign_config_core::{
     ClientError, ConfigPath, ConnectionId, ConnectionUrl, DisplayName, ErrorKind,
-    ManagedConnectionMetadata, ManagedConnectionState, PlainValue, ProvisionedManagedConnection,
-    Secret, SecretInput, SubTreeMutationContent, SubTreeMutationValue,
+    ManagedConnectionMetadata, ManagedConnectionState, ManagedPermission, ManagedPermissions,
+    PlainValue, ProvisionedManagedConnection, Secret, SecretInput, SubTreeMutationContent,
+    SubTreeMutationValue,
 };
 use sovereign_config_native::TonicTransport;
 use sovereign_config_proto::sovereign::config::v3::{
@@ -12,7 +13,8 @@ use sovereign_config_proto::sovereign::config::v3::{
     GetSubTreeResponse, GetVersionRequest, GetVersionResponse, ListManagedConnectionsRequest,
     ListManagedConnectionsResponse, ListValuesRequest, ListValuesResponse, ListedValue,
     ManagedConnectionMetadata as ProtoManagedConnectionMetadata,
-    ManagedConnectionState as ProtoManagedConnectionState, PutValueRequest, PutValueResponse,
+    ManagedConnectionState as ProtoManagedConnectionState,
+    ManagedPermission as ProtoManagedPermission, PutValueRequest, PutValueResponse,
     ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest, RevealSecretResponse,
     RevokeManagedConnectionRequest, RevokeManagedConnectionResponse,
     RotateManagedConnectionRequest, RotateManagedConnectionResponse,
@@ -250,6 +252,7 @@ fn contract_managed_metadata() -> ProtoManagedConnectionMetadata {
         display_name: "Contract".to_owned(),
         root: CONTRACT_MANAGED_ROOT.to_owned(),
         state: ProtoManagedConnectionState::Active as i32,
+        permissions: vec![ProtoManagedPermission::Read as i32],
         created_at: Some(prost_types::Timestamp {
             seconds: 1_700_000_000,
             nanos: 0,
@@ -449,11 +452,12 @@ async fn assert_managed_contract_case(transport: &TonicTransport, case: &Contrac
     let bearer = Secret::new(format!("grpc-{}", case.grpc_status));
     let display_name = DisplayName::parse("Contract").unwrap();
     let root = ConfigPath::parse(CONTRACT_MANAGED_ROOT).unwrap();
+    let permissions = ManagedPermissions::new([ManagedPermission::Read]).unwrap();
     let connection_id = ConnectionId::parse(CONTRACT_CONNECTION_ID).unwrap();
 
     let listing = transport.list_managed_connections(&bearer).await;
     let created = transport
-        .create_managed_connection(&display_name, &root, &bearer)
+        .create_managed_connection(&display_name, &root, &permissions, &bearer)
         .await;
     let rotated = transport
         .rotate_managed_connection(&connection_id, &bearer)
@@ -505,6 +509,7 @@ fn assert_managed_error<T: std::fmt::Debug>(result: Result<T, ClientError>, case
 async fn assert_invalid_managed_responses_are_internal(transport: &TonicTransport) {
     let display_name = DisplayName::parse("Contract").unwrap();
     let root = ConfigPath::parse(CONTRACT_MANAGED_ROOT).unwrap();
+    let permissions = ManagedPermissions::new([ManagedPermission::Read]).unwrap();
     for directive in [
         "invalid-missing-metadata",
         "invalid-missing-credential",
@@ -512,7 +517,7 @@ async fn assert_invalid_managed_responses_are_internal(transport: &TonicTranspor
         "invalid-state",
     ] {
         let error = transport
-            .create_managed_connection(&display_name, &root, &Secret::new(directive))
+            .create_managed_connection(&display_name, &root, &permissions, &Secret::new(directive))
             .await
             .unwrap_err();
         assert_eq!(error.kind, ErrorKind::Internal, "directive {directive}");

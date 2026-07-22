@@ -17,10 +17,10 @@ use sovereign_config_client::{
 use sovereign_config_core::{
     AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl, DeleteMetadata,
     DisplayName, ErrorKind, ListedValue, ManagedConnectionMetadata, ManagedConnectionState,
-    MaskedSecret, PlainValue, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata,
-    RevealedConnectionUrl, RevealedSecret, Secret, SecretInput, SubTreeMutationContent,
-    SubTreeMutationValue, SubTreeValue, Timestamp, ValueContent, ValueListing, ValueSubTree,
-    parse_subtree_json, render_subtree_json,
+    ManagedPermission, ManagedPermissions, MaskedSecret, PlainValue, ProvisionedManagedConnection,
+    PutMetadata, ReplaceMetadata, RevealedConnectionUrl, RevealedSecret, Secret, SecretInput,
+    SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, Timestamp, ValueContent,
+    ValueListing, ValueSubTree, parse_subtree_json, render_subtree_json,
 };
 use sovereign_config_proto::sovereign::config::v3::{
     CreateManagedConnectionRequest, CreateManagedConnectionResponse, DeleteValuesRequest,
@@ -381,6 +381,7 @@ impl ManagedConnectionTransport for BrowserTransport {
         &self,
         display_name: &DisplayName,
         root: &ConfigPath,
+        permissions: &ManagedPermissions,
         bearer: &Secret,
     ) -> Result<ProvisionedManagedConnection, ClientError> {
         let response: CreateManagedConnectionResponse = grpc_unary(
@@ -388,6 +389,7 @@ impl ManagedConnectionTransport for BrowserTransport {
             &CreateManagedConnectionRequest {
                 display_name: display_name.as_str().to_owned(),
                 root: root.as_str().to_owned(),
+                permissions: permissions.to_proto(),
             },
             Some(bearer),
         )
@@ -436,6 +438,8 @@ fn managed_metadata(
         display_name: DisplayName::parse(metadata.display_name).map_err(|_| browser_error())?,
         root: ConfigPath::parse(metadata.root).map_err(|_| browser_error())?,
         state: managed_state(metadata.state)?,
+        permissions: ManagedPermissions::from_proto(&metadata.permissions)
+            .map_err(|_| browser_error())?,
         created_at: proto_timestamp(metadata.created_at)?,
         updated_at: proto_timestamp(metadata.updated_at)?,
     })
@@ -1854,12 +1858,17 @@ fn validate_connection_root_field() -> bool {
 fn open_create_connection() {
     let name_valid = validate_connection_name_field();
     let root_valid = validate_connection_root_field();
+    let permissions_valid = validate_connection_permissions_field();
     if !name_valid {
         focus("connection-name");
         return;
     }
     if !root_valid {
         focus("connection-root");
+        return;
+    }
+    if !permissions_valid {
+        focus("connection-permission-read");
         return;
     }
     let Some(name) = element::<HtmlInputElement>("connection-name").map(|input| input.value())
@@ -1870,12 +1879,74 @@ fn open_create_connection() {
     else {
         return;
     };
+    let Some(permissions) = selected_connection_permissions() else {
+        return;
+    };
     set_text("create-connection-name", &name);
     set_text("create-connection-root", &root);
+    set_text(
+        "create-connection-permissions",
+        &connection_permissions_phrase(&permissions),
+    );
     if let Some(dialog) = element::<HtmlDialogElement>("create-connection-dialog") {
         let _ = dialog.show_modal();
         focus("cancel-create-connection");
     }
+}
+
+/// Reads the three permission checkboxes into a core permission set, returning
+/// `None` when the operator has selected nothing.
+fn selected_connection_permissions() -> Option<ManagedPermissions> {
+    let mut selected = Vec::new();
+    for (id, permission) in [
+        ("connection-permission-read", ManagedPermission::Read),
+        ("connection-permission-write", ManagedPermission::Write),
+        ("connection-permission-manage", ManagedPermission::Manage),
+    ] {
+        if element::<HtmlInputElement>(id).is_some_and(|input| input.checked()) {
+            selected.push(permission);
+        }
+    }
+    ManagedPermissions::new(selected).ok()
+}
+
+fn validate_connection_permissions_field() -> bool {
+    let valid = selected_connection_permissions().is_some();
+    set_validation(
+        "connection-permissions",
+        "connection-permissions-error",
+        if valid {
+            None
+        } else {
+            Some("select at least one permission")
+        },
+    );
+    valid
+}
+
+/// A natural-language list of granted permissions for the confirmation copy,
+/// e.g. `read`, `read and write`, or `read, write and manage`.
+fn connection_permissions_phrase(permissions: &ManagedPermissions) -> String {
+    let words = permissions.grant_tokens();
+    match words.as_slice() {
+        [] => String::new(),
+        [only] => (*only).to_owned(),
+        [head @ .., last] => format!("{} and {last}", head.join(", ")),
+    }
+}
+
+/// A capitalized, canonically ordered label for a connection's granted
+/// permissions, e.g. `Read, Write`.
+fn connection_permissions_label(permissions: &ManagedPermissions) -> String {
+    permissions
+        .iter()
+        .map(|permission| match permission {
+            ManagedPermission::Read => "Read",
+            ManagedPermission::Write => "Write",
+            ManagedPermission::Manage => "Manage",
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn cancel_connection_dialog(dialog_id: &str) {
@@ -1904,8 +1975,11 @@ async fn create_connection() {
     ) else {
         return;
     };
-    let (Ok(display_name), Ok(root)) = (DisplayName::parse(name), parse_absolute_path(&root))
-    else {
+    let (Ok(display_name), Ok(root), Some(permissions)) = (
+        DisplayName::parse(name),
+        parse_absolute_path(&root),
+        selected_connection_permissions(),
+    ) else {
         close_dialog("create-connection-dialog");
         return;
     };
@@ -1915,7 +1989,7 @@ async fn create_connection() {
     let result = async {
         let config = app_config()?;
         value_client(&config)
-            .create_managed_connection(&display_name, &root)
+            .create_managed_connection(&display_name, &root, &permissions)
             .await
     }
     .await;
@@ -2172,6 +2246,9 @@ fn render_connection_row(
     root_code.set_text_content(Some(connection.root.as_str()));
     append(&root, &root_code)?;
     append(&row, &root)?;
+    let permissions = create_element(document, "td", None)?;
+    permissions.set_text_content(Some(&connection_permissions_label(&connection.permissions)));
+    append(&row, &permissions)?;
     let state = create_element(document, "td", None)?;
     state.set_text_content(Some(connection_state_label(connection.state)));
     append(&row, &state)?;
