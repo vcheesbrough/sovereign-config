@@ -53,7 +53,15 @@ The server embeds the fingerprinted Rust WASM administration application and ser
 
 ## CLI
 
-Install the CLI from the matching tagged source with a Rust toolchain:
+Each running server publishes a prebuilt CLI installer matched to its own release. The installer is a static x86_64 Linux binary (no toolchain, no libc dependency) wrapped in a self-extracting shell script. Browse `https://<server>/downloads` for the download links and the exact command, or install directly — this downloads to a temporary directory that is removed afterwards:
+
+```sh
+sh -c 'd=$(mktemp -d); trap "rm -rf \"$d\"" EXIT; curl -fsSL "https://<server>/dist/install-sovereign-config-cli-<version>-x86_64-linux.sh" -o "$d/installer.sh" && sh "$d/installer.sh"'
+```
+
+The installer verifies its embedded checksum, installs `sovereign-config` into `~/.local/bin` (override with `SOVEREIGN_CONFIG_BIN`), and prints the installed version. Re-run it to upgrade. Because the binary is built from the server's own release tag, the installed CLI is protocol-matched to that server. The installer extracts itself from its own file, so download it and run it — it cannot be piped straight into a shell.
+
+Alternatively, build the CLI from the matching tagged source with a Rust toolchain:
 
 ```sh
 cargo install --locked --git https://github.com/vcheesbrough/sovereign-config --tag <version> sovereign-config-cli
@@ -187,4 +195,4 @@ The application writes structured redacted JSON logs to stdout. Authentication e
 
 ## Release Gate
 
-Publish an image tag only after `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, native and WASM checks, unit and integration checks, PostgreSQL migration checks, gRPC/gRPC-Web checks, and Chromium/Firefox UI checks pass. The tagged source supplies the protocol-matched CLI installed with `cargo install --locked`. SBOM generation is out of scope for the MVP.
+Publish an image tag only after `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `shellcheck` of the installer scripts, native and WASM checks, unit and integration checks, PostgreSQL migration checks, gRPC/gRPC-Web checks, and Chromium/Firefox UI checks pass. The release image bundles a static musl CLI installer built from the same tag and served unauthenticated under `/dist`; the image build gates on that installer extracting to a binary whose reported version equals the release tag. The tagged source also supplies the protocol-matched CLI through `cargo install --locked`. SBOM generation is out of scope for the MVP.

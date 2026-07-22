@@ -48,6 +48,8 @@ steps:
       - sovereign-config-cargo-git:/usr/local/cargo/git
       - sovereign-config-contract-target:/woodpecker/cache/sovereign-config-target
     commands:
+      - apt-get update && apt-get install -y --no-install-recommends shellcheck
+      - shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh
       - rustup component add clippy rustfmt
       - cargo fmt --check
       - cargo clippy --workspace --all-targets -- -D warnings
