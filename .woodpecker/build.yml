@@ -35,6 +35,14 @@ steps:
       github_token:
         from_secret: github_token
 
+  shellcheck:
+    depends_on: []
+    when:
+      - event: push
+    image: docker.io/koalaman/shellcheck-alpine@sha256:e19ed93c22423970d56568e171b4512c9244fc75dd9114045016b4a0073ac4b7
+    commands:
+      - shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh
+
   workspace-validation:
     depends_on: []
     when:
@@ -100,6 +108,7 @@ steps:
       - build-server
       - workspace-validation
       - browser-validation
+      - shellcheck
     when:
       - event: push
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c

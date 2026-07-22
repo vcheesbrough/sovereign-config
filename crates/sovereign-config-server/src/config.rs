@@ -1,4 +1,4 @@
-use std::{env, fs, net::IpAddr, net::SocketAddr, time::Duration};
+use std::{env, fs, net::IpAddr, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
@@ -29,6 +29,9 @@ pub(crate) struct ManagedConnectionConfig {
 pub(crate) struct WebConfig {
     pub(crate) issuer: String,
     pub(crate) client_id: String,
+    /// Optional directory of prebuilt installer artifacts to serve under
+    /// `/dist`. Absent in local runs that ship no installers.
+    pub(crate) dist_dir: Option<PathBuf>,
 }
 
 pub(crate) struct AuthenticationConfig {
@@ -74,6 +77,10 @@ impl Config {
 
         let public_origin =
             validated_public_origin(&required_env("SOVEREIGN_CONFIG_PUBLIC_ORIGIN")?)?;
+        let dist_dir = env::var("SOVEREIGN_CONFIG_DIST_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from);
         let grants_attribute = validated_grants_attribute(&required_env(
             "SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE",
         )?)?;
@@ -100,6 +107,7 @@ impl Config {
             web: WebConfig {
                 issuer: issuer.clone(),
                 client_id: audience.clone(),
+                dist_dir,
             },
             managed: ManagedConnectionConfig {
                 public_origin,

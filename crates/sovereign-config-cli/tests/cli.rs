@@ -1277,7 +1277,7 @@ fn version_does_not_require_profile_configuration() {
     assert_success(&output);
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "sovereign-config 2.0.0"
+        format!("sovereign-config {}", env!("CARGO_PKG_VERSION"))
     );
 }
 
