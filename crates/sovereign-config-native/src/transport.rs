@@ -8,10 +8,11 @@ use sovereign_config_client::{
 };
 use sovereign_config_core::{
     AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl, DeleteMetadata,
-    DisplayName, ListedValue, ManagedConnectionMetadata, ManagedConnectionState, MaskedSecret,
-    PlainValue, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedConnectionUrl,
-    RevealedSecret, Secret, SecretInput, SubTreeMutationContent, SubTreeMutationValue,
-    SubTreeValue, ValueContent, ValueListing, ValueSubTree,
+    DisplayName, ListedValue, ManagedConnectionMetadata, ManagedConnectionState,
+    ManagedPermissions, MaskedSecret, PlainValue, ProvisionedManagedConnection, PutMetadata,
+    ReplaceMetadata, RevealedConnectionUrl, RevealedSecret, Secret, SecretInput,
+    SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, ValueContent, ValueListing,
+    ValueSubTree,
 };
 use sovereign_config_proto::sovereign::config::v3::{
     CreateManagedConnectionRequest, DeleteValuesRequest, GetIdentityRequest, GetSubTreeRequest,
@@ -283,6 +284,7 @@ impl ManagedConnectionTransport for TonicTransport {
         &self,
         display_name: &DisplayName,
         root: &ConfigPath,
+        permissions: &ManagedPermissions,
         bearer: &Secret,
     ) -> Result<ProvisionedManagedConnection, ClientError> {
         let mut client = ManagedConnectionsClient::new(self.channel.clone());
@@ -291,6 +293,7 @@ impl ManagedConnectionTransport for TonicTransport {
                 CreateManagedConnectionRequest {
                     display_name: display_name.as_str().to_owned(),
                     root: root.as_str().to_owned(),
+                    permissions: permissions.to_proto(),
                 },
                 bearer,
             )?)
@@ -349,6 +352,8 @@ fn managed_metadata(
         display_name: DisplayName::parse(metadata.display_name).map_err(|_| invalid_response())?,
         root: ConfigPath::parse(metadata.root).map_err(|_| invalid_response())?,
         state: managed_state(metadata.state)?,
+        permissions: ManagedPermissions::from_proto(&metadata.permissions)
+            .map_err(|_| invalid_response())?,
         created_at: timestamp(created_at.seconds, created_at.nanos)?,
         updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
     })

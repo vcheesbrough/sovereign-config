@@ -153,6 +153,7 @@ impl AuthentikAdminClient {
         connection_id: &str,
         grants_attribute: &str,
         root: &str,
+        permissions: &[&str],
     ) -> Result<(), AdminError> {
         let mut attributes = serde_json::Map::new();
         attributes.insert(
@@ -163,7 +164,7 @@ impl AuthentikAdminClient {
         attributes.insert("sovereign_config_managed".to_owned(), json!(connection_id));
         attributes.insert(
             grants_attribute.to_owned(),
-            json!([{ "prefix": root, "permissions": ["read"] }]),
+            json!([{ "prefix": root, "permissions": permissions }]),
         );
         let response = self
             .http
@@ -876,6 +877,7 @@ mod live_tests {
                     "livetestconnectionid0123456789ab",
                     "sovereign_config_live_test_grants",
                     "/apps/api",
+                    &["read"],
                 )
                 .await
                 .map_err(|error| format!("patching the created account failed: {error:?}"))?;
