@@ -1216,9 +1216,24 @@ fn build_download_card(
     command_label.set_text_content(Some("Or download and run in one step:"));
     append(&card, &command_label)?;
 
+    // A readable multi-line form. Newlines inside the single-quoted `sh -c`
+    // script separate statements; the trailing `\` continues the long curl line.
+    // It stays a self-cleaning subshell so the temp directory is always removed.
+    let url = format!("{origin}/dist/{}", entry.file);
+    let command = [
+        "sh -c '".to_owned(),
+        "  d=$(mktemp -d)".to_owned(),
+        "  trap \"rm -rf \\\"$d\\\"\" EXIT".to_owned(),
+        format!("  curl -fsSL \"{url}\" \\"),
+        "    -o \"$d/installer.sh\"".to_owned(),
+        "  sh \"$d/installer.sh\"".to_owned(),
+        "'".to_owned(),
+    ]
+    .join("\n");
+
     let command_block = create_element(document, "pre", Some("download-command"))?;
-    // The block scrolls horizontally, so it must be keyboard-focusable for
-    // scroll access (axe scrollable-region-focusable).
+    // The block scrolls, so it must be keyboard-focusable for scroll access
+    // (axe scrollable-region-focusable).
     command_block
         .set_attribute("tabindex", "0")
         .map_err(|_| browser_error())?;
@@ -1226,16 +1241,45 @@ fn build_download_card(
         .set_attribute("aria-label", "Install command")
         .map_err(|_| browser_error())?;
     let command_code = create_element(document, "code", None)?;
-    let command = format!(
-        "sh -c 'd=$(mktemp -d); trap \"rm -rf \\\"$d\\\"\" EXIT; \
-         curl -fsSL \"{origin}/dist/{file}\" -o \"$d/installer.sh\" && sh \"$d/installer.sh\"'",
-        file = entry.file
-    );
     command_code.set_text_content(Some(&command));
     append(&command_block, &command_code)?;
     append(&card, &command_block)?;
 
+    let command_actions = create_element(document, "div", Some("download-command-actions"))?;
+    let copy = create_element(document, "button", Some("secondary"))?;
+    copy.set_attribute("type", "button")
+        .map_err(|_| browser_error())?;
+    copy.set_text_content(Some("Copy command"));
+    let status = create_element(document, "span", Some("download-copy-status"))?;
+    status
+        .set_attribute("aria-live", "polite")
+        .map_err(|_| browser_error())?;
+    let command_for_copy = command.clone();
+    let status_for_copy = status.clone();
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        let command = command_for_copy.clone();
+        let status = status_for_copy.clone();
+        spawn_local(async move { copy_to_clipboard(&command, &status).await });
+    });
+    copy.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
+    append(&command_actions, &copy)?;
+    append(&command_actions, &status)?;
+    append(&card, &command_actions)?;
+
     Ok(card)
+}
+
+async fn copy_to_clipboard(text: &str, status: &Element) {
+    let Some(clipboard) = window().map(|window| window.navigator().clipboard()) else {
+        status.set_text_content(Some("Copy failed"));
+        return;
+    };
+    match JsFuture::from(clipboard.write_text(text)).await {
+        Ok(_) => status.set_text_content(Some("Copied")),
+        Err(_) => status.set_text_content(Some("Copy failed")),
+    }
 }
 
 fn human_size(size: Option<f64>) -> String {
