@@ -1010,7 +1010,7 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
 
   await remove.click();
   await page.getByRole('dialog').getByRole('button', { name: 'Delete' }).click();
-  await expect(page.getByText('Deleted')).toBeVisible();
+  await expect(page.getByText('Deleted', { exact: true })).toBeVisible();
   await expect(page.getByText('No values at this path.')).toBeVisible();
   expect(requests.map(request => request.method)).toEqual([
     'ListValues', 'PutValue', 'ListValues', 'PutValue', 'ListValues', 'DeleteValues', 'ListValues'
@@ -1044,7 +1044,7 @@ test('grid lists every alias path and removes one without deleting the value', a
 
   await removeLegacy.click();
   await page.getByRole('dialog').getByRole('button', { name: 'Delete' }).click();
-  await expect(page.getByText('Deleted')).toBeVisible();
+  await expect(page.getByText('Deleted', { exact: true })).toBeVisible();
 
   const deletions = requests.filter(request => request.method === 'DeleteValues');
   expect(deletions).toHaveLength(1);
