@@ -3,6 +3,7 @@ members = [
   "crates/sovereign-config-client",
   "crates/sovereign-config-cli",
   "crates/sovereign-config-core",
+  "crates/sovereign-config-mcp",
   "crates/sovereign-config-native",
   "crates/sovereign-config-proto",
   "crates/sovereign-config-provider",
@@ -14,7 +15,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.11.0"
+version = "2.12.0"
 edition = "2024"
 rust-version = "1.94"
 license = "PolyForm-Noncommercial-1.0.0"
