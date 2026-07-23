@@ -7,17 +7,17 @@ use sovereign_config_client::{
     timestamp,
 };
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl, DeleteMetadata,
-    DisplayName, ListedValue, ManagedConnectionMetadata, ManagedConnectionState,
+    AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl,
+    DeleteMetadata, DisplayName, ListedValue, ManagedConnectionMetadata, ManagedConnectionState,
     ManagedPermissions, MaskedSecret, PlainValue, ProvisionedManagedConnection, PutMetadata,
     ReplaceMetadata, RevealedConnectionUrl, RevealedSecret, Secret, SecretInput,
     SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, ValueContent, ValueListing,
-    ValueSubTree,
+    ValuePaths, ValueSubTree,
 };
 use sovereign_config_proto::sovereign::config::v3::{
-    CreateManagedConnectionRequest, DeleteValuesRequest, GetIdentityRequest, GetSubTreeRequest,
-    GetVersionRequest, ListManagedConnectionsRequest, ListValuesRequest,
-    ManagedConnectionMetadata as ProtoManagedConnectionMetadata,
+    AddValuePathRequest, CreateManagedConnectionRequest, DeleteValuesRequest, GetIdentityRequest,
+    GetSubTreeRequest, GetVersionRequest, ListManagedConnectionsRequest, ListValuePathsRequest,
+    ListValuesRequest, ManagedConnectionMetadata as ProtoManagedConnectionMetadata,
     ManagedConnectionState as ProtoManagedConnectionState, PreserveSecret, PutValueRequest,
     ReplaceSubTreeRequest, RevealSecretRequest, RevokeManagedConnectionRequest,
     RotateManagedConnectionRequest, SubTreeMutationValue as ProtoSubTreeMutationValue,
@@ -63,11 +63,17 @@ impl ValueTransport for TonicTransport {
             .map(|value| {
                 let created_at = value.created_at.ok_or_else(invalid_response)?;
                 let updated_at = value.updated_at.ok_or_else(invalid_response)?;
+                let alias_paths = value
+                    .alias_paths
+                    .into_iter()
+                    .map(|path| ConfigPath::parse(path).map_err(|_| invalid_response()))
+                    .collect::<Result<Vec<_>, ClientError>>()?;
                 Ok(ListedValue {
                     path: ConfigPath::parse(value.path).map_err(|_| invalid_response())?,
                     value: listed_content(value.classification, value.content)?,
                     created_at: timestamp(created_at.seconds, created_at.nanos)?,
                     updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
+                    alias_paths,
                 })
             })
             .collect::<Result<Vec<_>, ClientError>>()?;
@@ -255,6 +261,54 @@ impl ValueTransport for TonicTransport {
             return Err(invalid_response());
         }
         Ok(RevealedSecret::new(response.value))
+    }
+
+    async fn add_value_path(
+        &self,
+        source: &ConfigPath,
+        new_path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<AddPathMetadata, ClientError> {
+        let mut client = ConfigurationClient::new(self.channel.clone());
+        let response = client
+            .add_value_path(authenticated_request(
+                AddValuePathRequest {
+                    source_path: source.as_str().to_owned(),
+                    new_path: new_path.as_str().to_owned(),
+                },
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        let created_at = response.created_at.ok_or_else(invalid_response)?;
+        Ok(AddPathMetadata {
+            created_at: timestamp(created_at.seconds, created_at.nanos)?,
+        })
+    }
+
+    async fn list_value_paths(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ValuePaths, ClientError> {
+        let mut client = ConfigurationClient::new(self.channel.clone());
+        let response = client
+            .list_value_paths(authenticated_request(
+                ListValuePathsRequest {
+                    path: path.as_str().to_owned(),
+                },
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        let paths = response
+            .paths
+            .into_iter()
+            .map(|path| ConfigPath::parse(path).map_err(|_| invalid_response()))
+            .collect::<Result<Vec<_>, ClientError>>()?;
+        Ok(ValuePaths { paths })
     }
 }
 

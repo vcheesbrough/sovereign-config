@@ -80,7 +80,8 @@ function listedValue(path, stored) {
     value.secret ? field(5, Buffer.alloc(0)) : field(2, Buffer.from(value.value)),
     field(3, instant),
     field(4, instant),
-    scalarField(6, value.secret ? 2 : 1)
+    scalarField(6, value.secret ? 2 : 1),
+    ...(value.aliases || []).map(alias => field(7, Buffer.from(alias)))
   ]);
 }
 
@@ -297,6 +298,16 @@ async function mockValues(page, initial = {}) {
       if (path === selected || (recurse && (selected === '/' || path.startsWith(`${selected}/`)))) {
         stored.delete(path);
         deleted++;
+      }
+    }
+    // Removing an alias path deletes only that path; the value survives via its
+    // primary path, so drop the alias rather than the whole entry.
+    if (deleted === 0) {
+      for (const value of stored.values()) {
+        if (value.aliases && value.aliases.includes(selected)) {
+          value.aliases = value.aliases.filter(alias => alias !== selected);
+          deleted++;
+        }
       }
     }
     return route.fulfill({
@@ -1003,6 +1014,50 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
   await expect(page.getByText('No values at this path.')).toBeVisible();
   expect(requests.map(request => request.method)).toEqual([
     'ListValues', 'PutValue', 'ListValues', 'PutValue', 'ListValues', 'DeleteValues', 'ListValues'
+  ]);
+});
+
+test('grid lists every alias path and removes one without deleting the value', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  const { requests } = await mockValues(page, {
+    '/apps/api/feature-flag': {
+      value: 'aliased-value-sentinel',
+      aliases: ['/apps/api/legacy-flag', '/shared/feature-flag']
+    }
+  });
+  await page.goto('/configuration/apps/api');
+
+  const row = page.getByRole('row', { name: /feature-flag/ });
+  await expect(row.getByText('/apps/api/feature-flag', { exact: true })).toBeVisible();
+  await expect(row.getByText('/apps/api/legacy-flag', { exact: true })).toBeVisible();
+  await expect(row.getByText('/shared/feature-flag', { exact: true })).toBeVisible();
+
+  const removeLegacy = row.getByRole('button', { name: 'Remove path /apps/api/legacy-flag' });
+  await removeLegacy.click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText('/apps/api/legacy-flag')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Cancel' })).toBeFocused();
+  await page.getByRole('button', { name: 'Cancel' }).click();
+  await expect(removeLegacy).toBeFocused();
+
+  await removeLegacy.click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Delete' }).click();
+  await expect(page.getByText('Deleted')).toBeVisible();
+
+  const deletions = requests.filter(request => request.method === 'DeleteValues');
+  expect(deletions).toHaveLength(1);
+  expect(deletions[0].fields.get(1)).toBe('/apps/api/legacy-flag');
+  expect(deletions[0].fields.get(2)).toBeUndefined();
+
+  const refreshedRow = page.getByRole('row', { name: /feature-flag/ });
+  await expect(refreshedRow.getByText('/apps/api/feature-flag', { exact: true })).toBeVisible();
+  await expect(refreshedRow.getByText('/shared/feature-flag', { exact: true })).toBeVisible();
+  await expect(refreshedRow.getByText('/apps/api/legacy-flag', { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel('Value for feature-flag')).toHaveValue('aliased-value-sentinel');
+  expect(requests.map(request => request.method)).toEqual([
+    'ListValues', 'DeleteValues', 'ListValues'
   ]);
 });
 

@@ -8,11 +8,12 @@ use sovereign_config_core::{
 };
 use sovereign_config_native::TonicTransport;
 use sovereign_config_proto::sovereign::config::v3::{
-    CreateManagedConnectionRequest, CreateManagedConnectionResponse, DeleteValuesRequest,
-    DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse, GetSubTreeRequest,
-    GetSubTreeResponse, GetVersionRequest, GetVersionResponse, ListManagedConnectionsRequest,
-    ListManagedConnectionsResponse, ListValuesRequest, ListValuesResponse, ListedValue,
-    ManagedConnectionMetadata as ProtoManagedConnectionMetadata,
+    AddValuePathRequest, AddValuePathResponse, CreateManagedConnectionRequest,
+    CreateManagedConnectionResponse, DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest,
+    GetIdentityResponse, GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest,
+    GetVersionResponse, ListManagedConnectionsRequest, ListManagedConnectionsResponse,
+    ListValuePathsRequest, ListValuePathsResponse, ListValuesRequest, ListValuesResponse,
+    ListedValue, ManagedConnectionMetadata as ProtoManagedConnectionMetadata,
     ManagedConnectionState as ProtoManagedConnectionState,
     ManagedPermission as ProtoManagedPermission, PutValueRequest, PutValueResponse,
     ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest, RevealSecretResponse,
@@ -69,6 +70,7 @@ impl Configuration for ContractConfiguration {
                     nanos: 0,
                 }),
                 classification: ValueClassification::Plain as i32,
+                alias_paths: vec!["/apps/api/feature-alias".into()],
             }],
             paths: vec![request.into_inner().path],
         }))
@@ -168,6 +170,33 @@ impl Configuration for ContractConfiguration {
         assert_eq!(request.into_inner().path, "/apps/api/credential");
         Ok(tonic::Response::new(RevealSecretResponse {
             value: "contract-secret-sentinel".into(),
+        }))
+    }
+
+    async fn add_value_path(
+        &self,
+        request: Request<AddValuePathRequest>,
+    ) -> Result<tonic::Response<AddValuePathResponse>, Status> {
+        require_bearer(&request)?;
+        let request = request.into_inner();
+        assert_eq!(request.source_path, "/apps/api/feature");
+        assert_eq!(request.new_path, "/apps/api/feature-alias");
+        Ok(tonic::Response::new(AddValuePathResponse {
+            created_at: Some(prost_types::Timestamp {
+                seconds: 1_700_000_003,
+                nanos: 0,
+            }),
+        }))
+    }
+
+    async fn list_value_paths(
+        &self,
+        request: Request<ListValuePathsRequest>,
+    ) -> Result<tonic::Response<ListValuePathsResponse>, Status> {
+        require_bearer(&request)?;
+        assert_eq!(request.into_inner().path, "/apps/api/feature");
+        Ok(tonic::Response::new(ListValuePathsResponse {
+            paths: vec!["/apps/api/feature".into(), "/apps/api/feature-alias".into()],
         }))
     }
 }
@@ -347,6 +376,7 @@ impl System for ContractSystem {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn tonic_transport_satisfies_shared_contract() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -377,6 +407,10 @@ async fn tonic_transport_satisfies_shared_contract() {
     assert_eq!(
         listing.values[0].value.display_text(),
         "contract-value-sentinel"
+    );
+    assert_eq!(
+        listing.values[0].alias_paths,
+        [ConfigPath::parse("/apps/api/feature-alias").unwrap()]
     );
 
     let selected = ConfigPath::parse("/apps/api").unwrap();
@@ -435,6 +469,29 @@ async fn tonic_transport_satisfies_shared_contract() {
             .unwrap()
             .deleted_count,
         2
+    );
+
+    transport
+        .add_value_path(
+            &ConfigPath::parse("/apps/api/feature").unwrap(),
+            &ConfigPath::parse("/apps/api/feature-alias").unwrap(),
+            &Secret::new("contract-token-sentinel"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        transport
+            .list_value_paths(
+                &ConfigPath::parse("/apps/api/feature").unwrap(),
+                &Secret::new("contract-token-sentinel"),
+            )
+            .await
+            .unwrap()
+            .paths,
+        [
+            ConfigPath::parse("/apps/api/feature").unwrap(),
+            ConfigPath::parse("/apps/api/feature-alias").unwrap(),
+        ]
     );
 
     for case in contract() {

@@ -21,8 +21,9 @@ use serde::Deserialize;
 use serde_json::json;
 use sovereign_config_core::{ConfigPath, ConnectionUrl, Secret};
 use sovereign_config_proto::sovereign::config::v3::{
-    DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse,
-    GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest, GetVersionResponse,
+    AddValuePathRequest, AddValuePathResponse, DeleteValuesRequest, DeleteValuesResponse,
+    GetIdentityRequest, GetIdentityResponse, GetSubTreeRequest, GetSubTreeResponse,
+    GetVersionRequest, GetVersionResponse, ListValuePathsRequest, ListValuePathsResponse,
     ListValuesRequest, ListValuesResponse, MaskedSecret, PutValueRequest, PutValueResponse,
     ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest, RevealSecretResponse,
     SubTreeValue, ValueClassification,
@@ -185,6 +186,20 @@ impl Configuration for MockConfiguration {
             })),
             None => Err(Status::not_found("no secret")),
         }
+    }
+
+    async fn add_value_path(
+        &self,
+        _: Request<AddValuePathRequest>,
+    ) -> Result<Response<AddValuePathResponse>, Status> {
+        Err(Status::unimplemented("add_value_path"))
+    }
+
+    async fn list_value_paths(
+        &self,
+        _: Request<ListValuePathsRequest>,
+    ) -> Result<Response<ListValuePathsResponse>, Status> {
+        Err(Status::unimplemented("list_value_paths"))
     }
 }
 

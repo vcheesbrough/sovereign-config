@@ -9,10 +9,10 @@
 
 use async_trait::async_trait;
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata, DisplayName,
-    ManagedConnectionMetadata, ManagedPermissions, PlainValue, ProvisionedManagedConnection,
-    PutMetadata, ReplaceMetadata, RevealedSecret, SecretInput, ServiceStatus, SubTreeMutationValue,
-    ValueListing, ValueSubTree,
+    AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata,
+    DisplayName, ManagedConnectionMetadata, ManagedPermissions, PlainValue,
+    ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret, SecretInput,
+    ServiceStatus, SubTreeMutationValue, ValueListing, ValuePaths, ValueSubTree,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -63,6 +63,13 @@ pub trait Backend {
         recurse: bool,
     ) -> Result<DeleteMetadata, ClientError>;
     async fn reveal_secret(&self, path: &ConfigPath) -> Result<RevealedSecret, ClientError>;
+
+    async fn add_value_path(
+        &self,
+        source: &ConfigPath,
+        new_path: &ConfigPath,
+    ) -> Result<AddPathMetadata, ClientError>;
+    async fn list_value_paths(&self, path: &ConfigPath) -> Result<ValuePaths, ClientError>;
 
     async fn list_connections(&self) -> Result<Vec<ManagedConnectionMetadata>, ClientError>;
     async fn create_connection(

@@ -16,6 +16,8 @@ service Configuration {
   rpc ReplaceSubTree(ReplaceSubTreeRequest) returns (ReplaceSubTreeResponse);
   rpc DeleteValues(DeleteValuesRequest) returns (DeleteValuesResponse);
   rpc RevealSecret(RevealSecretRequest) returns (RevealSecretResponse);
+  rpc AddValuePath(AddValuePathRequest) returns (AddValuePathResponse);
+  rpc ListValuePaths(ListValuePathsRequest) returns (ListValuePathsResponse);
 }
 
 service ManagedConnections {
@@ -47,6 +49,9 @@ message ListedValue {
   google.protobuf.Timestamp created_at = 3;
   google.protobuf.Timestamp updated_at = 4;
   ValueClassification classification = 6;
+  // Other canonical paths that resolve to the same stored value, restricted to
+  // those the caller is authorized to read. Excludes this value's own path.
+  repeated string alias_paths = 7;
 }
 
 message ListValuesResponse {
@@ -118,6 +123,26 @@ message RevealSecretRequest {
 
 message RevealSecretResponse {
   string value = 1;
+}
+
+message AddValuePathRequest {
+  // Existing path identifying the stored value to alias.
+  string source_path = 1;
+  // New canonical path to expose that same value at.
+  string new_path = 2;
+}
+
+message AddValuePathResponse {
+  google.protobuf.Timestamp created_at = 1;
+}
+
+message ListValuePathsRequest {
+  string path = 1;
+}
+
+message ListValuePathsResponse {
+  // Every path resolving to the same value that the caller may read, sorted.
+  repeated string paths = 1;
 }
 
 enum ManagedConnectionState {
