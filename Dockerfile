@@ -42,18 +42,25 @@ RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/carg
     apt-get update && apt-get install -y --no-install-recommends musl-tools \
     && rustup target add x86_64-unknown-linux-musl \
     && SOVEREIGN_CONFIG_RELEASE="$RELEASE_VERSION" cargo build --release --locked \
-        --target x86_64-unknown-linux-musl --package sovereign-config-cli \
-    && bin=/src/target/x86_64-unknown-linux-musl/release/sovereign-config \
-    && strip "$bin" \
-    && version="$("$bin" --version | awk '{print $NF}')" \
+        --target x86_64-unknown-linux-musl \
+        --package sovereign-config-cli --package sovereign-config-mcp \
     && mkdir -p /tmp/dist \
-    && installer="/tmp/dist/install-sovereign-config-cli-$version-x86_64-linux.sh" \
-    && sh scripts/make-installer.sh --binary "$bin" --name sovereign-config \
-        --version "$version" --output "$installer" \
-    # Gate: extract the finished installer and confirm it installs a binary that
-    # reports exactly the version it was built with.
-    && SOVEREIGN_CONFIG_BIN=/tmp/verify sh "$installer" \
-    && test "$(/tmp/verify/sovereign-config --version | awk '{print $NF}')" = "$version"
+    # Package each first-party binary as a self-extracting installer. The label
+    # (cli/mcp) names the installer file; the binary keeps its own name so the
+    # host launches it directly. The gate extracts each finished installer and
+    # confirms it installs a binary reporting exactly the version it was built
+    # with, so the served installer is protocol-matched to the server.
+    && for pair in "sovereign-config:cli" "sovereign-config-mcp:mcp"; do \
+        name="${pair%:*}"; label="${pair#*:}"; \
+        bin="/src/target/x86_64-unknown-linux-musl/release/$name"; \
+        strip "$bin"; \
+        version="$("$bin" --version | awk '{print $NF}')"; \
+        installer="/tmp/dist/install-sovereign-config-$label-$version-x86_64-linux.sh"; \
+        sh scripts/make-installer.sh --binary "$bin" --name "$name" \
+            --version "$version" --output "$installer"; \
+        SOVEREIGN_CONFIG_BIN="/tmp/verify-$label" sh "$installer"; \
+        test "$("/tmp/verify-$label/$name" --version | awk '{print $NF}')" = "$version"; \
+    done
 
 FROM docker.io/library/debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
 RUN useradd --system --uid 10001 --create-home sovereign-config
