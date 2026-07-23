@@ -10,7 +10,7 @@ use std::io;
 use serde_json::{Value, json};
 use sovereign_config_core::{
     ManagedConnectionMetadata, PlainValue, ProvisionedManagedConnection, SubTreeValue, Timestamp,
-    ValueContent, ValueListing, ValueSubTree, render_subtree_json,
+    ValueContent, ValueListing, ValuePaths, ValueSubTree, render_subtree_json,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::unbounded_channel;
@@ -228,6 +228,17 @@ impl<B: Backend> Server<B> {
                 let revealed = self.backend.reveal_secret(&path).await?;
                 Ok(revealed.expose().to_owned())
             }
+            ToolCall::AliasAdd {
+                source_path,
+                new_path,
+            } => {
+                self.backend.add_value_path(&source_path, &new_path).await?;
+                Ok(format!("Alias created at {}", new_path.as_str()))
+            }
+            ToolCall::AliasList { path } => {
+                let paths = self.backend.list_value_paths(&path).await?;
+                Ok(render_value_paths(&paths))
+            }
             ToolCall::ListConnections => {
                 let connections = self.backend.list_connections().await?;
                 let rendered: Vec<Value> = connections.iter().map(connection_json).collect();
@@ -379,6 +390,15 @@ fn render_listing(listing: &ValueListing) -> String {
         .map(sovereign_config_core::ConfigPath::as_str)
         .collect();
     to_pretty(&json!({ "values": values, "paths": paths }))
+}
+
+fn render_value_paths(paths: &ValuePaths) -> String {
+    let paths: Vec<&str> = paths
+        .paths
+        .iter()
+        .map(sovereign_config_core::ConfigPath::as_str)
+        .collect();
+    to_pretty(&json!({ "paths": paths }))
 }
 
 fn classification(content: &ValueContent) -> &'static str {

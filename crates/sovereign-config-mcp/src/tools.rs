@@ -56,6 +56,13 @@ pub enum ToolCall {
     RevealSecret {
         path: ConfigPath,
     },
+    AliasAdd {
+        source_path: ConfigPath,
+        new_path: ConfigPath,
+    },
+    AliasList {
+        path: ConfigPath,
+    },
     ListConnections,
     CreateConnection {
         display_name: DisplayName,
@@ -99,7 +106,11 @@ fn bounded(value: &str) -> Result<&str, ToolFailure> {
 }
 
 fn operation_path(arguments: &Value) -> Result<ConfigPath, ToolFailure> {
-    ConfigPath::parse_operation(require_str(arguments, "path")?)
+    operation_at(arguments, "path")
+}
+
+fn operation_at(arguments: &Value, key: &str) -> Result<ConfigPath, ToolFailure> {
+    ConfigPath::parse_operation(require_str(arguments, key)?)
         .map_err(|_| invalid("path must name a configuration value"))
 }
 
@@ -164,6 +175,13 @@ pub fn parse_call(name: &str, arguments: &Value) -> Result<ToolCall, ToolFailure
         "reveal_secret" => Ok(ToolCall::RevealSecret {
             path: operation_path(arguments)?,
         }),
+        "alias_add" => Ok(ToolCall::AliasAdd {
+            source_path: operation_at(arguments, "source_path")?,
+            new_path: operation_at(arguments, "new_path")?,
+        }),
+        "alias_list" => Ok(ToolCall::AliasList {
+            path: operation_path(arguments)?,
+        }),
         "list_connections" => Ok(ToolCall::ListConnections),
         "create_connection" => Ok(ToolCall::CreateConnection {
             display_name: DisplayName::parse(require_str(arguments, "display_name")?)
@@ -210,28 +228,36 @@ fn parse_permissions(arguments: &Value) -> Result<ManagedPermissions, ToolFailur
 ///
 /// Schemas are intentionally strict (`additionalProperties: false`) so callers
 /// cannot smuggle unexpected fields, and the surface is additive: later slices
-/// (e.g. alias tools from card #243) append entries without reshaping these.
+/// append entries without reshaping these.
 #[must_use]
 pub fn catalogue() -> Value {
     let path_property = json!({
         "type": "string",
         "description": "Absolute configuration path beginning with '/'.",
     });
-    json!([
+    let mut tools = value_tools(&path_property);
+    tools.extend(connection_tools());
+    Value::Array(tools)
+}
+
+/// Value-plane tools: authentication, reads, writes, deletes, secret reveals,
+/// and multi-path aliasing.
+fn value_tools(path_property: &Value) -> Vec<Value> {
+    vec![
         tool(
             "status",
             "Report the service version and whether the current profile is authenticated. Takes no arguments.",
-            json!({})
+            json!({}),
         ),
         tool(
             "login",
             "Begin an explicit device-authorization login. Surfaces the verification URL and user code as a log notification, then polls the provider to completion and stores the refresh credential. Takes no arguments.",
-            json!({})
+            json!({}),
         ),
         tool(
             "logout",
             "Delete the stored refresh credential for the current profile. Takes no arguments.",
-            json!({})
+            json!({}),
         ),
         tool_with(
             "get",
@@ -275,10 +301,31 @@ pub fn catalogue() -> Value {
             json!({ "path": path_property }),
             &["path"],
         ),
+        tool_with(
+            "alias_add",
+            "Expose an existing configuration value at an additional canonical path. The source value and the new alias path resolve to the same value thereafter.",
+            json!({
+                "source_path": { "type": "string", "description": "Absolute path of the existing value to alias, beginning with '/'." },
+                "new_path": { "type": "string", "description": "Absolute path of the new alias to create, beginning with '/'." },
+            }),
+            &["source_path", "new_path"],
+        ),
+        tool_with(
+            "alias_list",
+            "List every canonical path resolving to the same value as an exact configuration path, including the path itself.",
+            json!({ "path": path_property }),
+            &["path"],
+        ),
+    ]
+}
+
+/// Managed application connection lifecycle tools.
+fn connection_tools() -> Vec<Value> {
+    vec![
         tool(
             "list_connections",
             "List metadata for managed application connections rooted in manageable paths. Takes no arguments.",
-            json!({})
+            json!({}),
         ),
         tool_with(
             "create_connection",
@@ -307,7 +354,7 @@ pub fn catalogue() -> Value {
             json!({ "connection_id": { "type": "string", "description": "Identifier of the connection to revoke." } }),
             &["connection_id"],
         ),
-    ])
+    ]
 }
 
 fn tool(name: &str, description: &str, properties: Value) -> Value {
@@ -353,6 +400,8 @@ mod tests {
             "replace_subtree",
             "delete",
             "reveal_secret",
+            "alias_add",
+            "alias_list",
             "list_connections",
             "create_connection",
             "rotate_connection",
@@ -364,8 +413,6 @@ mod tests {
             assert_eq!(tool["inputSchema"]["type"], "object");
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         }
-        // Aliases are deferred to card #243 and must not appear yet.
-        assert!(!names.iter().any(|name| name.contains("alias")));
     }
 
     #[test]

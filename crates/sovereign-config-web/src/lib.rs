@@ -15,18 +15,20 @@ use sovereign_config_client::{
     VersionReply, map_rpc_status, timestamp,
 };
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl, DeleteMetadata,
-    DisplayName, ErrorKind, ListedValue, ManagedConnectionMetadata, ManagedConnectionState,
-    ManagedPermission, ManagedPermissions, MaskedSecret, PlainValue, ProvisionedManagedConnection,
-    PutMetadata, ReplaceMetadata, RevealedConnectionUrl, RevealedSecret, Secret, SecretInput,
-    SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, Timestamp, ValueContent,
-    ValueListing, ValueSubTree, parse_subtree_json, render_subtree_json,
+    AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl,
+    DeleteMetadata, DisplayName, ErrorKind, ListedValue, ManagedConnectionMetadata,
+    ManagedConnectionState, ManagedPermission, ManagedPermissions, MaskedSecret, PlainValue,
+    ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedConnectionUrl,
+    RevealedSecret, Secret, SecretInput, SubTreeMutationContent, SubTreeMutationValue,
+    SubTreeValue, Timestamp, ValueContent, ValueListing, ValuePaths, ValueSubTree,
+    parse_subtree_json, render_subtree_json,
 };
 use sovereign_config_proto::sovereign::config::v3::{
-    CreateManagedConnectionRequest, CreateManagedConnectionResponse, DeleteValuesRequest,
-    DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse, GetSubTreeRequest,
-    GetSubTreeResponse, GetVersionRequest, GetVersionResponse, ListManagedConnectionsRequest,
-    ListManagedConnectionsResponse, ListValuesRequest, ListValuesResponse,
+    AddValuePathRequest, AddValuePathResponse, CreateManagedConnectionRequest,
+    CreateManagedConnectionResponse, DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest,
+    GetIdentityResponse, GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest,
+    GetVersionResponse, ListManagedConnectionsRequest, ListManagedConnectionsResponse,
+    ListValuePathsRequest, ListValuePathsResponse, ListValuesRequest, ListValuesResponse,
     ManagedConnectionMetadata as ProtoManagedConnectionMetadata,
     ManagedConnectionState as ProtoManagedConnectionState, PreserveSecret, PutValueRequest,
     PutValueResponse, ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest,
@@ -189,11 +191,17 @@ impl ValueTransport for BrowserTransport {
             .values
             .into_iter()
             .map(|value| {
+                let alias_paths = value
+                    .alias_paths
+                    .into_iter()
+                    .map(|path| ConfigPath::parse(path).map_err(|_| browser_error()))
+                    .collect::<Result<Vec<_>, ClientError>>()?;
                 Ok(ListedValue {
                     path: ConfigPath::parse(value.path).map_err(|_| browser_error())?,
                     value: listed_content(value.classification, value.content)?,
                     created_at: proto_timestamp(value.created_at)?,
                     updated_at: proto_timestamp(value.updated_at)?,
+                    alias_paths,
                 })
             })
             .collect::<Result<Vec<_>, ClientError>>()?;
@@ -355,6 +363,47 @@ impl ValueTransport for BrowserTransport {
             return Err(browser_error());
         }
         Ok(RevealedSecret::new(response.value))
+    }
+
+    async fn add_value_path(
+        &self,
+        source: &ConfigPath,
+        new_path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<AddPathMetadata, ClientError> {
+        let response: AddValuePathResponse = grpc_unary(
+            "/sovereign.config.v3.Configuration/AddValuePath",
+            &AddValuePathRequest {
+                source_path: source.as_str().to_owned(),
+                new_path: new_path.as_str().to_owned(),
+            },
+            Some(bearer),
+        )
+        .await?;
+        Ok(AddPathMetadata {
+            created_at: proto_timestamp(response.created_at)?,
+        })
+    }
+
+    async fn list_value_paths(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ValuePaths, ClientError> {
+        let response: ListValuePathsResponse = grpc_unary(
+            "/sovereign.config.v3.Configuration/ListValuePaths",
+            &ListValuePathsRequest {
+                path: path.as_str().to_owned(),
+            },
+            Some(bearer),
+        )
+        .await?;
+        let paths = response
+            .paths
+            .into_iter()
+            .map(|path| ConfigPath::parse(path).map_err(|_| browser_error()))
+            .collect::<Result<Vec<_>, ClientError>>()?;
+        Ok(ValuePaths { paths })
     }
 }
 
@@ -2483,6 +2532,7 @@ fn render_value_row(
     full_path.set_text_content(Some(&absolute_path(&value.path)));
     append(&name_cell, &name_text)?;
     append(&name_cell, &full_path)?;
+    append_alias_paths(document, &name_cell, value, index)?;
 
     let value_cell = create_element(document, "td", None)?;
     let input_id = format!("listed-value-{index}");
@@ -2595,6 +2645,7 @@ fn render_secret_value_row(
     full_path.set_text_content(Some(&absolute_path(&value.path)));
     append(&name_cell, &name_text)?;
     append(&name_cell, &full_path)?;
+    append_alias_paths(document, &name_cell, value, index)?;
 
     let value_cell = create_element(document, "td", None)?;
     let kind = create_element(document, "span", Some("secret-kind"))?;
@@ -2722,6 +2773,51 @@ fn render_secret_value_row(
     append(&row, &updated)?;
     append(&row, &actions_cell)?;
     Ok(row)
+}
+
+/// Renders the value's additional authorized paths (`alias_paths`) beneath the
+/// primary path in the name cell. Each entry carries a danger "Remove" button
+/// that deletes only that path via the shared delete-confirm flow; the value
+/// survives through its remaining paths.
+fn append_alias_paths(
+    document: &Document,
+    name_cell: &Element,
+    value: &ListedValue,
+    index: usize,
+) -> Result<(), ClientError> {
+    if value.alias_paths.is_empty() {
+        return Ok(());
+    }
+    let list = create_element(document, "ul", Some("alias-paths"))?;
+    list.set_attribute("aria-label", "Additional paths for this value")
+        .map_err(|_| browser_error())?;
+    for (alias_index, alias_path) in value.alias_paths.iter().enumerate() {
+        let item = create_element(document, "li", Some("alias-path"))?;
+        let absolute = absolute_path(alias_path);
+        let path_text = create_element(document, "span", Some("full-path"))?;
+        path_text.set_text_content(Some(&absolute));
+        append(&item, &path_text)?;
+
+        let remove_id = format!("remove-alias-path-{index}-{alias_index}");
+        let remove = create_button(document, &remove_id, "Remove", Some("danger"))?;
+        remove
+            .set_attribute("aria-label", &format!("Remove path {absolute}"))
+            .map_err(|_| browser_error())?;
+        let remove_path = alias_path.clone();
+        let remove_focus = remove_id;
+        let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+            open_delete(remove_path.clone(), remove_focus.clone());
+        });
+        remove
+            .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+            .map_err(|_| browser_error())?;
+        callback.forget();
+        append(&item, &remove)?;
+
+        append(&list, &item)?;
+    }
+    append(name_cell, &list)?;
+    Ok(())
 }
 
 fn create_element(
