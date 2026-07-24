@@ -288,6 +288,26 @@ async function mockValues(page, initial = {}) {
         body: grpcFrame(status === 0 ? field(1, Buffer.from(value.value)) : Buffer.alloc(0), status)
       });
     }
+    if (method === 'AddValuePath') {
+      const source = fields.get(1);
+      const added = fields.get(2);
+      const value = stored.get(source);
+      if (!value) {
+        return route.fulfill({
+          status: 200,
+          headers: { 'content-type': 'application/grpc-web+proto' },
+          body: grpcFrame(Buffer.alloc(0), 5)
+        });
+      }
+      // One value, many paths: record the new path as another alias of the
+      // same stored value rather than copying its content.
+      value.aliases = [...(value.aliases || []), added].sort();
+      return route.fulfill({
+        status: 200,
+        headers: { 'content-type': 'application/grpc-web+proto' },
+        body: grpcFrame(field(1, timestamp(1700000002)))
+      });
+    }
     if (method !== 'DeleteValues') {
       throw new Error(`unexpected Configuration RPC ${method}`);
     }
@@ -1058,6 +1078,54 @@ test('grid lists every alias path and removes one without deleting the value', a
   await expect(page.getByLabel('Value for feature-flag')).toHaveValue('aliased-value-sentinel');
   expect(requests.map(request => request.method)).toEqual([
     'ListValues', 'DeleteValues', 'ListValues'
+  ]);
+});
+
+test('grid adds another path to an existing value', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  const { requests } = await mockValues(page, {
+    '/apps/api/feature-flag': { value: 'aliased-value-sentinel' }
+  });
+  await page.goto('/configuration/apps/api');
+
+  const row = page.getByRole('row', { name: /feature-flag/ });
+  await expect(row.getByText('/apps/worker/feature-flag', { exact: true })).toHaveCount(0);
+
+  const addPath = row.getByRole('button', { name: 'Add a path to feature-flag' });
+  await addPath.click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText('/apps/api/feature-flag')).toBeVisible();
+  await expect(page.getByLabel('New absolute path')).toBeFocused();
+
+  // A malformed path is rejected in the dialog without issuing an RPC.
+  await page.getByLabel('New absolute path').fill('worker/feature-flag');
+  await page.getByRole('button', { name: 'Add path', exact: true }).click();
+  await expect(dialog).toBeVisible();
+  await expect(page.getByText('Enter an absolute path such as /apps/worker/database-url.')).toBeVisible();
+  expect(requests.filter(request => request.method === 'AddValuePath')).toHaveLength(0);
+
+  // Cancelling returns focus to the control that opened the dialog.
+  await page.getByRole('button', { name: 'Cancel' }).click();
+  await expect(addPath).toBeFocused();
+
+  await addPath.click();
+  await page.getByLabel('New absolute path').fill('/apps/worker/feature-flag');
+  await page.getByRole('button', { name: 'Add path', exact: true }).click();
+  await expect(page.getByText('Path added', { exact: true })).toBeVisible();
+
+  const additions = requests.filter(request => request.method === 'AddValuePath');
+  expect(additions).toHaveLength(1);
+  expect(additions[0].fields.get(1)).toBe('/apps/api/feature-flag');
+  expect(additions[0].fields.get(2)).toBe('/apps/worker/feature-flag');
+
+  const refreshedRow = page.getByRole('row', { name: /feature-flag/ });
+  await expect(refreshedRow.getByText('/apps/api/feature-flag', { exact: true })).toBeVisible();
+  await expect(refreshedRow.getByText('/apps/worker/feature-flag', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('Value for feature-flag')).toHaveValue('aliased-value-sentinel');
+  expect(requests.map(request => request.method)).toEqual([
+    'ListValues', 'AddValuePath', 'ListValues'
   ]);
 });
 
