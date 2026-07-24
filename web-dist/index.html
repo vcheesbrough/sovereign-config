@@ -9,8 +9,8 @@
     <script src="/app-config.js"></script>
     
 <script type="module">
-import init, * as bindings from '/sovereign-config-web-d53d57132bb8d210.js';
-const wasm = await init({ module_or_path: '/sovereign-config-web-d53d57132bb8d210_bg.wasm' });
+import init, * as bindings from '/sovereign-config-web-62efcaee33b540c2.js';
+const wasm = await init({ module_or_path: '/sovereign-config-web-62efcaee33b540c2_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -19,7 +19,7 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-  <link rel="modulepreload" href="/sovereign-config-web-d53d57132bb8d210.js" crossorigin="anonymous" integrity="sha384-R+tWgeJD5c0bltxwmuwgbLgU9r5wjDsFKzXTs7rVALBARRxwuUdzdDKXtT83nNGt"><link rel="preload" href="/sovereign-config-web-d53d57132bb8d210_bg.wasm" crossorigin="anonymous" integrity="sha384-AAzdROrWVSD60DtXjdxpo6L4+l/s0ilV1ys6kbjvuVtYDccD+wgHIfCShC303LQb" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/sovereign-config-web-62efcaee33b540c2.js" crossorigin="anonymous" integrity="sha384-fQWGp3zJaUSO/FSHQlqQxjk51Qu9t3QXDqJ40QQl19fnezPzh3LD9YK5DmpWdASw"><link rel="preload" href="/sovereign-config-web-62efcaee33b540c2_bg.wasm" crossorigin="anonymous" integrity="sha384-kcb4cJP8gDYiWoX9TxKFv90MVJtGbKZk2THuEIQYmGAMpRGW7bMcLf8IFU7fAA3B" as="fetch" type="application/wasm"></head>
   <body>
     <header>
       <a id="brand-link" class="brand" href="/" aria-label="Sovereign Config home">
@@ -258,6 +258,17 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         <button id="reveal-connection-url" class="secondary" type="button" aria-controls="revealed-connection-url" aria-expanded="false">Reveal</button>
         <button id="copy-connection-url" class="secondary" type="button">Copy</button>
         <button id="close-connection-url" type="button">Close</button>
+      </div>
+    </dialog>
+    <dialog id="add-path-dialog" aria-labelledby="add-path-title">
+      <h2 id="add-path-title">Add a path to this value</h2>
+      <p><code id="add-path-source"></code> will also be readable at the new path. Changing the value through either path changes both.</p>
+      <label for="add-path-input">New absolute path</label>
+      <input id="add-path-input" type="text" autocomplete="off" spellcheck="false" placeholder="/apps/worker/database-url" aria-describedby="add-path-error">
+      <p id="add-path-error" class="field-error" aria-live="polite" hidden></p>
+      <div class="actions">
+        <button id="cancel-add-path" class="secondary" type="button">Cancel</button>
+        <button id="confirm-add-path" type="button">Add path</button>
       </div>
     </dialog>
     <dialog id="delete-dialog" aria-labelledby="delete-title">

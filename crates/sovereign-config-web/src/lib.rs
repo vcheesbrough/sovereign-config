@@ -56,6 +56,7 @@ const REFRESH_LIFETIME_MS: f64 = 8.0 * 60.0 * 60.0 * 1000.0;
 thread_local! {
     static TOKENS: RefCell<Option<MemoryTokens>> = const { RefCell::new(None) };
     static DELETE_TARGET: RefCell<Option<DeleteTarget>> = const { RefCell::new(None) };
+    static ADD_PATH_TARGET: RefCell<Option<AddPathTarget>> = const { RefCell::new(None) };
     static PATH_OPTIONS_REFRESHING: Cell<bool> = const { Cell::new(false) };
     static ACTIVE_PATH_OPTION: Cell<Option<usize>> = const { Cell::new(None) };
     static JSON_MODE: Cell<bool> = const { Cell::new(false) };
@@ -69,6 +70,14 @@ thread_local! {
 
 struct DeleteTarget {
     path: ConfigPath,
+    return_focus: String,
+}
+
+/// The value selected for a pending "add path" confirmation. The source path
+/// identifies the stored value; the new path is read from the dialog input.
+#[derive(Clone)]
+struct AddPathTarget {
+    source: ConfigPath,
     return_focus: String,
 }
 
@@ -782,6 +791,19 @@ fn install_configuration_actions(document: &Document) {
     if let Some(confirm) = document.get_element_by_id("confirm-delete") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
             spawn_local(async { delete_selected_value().await });
+        });
+        let _ =
+            confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(cancel) = document.get_element_by_id("cancel-add-path") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| cancel_add_path());
+        let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(confirm) = document.get_element_by_id("confirm-add-path") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            spawn_local(async { add_selected_path().await });
         });
         let _ =
             confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
@@ -1759,6 +1781,81 @@ fn close_delete_dialog() {
     }
 }
 
+fn open_add_path(source: ConfigPath, return_focus: String) {
+    set_text("add-path-source", &absolute_path(&source));
+    if let Some(input) = element::<HtmlInputElement>("add-path-input") {
+        input.set_value("");
+    }
+    set_hidden("add-path-error", true);
+    ADD_PATH_TARGET.with_borrow_mut(|target| {
+        *target = Some(AddPathTarget {
+            source,
+            return_focus,
+        });
+    });
+    if let Some(dialog) = element::<HtmlDialogElement>("add-path-dialog") {
+        let _ = dialog.show_modal();
+        focus("add-path-input");
+    }
+}
+
+fn cancel_add_path() {
+    let return_focus = ADD_PATH_TARGET
+        .with_borrow_mut(Option::take)
+        .map(|target| target.return_focus);
+    close_add_path_dialog();
+    if let Some(return_focus) = return_focus {
+        focus(&return_focus);
+    }
+}
+
+async fn add_selected_path() {
+    let Some(target) = ADD_PATH_TARGET.with_borrow(Clone::clone) else {
+        return;
+    };
+    let entered = element::<HtmlInputElement>("add-path-input")
+        .map(|input| input.value())
+        .unwrap_or_default();
+    // Keep the dialog open on a malformed path so the operator can correct it
+    // without losing the value they selected.
+    let Ok(new_path) = ConfigPath::parse_operation(entered.trim()) else {
+        set_text(
+            "add-path-error",
+            "Enter an absolute path such as /apps/worker/database-url.",
+        );
+        set_hidden("add-path-error", false);
+        focus("add-path-input");
+        return;
+    };
+    clear_error();
+    let result = async {
+        let config = app_config()?;
+        value_client(&config)
+            .add_value_path(&target.source, &new_path)
+            .await
+    }
+    .await;
+    ADD_PATH_TARGET.with_borrow_mut(Option::take);
+    close_add_path_dialog();
+    match result {
+        Ok(_) => {
+            load_current_configuration().await;
+            set_text("value-state", "Path added");
+            focus("add-value");
+        }
+        Err(error) => {
+            show_error(error.message());
+            focus(&target.return_focus);
+        }
+    }
+}
+
+fn close_add_path_dialog() {
+    if let Some(dialog) = element::<HtmlDialogElement>("add-path-dialog") {
+        dialog.close();
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn install_connections_actions(document: &Document) {
     if let Some(form) = document.get_element_by_id("connection-form") {
@@ -2578,11 +2675,27 @@ fn render_value_row(
     let actions = create_element(document, "div", Some("row-actions"))?;
     let save_id = format!("save-listed-value-{index}");
     let save = create_button(document, &save_id, "Save", None)?;
+    let add_path_id = format!("add-path-listed-value-{index}");
+    let add_path = create_button(document, &add_path_id, "Add path", Some("secondary"))?;
+    add_path
+        .set_attribute("aria-label", &format!("Add a path to {name}"))
+        .map_err(|_| browser_error())?;
     let remove_id = format!("delete-listed-value-{index}");
     let remove = create_button(document, &remove_id, "Delete", Some("danger"))?;
     append(&actions, &save)?;
+    append(&actions, &add_path)?;
     append(&actions, &remove)?;
     append(&actions_cell, &actions)?;
+
+    let add_path_source = value.path.clone();
+    let add_path_focus = add_path_id;
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        open_add_path(add_path_source.clone(), add_path_focus.clone());
+    });
+    add_path
+        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
 
     let save_path = value.path.clone();
     let save_input = input_id.clone();
@@ -2713,12 +2826,28 @@ fn render_secret_value_row(
     reveal
         .set_attribute("aria-expanded", "false")
         .map_err(|_| browser_error())?;
+    let add_path_id = format!("add-path-listed-value-{index}");
+    let add_path = create_button(document, &add_path_id, "Add path", Some("secondary"))?;
+    add_path
+        .set_attribute("aria-label", &format!("Add a path to {name}"))
+        .map_err(|_| browser_error())?;
     let remove_id = format!("delete-listed-value-{index}");
     let remove = create_button(document, &remove_id, "Delete", Some("danger"))?;
     append(&actions, &save)?;
     append(&actions, &reveal)?;
+    append(&actions, &add_path)?;
     append(&actions, &remove)?;
     append(&actions_cell, &actions)?;
+
+    let add_path_source = value.path.clone();
+    let add_path_focus = add_path_id;
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        open_add_path(add_path_source.clone(), add_path_focus.clone());
+    });
+    add_path
+        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
 
     let save_path = value.path.clone();
     let save_input = input_id.clone();
