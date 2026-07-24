@@ -5,12 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#10211b">
     <title>Sovereign Config</title>
-    <link rel="stylesheet" href="/style-16cdf03e697c78cf.css" integrity="sha384-5ALfxjK2oVsKoRm8Hz9SWeg+WKlVoANQNzW4CU6flP4NE/nqUVuRgvRpxQvh6wh7"/>
+    <link rel="stylesheet" href="/style-f5f811ceb2272a43.css" integrity="sha384-5xcOJanQVAMuP/c8oA8MLLXlS6A8+kFBilBxcFDzerTdIs6LFo1julWoClTqYRuE"/>
     <script src="/app-config.js"></script>
     
 <script type="module">
-import init, * as bindings from '/sovereign-config-web-6b13210daa9f2996.js';
-const wasm = await init({ module_or_path: '/sovereign-config-web-6b13210daa9f2996_bg.wasm' });
+import init, * as bindings from '/sovereign-config-web-d53d57132bb8d210.js';
+const wasm = await init({ module_or_path: '/sovereign-config-web-d53d57132bb8d210_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -19,7 +19,7 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-  <link rel="modulepreload" href="/sovereign-config-web-6b13210daa9f2996.js" crossorigin="anonymous" integrity="sha384-BC43Fk0SqxnhV5O7b9HVpI2Sml6Sr8eXn33QHCND8wiBkl0wOYbQyLTg5cm1rhl5"><link rel="preload" href="/sovereign-config-web-6b13210daa9f2996_bg.wasm" crossorigin="anonymous" integrity="sha384-szyLdCoJtx+sI/Cki62xHxmGo27XR197YHX11uIVfFhdWbwxzoiBrgpm5nKGtjo2" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/sovereign-config-web-d53d57132bb8d210.js" crossorigin="anonymous" integrity="sha384-R+tWgeJD5c0bltxwmuwgbLgU9r5wjDsFKzXTs7rVALBARRxwuUdzdDKXtT83nNGt"><link rel="preload" href="/sovereign-config-web-d53d57132bb8d210_bg.wasm" crossorigin="anonymous" integrity="sha384-AAzdROrWVSD60DtXjdxpo6L4+l/s0ilV1ys6kbjvuVtYDccD+wgHIfCShC303LQb" as="fetch" type="application/wasm"></head>
   <body>
     <header>
       <a id="brand-link" class="brand" href="/" aria-label="Sovereign Config home">
@@ -261,8 +261,8 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       </div>
     </dialog>
     <dialog id="delete-dialog" aria-labelledby="delete-title">
-      <h2 id="delete-title">Permanently delete this value?</h2>
-      <p><code id="delete-path"></code> will be removed immediately. This operation cannot be undone.</p>
+      <h2 id="delete-title">Remove this path?</h2>
+      <p><code id="delete-path"></code> will be removed immediately. If the value has no other paths it is deleted permanently. This operation cannot be undone.</p>
       <div class="actions">
         <button id="cancel-delete" class="secondary" type="button">Cancel</button>
         <button id="confirm-delete" class="danger" type="button">Delete</button>
