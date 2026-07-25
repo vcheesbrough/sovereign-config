@@ -1091,10 +1091,16 @@ fn encryption_failed() -> Status {
 /// also repairs a deployment that was rolled back, wrote plaintext, and rolled
 /// forward again.
 ///
-/// A row that looks encrypted but will not open aborts startup. That is the
-/// signature of the wrong key, and continuing would mean serving errors for
-/// secrets that are perfectly intact under the right one — or, worse, sealing
-/// a second layer over them.
+/// Rows that will not open are judged together rather than one at a time,
+/// because the same symptom has two very different causes. If *every* sealed
+/// row fails, the key does not match this database: startup aborts, since
+/// running on would mean serving errors for secrets that are perfectly intact
+/// under the right key — or, worse, sealing a second layer over them. If only
+/// some fail among healthy ones, that is damage to those rows — a torn write, a
+/// partial restore — and taking the whole service down with them would deny
+/// every `plain` value too, none of which needs a key at all. Those rows are
+/// logged and left exactly as found, and [`ConfigurationService::reveal_secret`]
+/// still fails closed for their paths.
 pub(crate) async fn encrypt_stored_secrets(
     database: &PgPool,
     cipher: &ValueCipher,
@@ -1132,16 +1138,19 @@ pub(crate) async fn encrypt_stored_secrets(
     .context("unable to read configuration secrets for encryption")?;
 
     let mut encrypted = 0usize;
+    let mut sealed_on_entry = 0usize;
+    let mut unreadable = Vec::new();
     for row in stored {
         if is_envelope(&row.value) {
-            cipher
-                .decrypt(row.id, SECRET, &row.value)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "stored configuration secret {} is unreadable: {error}",
-                        row.id
-                    )
-                })?;
+            sealed_on_entry += 1;
+            if let Err(error) = cipher.decrypt(row.id, SECRET, &row.value) {
+                error!(
+                    content_id = row.id,
+                    reason = %error,
+                    "stored configuration secret is unreadable"
+                );
+                unreadable.push(row.id);
+            }
             continue;
         }
         let sealed = cipher
@@ -1159,6 +1168,15 @@ pub(crate) async fn encrypt_stored_secrets(
         encrypted += 1;
     }
 
+    if wrong_key(unreadable.len(), sealed_on_entry) {
+        // Nothing is committed: the rows encrypted above roll back with the
+        // transaction, so a mistaken key cannot half-convert the database.
+        anyhow::bail!(
+            "every stored configuration secret is unreadable ({sealed_on_entry} rows); \
+             the configured value encryption key does not match this database"
+        );
+    }
+
     transaction
         .commit()
         .await
@@ -1166,7 +1184,28 @@ pub(crate) async fn encrypt_stored_secrets(
     if encrypted > 0 {
         info!(count = encrypted, "encrypted stored configuration secrets");
     }
+    if !unreadable.is_empty() {
+        error!(
+            count = unreadable.len(),
+            content_ids = ?unreadable,
+            "some stored configuration secrets are unreadable and will fail when revealed; \
+             every other value is unaffected"
+        );
+    }
     Ok(())
+}
+
+/// Decides whether unreadable secrets mean the key is wrong or the rows are.
+///
+/// Every sealed row failing points at the key, because one key opens all of
+/// them. A mix means the key is right and those particular rows are damaged.
+///
+/// The two are genuinely indistinguishable when the database holds exactly one
+/// sealed secret and it fails, so that case is treated as the wrong key: a
+/// server that refuses to start is easier to diagnose and safer than one
+/// quietly serving a secret it cannot read.
+fn wrong_key(unreadable: usize, sealed_on_entry: usize) -> bool {
+    unreadable > 0 && unreadable == sealed_on_entry
 }
 
 /// Reports a value that could not be decrypted.
@@ -1196,7 +1235,7 @@ mod tests {
     use super::{
         AddValuePathRequest, ConfigurationService, DeleteValuesRequest, GetSubTreeRequest,
         ListValuePathsRequest, ListValuesRequest, MASKED_SECRET_TEXT, PutValueRequest,
-        ReplaceSubTreeRequest, encrypt_stored_secrets,
+        ReplaceSubTreeRequest, encrypt_stored_secrets, wrong_key,
     };
     use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
 
@@ -3049,49 +3088,62 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
-    async fn postgres_refuses_to_start_against_a_secret_it_cannot_read() {
+    async fn postgres_survives_one_damaged_secret_and_fails_closed_on_reading_it() {
         let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
             .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        clear_test_paths(&pool, &["/tests/encryptionwrongkey"]).await;
-        let path = "/tests/encryptionwrongkey/token";
-        seed_legacy_plaintext_secret(&pool, path, "placeholder").await;
-        let (content_id, _, _) = stored_value(&pool, path).await;
+        clear_test_paths(&pool, &["/tests/encryptiondamaged"]).await;
+        let damaged_path = "/tests/encryptiondamaged/token";
+        let healthy_path = "/tests/encryptiondamaged/legacy";
+        seed_legacy_plaintext_secret(&pool, damaged_path, "placeholder").await;
+        seed_legacy_plaintext_secret(&pool, healthy_path, "still-fine").await;
+        let (damaged_id, _, _) = stored_value(&pool, damaged_path).await;
 
-        // Stand in for a database whose secrets were sealed under a key this
-        // server no longer has. Sealing just this row keeps the rest of the
-        // shared test database readable, so the pass fails for exactly one
-        // reason.
+        // One row sealed under a key this server does not have — a torn write
+        // or a partial restore looks the same from here.
         let foreign = cipher_seeded(0x11)
-            .encrypt(content_id, "secret", "sealed-under-another-key")
+            .encrypt(damaged_id, "secret", "sealed-under-another-key")
             .unwrap();
         sqlx::query("UPDATE configuration_value_contents SET value = $2 WHERE id = $1")
-            .bind(content_id)
+            .bind(damaged_id)
             .bind(&foreign)
             .execute(&pool)
             .await
             .unwrap();
 
-        // Startup must stop rather than run on and fail every reveal — or,
-        // worse, seal a second layer over data that is perfectly intact under
-        // the right key.
-        let error = encrypt_stored_secrets(&pool, &test_cipher())
-            .await
-            .unwrap_err();
-        let message = error.to_string();
-        assert!(
-            message.contains("unreadable"),
-            "unexpected error: {message}"
-        );
-        assert!(message.contains(&content_id.to_string()));
-        assert!(!message.contains("sealed-under-another-key"));
-        assert!(!message.contains(&foreign));
+        // Restore the database before asserting. A panic below would otherwise
+        // leave a foreign envelope in the shared test database, and this pass
+        // is global rather than prefix-scoped, so every later run — and any
+        // developer server pointed at it — would inherit the damage.
+        let outcome = encrypt_stored_secrets(&pool, &test_cipher()).await;
+        let sealed_healthy = stored_value(&pool, healthy_path).await.1;
+        let damaged_after = stored_value(&pool, damaged_path).await.1;
+        clear_test_paths(&pool, &["/tests/encryptiondamaged"]).await;
 
-        let (_, unchanged, _) = stored_value(&pool, path).await;
-        assert_eq!(unchanged, foreign);
+        // Damage to one secret must not deny the service to everything else,
+        // including every plain value, none of which needs a key at all.
+        outcome.expect("one damaged secret must not prevent startup");
+        assert!(sealed_healthy.starts_with("enc:v1:"));
+        assert!(!sealed_healthy.contains("still-fine"));
+        // The damaged row is left exactly as found, never re-sealed.
+        assert_eq!(damaged_after, foreign);
 
-        clear_test_paths(&pool, &["/tests/encryptionwrongkey"]).await;
         pool.close().await;
+    }
+
+    #[test]
+    fn a_key_that_opens_nothing_is_reported_as_the_wrong_key() {
+        // Every sealed row failing points at the key; one key opens all of
+        // them. A mix means the key is right and those rows are damaged.
+        assert!(wrong_key(3, 3));
+        assert!(!wrong_key(1, 3));
+        assert!(!wrong_key(0, 3));
+        // Nothing sealed yet cannot condemn the key.
+        assert!(!wrong_key(0, 0));
+        // A lone sealed secret that fails is ambiguous, and resolved as the
+        // wrong key: refusing to start is easier to diagnose than quietly
+        // serving a secret the server cannot read.
+        assert!(wrong_key(1, 1));
     }
 }
