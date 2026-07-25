@@ -1129,6 +1129,45 @@ test('grid adds another path to an existing value', async ({ page }) => {
   ]);
 });
 
+// Two paths of one value can both sit directly under the selected namespace.
+// A namespace listing enumerates the paths that live in it, so both appear as
+// their own row rather than one being collapsed into the other's alias list:
+// hiding either would omit a real, authorized path from its own namespace and
+// leave which one survives decided by sort order.
+test('sibling paths of one value each keep their own grid row', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, {
+    '/apps/api/feature-flag': {
+      value: 'shared-value-sentinel',
+      aliases: ['/apps/api/legacy-flag']
+    },
+    '/apps/api/legacy-flag': {
+      value: 'shared-value-sentinel',
+      aliases: ['/apps/api/feature-flag']
+    }
+  });
+  await page.goto('/configuration/apps/api');
+
+  const canonical = page.getByRole('row').filter({ has: page.getByLabel('Value for feature-flag') });
+  const sibling = page.getByRole('row').filter({ has: page.getByLabel('Value for legacy-flag') });
+  await expect(canonical).toHaveCount(1);
+  await expect(sibling).toHaveCount(1);
+
+  // Each row is anchored on its own path and names the other as an alias.
+  await expect(canonical.getByText('/apps/api/feature-flag', { exact: true })).toBeVisible();
+  await expect(canonical.getByText('/apps/api/legacy-flag', { exact: true })).toBeVisible();
+  await expect(sibling.getByText('/apps/api/legacy-flag', { exact: true })).toBeVisible();
+  await expect(sibling.getByText('/apps/api/feature-flag', { exact: true })).toBeVisible();
+
+  // Both resolve to the same stored value, and both stay independently operable.
+  await expect(page.getByLabel('Value for feature-flag')).toHaveValue('shared-value-sentinel');
+  await expect(page.getByLabel('Value for legacy-flag')).toHaveValue('shared-value-sentinel');
+  await expect(canonical.getByRole('button', { name: 'Add a path to feature-flag' })).toBeVisible();
+  await expect(sibling.getByRole('button', { name: 'Add a path to legacy-flag' })).toBeVisible();
+  await expect(page.getByText('2 values')).toBeVisible();
+});
+
 test('secret values stay masked, rotate explicitly, and survive JSON edits', async ({ page }) => {
   const originalSecret = 'original-browser-secret-sentinel';
   const rotatedSecret = 'rotated-browser-secret-sentinel';
