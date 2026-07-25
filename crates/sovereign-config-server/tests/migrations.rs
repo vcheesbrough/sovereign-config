@@ -25,28 +25,43 @@ async fn connect_when_ready(database_url: &str) -> PgPool {
 
 async fn reset_schema(pool: &PgPool, context: &str) {
     sqlx::query(
-        "DROP TABLE IF EXISTS configuration_values, managed_connections, schema_metadata, _sqlx_migrations CASCADE",
+        "DROP TABLE IF EXISTS configuration_paths, configuration_value_contents, configuration_values, managed_connections, schema_metadata, _sqlx_migrations CASCADE",
     )
     .execute(pool)
     .await
     .unwrap_or_else(|_| panic!("test schema must reset {context}"));
 }
 
-async fn rooted_path_constraint_accepts_only_rooted_values(pool: &PgPool) {
-    let invalid_path = sqlx::query(
-        "INSERT INTO configuration_values (path, value, classification, created_at, updated_at) VALUES ('Invalid/Path', '', 'plain', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+// Insert one content row and return its id, so path-constraint fixtures can
+// satisfy the foreign key.
+async fn seed_content(pool: &PgPool, classification: &str) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO configuration_value_contents (value, classification, created_at, updated_at) VALUES ('', $1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id",
     )
+    .bind(classification)
+    .fetch_one(pool)
+    .await
+    .expect("content fixture must be insertable")
+}
+
+async fn rooted_path_constraint_accepts_only_rooted_values(pool: &PgPool) {
+    let content_id = seed_content(pool, "plain").await;
+    let invalid_path = sqlx::query(
+        "INSERT INTO configuration_paths (path, content_id, created_at, updated_at) VALUES ('Invalid/Path', $1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .bind(content_id)
     .execute(pool)
     .await;
     let rooted_path = sqlx::query(
-        "INSERT INTO configuration_values (path, value, classification, created_at, updated_at) VALUES ('/valid/path', '', 'plain', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        "INSERT INTO configuration_paths (path, content_id, created_at, updated_at) VALUES ('/valid/path', $1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
+    .bind(content_id)
     .execute(pool)
     .await;
-    let retained_values: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM configuration_values")
+    let retained_values: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM configuration_paths")
         .fetch_one(pool)
         .await
-        .expect("configuration value inventory must be readable");
+        .expect("configuration path inventory must be readable");
 
     assert!(invalid_path.is_err());
     assert!(rooted_path.is_ok());
@@ -55,12 +70,12 @@ async fn rooted_path_constraint_accepts_only_rooted_values(pool: &PgPool) {
 
 async fn classification_is_explicit_and_constrained(pool: &PgPool) {
     let invalid = sqlx::query(
-        "INSERT INTO configuration_values (path, value, classification, created_at, updated_at) VALUES ('/invalid/classification', '', 'unknown', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        "INSERT INTO configuration_value_contents (value, classification, created_at, updated_at) VALUES ('', 'unknown', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .execute(pool)
     .await;
     let omitted = sqlx::query(
-        "INSERT INTO configuration_values (path, value, created_at, updated_at) VALUES ('/missing/classification', '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        "INSERT INTO configuration_value_contents (value, created_at, updated_at) VALUES ('', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
     )
     .execute(pool)
     .await;
@@ -203,11 +218,13 @@ async fn migrations_are_repeatable_against_postgresql() {
         .run(&pool)
         .await
         .expect("upgrade from the prior release must succeed");
+    // The rooted migration (0003) purges legacy rows; the alias migration
+    // (0007) then leaves no paths to back-fill.
     let values_after_rooted_upgrade: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM configuration_values")
+        sqlx::query_scalar("SELECT COUNT(*) FROM configuration_paths")
             .fetch_one(&pool)
             .await
-            .expect("upgraded configuration value inventory must be readable");
+            .expect("upgraded configuration path inventory must be readable");
     assert_eq!(values_after_rooted_upgrade, 0);
 
     reset_schema(&pool, "after upgrade validation").await;
@@ -230,8 +247,15 @@ async fn migrations_are_repeatable_against_postgresql() {
         .run(&pool)
         .await
         .expect("v2 classification upgrade must succeed");
+    // After the alias split (0007) the value is reached through a path row
+    // joined to its content, preserving the sentinel and default classification.
     let migrated: (String, String) = sqlx::query_as(
-        "SELECT value, classification FROM configuration_values WHERE path = '/existing/value'",
+        r"
+        SELECT c.value, c.classification
+        FROM configuration_paths p
+        JOIN configuration_value_contents c ON c.id = p.content_id
+        WHERE p.path = '/existing/value'
+        ",
     )
     .fetch_one(&pool)
     .await
@@ -279,18 +303,37 @@ async fn migrations_are_repeatable_against_postgresql() {
     .await
     .expect("authorization table inventory must be readable");
 
-    let value_columns: i64 = sqlx::query_scalar(
+    // The alias split replaces configuration_values with a content table and a
+    // path table referencing it.
+    let legacy_value_table: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('configuration_values')::text")
+            .fetch_one(&pool)
+            .await
+            .expect("legacy value table inventory must be readable");
+    let content_columns: i64 = sqlx::query_scalar(
         r"
         SELECT COUNT(*)
         FROM information_schema.columns
         WHERE table_schema = current_schema()
-          AND table_name = 'configuration_values'
-          AND column_name IN ('path', 'value', 'classification', 'created_at', 'updated_at')
+          AND table_name = 'configuration_value_contents'
+          AND column_name IN ('id', 'value', 'classification', 'created_at', 'updated_at')
         ",
     )
     .fetch_one(&pool)
     .await
-    .expect("configuration value schema must be readable");
+    .expect("configuration content schema must be readable");
+    let path_columns: i64 = sqlx::query_scalar(
+        r"
+        SELECT COUNT(*)
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'configuration_paths'
+          AND column_name IN ('path', 'content_id', 'created_at', 'updated_at')
+        ",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("configuration path schema must be readable");
     let managed_connection_columns: Vec<String> = sqlx::query_scalar(
         r"
         SELECT column_name
@@ -336,10 +379,12 @@ async fn migrations_are_repeatable_against_postgresql() {
     .fetch_one(&pool)
     .await
     .expect("credential column inventory must be readable");
-    assert_eq!(applied_migrations, 6);
+    assert_eq!(applied_migrations, 7);
     assert_eq!(metadata_rows, 1);
     assert_eq!(authorization_tables, 0);
-    assert_eq!(value_columns, 5);
+    assert!(legacy_value_table.is_none());
+    assert_eq!(content_columns, 5);
+    assert_eq!(path_columns, 4);
     assert_eq!(credential_columns, 0);
     rooted_path_constraint_accepts_only_rooted_values(&pool).await;
     classification_is_explicit_and_constrained(&pool).await;

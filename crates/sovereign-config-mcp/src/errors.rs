@@ -35,6 +35,7 @@ impl ToolFailure {
             ErrorKind::IncompatibleProtocol => "incompatible_protocol",
             ErrorKind::InvalidRequest => "invalid_request",
             ErrorKind::NotFound => "not_found",
+            ErrorKind::Conflict => "conflict",
             ErrorKind::Unavailable => "unavailable",
             ErrorKind::Internal => "internal",
         };

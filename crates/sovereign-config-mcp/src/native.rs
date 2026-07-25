@@ -10,10 +10,10 @@
 use async_trait::async_trait;
 use sovereign_config_client::{AccessTokenProvider, Client};
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl, DeleteMetadata,
-    DisplayName, ErrorKind, ManagedConnectionMetadata, ManagedPermissions, PlainValue,
-    ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret, Secret,
-    SecretInput, ServiceStatus, SubTreeMutationValue, ValueListing, ValueSubTree,
+    AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl,
+    DeleteMetadata, DisplayName, ErrorKind, ManagedConnectionMetadata, ManagedPermissions,
+    PlainValue, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret, Secret,
+    SecretInput, ServiceStatus, SubTreeMutationValue, ValueListing, ValuePaths, ValueSubTree,
 };
 use sovereign_config_native::{
     CredentialStore, DeviceFlowClient, ProfileStore, TonicTransport, default_credential_directory,
@@ -222,6 +222,24 @@ impl Backend for NativeBackend {
 
     async fn reveal_secret(&self, path: &ConfigPath) -> Result<RevealedSecret, ClientError> {
         self.operational_client().await?.reveal_secret(path).await
+    }
+
+    async fn add_value_path(
+        &self,
+        source: &ConfigPath,
+        new_path: &ConfigPath,
+    ) -> Result<AddPathMetadata, ClientError> {
+        self.operational_client()
+            .await?
+            .add_value_path(source, new_path)
+            .await
+    }
+
+    async fn list_value_paths(&self, path: &ConfigPath) -> Result<ValuePaths, ClientError> {
+        self.operational_client()
+            .await?
+            .list_value_paths(path)
+            .await
     }
 
     async fn list_connections(&self) -> Result<Vec<ManagedConnectionMetadata>, ClientError> {

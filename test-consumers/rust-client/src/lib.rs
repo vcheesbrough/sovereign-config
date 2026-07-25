@@ -9,10 +9,10 @@ mod tests {
         AccessTokenProvider, Client, Transport, ValueTransport, VersionReply,
     };
     use sovereign_config_core::{
-        AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind, ListedValue,
-        MaskedSecret, PlainValue, PutMetadata, ReplaceMetadata, RevealedSecret, Secret,
-        SecretInput, SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, Timestamp,
-        ValueContent, ValueListing, ValueSubTree,
+        AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind,
+        ListedValue, MaskedSecret, PlainValue, PutMetadata, ReplaceMetadata, RevealedSecret,
+        Secret, SecretInput, SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, Timestamp,
+        ValueContent, ValueListing, ValuePaths, ValueSubTree,
     };
 
     #[derive(Clone)]
@@ -71,6 +71,7 @@ mod tests {
                     value: ordinary_content(&value.value),
                     created_at: value.created_at,
                     updated_at: value.updated_at,
+                    alias_paths: Vec::new(),
                 })
                 .collect();
             Ok(ValueListing {
@@ -229,6 +230,40 @@ mod tests {
                     "configuration value not found",
                 )),
             }
+        }
+
+        async fn add_value_path(
+            &self,
+            source: &ConfigPath,
+            new_path: &ConfigPath,
+            _: &Secret,
+        ) -> Result<AddPathMetadata, ClientError> {
+            let stored = self.values.borrow().get(source).cloned().ok_or_else(|| {
+                ClientError::new(ErrorKind::NotFound, "configuration value not found")
+            })?;
+            self.values.borrow_mut().insert(new_path.clone(), stored);
+            Ok(AddPathMetadata {
+                created_at: Timestamp {
+                    seconds: 1_700_000_002,
+                    nanos: 0,
+                },
+            })
+        }
+
+        async fn list_value_paths(
+            &self,
+            path: &ConfigPath,
+            _: &Secret,
+        ) -> Result<ValuePaths, ClientError> {
+            if !self.values.borrow().contains_key(path) {
+                return Err(ClientError::new(
+                    ErrorKind::NotFound,
+                    "configuration value not found",
+                ));
+            }
+            Ok(ValuePaths {
+                paths: vec![path.clone()],
+            })
         }
     }
 

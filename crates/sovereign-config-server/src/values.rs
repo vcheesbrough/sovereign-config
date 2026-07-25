@@ -1,8 +1,11 @@
 use std::{collections::BTreeSet, time::SystemTime};
 
+use std::collections::BTreeMap;
+
 use sovereign_config_core::{ConfigPath, MASKED_SECRET_TEXT};
 use sovereign_config_proto::sovereign::config::v3::{
-    DeleteValuesRequest, DeleteValuesResponse, GetSubTreeRequest, GetSubTreeResponse,
+    AddValuePathRequest, AddValuePathResponse, DeleteValuesRequest, DeleteValuesResponse,
+    GetSubTreeRequest, GetSubTreeResponse, ListValuePathsRequest, ListValuePathsResponse,
     ListValuesRequest, ListValuesResponse, ListedValue, MaskedSecret, PutValueRequest,
     PutValueResponse, ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest,
     RevealSecretResponse, SubTreeValue, ValueClassification, configuration_server::Configuration,
@@ -22,10 +25,18 @@ pub(crate) struct ConfigurationService {
 #[derive(FromRow)]
 struct ListedValueRow {
     path: String,
+    content_id: i64,
     value: String,
     classification: String,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
+}
+
+#[derive(FromRow)]
+struct SubTreeRow {
+    path: String,
+    value: String,
+    classification: String,
 }
 
 #[derive(FromRow)]
@@ -34,7 +45,32 @@ struct PathRow {
 }
 
 #[derive(FromRow)]
+struct PathContentRow {
+    path: String,
+    content_id: i64,
+}
+
+#[derive(FromRow)]
+struct PathContentClassRow {
+    content_id: i64,
+    classification: String,
+    path_count: i64,
+}
+
+#[derive(FromRow)]
+struct DeletedPathRow {
+    content_id: i64,
+}
+
+#[derive(FromRow)]
 struct MutationRow {
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+#[derive(FromRow)]
+struct ContentRow {
+    id: i64,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
 }
@@ -58,48 +94,70 @@ impl Configuration for ConfigurationService {
             .extensions()
             .get::<AuthenticatedPrincipal>()
             .ok_or_else(|| Status::unauthenticated("authentication required"))?;
-        let candidates =
-            sqlx::query_as::<_, PathRow>("SELECT path FROM configuration_values ORDER BY path")
-                .fetch_all(&self.database)
-                .await
-                .map_err(|_| storage_unavailable())?;
+        let candidates = sqlx::query_as::<_, PathContentRow>(
+            "SELECT path, content_id FROM configuration_paths ORDER BY path",
+        )
+        .fetch_all(&self.database)
+        .await
+        .map_err(|_| storage_unavailable())?;
 
-        let mut readable_values = Vec::new();
+        // Group every readable path by the content it resolves to so a listed
+        // value can advertise its other authorized aliases, even ones outside
+        // the selected namespace. Candidates arrive sorted, so each group stays
+        // sorted too.
+        let mut content_paths: BTreeMap<i64, Vec<String>> = BTreeMap::new();
         let mut paths = BTreeSet::new();
+        let mut direct = Vec::new();
         for row in candidates {
             let path = ConfigPath::parse(&row.path).map_err(|_| storage_unavailable())?;
             if !principal.allows(&path, Permission::Read) {
                 continue;
             }
+            content_paths
+                .entry(row.content_id)
+                .or_default()
+                .push(row.path.clone());
             add_parent_paths(&mut paths, &path);
             if parent_path(&path) == selected.as_str() {
-                readable_values.push(row.path);
+                direct.push(row.path);
             }
         }
 
         let mut values = Vec::new();
-        if !readable_values.is_empty() {
+        if !direct.is_empty() {
             let rows = sqlx::query_as::<_, ListedValueRow>(
                 r"
-                SELECT path, value, classification, created_at, updated_at
-                FROM configuration_values
-                WHERE path = ANY($1::TEXT[])
-                ORDER BY path
+                SELECT p.path, p.content_id, c.value, c.classification, c.created_at, c.updated_at
+                FROM configuration_paths p
+                JOIN configuration_value_contents c ON c.id = p.content_id
+                WHERE p.path = ANY($1::TEXT[])
+                ORDER BY p.path
                 ",
             )
-            .bind(&readable_values)
+            .bind(&direct)
             .fetch_all(&self.database)
             .await
             .map_err(|_| storage_unavailable())?;
             for row in rows {
                 let (classification, content) = listed_content(row.value, &row.classification)
                     .ok_or_else(storage_unavailable)?;
+                let alias_paths = content_paths
+                    .get(&row.content_id)
+                    .map(|siblings| {
+                        siblings
+                            .iter()
+                            .filter(|candidate| *candidate != &row.path)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 values.push(ListedValue {
                     path: row.path,
                     created_at: Some(to_proto_timestamp(row.created_at)?),
                     updated_at: Some(to_proto_timestamp(row.updated_at)?),
                     classification,
                     content: Some(content),
+                    alias_paths,
                 });
             }
         }
@@ -115,12 +173,13 @@ impl Configuration for ConfigurationService {
         request: Request<GetSubTreeRequest>,
     ) -> Result<Response<GetSubTreeResponse>, Status> {
         let path = authorize(&request, &[Permission::Read], true)?;
-        let rows = sqlx::query_as::<_, ListedValueRow>(
+        let rows = sqlx::query_as::<_, SubTreeRow>(
             r"
-            SELECT path, value, classification, created_at, updated_at
-            FROM configuration_values
-            WHERE $1 = '/' OR path = $1 OR path LIKE $1 || '/%'
-            ORDER BY path
+            SELECT p.path, c.value, c.classification
+            FROM configuration_paths p
+            JOIN configuration_value_contents c ON c.id = p.content_id
+            WHERE $1 = '/' OR p.path = $1 OR p.path LIKE $1 || '/%'
+            ORDER BY p.path
             ",
         )
         .bind(path.as_str())
@@ -162,44 +221,70 @@ impl Configuration for ConfigurationService {
             .await
             .map_err(|_| storage_unavailable())?;
         lock_mutation_path(&mut transaction, &path).await?;
-        let collides = sqlx::query_scalar::<_, String>(
+        let now = OffsetDateTime::from(SystemTime::now());
+        let existing = sqlx::query_as::<_, PathContentClassRow>(
             r"
-            SELECT path
-            FROM configuration_values
-            WHERE path <> $1
-              AND (path LIKE $1 || '/%' OR $1 LIKE path || '/%')
-            LIMIT 1
+            SELECT
+                p.content_id,
+                c.classification,
+                (
+                    SELECT COUNT(*)
+                    FROM configuration_paths siblings
+                    WHERE siblings.content_id = p.content_id
+                ) AS path_count
+            FROM configuration_paths p
+            JOIN configuration_value_contents c ON c.id = p.content_id
+            WHERE p.path = $1
             ",
         )
         .bind(path.as_str())
         .fetch_optional(&mut *transaction)
         .await
-        .map_err(|_| storage_unavailable())?
-        .is_some();
-        if collides {
-            return Err(Status::invalid_argument(
-                "configuration value collides with an existing value",
-            ));
-        }
-        let now = OffsetDateTime::from(SystemTime::now());
-        let row = sqlx::query_as::<_, MutationRow>(
-            r"
-            INSERT INTO configuration_values (path, value, classification, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $4)
-            ON CONFLICT (path) DO UPDATE
-            SET value = EXCLUDED.value,
-                classification = EXCLUDED.classification,
-                updated_at = EXCLUDED.updated_at
-            RETURNING created_at, updated_at
-            ",
-        )
-        .bind(path.as_str())
-        .bind(value)
-        .bind(classification)
-        .bind(now)
-        .fetch_one(&mut *transaction)
-        .await
         .map_err(|_| storage_unavailable())?;
+        let row = if let Some(existing) = existing {
+            // Classification belongs to the stored value, so it cannot differ
+            // between aliases. Rather than let a write through one path silently
+            // change how the value is exposed at every other path — including
+            // paths the caller may not be able to see — refuse the change while
+            // more than one path resolves to it. Rotating a value in place, and
+            // changing classification while a single path remains, both still
+            // work.
+            if existing.path_count > 1 && existing.classification != classification {
+                return Err(Status::invalid_argument(
+                    "configuration value has multiple paths and cannot change classification",
+                ));
+            }
+            let content_id = existing.content_id;
+            // Writing through any path updates the shared content, so every
+            // other path aliasing it observes the new value.
+            sqlx::query_as::<_, MutationRow>(
+                r"
+                UPDATE configuration_value_contents
+                SET value = $2, classification = $3, updated_at = $4
+                WHERE id = $1
+                RETURNING created_at, updated_at
+                ",
+            )
+            .bind(content_id)
+            .bind(value)
+            .bind(classification)
+            .bind(now)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| storage_unavailable())?
+        } else {
+            if path_collides(&mut transaction, path.as_str()).await? {
+                return Err(Status::invalid_argument(
+                    "configuration value collides with an existing value",
+                ));
+            }
+            let content = insert_content(&mut transaction, value, classification, now).await?;
+            insert_path(&mut transaction, path.as_str(), content.id, now).await?;
+            MutationRow {
+                created_at: content.created_at,
+                updated_at: content.updated_at,
+            }
+        };
         transaction
             .commit()
             .await
@@ -256,16 +341,17 @@ impl Configuration for ConfigurationService {
         lock_mutation_path(&mut transaction, &path).await?;
         let secret_rows = sqlx::query_as::<_, PathRow>(
             r"
-            SELECT path
-            FROM configuration_values
-            WHERE classification = 'secret'
+            SELECT p.path
+            FROM configuration_paths p
+            JOIN configuration_value_contents c ON c.id = p.content_id
+            WHERE c.classification = 'secret'
               AND (
                     $1 = '/'
-                    OR path = $1
-                    OR path LIKE $1 || '/%'
-                    OR $1 LIKE path || '/%'
+                    OR p.path = $1
+                    OR p.path LIKE $1 || '/%'
+                    OR $1 LIKE p.path || '/%'
                   )
-            ORDER BY path
+            ORDER BY p.path
             ",
         )
         .bind(path.as_str())
@@ -320,42 +406,86 @@ impl Configuration for ConfigurationService {
             return Err(Status::invalid_argument("configuration subtree is invalid"));
         }
         let now = OffsetDateTime::from(SystemTime::now());
-        sqlx::query(
+        let cleared = sqlx::query_as::<_, DeletedPathRow>(
             r"
-            DELETE FROM configuration_values
-            WHERE ($1 = '/' OR path = $1 OR path LIKE $1 || '/%')
-              AND classification = 'plain'
-              AND NOT (path = ANY($2::TEXT[]))
+            DELETE FROM configuration_paths p
+            USING configuration_value_contents c
+            WHERE p.content_id = c.id
+              AND ($1 = '/' OR p.path = $1 OR p.path LIKE $1 || '/%')
+              AND c.classification = 'plain'
+              AND NOT (p.path = ANY($2::TEXT[]))
+            RETURNING p.content_id
             ",
         )
         .bind(path.as_str())
         .bind(&plain_paths)
-        .execute(&mut *transaction)
+        .fetch_all(&mut *transaction)
         .await
         .map_err(|_| storage_unavailable())?;
+        prune_orphan_contents(&mut transaction, &content_ids(&cleared)).await?;
+        // Several paths in the subtree can alias one stored value, and the
+        // subtree representation exposes every one of them. Resolve each
+        // mutation to its content before writing so a shared value is written
+        // exactly once: applying one update per path would let the last path in
+        // sort order overwrite the others, silently discarding an edit while
+        // still reporting success. Ascending content id also gives concurrent
+        // replacements a common write order.
+        // The map must stay ordered by content id: iterating it ascending is
+        // what gives concurrent replacements a common row-lock order. Values
+        // cross-aliased between disjoint subtrees (X at /a/1 and /b/2, Y at /a/2
+        // and /b/1) would otherwise lock X-then-Y in one transaction and
+        // Y-then-X in the other and deadlock, since their path locks are
+        // disjoint. Do not swap this for a HashMap.
+        let mut shared: BTreeMap<i64, &String> = BTreeMap::new();
+        let mut fresh: Vec<(&String, &String)> = Vec::new();
         for value in &values {
             let Some(sub_tree_mutation_value::Content::PlainValue(content)) =
                 value.content.as_ref()
             else {
                 continue;
             };
-            sqlx::query(
-                r"
-                INSERT INTO configuration_values
-                    (path, value, classification, created_at, updated_at)
-                VALUES ($1, $2, 'plain', $3, $3)
-                ON CONFLICT (path) DO UPDATE
-                SET value = EXCLUDED.value,
-                    classification = 'plain',
-                    updated_at = EXCLUDED.updated_at
-                ",
+            let existing = sqlx::query_scalar::<_, i64>(
+                "SELECT content_id FROM configuration_paths WHERE path = $1",
             )
             .bind(&value.path)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| storage_unavailable())?;
+            match existing {
+                Some(content_id) => match shared.get(&content_id) {
+                    // Aliases of one value must agree; a genuine conflict is
+                    // ambiguous, so reject it rather than pick a winner.
+                    Some(assigned) if *assigned != content => {
+                        return Err(Status::invalid_argument(
+                            "configuration subtree assigns conflicting values to one stored value",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        shared.insert(content_id, content);
+                    }
+                },
+                None => fresh.push((&value.path, content)),
+            }
+        }
+        for (content_id, content) in &shared {
+            sqlx::query(
+                r"
+                UPDATE configuration_value_contents
+                SET value = $2, classification = 'plain', updated_at = $3
+                WHERE id = $1
+                ",
+            )
+            .bind(content_id)
             .bind(content)
             .bind(now)
             .execute(&mut *transaction)
             .await
             .map_err(|_| storage_unavailable())?;
+        }
+        for (path, content) in fresh {
+            let inserted = insert_content(&mut transaction, content, "plain", now).await?;
+            insert_path(&mut transaction, path, inserted.id, now).await?;
         }
         transaction
             .commit()
@@ -380,23 +510,29 @@ impl Configuration for ConfigurationService {
             .map_err(|_| storage_unavailable())?;
         lock_mutation_path(&mut transaction, &path).await?;
         let deleted = if recurse {
-            sqlx::query(
-                "DELETE FROM configuration_values WHERE $1 = '/' OR path = $1 OR path LIKE $1 || '/%' RETURNING path",
+            sqlx::query_as::<_, DeletedPathRow>(
+                "DELETE FROM configuration_paths WHERE $1 = '/' OR path = $1 OR path LIKE $1 || '/%' RETURNING content_id",
             )
             .bind(path.as_str())
             .fetch_all(&mut *transaction)
             .await
             .map_err(|_| storage_unavailable())?
         } else {
-            sqlx::query("DELETE FROM configuration_values WHERE path = $1 RETURNING path")
-                .bind(path.as_str())
-                .fetch_all(&mut *transaction)
-                .await
-                .map_err(|_| storage_unavailable())?
+            sqlx::query_as::<_, DeletedPathRow>(
+                "DELETE FROM configuration_paths WHERE path = $1 RETURNING content_id",
+            )
+            .bind(path.as_str())
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|_| storage_unavailable())?
         };
         if deleted.is_empty() {
             return Err(Status::not_found("configuration value not found"));
         }
+        // A path may have been the sole alias of its value; drop any content
+        // left with no remaining paths so deleting the last path removes the
+        // value for good, while shared values survive.
+        prune_orphan_contents(&mut transaction, &content_ids(&deleted)).await?;
         transaction
             .commit()
             .await
@@ -413,11 +549,12 @@ impl Configuration for ConfigurationService {
         request: Request<RevealSecretRequest>,
     ) -> Result<Response<RevealSecretResponse>, Status> {
         let path = authorize(&request, &[Permission::Read], false)?;
-        let row = sqlx::query_as::<_, ListedValueRow>(
+        let row = sqlx::query_as::<_, SubTreeRow>(
             r"
-            SELECT path, value, classification, created_at, updated_at
-            FROM configuration_values
-            WHERE path = $1
+            SELECT p.path, c.value, c.classification
+            FROM configuration_paths p
+            JOIN configuration_value_contents c ON c.id = p.content_id
+            WHERE p.path = $1
             ",
         )
         .bind(path.as_str())
@@ -432,6 +569,119 @@ impl Configuration for ConfigurationService {
         }
         Ok(Response::new(RevealSecretResponse { value: row.value }))
     }
+
+    async fn add_value_path(
+        &self,
+        request: Request<AddValuePathRequest>,
+    ) -> Result<Response<AddValuePathResponse>, Status> {
+        let principal = request
+            .extensions()
+            .get::<AuthenticatedPrincipal>()
+            .ok_or_else(|| Status::unauthenticated("authentication required"))?;
+        let source = ConfigPath::parse_operation(&request.get_ref().source_path)
+            .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
+        let new_path = ConfigPath::parse_operation(&request.get_ref().new_path)
+            .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
+        // Resolving the value and exposing it elsewhere is a write on both
+        // paths; reading the source is required to name the value at all.
+        if !principal.allows(&source, Permission::Read)
+            || !principal.allows(&source, Permission::Write)
+            || !principal.allows(&new_path, Permission::Write)
+        {
+            return Err(Status::permission_denied(
+                "configuration operation is not permitted",
+            ));
+        }
+        if source.as_str() == new_path.as_str() {
+            return Err(Status::invalid_argument(
+                "configuration value already has that path",
+            ));
+        }
+
+        let mut transaction = self
+            .database
+            .begin()
+            .await
+            .map_err(|_| storage_unavailable())?;
+        // Lock both mutation hierarchies in a canonical order so concurrent
+        // aliasing in either direction cannot deadlock.
+        let (first, second) = if source.as_str() <= new_path.as_str() {
+            (&source, &new_path)
+        } else {
+            (&new_path, &source)
+        };
+        lock_mutation_path(&mut transaction, first).await?;
+        lock_mutation_path(&mut transaction, second).await?;
+
+        let content_id = sqlx::query_scalar::<_, i64>(
+            "SELECT content_id FROM configuration_paths WHERE path = $1",
+        )
+        .bind(source.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| storage_unavailable())?
+        .ok_or_else(|| Status::not_found("configuration value not found"))?;
+        let occupied =
+            sqlx::query_scalar::<_, String>("SELECT path FROM configuration_paths WHERE path = $1")
+                .bind(new_path.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| storage_unavailable())?
+                .is_some();
+        if occupied {
+            return Err(Status::already_exists("configuration path already exists"));
+        }
+        if path_collides(&mut transaction, new_path.as_str()).await? {
+            return Err(Status::invalid_argument(
+                "configuration value collides with an existing value",
+            ));
+        }
+        let now = OffsetDateTime::from(SystemTime::now());
+        insert_path(&mut transaction, new_path.as_str(), content_id, now).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| storage_unavailable())?;
+        Ok(Response::new(AddValuePathResponse {
+            created_at: Some(to_proto_timestamp(now)?),
+        }))
+    }
+
+    async fn list_value_paths(
+        &self,
+        request: Request<ListValuePathsRequest>,
+    ) -> Result<Response<ListValuePathsResponse>, Status> {
+        let path = authorize(&request, &[Permission::Read], false)?;
+        let principal = request
+            .extensions()
+            .get::<AuthenticatedPrincipal>()
+            .ok_or_else(|| Status::unauthenticated("authentication required"))?;
+        let content_id = sqlx::query_scalar::<_, i64>(
+            "SELECT content_id FROM configuration_paths WHERE path = $1",
+        )
+        .bind(path.as_str())
+        .fetch_optional(&self.database)
+        .await
+        .map_err(|_| storage_unavailable())?
+        .ok_or_else(|| Status::not_found("configuration value not found"))?;
+        let rows = sqlx::query_as::<_, PathRow>(
+            "SELECT path FROM configuration_paths WHERE content_id = $1 ORDER BY path",
+        )
+        .bind(content_id)
+        .fetch_all(&self.database)
+        .await
+        .map_err(|_| storage_unavailable())?;
+        // Hide paths the caller cannot read: one value may be reachable through
+        // paths outside the caller's grants.
+        let mut paths = Vec::new();
+        for row in rows {
+            let candidate = ConfigPath::parse(&row.path).map_err(|_| storage_unavailable())?;
+            if principal.allows(&candidate, Permission::Read) {
+                paths.push(row.path);
+            }
+        }
+        Ok(Response::new(ListValuePathsResponse { paths }))
+    }
 }
 
 fn paths_collide(first: &str, second: &str) -> bool {
@@ -442,6 +692,117 @@ fn paths_collide(first: &str, second: &str) -> bool {
         || second
             .strip_prefix(first)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+// True if `path` is an ancestor or descendant of an existing path; values form
+// a tree of leaves, so nesting is never allowed.
+async fn path_collides(
+    transaction: &mut Transaction<'_, Postgres>,
+    path: &str,
+) -> Result<bool, Status> {
+    let collision = sqlx::query_scalar::<_, String>(
+        r"
+        SELECT path
+        FROM configuration_paths
+        WHERE path <> $1
+          AND (path LIKE $1 || '/%' OR $1 LIKE path || '/%')
+        LIMIT 1
+        ",
+    )
+    .bind(path)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| storage_unavailable())?;
+    Ok(collision.is_some())
+}
+
+async fn insert_content(
+    transaction: &mut Transaction<'_, Postgres>,
+    value: &str,
+    classification: &str,
+    now: OffsetDateTime,
+) -> Result<ContentRow, Status> {
+    sqlx::query_as::<_, ContentRow>(
+        r"
+        INSERT INTO configuration_value_contents (value, classification, created_at, updated_at)
+        VALUES ($1, $2, $3, $3)
+        RETURNING id, created_at, updated_at
+        ",
+    )
+    .bind(value)
+    .bind(classification)
+    .bind(now)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| storage_unavailable())
+}
+
+async fn insert_path(
+    transaction: &mut Transaction<'_, Postgres>,
+    path: &str,
+    content_id: i64,
+    now: OffsetDateTime,
+) -> Result<(), Status> {
+    sqlx::query(
+        r"
+        INSERT INTO configuration_paths (path, content_id, created_at, updated_at)
+        VALUES ($1, $2, $3, $3)
+        ",
+    )
+    .bind(path)
+    .bind(content_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| storage_unavailable())?;
+    Ok(())
+}
+
+fn content_ids(rows: &[DeletedPathRow]) -> Vec<i64> {
+    let mut ids = rows.iter().map(|row| row.content_id).collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+// Delete any of the given contents that no longer have a path referencing them.
+// Runs inline in the mutation transaction so the last path removal is what
+// deletes the value — no background reconciliation.
+async fn prune_orphan_contents(
+    transaction: &mut Transaction<'_, Postgres>,
+    content_ids: &[i64],
+) -> Result<(), Status> {
+    if content_ids.is_empty() {
+        return Ok(());
+    }
+    // Path locks do not serialize deletions of aliases under unrelated
+    // hierarchies, so two transactions each removing one of a value's last two
+    // paths would both still see the other's uncommitted path row and skip
+    // pruning, orphaning the content permanently. Lock each affected content
+    // first. `content_ids` arrives sorted and deduplicated, so concurrent
+    // pruners take these in a common order and cannot deadlock; every path lock
+    // in a transaction is already held before any content lock.
+    for content_id in content_ids {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('content:' || $1::TEXT, 0))")
+            .bind(content_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| storage_unavailable())?;
+    }
+    sqlx::query(
+        r"
+        DELETE FROM configuration_value_contents c
+        WHERE c.id = ANY($1::BIGINT[])
+          AND NOT EXISTS (
+                SELECT 1 FROM configuration_paths p WHERE p.content_id = c.id
+              )
+        ",
+    )
+    .bind(content_ids)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| storage_unavailable())?;
+    Ok(())
 }
 
 // Shared ancestor locks and an exclusive target lock form a hierarchy: sibling
@@ -548,6 +909,12 @@ impl ValueRequest for RevealSecretRequest {
     }
 }
 
+impl ValueRequest for ListValuePathsRequest {
+    fn path(&self) -> &str {
+        &self.path
+    }
+}
+
 fn listed_content(value: String, classification: &str) -> Option<(i32, listed_value::Content)> {
     match classification {
         "plain" => Some((
@@ -628,10 +995,26 @@ mod tests {
     use tonic::{Code, Request};
 
     use super::{
-        ConfigurationService, DeleteValuesRequest, GetSubTreeRequest, ListValuesRequest,
-        MASKED_SECRET_TEXT, PutValueRequest, ReplaceSubTreeRequest,
+        AddValuePathRequest, ConfigurationService, DeleteValuesRequest, GetSubTreeRequest,
+        ListValuePathsRequest, ListValuesRequest, MASKED_SECRET_TEXT, PutValueRequest,
+        ReplaceSubTreeRequest,
     };
     use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
+
+    fn request_with_grants<T>(message: T, grants: &[(&str, &[Permission])]) -> Request<T> {
+        let mut request = Request::new(message);
+        request.extensions_mut().insert(AuthenticatedPrincipal {
+            subject: "integration-principal".into(),
+            grants: grants
+                .iter()
+                .map(|(prefix, permissions)| Grant {
+                    prefix: (*prefix).into(),
+                    permissions: permissions.iter().copied().collect::<BTreeSet<_>>(),
+                })
+                .collect(),
+        });
+        request
+    }
 
     fn request<T>(message: T, permissions: &[Permission]) -> Request<T> {
         request_for_prefix(message, "/tests/exact", permissions)
@@ -679,6 +1062,57 @@ mod tests {
         }
     }
 
+    // Remove every path at or below the given prefixes and drop any content
+    // left without a path, scoped to the affected contents so parallel tests
+    // under other prefixes are untouched.
+    async fn clear_test_paths(pool: &sqlx::PgPool, prefixes: &[&str]) {
+        let mut ids: Vec<i64> = Vec::new();
+        for prefix in prefixes {
+            let mut removed = sqlx::query_scalar::<_, i64>(
+                "DELETE FROM configuration_paths WHERE path = $1 OR path LIKE $1 || '/%' RETURNING content_id",
+            )
+            .bind(prefix)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            ids.append(&mut removed);
+        }
+        if !ids.is_empty() {
+            sqlx::query(
+                r"
+                DELETE FROM configuration_value_contents c
+                WHERE c.id = ANY($1::BIGINT[])
+                  AND NOT EXISTS (
+                        SELECT 1 FROM configuration_paths p WHERE p.content_id = c.id
+                      )
+                ",
+            )
+            .bind(&ids)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn seed_plain(pool: &sqlx::PgPool, path: &str, value: &str) {
+        sqlx::query(
+            r"
+            WITH inserted AS (
+                INSERT INTO configuration_value_contents (value, classification, created_at, updated_at)
+                VALUES ($2, 'plain', NOW(), NOW())
+                RETURNING id
+            )
+            INSERT INTO configuration_paths (path, content_id, created_at, updated_at)
+            SELECT $1, id, NOW(), NOW() FROM inserted
+            ",
+        )
+        .bind(path)
+        .bind(value)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
     #[allow(clippy::too_many_lines)]
@@ -687,12 +1121,7 @@ mod tests {
             .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        sqlx::query(
-            "DELETE FROM configuration_values WHERE path = '/tests/exact' OR path LIKE '/tests/exact/%' OR path LIKE '/tests/exactly/%'",
-        )
-            .execute(&pool)
-            .await
-            .unwrap();
+        clear_test_paths(&pool, &["/tests/exact", "/tests/exactly"]).await;
         let service = ConfigurationService::new(pool.clone());
 
         let invalid_list = service
@@ -1056,12 +1485,7 @@ mod tests {
             .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        sqlx::query(
-            "DELETE FROM configuration_values WHERE path = '/tests/secrets' OR path LIKE '/tests/secrets/%'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        clear_test_paths(&pool, &["/tests/secrets"]).await;
         let service = ConfigurationService::new(pool.clone());
 
         for sentinel in ["secret-sentinel-one", "secret-sentinel-two"] {
@@ -1362,7 +1786,7 @@ mod tests {
             .await
             .unwrap();
         let retained: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM configuration_values WHERE path = '/tests/secrets/credential'",
+            "SELECT COUNT(*) FROM configuration_paths WHERE path = '/tests/secrets/credential'",
         )
         .fetch_one(&pool)
         .await
@@ -1382,22 +1806,12 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        sqlx::query(
-            "DELETE FROM configuration_values WHERE path = '/tests/concurrent' OR path LIKE '/tests/concurrent/%'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO configuration_values (path, value, classification, created_at, updated_at) VALUES ('/tests/concurrent/existing', 'seed', 'plain', NOW(), NOW())",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        clear_test_paths(&pool, &["/tests/concurrent"]).await;
+        seed_plain(&pool, "/tests/concurrent/existing", "seed").await;
 
         let mut blocker = pool.begin().await.unwrap();
         sqlx::query(
-            "SELECT path FROM configuration_values WHERE path = '/tests/concurrent/existing' FOR UPDATE",
+            "SELECT path FROM configuration_paths WHERE path = '/tests/concurrent/existing' FOR UPDATE",
         )
         .fetch_one(&mut *blocker)
         .await
@@ -1446,7 +1860,7 @@ mod tests {
                       AND pid <> pg_backend_pid()
                       AND wait_event_type = 'Lock'
                       AND (
-                        query LIKE '%DELETE FROM configuration_values%'
+                        query LIKE '%DELETE FROM configuration_paths%'
                         OR query LIKE '%pg_advisory_xact_lock%'
                       )
                     ",
@@ -1475,7 +1889,7 @@ mod tests {
         }
 
         let paths = sqlx::query_scalar::<_, String>(
-            "SELECT path FROM configuration_values WHERE path LIKE '/tests/concurrent/%' ORDER BY path",
+            "SELECT path FROM configuration_paths WHERE path LIKE '/tests/concurrent/%' ORDER BY path",
         )
         .fetch_all(&pool)
         .await
@@ -1486,12 +1900,634 @@ mod tests {
             "final subtree was not one complete replacement: {paths:?}"
         );
 
-        sqlx::query(
-            "DELETE FROM configuration_values WHERE path = '/tests/concurrent' OR path LIKE '/tests/concurrent/%'",
+        clear_test_paths(&pool, &["/tests/concurrent"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_service_exposes_one_value_at_multiple_paths() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/alias"]).await;
+        let service = ConfigurationService::new(pool.clone());
+        let read_write = [Permission::Read, Permission::Write];
+
+        service
+            .put_value(request_for_prefix(
+                plain_put("/tests/alias/primary", "one"),
+                "/tests/alias",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+        service
+            .add_value_path(request_for_prefix(
+                AddValuePathRequest {
+                    source_path: "/tests/alias/primary".into(),
+                    new_path: "/tests/alias/mirror".into(),
+                },
+                "/tests/alias",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+
+        let both = service
+            .list_value_paths(request_for_prefix(
+                ListValuePathsRequest {
+                    path: "/tests/alias/primary".into(),
+                },
+                "/tests/alias",
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(both.paths, ["/tests/alias/mirror", "/tests/alias/primary"]);
+
+        // Writing through either path updates the shared content.
+        service
+            .put_value(request_for_prefix(
+                plain_put("/tests/alias/mirror", "two"),
+                "/tests/alias",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+        let primary = service
+            .get_sub_tree(request_for_prefix(
+                GetSubTreeRequest {
+                    path: "/tests/alias/primary".into(),
+                },
+                "/tests/alias",
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            primary.values[0].content.as_ref(),
+            Some(sub_tree_value::Content::PlainValue(value)) if value == "two"
+        ));
+
+        // Deleting one path keeps the value reachable via the other.
+        let content_id: i64 =
+            sqlx::query_scalar("SELECT content_id FROM configuration_paths WHERE path = $1")
+                .bind("/tests/alias/primary")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        service
+            .delete_values(request_for_prefix(
+                DeleteValuesRequest {
+                    path: "/tests/alias/mirror".into(),
+                    recurse: false,
+                },
+                "/tests/alias",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        let survivors = service
+            .list_value_paths(request_for_prefix(
+                ListValuePathsRequest {
+                    path: "/tests/alias/primary".into(),
+                },
+                "/tests/alias",
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(survivors.paths, ["/tests/alias/primary"]);
+        let content_alive: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM configuration_value_contents WHERE id = $1")
+                .bind(content_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(content_alive, 1);
+
+        // Deleting the last path removes the value for good.
+        service
+            .delete_values(request_for_prefix(
+                DeleteValuesRequest {
+                    path: "/tests/alias/primary".into(),
+                    recurse: false,
+                },
+                "/tests/alias",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        let orphaned: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM configuration_value_contents WHERE id = $1")
+                .bind(content_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(orphaned, 0);
+
+        clear_test_paths(&pool, &["/tests/alias"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn postgres_refuses_to_reclassify_a_value_with_multiple_paths() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/aliasclass"]).await;
+        let service = ConfigurationService::new(pool.clone());
+        let read_write = [Permission::Read, Permission::Write];
+
+        service
+            .put_value(request_for_prefix(
+                secret_put("/tests/aliasclass/credential", "secret-sentinel"),
+                "/tests/aliasclass",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+        service
+            .add_value_path(request_for_prefix(
+                AddValuePathRequest {
+                    source_path: "/tests/aliasclass/credential".into(),
+                    new_path: "/tests/aliasclass/mirror".into(),
+                },
+                "/tests/aliasclass",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+
+        // Demoting the secret through either alias would change how the value is
+        // exposed at the other path, so it is refused while both exist.
+        for path in ["/tests/aliasclass/credential", "/tests/aliasclass/mirror"] {
+            let refused = service
+                .put_value(request_for_prefix(
+                    plain_put(path, "demoted"),
+                    "/tests/aliasclass",
+                    &read_write,
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code(), Code::InvalidArgument);
+        }
+        let classification = sqlx::query_scalar::<_, String>(
+            r"
+            SELECT c.classification
+            FROM configuration_paths p
+            JOIN configuration_value_contents c ON c.id = p.content_id
+            WHERE p.path = '/tests/aliasclass/credential'
+            ",
         )
-        .execute(&pool)
+        .fetch_one(&pool)
         .await
         .unwrap();
+        assert_eq!(classification, "secret");
+
+        // Rotating the secret in place is unaffected by the alias.
+        service
+            .put_value(request_for_prefix(
+                secret_put("/tests/aliasclass/credential", "rotated-sentinel"),
+                "/tests/aliasclass",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .reveal_secret(request_for_prefix(
+                    RevealSecretRequest {
+                        path: "/tests/aliasclass/mirror".into(),
+                    },
+                    "/tests/aliasclass",
+                    &[Permission::Read],
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .value,
+            "rotated-sentinel"
+        );
+
+        // Once a single path remains, classification can change again.
+        service
+            .delete_values(request_for_prefix(
+                DeleteValuesRequest {
+                    path: "/tests/aliasclass/mirror".into(),
+                    recurse: false,
+                },
+                "/tests/aliasclass",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        service
+            .put_value(request_for_prefix(
+                plain_put("/tests/aliasclass/credential", "now-plain"),
+                "/tests/aliasclass",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+
+        clear_test_paths(&pool, &["/tests/aliasclass"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_replaces_cross_aliased_subtrees_without_deadlock() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let service = ConfigurationService::new(pool.clone());
+        let read_write = [Permission::Read, Permission::Write];
+        let replace = [Permission::Write, Permission::Manage];
+
+        // Two values, each aliased across both subtrees in opposite positions:
+        // updating by path order would lock them in opposite orders.
+        for round in 0..6 {
+            clear_test_paths(&pool, &["/tests/crossleft", "/tests/crossright"]).await;
+            let left_first = format!("/tests/crossleft/one-{round}");
+            let left_second = format!("/tests/crossleft/two-{round}");
+            let right_first = format!("/tests/crossright/one-{round}");
+            let right_second = format!("/tests/crossright/two-{round}");
+            for (source, alias) in [(&left_first, &right_second), (&left_second, &right_first)] {
+                service
+                    .put_value(request_with_grants(
+                        plain_put(source, "seed"),
+                        &[("/", &read_write)],
+                    ))
+                    .await
+                    .unwrap();
+                service
+                    .add_value_path(request_with_grants(
+                        AddValuePathRequest {
+                            source_path: source.clone(),
+                            new_path: alias.clone(),
+                        },
+                        &[("/", &read_write)],
+                    ))
+                    .await
+                    .unwrap();
+            }
+
+            let left_service = service.clone();
+            let right_service = service.clone();
+            let left_values = vec![
+                plain_mutation(&left_first, "left"),
+                plain_mutation(&left_second, "left"),
+            ];
+            let right_values = vec![
+                plain_mutation(&right_first, "right"),
+                plain_mutation(&right_second, "right"),
+            ];
+            let left_task = tokio::spawn(async move {
+                left_service
+                    .replace_sub_tree(request_with_grants(
+                        ReplaceSubTreeRequest {
+                            path: "/tests/crossleft".into(),
+                            values: left_values,
+                        },
+                        &[("/", &replace)],
+                    ))
+                    .await
+            });
+            let right_task = tokio::spawn(async move {
+                right_service
+                    .replace_sub_tree(request_with_grants(
+                        ReplaceSubTreeRequest {
+                            path: "/tests/crossright".into(),
+                            values: right_values,
+                        },
+                        &[("/", &replace)],
+                    ))
+                    .await
+            });
+
+            // A deadlock would abort one transaction; both must commit.
+            for task in [left_task, right_task] {
+                timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_or_else(|error| {
+                        panic!("cross-aliased replacement failed in round {round}: {error:?}")
+                    });
+            }
+        }
+
+        clear_test_paths(&pool, &["/tests/crossleft", "/tests/crossright"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn postgres_prunes_content_when_last_aliases_are_deleted_concurrently() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let service = ConfigurationService::new(pool.clone());
+        let read_write = [Permission::Read, Permission::Write];
+
+        // The two aliases sit under unrelated hierarchies, so the path locks
+        // deliberately do not serialize these deletions. Repeat the race to make
+        // an unsynchronized prune overwhelmingly likely to be observed.
+        for round in 0..8 {
+            clear_test_paths(&pool, &["/tests/aliasrace-left", "/tests/aliasrace-right"]).await;
+            let left = format!("/tests/aliasrace-left/value-{round}");
+            let right = format!("/tests/aliasrace-right/value-{round}");
+            service
+                .put_value(request_with_grants(
+                    plain_put(&left, "shared"),
+                    &[("/", &read_write)],
+                ))
+                .await
+                .unwrap();
+            service
+                .add_value_path(request_with_grants(
+                    AddValuePathRequest {
+                        source_path: left.clone(),
+                        new_path: right.clone(),
+                    },
+                    &[("/", &read_write)],
+                ))
+                .await
+                .unwrap();
+            let content_id: i64 =
+                sqlx::query_scalar("SELECT content_id FROM configuration_paths WHERE path = $1")
+                    .bind(&left)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+
+            let first = service.clone();
+            let second = service.clone();
+            let left_task = tokio::spawn(async move {
+                first
+                    .delete_values(request_with_grants(
+                        DeleteValuesRequest {
+                            path: left,
+                            recurse: false,
+                        },
+                        &[("/", &[Permission::Write])],
+                    ))
+                    .await
+            });
+            let right_task = tokio::spawn(async move {
+                second
+                    .delete_values(request_with_grants(
+                        DeleteValuesRequest {
+                            path: right,
+                            recurse: false,
+                        },
+                        &[("/", &[Permission::Write])],
+                    ))
+                    .await
+            });
+            for task in [left_task, right_task] {
+                timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+
+            // Every path is gone, so the value must be gone with it: an
+            // unreachable content row would retain secret plaintext forever.
+            let orphaned: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM configuration_value_contents WHERE id = $1",
+            )
+            .bind(content_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                orphaned, 0,
+                "content survived its last paths in round {round}"
+            );
+        }
+
+        clear_test_paths(&pool, &["/tests/aliasrace-left", "/tests/aliasrace-right"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn postgres_subtree_replacement_writes_a_shared_value_once() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/aliasreplace"]).await;
+        let service = ConfigurationService::new(pool.clone());
+        let read_write = [Permission::Read, Permission::Write];
+        let replace = [Permission::Write, Permission::Manage];
+
+        service
+            .put_value(request_for_prefix(
+                plain_put("/tests/aliasreplace/first", "original"),
+                "/tests/aliasreplace",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+        service
+            .add_value_path(request_for_prefix(
+                AddValuePathRequest {
+                    source_path: "/tests/aliasreplace/first".into(),
+                    new_path: "/tests/aliasreplace/second".into(),
+                },
+                "/tests/aliasreplace",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+
+        // Editing one alias while the other still carries the old value is
+        // ambiguous: rejected rather than silently resolved by sort order.
+        let conflicting = service
+            .replace_sub_tree(request_for_prefix(
+                ReplaceSubTreeRequest {
+                    path: "/tests/aliasreplace".into(),
+                    values: vec![
+                        plain_mutation("/tests/aliasreplace/first", "edited"),
+                        plain_mutation("/tests/aliasreplace/second", "original"),
+                    ],
+                },
+                "/tests/aliasreplace",
+                &replace,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(conflicting.code(), Code::InvalidArgument);
+        let unchanged = sqlx::query_scalar::<_, String>(
+            r"
+            SELECT c.value
+            FROM configuration_paths p
+            JOIN configuration_value_contents c ON c.id = p.content_id
+            WHERE p.path = '/tests/aliasreplace/first'
+            ",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged, "original");
+
+        // Agreeing aliases collapse to a single write, and both paths survive.
+        service
+            .replace_sub_tree(request_for_prefix(
+                ReplaceSubTreeRequest {
+                    path: "/tests/aliasreplace".into(),
+                    values: vec![
+                        plain_mutation("/tests/aliasreplace/first", "edited"),
+                        plain_mutation("/tests/aliasreplace/second", "edited"),
+                    ],
+                },
+                "/tests/aliasreplace",
+                &replace,
+            ))
+            .await
+            .unwrap();
+        let stored = sqlx::query_scalar::<_, String>(
+            r"
+            SELECT c.value
+            FROM configuration_paths p
+            JOIN configuration_value_contents c ON c.id = p.content_id
+            WHERE p.path = ANY(ARRAY['/tests/aliasreplace/first', '/tests/aliasreplace/second'])
+            GROUP BY c.value
+            ",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, ["edited"]);
+        let contents: i64 = sqlx::query_scalar(
+            r"
+            SELECT COUNT(DISTINCT p.content_id)
+            FROM configuration_paths p
+            WHERE p.path LIKE '/tests/aliasreplace/%'
+            ",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(contents, 1);
+
+        clear_test_paths(&pool, &["/tests/aliasreplace"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_service_scopes_alias_permissions() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/aliasauth"]).await;
+        let service = ConfigurationService::new(pool.clone());
+        let read_write = [Permission::Read, Permission::Write];
+
+        service
+            .put_value(request_for_prefix(
+                plain_put("/tests/aliasauth/visible", "one"),
+                "/tests/aliasauth",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+        service
+            .add_value_path(request_for_prefix(
+                AddValuePathRequest {
+                    source_path: "/tests/aliasauth/visible".into(),
+                    new_path: "/tests/aliasauth/hidden".into(),
+                },
+                "/tests/aliasauth",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+
+        // A caller who can only read one path sees only that path.
+        let scoped = service
+            .list_value_paths(request_with_grants(
+                ListValuePathsRequest {
+                    path: "/tests/aliasauth/visible".into(),
+                },
+                &[("/tests/aliasauth/visible", &[Permission::Read])],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(scoped.paths, ["/tests/aliasauth/visible"]);
+
+        // Aliasing requires write on the new path, not just the source.
+        let denied = service
+            .add_value_path(request_with_grants(
+                AddValuePathRequest {
+                    source_path: "/tests/aliasauth/visible".into(),
+                    new_path: "/tests/aliasauth/another".into(),
+                },
+                &[(
+                    "/tests/aliasauth/visible",
+                    &[Permission::Read, Permission::Write],
+                )],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), Code::PermissionDenied);
+
+        // A new path nesting under an existing path collides.
+        let collision = service
+            .add_value_path(request_for_prefix(
+                AddValuePathRequest {
+                    source_path: "/tests/aliasauth/visible".into(),
+                    new_path: "/tests/aliasauth/visible/child".into(),
+                },
+                "/tests/aliasauth",
+                &read_write,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(collision.code(), Code::InvalidArgument);
+
+        // Re-aliasing an occupied path is rejected.
+        let duplicate = service
+            .add_value_path(request_for_prefix(
+                AddValuePathRequest {
+                    source_path: "/tests/aliasauth/visible".into(),
+                    new_path: "/tests/aliasauth/hidden".into(),
+                },
+                "/tests/aliasauth",
+                &read_write,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.code(), Code::AlreadyExists);
+
+        clear_test_paths(&pool, &["/tests/aliasauth"]).await;
         pool.close().await;
     }
 }

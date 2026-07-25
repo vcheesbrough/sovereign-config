@@ -80,7 +80,8 @@ function listedValue(path, stored) {
     value.secret ? field(5, Buffer.alloc(0)) : field(2, Buffer.from(value.value)),
     field(3, instant),
     field(4, instant),
-    scalarField(6, value.secret ? 2 : 1)
+    scalarField(6, value.secret ? 2 : 1),
+    ...(value.aliases || []).map(alias => field(7, Buffer.from(alias)))
   ]);
 }
 
@@ -206,6 +207,7 @@ async function mockValues(page, initial = {}) {
   const requests = [];
   let delayedSubtree;
   let delayedReveal;
+  let delayedAddPath;
   await page.route('**/sovereign.config.v3.Configuration/*', async route => {
     const method = route.request().url().split('/').pop();
     const body = route.request().postDataBuffer();
@@ -287,6 +289,31 @@ async function mockValues(page, initial = {}) {
         body: grpcFrame(status === 0 ? field(1, Buffer.from(value.value)) : Buffer.alloc(0), status)
       });
     }
+    if (method === 'AddValuePath') {
+      if (delayedAddPath) {
+        const delay = delayedAddPath;
+        delayedAddPath = undefined;
+        await delay.promise;
+      }
+      const source = fields.get(1);
+      const added = fields.get(2);
+      const value = stored.get(source);
+      if (!value) {
+        return route.fulfill({
+          status: 200,
+          headers: { 'content-type': 'application/grpc-web+proto' },
+          body: grpcFrame(Buffer.alloc(0), 5)
+        });
+      }
+      // One value, many paths: record the new path as another alias of the
+      // same stored value rather than copying its content.
+      value.aliases = [...(value.aliases || []), added].sort();
+      return route.fulfill({
+        status: 200,
+        headers: { 'content-type': 'application/grpc-web+proto' },
+        body: grpcFrame(field(1, timestamp(1700000002)))
+      });
+    }
     if (method !== 'DeleteValues') {
       throw new Error(`unexpected Configuration RPC ${method}`);
     }
@@ -297,6 +324,16 @@ async function mockValues(page, initial = {}) {
       if (path === selected || (recurse && (selected === '/' || path.startsWith(`${selected}/`)))) {
         stored.delete(path);
         deleted++;
+      }
+    }
+    // Removing an alias path deletes only that path; the value survives via its
+    // primary path, so drop the alias rather than the whole entry.
+    if (deleted === 0) {
+      for (const value of stored.values()) {
+        if (value.aliases && value.aliases.includes(selected)) {
+          value.aliases = value.aliases.filter(alias => alias !== selected);
+          deleted++;
+        }
       }
     }
     return route.fulfill({
@@ -319,6 +356,12 @@ async function mockValues(page, initial = {}) {
       let release;
       const promise = new Promise(resolve => { release = resolve; });
       delayedReveal = { promise };
+      return release;
+    },
+    delayNextAddPath() {
+      let release;
+      const promise = new Promise(resolve => { release = resolve; });
+      delayedAddPath = { promise };
       return release;
     },
     setValue(path, value, secret = false) {
@@ -999,11 +1042,171 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
 
   await remove.click();
   await page.getByRole('dialog').getByRole('button', { name: 'Delete' }).click();
-  await expect(page.getByText('Deleted')).toBeVisible();
+  await expect(page.getByText('Deleted', { exact: true })).toBeVisible();
   await expect(page.getByText('No values at this path.')).toBeVisible();
   expect(requests.map(request => request.method)).toEqual([
     'ListValues', 'PutValue', 'ListValues', 'PutValue', 'ListValues', 'DeleteValues', 'ListValues'
   ]);
+});
+
+test('grid lists every alias path and removes one without deleting the value', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  const { requests } = await mockValues(page, {
+    '/apps/api/feature-flag': {
+      value: 'aliased-value-sentinel',
+      aliases: ['/apps/api/legacy-flag', '/shared/feature-flag']
+    }
+  });
+  await page.goto('/configuration/apps/api');
+
+  const row = page.getByRole('row', { name: /feature-flag/ });
+  await expect(row.getByText('/apps/api/feature-flag', { exact: true })).toBeVisible();
+  await expect(row.getByText('/apps/api/legacy-flag', { exact: true })).toBeVisible();
+  await expect(row.getByText('/shared/feature-flag', { exact: true })).toBeVisible();
+
+  const removeLegacy = row.getByRole('button', { name: 'Remove path /apps/api/legacy-flag' });
+  await removeLegacy.click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText('/apps/api/legacy-flag')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Cancel' })).toBeFocused();
+  await page.getByRole('button', { name: 'Cancel' }).click();
+  await expect(removeLegacy).toBeFocused();
+
+  await removeLegacy.click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Delete' }).click();
+  await expect(page.getByText('Deleted', { exact: true })).toBeVisible();
+
+  const deletions = requests.filter(request => request.method === 'DeleteValues');
+  expect(deletions).toHaveLength(1);
+  expect(deletions[0].fields.get(1)).toBe('/apps/api/legacy-flag');
+  expect(deletions[0].fields.get(2)).toBeUndefined();
+
+  const refreshedRow = page.getByRole('row', { name: /feature-flag/ });
+  await expect(refreshedRow.getByText('/apps/api/feature-flag', { exact: true })).toBeVisible();
+  await expect(refreshedRow.getByText('/shared/feature-flag', { exact: true })).toBeVisible();
+  await expect(refreshedRow.getByText('/apps/api/legacy-flag', { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel('Value for feature-flag')).toHaveValue('aliased-value-sentinel');
+  expect(requests.map(request => request.method)).toEqual([
+    'ListValues', 'DeleteValues', 'ListValues'
+  ]);
+});
+
+test('grid adds another path to an existing value', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  const { requests } = await mockValues(page, {
+    '/apps/api/feature-flag': { value: 'aliased-value-sentinel' }
+  });
+  await page.goto('/configuration/apps/api');
+
+  const row = page.getByRole('row', { name: /feature-flag/ });
+  await expect(row.getByText('/apps/worker/feature-flag', { exact: true })).toHaveCount(0);
+
+  const addPath = row.getByRole('button', { name: 'Add a path to feature-flag' });
+  await addPath.click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText('/apps/api/feature-flag')).toBeVisible();
+  await expect(page.getByLabel('New absolute path')).toBeFocused();
+
+  // A malformed path is rejected in the dialog without issuing an RPC.
+  await page.getByLabel('New absolute path').fill('worker/feature-flag');
+  await page.getByRole('button', { name: 'Add path', exact: true }).click();
+  await expect(dialog).toBeVisible();
+  await expect(page.getByText('Enter an absolute path such as /apps/worker/database-url.')).toBeVisible();
+  expect(requests.filter(request => request.method === 'AddValuePath')).toHaveLength(0);
+
+  // Cancelling returns focus to the control that opened the dialog.
+  await page.getByRole('button', { name: 'Cancel' }).click();
+  await expect(addPath).toBeFocused();
+
+  await addPath.click();
+  await page.getByLabel('New absolute path').fill('/apps/worker/feature-flag');
+  await page.getByRole('button', { name: 'Add path', exact: true }).click();
+  await expect(page.getByText('Path added', { exact: true })).toBeVisible();
+
+  const additions = requests.filter(request => request.method === 'AddValuePath');
+  expect(additions).toHaveLength(1);
+  expect(additions[0].fields.get(1)).toBe('/apps/api/feature-flag');
+  expect(additions[0].fields.get(2)).toBe('/apps/worker/feature-flag');
+
+  const refreshedRow = page.getByRole('row', { name: /feature-flag/ });
+  await expect(refreshedRow.getByText('/apps/api/feature-flag', { exact: true })).toBeVisible();
+  await expect(refreshedRow.getByText('/apps/worker/feature-flag', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('Value for feature-flag')).toHaveValue('aliased-value-sentinel');
+  expect(requests.map(request => request.method)).toEqual([
+    'ListValues', 'AddValuePath', 'ListValues'
+  ]);
+});
+
+test('a second add-path activation while the request is in flight is ignored', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  const values = await mockValues(page, {
+    '/apps/api/feature-flag': { value: 'aliased-value-sentinel' }
+  });
+  await page.goto('/configuration/apps/api');
+
+  const row = page.getByRole('row').filter({ has: page.getByLabel('Value for feature-flag') });
+  await row.getByRole('button', { name: 'Add a path to feature-flag' }).click();
+  await page.getByLabel('New absolute path').fill('/apps/worker/feature-flag');
+
+  // Hold the RPC open so both activations land while it is still in flight. A
+  // duplicate would create the path once and then report the second request's
+  // conflict, showing an error for a mutation that actually succeeded.
+  const release = values.delayNextAddPath();
+  const confirm = page.getByRole('button', { name: 'Add path', exact: true });
+  await confirm.click();
+  await expect(confirm).toBeDisabled();
+  await confirm.click({ force: true });
+  release();
+
+  await expect(page.getByText('Path added', { exact: true })).toBeVisible();
+  expect(values.requests.filter(request => request.method === 'AddValuePath')).toHaveLength(1);
+  await expect(page.locator('#error')).toBeHidden();
+  const refreshed = page.getByRole('row').filter({ has: page.getByLabel('Value for feature-flag') });
+  await expect(refreshed.getByText('/apps/worker/feature-flag', { exact: true })).toBeVisible();
+});
+
+// Two paths of one value can both sit directly under the selected namespace.
+// A namespace listing enumerates the paths that live in it, so both appear as
+// their own row rather than one being collapsed into the other's alias list:
+// hiding either would omit a real, authorized path from its own namespace and
+// leave which one survives decided by sort order.
+test('sibling paths of one value each keep their own grid row', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, {
+    '/apps/api/feature-flag': {
+      value: 'shared-value-sentinel',
+      aliases: ['/apps/api/legacy-flag']
+    },
+    '/apps/api/legacy-flag': {
+      value: 'shared-value-sentinel',
+      aliases: ['/apps/api/feature-flag']
+    }
+  });
+  await page.goto('/configuration/apps/api');
+
+  const canonical = page.getByRole('row').filter({ has: page.getByLabel('Value for feature-flag') });
+  const sibling = page.getByRole('row').filter({ has: page.getByLabel('Value for legacy-flag') });
+  await expect(canonical).toHaveCount(1);
+  await expect(sibling).toHaveCount(1);
+
+  // Each row is anchored on its own path and names the other as an alias.
+  await expect(canonical.getByText('/apps/api/feature-flag', { exact: true })).toBeVisible();
+  await expect(canonical.getByText('/apps/api/legacy-flag', { exact: true })).toBeVisible();
+  await expect(sibling.getByText('/apps/api/legacy-flag', { exact: true })).toBeVisible();
+  await expect(sibling.getByText('/apps/api/feature-flag', { exact: true })).toBeVisible();
+
+  // Both resolve to the same stored value, and both stay independently operable.
+  await expect(page.getByLabel('Value for feature-flag')).toHaveValue('shared-value-sentinel');
+  await expect(page.getByLabel('Value for legacy-flag')).toHaveValue('shared-value-sentinel');
+  await expect(canonical.getByRole('button', { name: 'Add a path to feature-flag' })).toBeVisible();
+  await expect(sibling.getByRole('button', { name: 'Add a path to legacy-flag' })).toBeVisible();
+  await expect(page.getByText('2 values')).toBeVisible();
 });
 
 test('secret values stay masked, rotate explicitly, and survive JSON edits', async ({ page }) => {
