@@ -61,6 +61,10 @@ enum Command {
         #[command(subcommand)]
         command: SecretCommand,
     },
+    Alias {
+        #[command(subcommand)]
+        command: AliasCommand,
+    },
     Delete {
         #[arg(
             value_name = "ABSOLUTE_PATH",
@@ -82,6 +86,29 @@ enum SecretCommand {
     },
     Reveal {
         #[arg(value_name = "ABSOLUTE_PATH")]
+        path: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AliasCommand {
+    Add {
+        #[arg(
+            value_name = "SOURCE_ABSOLUTE_PATH",
+            help = "Absolute path of the existing configuration value, beginning with /"
+        )]
+        source_path: String,
+        #[arg(
+            value_name = "NEW_ABSOLUTE_PATH",
+            help = "Absolute path to expose the value at, beginning with /"
+        )]
+        new_path: String,
+    },
+    List {
+        #[arg(
+            value_name = "ABSOLUTE_PATH",
+            help = "Absolute configuration value path, beginning with /"
+        )]
         path: String,
     },
 }
@@ -132,6 +159,7 @@ async fn main() -> Result<()> {
                 } => get_value(&connection, &path, format, reveal).await,
                 Command::Put { path, format } => put_value(&connection, &path, format).await,
                 Command::Secret { command } => secret_value(&connection, command).await,
+                Command::Alias { command } => alias_value(&connection, command).await,
                 Command::Delete { path, yes, recurse } => {
                     delete_values(&connection, &path, yes, recurse).await
                 }
@@ -416,6 +444,34 @@ async fn secret_value(connection: &ConnectionUrl, command: SecretCommand) -> Res
                 .reveal_secret(&path)
                 .await?;
             print!("{}", value.expose());
+        }
+    }
+    Ok(())
+}
+
+async fn alias_value(connection: &ConnectionUrl, command: AliasCommand) -> Result<()> {
+    match command {
+        AliasCommand::Add {
+            source_path,
+            new_path,
+        } => {
+            let source = operation_path(connection, &source_path, false)?;
+            let new_path = operation_path(connection, &new_path, false)?;
+            operational_client(connection)
+                .await?
+                .add_value_path(&source, &new_path)
+                .await?;
+            println!("Path added");
+        }
+        AliasCommand::List { path } => {
+            let path = operation_path(connection, &path, false)?;
+            let paths = operational_client(connection)
+                .await?
+                .list_value_paths(&path)
+                .await?;
+            for path in paths.paths {
+                println!("{}", path.as_str());
+            }
         }
     }
     Ok(())

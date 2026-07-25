@@ -2,10 +2,11 @@
 
 use async_trait::async_trait;
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata, DisplayName,
-    ErrorKind, ManagedConnectionMetadata, ManagedPermissions, PROTOCOL_VERSION, PlainValue,
-    ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret, Secret,
-    SecretInput, ServiceStatus, SubTreeMutationValue, Timestamp, ValueListing, ValueSubTree,
+    AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata,
+    DisplayName, ErrorKind, ManagedConnectionMetadata, ManagedPermissions, PROTOCOL_VERSION,
+    PlainValue, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret, Secret,
+    SecretInput, ServiceStatus, SubTreeMutationValue, Timestamp, ValueListing, ValuePaths,
+    ValueSubTree,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +16,7 @@ pub enum RpcCode {
     FailedPrecondition,
     InvalidArgument,
     NotFound,
+    AlreadyExists,
     Unavailable,
     Other,
 }
@@ -36,6 +38,9 @@ pub fn map_rpc_status(code: RpcCode) -> ClientError {
             ClientError::new(ErrorKind::InvalidRequest, "request is invalid")
         }
         RpcCode::NotFound => ClientError::new(ErrorKind::NotFound, "configuration value not found"),
+        RpcCode::AlreadyExists => {
+            ClientError::new(ErrorKind::Conflict, "configuration path already exists")
+        }
         RpcCode::Unavailable => ClientError::new(ErrorKind::Unavailable, "service is unavailable"),
         RpcCode::Other => ClientError::new(ErrorKind::Internal, "request failed"),
     }
@@ -95,6 +100,17 @@ pub trait ValueTransport: Transport {
         path: &ConfigPath,
         bearer: &Secret,
     ) -> Result<RevealedSecret, ClientError>;
+    async fn add_value_path(
+        &self,
+        source: &ConfigPath,
+        new_path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<AddPathMetadata, ClientError>;
+    async fn list_value_paths(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ValuePaths, ClientError>;
 }
 
 #[async_trait(?Send)]
@@ -289,6 +305,34 @@ where
     pub async fn reveal_secret(&self, path: &ConfigPath) -> Result<RevealedSecret, ClientError> {
         let token = self.required_token().await?;
         self.transport.reveal_secret(path, &token).await
+    }
+
+    /// Exposes an existing value at an additional canonical path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, authorization, validation, missing-value,
+    /// conflict, or dependency error.
+    pub async fn add_value_path(
+        &self,
+        source: &ConfigPath,
+        new_path: &ConfigPath,
+    ) -> Result<AddPathMetadata, ClientError> {
+        let token = self.required_token().await?;
+        self.transport
+            .add_value_path(source, new_path, &token)
+            .await
+    }
+
+    /// Lists every path resolving to the same value that the caller may read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, authorization, validation, missing-value,
+    /// or dependency error.
+    pub async fn list_value_paths(&self, path: &ConfigPath) -> Result<ValuePaths, ClientError> {
+        let token = self.required_token().await?;
+        self.transport.list_value_paths(path, &token).await
     }
 }
 

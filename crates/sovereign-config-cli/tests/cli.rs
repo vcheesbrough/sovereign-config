@@ -22,8 +22,9 @@ use base64::{Engine, engine::general_purpose};
 use serde_json::json;
 use sovereign_config_core::{ConfigPath, ConnectionUrl, Secret};
 use sovereign_config_proto::sovereign::config::v3::{
-    DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse,
-    GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest, GetVersionResponse,
+    AddValuePathRequest, AddValuePathResponse, DeleteValuesRequest, DeleteValuesResponse,
+    GetIdentityRequest, GetIdentityResponse, GetSubTreeRequest, GetSubTreeResponse,
+    GetVersionRequest, GetVersionResponse, ListValuePathsRequest, ListValuePathsResponse,
     ListValuesRequest, ListValuesResponse, ListedValue, MaskedSecret, PutValueRequest,
     PutValueResponse, ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest,
     RevealSecretResponse, SubTreeValue, ValueClassification,
@@ -154,6 +155,7 @@ impl Configuration for MockConfiguration {
                 } else {
                     ValueClassification::Plain as i32
                 },
+                alias_paths: Vec::new(),
             })
             .collect();
         Ok(tonic::Response::new(ListValuesResponse {
@@ -318,6 +320,65 @@ impl Configuration for MockConfiguration {
             None => Err(Status::not_found("missing")),
         }
     }
+
+    async fn add_value_path(
+        &self,
+        request: Request<AddValuePathRequest>,
+    ) -> Result<tonic::Response<AddValuePathResponse>, Status> {
+        require_access_token(&request)?;
+        let request = request.into_inner();
+        let new_path = request.new_path.to_ascii_lowercase();
+        // Sentinel path standing in for a grant the caller cannot write.
+        if new_path.ends_with("/forbidden") {
+            return Err(Status::permission_denied("not permitted"));
+        }
+        let source = request.source_path.to_ascii_lowercase();
+        let timestamp = prost_types::Timestamp {
+            seconds: 1_700_000_003,
+            nanos: 0,
+        };
+        let mut values = self.values.lock().unwrap();
+        let Some(stored) = values.get(&source) else {
+            return Err(Status::not_found("missing"));
+        };
+        let (value, secret) = (stored.value.clone(), stored.secret);
+        if values.contains_key(&new_path) {
+            return Err(Status::already_exists("exists"));
+        }
+        values.insert(
+            new_path,
+            MockStoredValue {
+                value,
+                created_at: timestamp,
+                secret,
+            },
+        );
+        Ok(tonic::Response::new(AddValuePathResponse {
+            created_at: Some(timestamp),
+        }))
+    }
+
+    async fn list_value_paths(
+        &self,
+        request: Request<ListValuePathsRequest>,
+    ) -> Result<tonic::Response<ListValuePathsResponse>, Status> {
+        require_access_token(&request)?;
+        let path = request.into_inner().path.to_ascii_lowercase();
+        let values = self.values.lock().unwrap();
+        let Some(stored) = values.get(&path) else {
+            return Err(Status::not_found("missing"));
+        };
+        // Group by stored value: aliases carry an identical copy of the value.
+        let mut paths = values
+            .iter()
+            .filter(|(_, candidate)| {
+                candidate.secret == stored.secret && candidate.value == stored.value
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        Ok(tonic::Response::new(ListValuePathsResponse { paths }))
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -400,6 +461,91 @@ async fn exact_value_commands_use_absolute_paths_within_profile_root_and_hard_de
     let outside_root = run_cli(home.path(), &["get", "/other/feature-flag"]).await;
     assert!(!outside_root.status.success());
     assert!(combined(&outside_root).contains("path is outside the selected profile root"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn value_path_aliases_are_added_listed_and_permission_checked() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let connection = connection_url(&services, true, "team/service");
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["profile", "add", "managed"],
+            Some(&format!("{connection}\n")),
+        )
+        .await,
+    );
+
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["put", "/team/service/original"],
+            Some("aliased-value-sentinel"),
+        )
+        .await,
+    );
+
+    let added = run_cli(
+        home.path(),
+        &[
+            "alias",
+            "add",
+            "/team/service/original",
+            "/team/service/Alias",
+        ],
+    )
+    .await;
+    assert_success(&added);
+    assert_eq!(String::from_utf8_lossy(&added.stdout), "Path added\n");
+
+    let aliased = run_cli(home.path(), &["get", "/team/service/alias"]).await;
+    assert_success(&aliased);
+    assert_eq!(
+        String::from_utf8_lossy(&aliased.stdout),
+        "aliased-value-sentinel"
+    );
+
+    let listed = run_cli(home.path(), &["alias", "list", "/team/service/ORIGINAL"]).await;
+    assert_success(&listed);
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout),
+        "/team/service/alias\n/team/service/original\n"
+    );
+
+    let relative = run_cli(
+        home.path(),
+        &[
+            "alias",
+            "add",
+            "team/service/original",
+            "/team/service/other",
+        ],
+    )
+    .await;
+    assert!(!relative.status.success());
+    assert!(combined(&relative).contains("path must name a configuration value"));
+
+    let outside = run_cli(
+        home.path(),
+        &["alias", "add", "/team/service/original", "/other/alias"],
+    )
+    .await;
+    assert!(!outside.status.success());
+    assert!(combined(&outside).contains("path is outside the selected profile root"));
+
+    let denied = run_cli(
+        home.path(),
+        &[
+            "alias",
+            "add",
+            "/team/service/original",
+            "/team/service/forbidden",
+        ],
+    )
+    .await;
+    assert!(!denied.status.success());
+    assert!(combined(&denied).contains("permission denied"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

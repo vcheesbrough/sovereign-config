@@ -10,11 +10,12 @@ use std::cell::RefCell;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl, DeleteMetadata,
-    DisplayName, ErrorKind, ListedValue, ManagedConnectionMetadata, ManagedConnectionState,
-    ManagedPermissions, MaskedSecret, PlainValue, ProvisionedManagedConnection, PutMetadata,
-    ReplaceMetadata, RevealedConnectionUrl, RevealedSecret, Secret, SecretInput, ServiceStatus,
-    SubTreeMutationValue, SubTreeValue, Timestamp, ValueContent, ValueListing, ValueSubTree,
+    AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl,
+    DeleteMetadata, DisplayName, ErrorKind, ListedValue, ManagedConnectionMetadata,
+    ManagedConnectionState, ManagedPermissions, MaskedSecret, PlainValue,
+    ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedConnectionUrl,
+    RevealedSecret, Secret, SecretInput, ServiceStatus, SubTreeMutationValue, SubTreeValue,
+    Timestamp, ValueContent, ValueListing, ValuePaths, ValueSubTree,
 };
 use sovereign_config_mcp::backend::{Backend, LoginPrompt};
 use sovereign_config_mcp::server::Server;
@@ -31,6 +32,7 @@ struct Recorder {
     roots: Vec<String>,
     connection_ids: Vec<String>,
     login_calls: usize,
+    alias_adds: Vec<(String, String)>,
 }
 
 struct MockBackend {
@@ -177,6 +179,7 @@ impl Backend for MockBackend {
                     seconds: 1,
                     nanos: 0,
                 },
+                alias_paths: vec![],
             }],
             paths: vec![ConfigPath::parse("/apps/api").unwrap()],
         })
@@ -271,6 +274,38 @@ impl Backend for MockBackend {
             .push(path.as_str().to_owned());
         self.guard()?;
         Ok(RevealedSecret::new(REVEALED_SECRET))
+    }
+
+    async fn add_value_path(
+        &self,
+        source: &ConfigPath,
+        new_path: &ConfigPath,
+    ) -> Result<AddPathMetadata, ClientError> {
+        self.record
+            .borrow_mut()
+            .alias_adds
+            .push((source.as_str().to_owned(), new_path.as_str().to_owned()));
+        self.guard()?;
+        Ok(AddPathMetadata {
+            created_at: Timestamp {
+                seconds: 1,
+                nanos: 0,
+            },
+        })
+    }
+
+    async fn list_value_paths(&self, path: &ConfigPath) -> Result<ValuePaths, ClientError> {
+        self.record
+            .borrow_mut()
+            .paths
+            .push(path.as_str().to_owned());
+        self.guard()?;
+        Ok(ValuePaths {
+            paths: vec![
+                ConfigPath::parse("/apps/api/name").unwrap(),
+                ConfigPath::parse("/apps/api/alias").unwrap(),
+            ],
+        })
     }
 
     async fn list_connections(&self) -> Result<Vec<ManagedConnectionMetadata>, ClientError> {
@@ -384,7 +419,7 @@ async fn initialize_advertises_tools_and_echoes_protocol_version() {
 }
 
 #[tokio::test]
-async fn tools_list_exposes_the_implemented_surface_without_aliases() {
+async fn tools_list_exposes_the_implemented_surface_including_aliases() {
     let out = run_script(
         MockBackend::healthy(),
         &[json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })],
@@ -403,12 +438,49 @@ async fn tools_list_exposes_the_implemented_surface_without_aliases() {
         "put_value",
         "put_secret",
         "reveal_secret",
+        "alias_add",
+        "alias_list",
         "create_connection",
         "revoke_connection",
     ] {
         assert!(names.contains(&expected), "missing {expected}");
     }
-    assert!(!names.iter().any(|name| name.contains("alias")));
+}
+
+#[tokio::test]
+async fn alias_add_passes_the_exact_paths_to_the_backend() {
+    let out = run_script(
+        MockBackend::healthy(),
+        &[call(
+            1,
+            "alias_add",
+            json!({ "source_path": "/apps/api/name", "new_path": "/apps/api/alias" }),
+        )],
+    )
+    .await;
+    assert!(!is_error(&out[0]));
+    // The confirmation names the exact alias created, proving the call reached
+    // the backend with the caller's new path unchanged.
+    assert_eq!(result_text(&out[0]), "Alias created at /apps/api/alias");
+}
+
+#[tokio::test]
+async fn alias_list_returns_every_resolving_path() {
+    let out = run_script(
+        MockBackend::healthy(),
+        &[call(1, "alias_list", json!({ "path": "/apps/api/name" }))],
+    )
+    .await;
+    assert!(!is_error(&out[0]));
+    let text = result_text(&out[0]);
+    let rendered: Value = serde_json::from_str(&text).unwrap();
+    let paths: Vec<&str> = rendered["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|path| path.as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["/apps/api/name", "/apps/api/alias"]);
 }
 
 #[tokio::test]

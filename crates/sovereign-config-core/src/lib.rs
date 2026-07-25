@@ -358,6 +358,9 @@ pub struct ListedValue {
     pub value: ValueContent,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+    /// Other canonical paths resolving to the same value that the caller may
+    /// read. Excludes this value's own `path`.
+    pub alias_paths: Vec<ConfigPath>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -405,6 +408,16 @@ pub struct DeleteMetadata {
 pub struct ReplaceMetadata {
     pub updated_at: Timestamp,
     pub value_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AddPathMetadata {
+    pub created_at: Timestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValuePaths {
+    pub paths: Vec<ConfigPath>,
 }
 
 impl fmt::Display for ConfigPath {
@@ -659,6 +672,9 @@ pub enum ErrorKind {
     IncompatibleProtocol,
     InvalidRequest,
     NotFound,
+    /// The request cannot apply because the target is already taken, such as
+    /// aliasing a value onto an occupied path.
+    Conflict,
     Unavailable,
     Internal,
 }

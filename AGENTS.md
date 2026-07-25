@@ -59,6 +59,10 @@ In addition to baseline §3 (git safety) and §7 (MCP/secrets):
 
 ---
 
+## 3. Protocol Compatibility
+
+This software uses the native gRPC `System.GetVersion` endpoint to verify protocol compatibility. However it is likely that the client cli/mcp/provider will be using an earlier version of the protocol. It is acceptable make breaking protocol change as a last resort but should be avoided whenever possible. If a breaking change is unavoidable, it should be documented and communicated to all clients. If a breaking change is unavoidable, it should be documented. If required we can add protocol versions but the server must support older versions too. A protocol version defines not only the signature/datatypes etc but also key behaviour of endpoints, earlier behaviour contracts cannot be broken without a protocol version change. Any change in protocol must be request and permission given.
+
 *Kanban workflow and automated test coverage follow the agent-shared baseline
 unchanged — see baseline §1 and §6. Start a card with the **`start-iteration`**
 skill (baseline §2). PR self-review + comment loop: run the **`pr-review-loop`**

@@ -15,18 +15,20 @@ use sovereign_config_client::{
     VersionReply, map_rpc_status, timestamp,
 };
 use sovereign_config_core::{
-    AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl, DeleteMetadata,
-    DisplayName, ErrorKind, ListedValue, ManagedConnectionMetadata, ManagedConnectionState,
-    ManagedPermission, ManagedPermissions, MaskedSecret, PlainValue, ProvisionedManagedConnection,
-    PutMetadata, ReplaceMetadata, RevealedConnectionUrl, RevealedSecret, Secret, SecretInput,
-    SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, Timestamp, ValueContent,
-    ValueListing, ValueSubTree, parse_subtree_json, render_subtree_json,
+    AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl,
+    DeleteMetadata, DisplayName, ErrorKind, ListedValue, ManagedConnectionMetadata,
+    ManagedConnectionState, ManagedPermission, ManagedPermissions, MaskedSecret, PlainValue,
+    ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedConnectionUrl,
+    RevealedSecret, Secret, SecretInput, SubTreeMutationContent, SubTreeMutationValue,
+    SubTreeValue, Timestamp, ValueContent, ValueListing, ValuePaths, ValueSubTree,
+    parse_subtree_json, render_subtree_json,
 };
 use sovereign_config_proto::sovereign::config::v3::{
-    CreateManagedConnectionRequest, CreateManagedConnectionResponse, DeleteValuesRequest,
-    DeleteValuesResponse, GetIdentityRequest, GetIdentityResponse, GetSubTreeRequest,
-    GetSubTreeResponse, GetVersionRequest, GetVersionResponse, ListManagedConnectionsRequest,
-    ListManagedConnectionsResponse, ListValuesRequest, ListValuesResponse,
+    AddValuePathRequest, AddValuePathResponse, CreateManagedConnectionRequest,
+    CreateManagedConnectionResponse, DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest,
+    GetIdentityResponse, GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest,
+    GetVersionResponse, ListManagedConnectionsRequest, ListManagedConnectionsResponse,
+    ListValuePathsRequest, ListValuePathsResponse, ListValuesRequest, ListValuesResponse,
     ManagedConnectionMetadata as ProtoManagedConnectionMetadata,
     ManagedConnectionState as ProtoManagedConnectionState, PreserveSecret, PutValueRequest,
     PutValueResponse, ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest,
@@ -54,6 +56,7 @@ const REFRESH_LIFETIME_MS: f64 = 8.0 * 60.0 * 60.0 * 1000.0;
 thread_local! {
     static TOKENS: RefCell<Option<MemoryTokens>> = const { RefCell::new(None) };
     static DELETE_TARGET: RefCell<Option<DeleteTarget>> = const { RefCell::new(None) };
+    static ADD_PATH_TARGET: RefCell<Option<AddPathTarget>> = const { RefCell::new(None) };
     static PATH_OPTIONS_REFRESHING: Cell<bool> = const { Cell::new(false) };
     static ACTIVE_PATH_OPTION: Cell<Option<usize>> = const { Cell::new(None) };
     static JSON_MODE: Cell<bool> = const { Cell::new(false) };
@@ -67,6 +70,14 @@ thread_local! {
 
 struct DeleteTarget {
     path: ConfigPath,
+    return_focus: String,
+}
+
+/// The value selected for a pending "add path" confirmation. The source path
+/// identifies the stored value; the new path is read from the dialog input.
+#[derive(Clone)]
+struct AddPathTarget {
+    source: ConfigPath,
     return_focus: String,
 }
 
@@ -189,11 +200,17 @@ impl ValueTransport for BrowserTransport {
             .values
             .into_iter()
             .map(|value| {
+                let alias_paths = value
+                    .alias_paths
+                    .into_iter()
+                    .map(|path| ConfigPath::parse(path).map_err(|_| browser_error()))
+                    .collect::<Result<Vec<_>, ClientError>>()?;
                 Ok(ListedValue {
                     path: ConfigPath::parse(value.path).map_err(|_| browser_error())?,
                     value: listed_content(value.classification, value.content)?,
                     created_at: proto_timestamp(value.created_at)?,
                     updated_at: proto_timestamp(value.updated_at)?,
+                    alias_paths,
                 })
             })
             .collect::<Result<Vec<_>, ClientError>>()?;
@@ -355,6 +372,47 @@ impl ValueTransport for BrowserTransport {
             return Err(browser_error());
         }
         Ok(RevealedSecret::new(response.value))
+    }
+
+    async fn add_value_path(
+        &self,
+        source: &ConfigPath,
+        new_path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<AddPathMetadata, ClientError> {
+        let response: AddValuePathResponse = grpc_unary(
+            "/sovereign.config.v3.Configuration/AddValuePath",
+            &AddValuePathRequest {
+                source_path: source.as_str().to_owned(),
+                new_path: new_path.as_str().to_owned(),
+            },
+            Some(bearer),
+        )
+        .await?;
+        Ok(AddPathMetadata {
+            created_at: proto_timestamp(response.created_at)?,
+        })
+    }
+
+    async fn list_value_paths(
+        &self,
+        path: &ConfigPath,
+        bearer: &Secret,
+    ) -> Result<ValuePaths, ClientError> {
+        let response: ListValuePathsResponse = grpc_unary(
+            "/sovereign.config.v3.Configuration/ListValuePaths",
+            &ListValuePathsRequest {
+                path: path.as_str().to_owned(),
+            },
+            Some(bearer),
+        )
+        .await?;
+        let paths = response
+            .paths
+            .into_iter()
+            .map(|path| ConfigPath::parse(path).map_err(|_| browser_error()))
+            .collect::<Result<Vec<_>, ClientError>>()?;
+        Ok(ValuePaths { paths })
     }
 }
 
@@ -733,6 +791,19 @@ fn install_configuration_actions(document: &Document) {
     if let Some(confirm) = document.get_element_by_id("confirm-delete") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
             spawn_local(async { delete_selected_value().await });
+        });
+        let _ =
+            confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(cancel) = document.get_element_by_id("cancel-add-path") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| cancel_add_path());
+        let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(confirm) = document.get_element_by_id("confirm-add-path") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            spawn_local(async { add_selected_path().await });
         });
         let _ =
             confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
@@ -1710,6 +1781,88 @@ fn close_delete_dialog() {
     }
 }
 
+fn open_add_path(source: ConfigPath, return_focus: String) {
+    set_text("add-path-source", &absolute_path(&source));
+    if let Some(input) = element::<HtmlInputElement>("add-path-input") {
+        input.set_value("");
+    }
+    set_hidden("add-path-error", true);
+    ADD_PATH_TARGET.with_borrow_mut(|target| {
+        *target = Some(AddPathTarget {
+            source,
+            return_focus,
+        });
+    });
+    if let Some(dialog) = element::<HtmlDialogElement>("add-path-dialog") {
+        let _ = dialog.show_modal();
+        focus("add-path-input");
+    }
+}
+
+fn cancel_add_path() {
+    let return_focus = ADD_PATH_TARGET
+        .with_borrow_mut(Option::take)
+        .map(|target| target.return_focus);
+    close_add_path_dialog();
+    if let Some(return_focus) = return_focus {
+        focus(&return_focus);
+    }
+}
+
+async fn add_selected_path() {
+    // Inspect the target without consuming it so a malformed path can be
+    // corrected in place, then take it before awaiting: a second activation
+    // while the request is in flight would otherwise send the same alias twice,
+    // and the duplicate's conflict would report a failure for a mutation that
+    // actually succeeded.
+    let Some(target) = ADD_PATH_TARGET.with_borrow(Clone::clone) else {
+        return;
+    };
+    let entered = element::<HtmlInputElement>("add-path-input")
+        .map(|input| input.value())
+        .unwrap_or_default();
+    let Ok(new_path) = ConfigPath::parse_operation(entered.trim()) else {
+        set_text(
+            "add-path-error",
+            "Enter an absolute path such as /apps/worker/database-url.",
+        );
+        set_hidden("add-path-error", false);
+        focus("add-path-input");
+        return;
+    };
+    ADD_PATH_TARGET.with_borrow_mut(Option::take);
+    set_button_disabled("confirm-add-path", true);
+    clear_error();
+    let result = async {
+        let config = app_config()?;
+        value_client(&config)
+            .add_value_path(&target.source, &new_path)
+            .await
+    }
+    .await;
+    // Re-enable for the next time the dialog opens; the target stays consumed so
+    // a retry starts from the row, as a failed delete does.
+    set_button_disabled("confirm-add-path", false);
+    close_add_path_dialog();
+    match result {
+        Ok(_) => {
+            load_current_configuration().await;
+            set_text("value-state", "Path added");
+            focus("add-value");
+        }
+        Err(error) => {
+            show_error(error.message());
+            focus(&target.return_focus);
+        }
+    }
+}
+
+fn close_add_path_dialog() {
+    if let Some(dialog) = element::<HtmlDialogElement>("add-path-dialog") {
+        dialog.close();
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn install_connections_actions(document: &Document) {
     if let Some(form) = document.get_element_by_id("connection-form") {
@@ -2483,6 +2636,7 @@ fn render_value_row(
     full_path.set_text_content(Some(&absolute_path(&value.path)));
     append(&name_cell, &name_text)?;
     append(&name_cell, &full_path)?;
+    append_alias_paths(document, &name_cell, value, index)?;
 
     let value_cell = create_element(document, "td", None)?;
     let input_id = format!("listed-value-{index}");
@@ -2528,11 +2682,27 @@ fn render_value_row(
     let actions = create_element(document, "div", Some("row-actions"))?;
     let save_id = format!("save-listed-value-{index}");
     let save = create_button(document, &save_id, "Save", None)?;
+    let add_path_id = format!("add-path-listed-value-{index}");
+    let add_path = create_button(document, &add_path_id, "Add path", Some("secondary"))?;
+    add_path
+        .set_attribute("aria-label", &format!("Add a path to {name}"))
+        .map_err(|_| browser_error())?;
     let remove_id = format!("delete-listed-value-{index}");
     let remove = create_button(document, &remove_id, "Delete", Some("danger"))?;
     append(&actions, &save)?;
+    append(&actions, &add_path)?;
     append(&actions, &remove)?;
     append(&actions_cell, &actions)?;
+
+    let add_path_source = value.path.clone();
+    let add_path_focus = add_path_id;
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        open_add_path(add_path_source.clone(), add_path_focus.clone());
+    });
+    add_path
+        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
 
     let save_path = value.path.clone();
     let save_input = input_id.clone();
@@ -2595,6 +2765,7 @@ fn render_secret_value_row(
     full_path.set_text_content(Some(&absolute_path(&value.path)));
     append(&name_cell, &name_text)?;
     append(&name_cell, &full_path)?;
+    append_alias_paths(document, &name_cell, value, index)?;
 
     let value_cell = create_element(document, "td", None)?;
     let kind = create_element(document, "span", Some("secret-kind"))?;
@@ -2662,12 +2833,28 @@ fn render_secret_value_row(
     reveal
         .set_attribute("aria-expanded", "false")
         .map_err(|_| browser_error())?;
+    let add_path_id = format!("add-path-listed-value-{index}");
+    let add_path = create_button(document, &add_path_id, "Add path", Some("secondary"))?;
+    add_path
+        .set_attribute("aria-label", &format!("Add a path to {name}"))
+        .map_err(|_| browser_error())?;
     let remove_id = format!("delete-listed-value-{index}");
     let remove = create_button(document, &remove_id, "Delete", Some("danger"))?;
     append(&actions, &save)?;
     append(&actions, &reveal)?;
+    append(&actions, &add_path)?;
     append(&actions, &remove)?;
     append(&actions_cell, &actions)?;
+
+    let add_path_source = value.path.clone();
+    let add_path_focus = add_path_id;
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        open_add_path(add_path_source.clone(), add_path_focus.clone());
+    });
+    add_path
+        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
 
     let save_path = value.path.clone();
     let save_input = input_id.clone();
@@ -2722,6 +2909,51 @@ fn render_secret_value_row(
     append(&row, &updated)?;
     append(&row, &actions_cell)?;
     Ok(row)
+}
+
+/// Renders the value's additional authorized paths (`alias_paths`) beneath the
+/// primary path in the name cell. Each entry carries a danger "Remove" button
+/// that deletes only that path via the shared delete-confirm flow; the value
+/// survives through its remaining paths.
+fn append_alias_paths(
+    document: &Document,
+    name_cell: &Element,
+    value: &ListedValue,
+    index: usize,
+) -> Result<(), ClientError> {
+    if value.alias_paths.is_empty() {
+        return Ok(());
+    }
+    let list = create_element(document, "ul", Some("alias-paths"))?;
+    list.set_attribute("aria-label", "Additional paths for this value")
+        .map_err(|_| browser_error())?;
+    for (alias_index, alias_path) in value.alias_paths.iter().enumerate() {
+        let item = create_element(document, "li", Some("alias-path"))?;
+        let absolute = absolute_path(alias_path);
+        let path_text = create_element(document, "span", Some("full-path"))?;
+        path_text.set_text_content(Some(&absolute));
+        append(&item, &path_text)?;
+
+        let remove_id = format!("remove-alias-path-{index}-{alias_index}");
+        let remove = create_button(document, &remove_id, "Remove", Some("danger"))?;
+        remove
+            .set_attribute("aria-label", &format!("Remove path {absolute}"))
+            .map_err(|_| browser_error())?;
+        let remove_path = alias_path.clone();
+        let remove_focus = remove_id;
+        let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+            open_delete(remove_path.clone(), remove_focus.clone());
+        });
+        remove
+            .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+            .map_err(|_| browser_error())?;
+        callback.forget();
+        append(&item, &remove)?;
+
+        append(&list, &item)?;
+    }
+    append(name_cell, &list)?;
+    Ok(())
 }
 
 fn create_element(
@@ -3382,6 +3614,7 @@ fn grpc_status_code(status: u16) -> RpcCode {
     match status {
         3 => RpcCode::InvalidArgument,
         5 => RpcCode::NotFound,
+        6 => RpcCode::AlreadyExists,
         7 => RpcCode::PermissionDenied,
         9 => RpcCode::FailedPrecondition,
         10 | 14 => RpcCode::Unavailable,

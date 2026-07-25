@@ -249,9 +249,20 @@
         <button id="close-connection-url" type="button">Close</button>
       </div>
     </dialog>
+    <dialog id="add-path-dialog" aria-labelledby="add-path-title">
+      <h2 id="add-path-title">Add a path to this value</h2>
+      <p><code id="add-path-source"></code> will also be readable at the new path. Changing the value through either path changes both.</p>
+      <label for="add-path-input">New absolute path</label>
+      <input id="add-path-input" type="text" autocomplete="off" spellcheck="false" placeholder="/apps/worker/database-url" aria-describedby="add-path-error">
+      <p id="add-path-error" class="field-error" aria-live="polite" hidden></p>
+      <div class="actions">
+        <button id="cancel-add-path" class="secondary" type="button">Cancel</button>
+        <button id="confirm-add-path" type="button">Add path</button>
+      </div>
+    </dialog>
     <dialog id="delete-dialog" aria-labelledby="delete-title">
-      <h2 id="delete-title">Permanently delete this value?</h2>
-      <p><code id="delete-path"></code> will be removed immediately. This operation cannot be undone.</p>
+      <h2 id="delete-title">Remove this path?</h2>
+      <p><code id="delete-path"></code> will be removed immediately. If the value has no other paths it is deleted permanently. This operation cannot be undone.</p>
       <div class="actions">
         <button id="cancel-delete" class="secondary" type="button">Cancel</button>
         <button id="confirm-delete" class="danger" type="button">Delete</button>
