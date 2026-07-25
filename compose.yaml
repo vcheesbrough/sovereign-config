@@ -40,10 +40,13 @@ services:
       SOVEREIGN_CONFIG_MANAGER_GROUP: ${SOVEREIGN_CONFIG_MANAGER_GROUP:?Set SOVEREIGN_CONFIG_MANAGER_GROUP}
       SOVEREIGN_CONFIG_MANAGER_API_TOKEN: ${SOVEREIGN_CONFIG_MANAGER_API_TOKEN:-}
       SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE: ${SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE-/run/secrets/manager_api_token}
+      SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY: ${SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY:-}
+      SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE: ${SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE-/run/secrets/value_encryption_key}
     secrets:
       - database_url
       - oidc_introspection_client_secret
       - manager_api_token
+      - value_encryption_key
     depends_on:
       postgres:
         condition: service_healthy
@@ -80,11 +83,13 @@ secrets:
     file: ${OIDC_INTROSPECTION_CLIENT_SECRET_FILE:-/dev/null}
   manager_api_token:
     file: ${MANAGER_API_TOKEN_FILE:-/dev/null}
+  value_encryption_key:
+    file: ${VALUE_ENCRYPTION_KEY_FILE:-/dev/null}
 
 volumes:
   postgres_data:
     external: true
-    name: ${POSTGRES_DATA_VOLUME:?Set POSTGRES_DATA_VOLUME to a pre-created encrypted volume}
+    name: ${POSTGRES_DATA_VOLUME:?Set POSTGRES_DATA_VOLUME to a pre-created external volume holding the PostgreSQL data directory}
 
 networks:
   sovereign_config_private:

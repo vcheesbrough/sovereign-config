@@ -3,6 +3,8 @@ use std::{env, fs, net::IpAddr, net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
 
+use crate::encryption::{ValueCipher, decode_key};
+
 const INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(3);
 const MANAGER_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -13,6 +15,10 @@ pub(crate) struct Config {
     pub(crate) authentication: AuthenticationConfig,
     pub(crate) web: WebConfig,
     pub(crate) managed: ManagedConnectionConfig,
+    /// Seals secret-classified configuration values before they reach
+    /// `PostgreSQL`. Held as a live cipher rather than key bytes so no part of
+    /// the process keeps a copy that could be printed.
+    pub(crate) value_cipher: ValueCipher,
 }
 
 pub(crate) struct ManagedConnectionConfig {
@@ -87,6 +93,7 @@ impl Config {
         let managed_group = validated_group_name(&required_env("SOVEREIGN_CONFIG_MANAGER_GROUP")?)?;
         let api_origin = issuer_api_origin(&issuer_url)?;
         let api_token = required_secret("SOVEREIGN_CONFIG_MANAGER_API_TOKEN")?;
+        let value_cipher = value_cipher_from_env()?;
 
         Ok(Self {
             database_url,
@@ -119,8 +126,25 @@ impl Config {
                 api_token,
                 timeout: MANAGER_TIMEOUT,
             },
+            value_cipher,
         })
     }
+}
+
+/// Builds the value cipher from the operator-supplied encryption key.
+///
+/// The key is required unconditionally, exactly like the database URL and the
+/// manager token. Making it conditional on secrets already being stored would
+/// only move the failure to the first secret write, long after startup, where
+/// it is far harder to diagnose and far easier to miss.
+fn value_cipher_from_env() -> Result<ValueCipher> {
+    const NAME: &str = "SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY";
+
+    let encoded = required_secret(NAME)?;
+    // Only the shape of the failure is reported; the supplied value never
+    // reaches the message, so a startup error is safe to log.
+    let mut key = decode_key(&encoded).map_err(|error| anyhow::anyhow!("{NAME} {error}"))?;
+    Ok(ValueCipher::new(&mut key))
 }
 
 /// Validates the exact canonical public origin used for generated URLs.

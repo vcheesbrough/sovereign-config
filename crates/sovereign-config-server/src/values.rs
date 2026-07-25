@@ -1,7 +1,8 @@
-use std::{collections::BTreeSet, time::SystemTime};
+use std::{collections::BTreeSet, sync::Arc, time::SystemTime};
 
 use std::collections::BTreeMap;
 
+use anyhow::Context as _;
 use sovereign_config_core::{ConfigPath, MASKED_SECRET_TEXT};
 use sovereign_config_proto::sovereign::config::v3::{
     AddValuePathRequest, AddValuePathResponse, DeleteValuesRequest, DeleteValuesResponse,
@@ -14,12 +15,20 @@ use sovereign_config_proto::sovereign::config::v3::{
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use tonic::{Request, Response, Status};
+use tracing::{error, info};
 
 use crate::auth::{AuthenticatedPrincipal, Permission};
+use crate::encryption::{DecryptError, ValueCipher, is_envelope};
+
+/// Classification of a value the caller may read back in the clear.
+const PLAIN: &str = "plain";
+/// Classification of a value stored as ciphertext and masked on read.
+const SECRET: &str = "secret";
 
 #[derive(Clone)]
 pub(crate) struct ConfigurationService {
     database: PgPool,
+    cipher: Arc<ValueCipher>,
 }
 
 #[derive(FromRow)]
@@ -42,6 +51,19 @@ struct SubTreeRow {
 #[derive(FromRow)]
 struct PathRow {
     path: String,
+}
+
+#[derive(FromRow)]
+struct RevealedRow {
+    content_id: i64,
+    value: String,
+    classification: String,
+}
+
+#[derive(FromRow)]
+struct StoredSecretRow {
+    id: i64,
+    value: String,
 }
 
 #[derive(FromRow)]
@@ -76,8 +98,29 @@ struct ContentRow {
 }
 
 impl ConfigurationService {
-    pub(crate) fn new(database: PgPool) -> Self {
-        Self { database }
+    pub(crate) fn new(database: PgPool, cipher: Arc<ValueCipher>) -> Self {
+        Self { database, cipher }
+    }
+
+    /// Produces the representation to store for a value of `classification`.
+    ///
+    /// Secrets become an AEAD envelope bound to the content row that will hold
+    /// them; plain values are stored verbatim, because masking them would only
+    /// obstruct the operators and tooling that are meant to read them.
+    #[allow(clippy::result_large_err)]
+    fn stored_representation(
+        &self,
+        content_id: i64,
+        classification: &str,
+        value: &str,
+    ) -> Result<String, Status> {
+        if classification == SECRET {
+            self.cipher
+                .encrypt(content_id, classification, value)
+                .map_err(|_| encryption_failed())
+        } else {
+            Ok(value.to_owned())
+        }
     }
 }
 
@@ -206,8 +249,8 @@ impl Configuration for ConfigurationService {
     ) -> Result<Response<PutValueResponse>, Status> {
         let path = authorize(&request, &[Permission::Write], false)?;
         let (value, classification) = match request.get_ref().content.as_ref() {
-            Some(put_value_request::Content::PlainValue(value)) => (value, "plain"),
-            Some(put_value_request::Content::SecretValue(value)) => (value, "secret"),
+            Some(put_value_request::Content::PlainValue(value)) => (value, PLAIN),
+            Some(put_value_request::Content::SecretValue(value)) => (value, SECRET),
             None => return Err(Status::invalid_argument("configuration value is invalid")),
         };
         if value.contains('\0') {
@@ -255,6 +298,11 @@ impl Configuration for ConfigurationService {
                 ));
             }
             let content_id = existing.content_id;
+            // Reclassification needs no conversion of what is already stored:
+            // every classification change arrives with a fresh value from the
+            // caller, so `plain -> secret` seals the new value and
+            // `secret -> plain` writes the new plaintext.
+            let stored = self.stored_representation(content_id, classification, value)?;
             // Writing through any path updates the shared content, so every
             // other path aliasing it observes the new value.
             sqlx::query_as::<_, MutationRow>(
@@ -266,7 +314,7 @@ impl Configuration for ConfigurationService {
                 ",
             )
             .bind(content_id)
-            .bind(value)
+            .bind(&stored)
             .bind(classification)
             .bind(now)
             .fetch_one(&mut *transaction)
@@ -278,7 +326,10 @@ impl Configuration for ConfigurationService {
                     "configuration value collides with an existing value",
                 ));
             }
-            let content = insert_content(&mut transaction, value, classification, now).await?;
+            let content_id = reserve_content_id(&mut transaction).await?;
+            let stored = self.stored_representation(content_id, classification, value)?;
+            let content =
+                insert_content(&mut transaction, content_id, &stored, classification, now).await?;
             insert_path(&mut transaction, path.as_str(), content.id, now).await?;
             MutationRow {
                 created_at: content.created_at,
@@ -468,6 +519,11 @@ impl Configuration for ConfigurationService {
                 None => fresh.push((&value.path, content)),
             }
         }
+        // Nothing below encrypts, because subtree replacement can neither read
+        // nor create a secret: it only ever writes `plain`, only ever deletes
+        // `plain`, and the validation above rejects a plain value colliding
+        // with a secret path. Every content row reached here is therefore
+        // already plaintext and stays that way.
         for (content_id, content) in &shared {
             sqlx::query(
                 r"
@@ -484,7 +540,9 @@ impl Configuration for ConfigurationService {
             .map_err(|_| storage_unavailable())?;
         }
         for (path, content) in fresh {
-            let inserted = insert_content(&mut transaction, content, "plain", now).await?;
+            let content_id = reserve_content_id(&mut transaction).await?;
+            let inserted =
+                insert_content(&mut transaction, content_id, content, PLAIN, now).await?;
             insert_path(&mut transaction, path, inserted.id, now).await?;
         }
         transaction
@@ -549,9 +607,9 @@ impl Configuration for ConfigurationService {
         request: Request<RevealSecretRequest>,
     ) -> Result<Response<RevealSecretResponse>, Status> {
         let path = authorize(&request, &[Permission::Read], false)?;
-        let row = sqlx::query_as::<_, SubTreeRow>(
+        let row = sqlx::query_as::<_, RevealedRow>(
             r"
-            SELECT p.path, c.value, c.classification
+            SELECT p.content_id, c.value, c.classification
             FROM configuration_paths p
             JOIN configuration_value_contents c ON c.id = p.content_id
             WHERE p.path = $1
@@ -562,12 +620,20 @@ impl Configuration for ConfigurationService {
         .await
         .map_err(|_| storage_unavailable())?
         .ok_or_else(|| Status::not_found("configuration value not found"))?;
-        if row.classification != "secret" {
+        if row.classification != SECRET {
             return Err(Status::invalid_argument(
                 "configuration value is not a secret",
             ));
         }
-        Ok(Response::new(RevealSecretResponse { value: row.value }))
+        // This is the only RPC that returns a secret in the clear, so it is the
+        // only one that decrypts. A failure here means the key is wrong or the
+        // stored envelope was tampered with; returning what is stored would
+        // hand the caller ciphertext labelled as their secret.
+        let value = self
+            .cipher
+            .decrypt(row.content_id, &row.classification, &row.value)
+            .map_err(|error| decryption_failed(row.content_id, &error))?;
+        Ok(Response::new(RevealSecretResponse { value }))
     }
 
     async fn add_value_path(
@@ -716,19 +782,43 @@ async fn path_collides(
     Ok(collision.is_some())
 }
 
+/// Claims the identity a new content row will be inserted under.
+///
+/// A secret's ciphertext is bound to the row that stores it, so the identity
+/// has to be known before the value is encrypted — which rules out letting the
+/// INSERT generate it. Taking it from the sequence up front means the row is
+/// written once, already sealed: no plaintext is ever handed to `PostgreSQL`,
+/// not even briefly inside the transaction, where it would still reach the
+/// write-ahead log.
+async fn reserve_content_id(transaction: &mut Transaction<'_, Postgres>) -> Result<i64, Status> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT nextval(pg_get_serial_sequence('configuration_value_contents', 'id'))",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|_| storage_unavailable())
+}
+
+/// Inserts a content row under a previously reserved identity.
+///
+/// `value` is the stored representation, already encrypted when the
+/// classification calls for it — this function does no encoding of its own.
 async fn insert_content(
     transaction: &mut Transaction<'_, Postgres>,
+    content_id: i64,
     value: &str,
     classification: &str,
     now: OffsetDateTime,
 ) -> Result<ContentRow, Status> {
     sqlx::query_as::<_, ContentRow>(
         r"
-        INSERT INTO configuration_value_contents (value, classification, created_at, updated_at)
-        VALUES ($1, $2, $3, $3)
+        INSERT INTO configuration_value_contents (id, value, classification, created_at, updated_at)
+        OVERRIDING SYSTEM VALUE
+        VALUES ($1, $2, $3, $4, $4)
         RETURNING id, created_at, updated_at
         ",
     )
+    .bind(content_id)
     .bind(value)
     .bind(classification)
     .bind(now)
@@ -915,13 +1005,17 @@ impl ValueRequest for ListValuePathsRequest {
     }
 }
 
+/// Renders a stored value for a listing.
+///
+/// A secret's stored representation is dropped here rather than decrypted:
+/// listings mask secrets, so the ciphertext must not travel any further.
 fn listed_content(value: String, classification: &str) -> Option<(i32, listed_value::Content)> {
     match classification {
-        "plain" => Some((
+        PLAIN => Some((
             ValueClassification::Plain as i32,
             listed_value::Content::PlainValue(value),
         )),
-        "secret" => Some((
+        SECRET => Some((
             ValueClassification::Secret as i32,
             listed_value::Content::MaskedSecret(MaskedSecret {}),
         )),
@@ -929,13 +1023,15 @@ fn listed_content(value: String, classification: &str) -> Option<(i32, listed_va
     }
 }
 
+/// Renders a stored value for a subtree read. Masks secrets exactly as
+/// [`listed_content`] does, so ciphertext never leaves the server here either.
 fn subtree_content(value: String, classification: &str) -> Option<(i32, sub_tree_value::Content)> {
     match classification {
-        "plain" => Some((
+        PLAIN => Some((
             ValueClassification::Plain as i32,
             sub_tree_value::Content::PlainValue(value),
         )),
-        "secret" => Some((
+        SECRET => Some((
             ValueClassification::Secret as i32,
             sub_tree_value::Content::MaskedSecret(MaskedSecret {}),
         )),
@@ -981,10 +1077,106 @@ fn invalid_timestamp() -> Status {
     Status::internal("configuration timestamp is invalid")
 }
 
+fn encryption_failed() -> Status {
+    Status::internal("configuration value could not be encrypted")
+}
+
+/// Brings every stored secret up to the current encrypted representation.
+///
+/// Runs at startup, after migrations, because encrypting is something only the
+/// server can do — a SQL migration has no access to the key. Rows already
+/// sealed are verified and left alone, so a second run changes nothing; rows
+/// still in plaintext, written before this server encrypted anything, are
+/// sealed in place. Running on every start rather than once behind a marker
+/// also repairs a deployment that was rolled back, wrote plaintext, and rolled
+/// forward again.
+///
+/// A row that looks encrypted but will not open aborts startup. That is the
+/// signature of the wrong key, and continuing would mean serving errors for
+/// secrets that are perfectly intact under the right one — or, worse, sealing
+/// a second layer over them.
+pub(crate) async fn encrypt_stored_secrets(
+    database: &PgPool,
+    cipher: &ValueCipher,
+) -> anyhow::Result<()> {
+    let mut transaction = database
+        .begin()
+        .await
+        .context("unable to begin the configuration secret encryption pass")?;
+    // Replicas start concurrently, and two of them rewriting the same row would
+    // race. The lock is held for the transaction, so it is released either way.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('sovereign-config:encrypt-stored-secrets', 0))",
+    )
+    .execute(&mut *transaction)
+    .await
+    .context("unable to lock configuration secrets for encryption")?;
+
+    let stored = sqlx::query_as::<_, StoredSecretRow>(
+        r"
+        SELECT id, value
+        FROM configuration_value_contents
+        WHERE classification = 'secret'
+        ORDER BY id
+        ",
+    )
+    .fetch_all(&mut *transaction)
+    .await
+    .context("unable to read configuration secrets for encryption")?;
+
+    let mut encrypted = 0usize;
+    for row in stored {
+        if is_envelope(&row.value) {
+            cipher
+                .decrypt(row.id, SECRET, &row.value)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "stored configuration secret {} is unreadable: {error}",
+                        row.id
+                    )
+                })?;
+            continue;
+        }
+        let sealed = cipher
+            .encrypt(row.id, SECRET, &row.value)
+            .map_err(|error| anyhow::anyhow!("configuration secret {}: {error}", row.id))?;
+        // `updated_at` deliberately stays put: how a value is stored changed,
+        // the value itself did not, and moving the timestamp would misreport a
+        // rotation to every client watching it.
+        sqlx::query("UPDATE configuration_value_contents SET value = $2 WHERE id = $1")
+            .bind(row.id)
+            .bind(&sealed)
+            .execute(&mut *transaction)
+            .await
+            .context("unable to encrypt a stored configuration secret")?;
+        encrypted += 1;
+    }
+
+    transaction
+        .commit()
+        .await
+        .context("unable to commit encrypted configuration secrets")?;
+    if encrypted > 0 {
+        info!(count = encrypted, "encrypted stored configuration secrets");
+    }
+    Ok(())
+}
+
+/// Reports a value that could not be decrypted.
+///
+/// The log records which row failed and why, but never the stored bytes: an
+/// envelope that fails to authenticate may still be somebody's ciphertext, and
+/// one that turns out to be legacy plaintext is a secret in the clear.
+fn decryption_failed(content_id: i64, error: &DecryptError) -> Status {
+    error!(content_id, reason = %error, "configuration value could not be decrypted");
+    Status::internal("configuration value could not be decrypted")
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, env, time::Duration};
+    use std::{collections::BTreeSet, env, sync::Arc, time::Duration};
 
+    use crate::encryption::ValueCipher;
     use sovereign_config_proto::sovereign::config::v3::{
         PreserveSecret, RevealSecretRequest, SubTreeMutationValue, ValueClassification,
         configuration_server::Configuration, listed_value, put_value_request,
@@ -997,7 +1189,7 @@ mod tests {
     use super::{
         AddValuePathRequest, ConfigurationService, DeleteValuesRequest, GetSubTreeRequest,
         ListValuePathsRequest, ListValuesRequest, MASKED_SECRET_TEXT, PutValueRequest,
-        ReplaceSubTreeRequest,
+        ReplaceSubTreeRequest, encrypt_stored_secrets,
     };
     use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
 
@@ -1062,6 +1254,34 @@ mod tests {
         }
     }
 
+    // A fixed key, so a test can seal a value with one cipher and open it with
+    // another. Test data is disposable; nothing here needs a real key.
+    fn test_cipher() -> Arc<ValueCipher> {
+        cipher_seeded(0xA5)
+    }
+
+    fn cipher_seeded(seed: u8) -> Arc<ValueCipher> {
+        let mut key = [seed; 32];
+        Arc::new(ValueCipher::new(&mut key))
+    }
+
+    // Reads what is physically stored for a path, bypassing the service, so a
+    // test can assert on the representation rather than on what a client sees.
+    async fn stored_value(pool: &sqlx::PgPool, path: &str) -> (i64, String, String) {
+        sqlx::query_as::<_, (i64, String, String)>(
+            r"
+            SELECT p.content_id, c.value, c.classification
+            FROM configuration_paths p
+            JOIN configuration_value_contents c ON c.id = p.content_id
+            WHERE p.path = $1
+            ",
+        )
+        .bind(path)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
     // Remove every path at or below the given prefixes and drop any content
     // left without a path, scoped to the affected contents so parallel tests
     // under other prefixes are untouched.
@@ -1113,6 +1333,28 @@ mod tests {
         .unwrap();
     }
 
+    // Writes a secret the way a server that predates encryption would have:
+    // classified as secret, stored in the clear. This is what the startup pass
+    // has to find and seal.
+    async fn seed_legacy_plaintext_secret(pool: &sqlx::PgPool, path: &str, value: &str) {
+        sqlx::query(
+            r"
+            WITH inserted AS (
+                INSERT INTO configuration_value_contents (value, classification, created_at, updated_at)
+                VALUES ($2, 'secret', NOW(), NOW())
+                RETURNING id
+            )
+            INSERT INTO configuration_paths (path, content_id, created_at, updated_at)
+            SELECT $1, id, NOW(), NOW() FROM inserted
+            ",
+        )
+        .bind(path)
+        .bind(value)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
     #[allow(clippy::too_many_lines)]
@@ -1122,7 +1364,7 @@ mod tests {
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         clear_test_paths(&pool, &["/tests/exact", "/tests/exactly"]).await;
-        let service = ConfigurationService::new(pool.clone());
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
 
         let invalid_list = service
             .list_values(request(
@@ -1486,7 +1728,7 @@ mod tests {
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         clear_test_paths(&pool, &["/tests/secrets"]).await;
-        let service = ConfigurationService::new(pool.clone());
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
 
         for sentinel in ["secret-sentinel-one", "secret-sentinel-two"] {
             service
@@ -1817,7 +2059,7 @@ mod tests {
         .await
         .unwrap();
 
-        let service = ConfigurationService::new(pool.clone());
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
         let first_service = service.clone();
         let first = tokio::spawn(async move {
             first_service
@@ -1913,7 +2155,7 @@ mod tests {
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         clear_test_paths(&pool, &["/tests/alias"]).await;
-        let service = ConfigurationService::new(pool.clone());
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
         let read_write = [Permission::Read, Permission::Write];
 
         service
@@ -2044,7 +2286,7 @@ mod tests {
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         clear_test_paths(&pool, &["/tests/aliasclass"]).await;
-        let service = ConfigurationService::new(pool.clone());
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
         let read_write = [Permission::Read, Permission::Write];
 
         service
@@ -2155,7 +2397,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        let service = ConfigurationService::new(pool.clone());
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
         let read_write = [Permission::Read, Permission::Write];
         let replace = [Permission::Write, Permission::Manage];
 
@@ -2247,7 +2489,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        let service = ConfigurationService::new(pool.clone());
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
         let read_write = [Permission::Read, Permission::Write];
 
         // The two aliases sit under unrelated hierarchies, so the path locks
@@ -2340,7 +2582,7 @@ mod tests {
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         clear_test_paths(&pool, &["/tests/aliasreplace"]).await;
-        let service = ConfigurationService::new(pool.clone());
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
         let read_write = [Permission::Read, Permission::Write];
         let replace = [Permission::Write, Permission::Manage];
 
@@ -2447,7 +2689,7 @@ mod tests {
         let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         clear_test_paths(&pool, &["/tests/aliasauth"]).await;
-        let service = ConfigurationService::new(pool.clone());
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
         let read_write = [Permission::Read, Permission::Write];
 
         service
@@ -2528,6 +2770,321 @@ mod tests {
         assert_eq!(duplicate.code(), Code::AlreadyExists);
 
         clear_test_paths(&pool, &["/tests/aliasauth"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn postgres_stores_secrets_as_ciphertext_and_reveals_them() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/encryption"]).await;
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
+        let permissions = [Permission::Read, Permission::Write];
+
+        service
+            .put_value(request_for_prefix(
+                secret_put("/tests/encryption/token", "hunter2"),
+                "/tests/encryption",
+                &permissions,
+            ))
+            .await
+            .unwrap();
+
+        // The point of the whole change: anyone reading the table directly —
+        // a dump, a backup, a replica — sees no plaintext.
+        let (_, stored, classification) = stored_value(&pool, "/tests/encryption/token").await;
+        assert_eq!(classification, "secret");
+        assert!(stored.starts_with("enc:v1:"));
+        assert!(!stored.contains("hunter2"));
+
+        let revealed = service
+            .reveal_secret(request_for_prefix(
+                RevealSecretRequest {
+                    path: "/tests/encryption/token".into(),
+                },
+                "/tests/encryption",
+                &permissions,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(revealed.value, "hunter2");
+
+        // Listings mask secrets, so they must not carry the ciphertext either.
+        let listing = service
+            .list_values(request_for_prefix(
+                ListValuesRequest {
+                    path: "/tests/encryption".into(),
+                },
+                "/tests/encryption",
+                &permissions,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let listed = listing
+            .values
+            .iter()
+            .find(|value| value.path == "/tests/encryption/token")
+            .expect("the stored secret must be listed");
+        assert!(matches!(
+            listed.content,
+            Some(listed_value::Content::MaskedSecret(_))
+        ));
+
+        clear_test_paths(&pool, &["/tests/encryption"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn postgres_leaves_plain_values_readable() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/encryptionplain"]).await;
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
+        let permissions = [Permission::Read, Permission::Write];
+
+        service
+            .put_value(request_for_prefix(
+                plain_put("/tests/encryptionplain/host", "db.internal"),
+                "/tests/encryptionplain",
+                &permissions,
+            ))
+            .await
+            .unwrap();
+
+        let (_, stored, classification) = stored_value(&pool, "/tests/encryptionplain/host").await;
+        assert_eq!(classification, "plain");
+        assert_eq!(stored, "db.internal");
+
+        clear_test_paths(&pool, &["/tests/encryptionplain"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn postgres_rejects_ciphertext_moved_between_values() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/encryptionswap"]).await;
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
+        let permissions = [Permission::Read, Permission::Write];
+
+        for (path, value) in [("first", "alpha-secret"), ("second", "beta-secret")] {
+            service
+                .put_value(request_for_prefix(
+                    secret_put(&format!("/tests/encryptionswap/{path}"), value),
+                    "/tests/encryptionswap",
+                    &permissions,
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Someone with SQL write access copies one value's ciphertext over
+        // another's. Without the row binding this would silently reveal the
+        // first secret under the second path.
+        let (_, first_stored, _) = stored_value(&pool, "/tests/encryptionswap/first").await;
+        let (second_id, _, _) = stored_value(&pool, "/tests/encryptionswap/second").await;
+        sqlx::query("UPDATE configuration_value_contents SET value = $2 WHERE id = $1")
+            .bind(second_id)
+            .bind(&first_stored)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = service
+            .reveal_secret(request_for_prefix(
+                RevealSecretRequest {
+                    path: "/tests/encryptionswap/second".into(),
+                },
+                "/tests/encryptionswap",
+                &permissions,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Internal);
+        assert!(!error.message().contains("alpha-secret"));
+        assert!(!error.message().contains("enc:v1:"));
+
+        clear_test_paths(&pool, &["/tests/encryptionswap"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn postgres_reclassification_switches_the_stored_representation() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/encryptionclass"]).await;
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
+        let permissions = [Permission::Read, Permission::Write];
+        let path = "/tests/encryptionclass/value";
+
+        service
+            .put_value(request_for_prefix(
+                plain_put(path, "not-yet-sensitive"),
+                "/tests/encryptionclass",
+                &permissions,
+            ))
+            .await
+            .unwrap();
+        let (_, stored, classification) = stored_value(&pool, path).await;
+        assert_eq!(
+            (stored.as_str(), classification.as_str()),
+            ("not-yet-sensitive", "plain")
+        );
+
+        // plain -> secret seals the new value.
+        service
+            .put_value(request_for_prefix(
+                secret_put(path, "now-sensitive"),
+                "/tests/encryptionclass",
+                &permissions,
+            ))
+            .await
+            .unwrap();
+        let (_, stored, classification) = stored_value(&pool, path).await;
+        assert_eq!(classification, "secret");
+        assert!(stored.starts_with("enc:v1:"));
+        assert!(!stored.contains("now-sensitive"));
+        let revealed = service
+            .reveal_secret(request_for_prefix(
+                RevealSecretRequest { path: path.into() },
+                "/tests/encryptionclass",
+                &permissions,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(revealed.value, "now-sensitive");
+
+        // secret -> plain stores the new value in the clear, and it is no
+        // longer revealable.
+        service
+            .put_value(request_for_prefix(
+                plain_put(path, "public-again"),
+                "/tests/encryptionclass",
+                &permissions,
+            ))
+            .await
+            .unwrap();
+        let (_, stored, classification) = stored_value(&pool, path).await;
+        assert_eq!(
+            (stored.as_str(), classification.as_str()),
+            ("public-again", "plain")
+        );
+        let error = service
+            .reveal_secret(request_for_prefix(
+                RevealSecretRequest { path: path.into() },
+                "/tests/encryptionclass",
+                &permissions,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+
+        clear_test_paths(&pool, &["/tests/encryptionclass"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn postgres_encrypts_legacy_plaintext_secrets_once() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/encryptionbackfill"]).await;
+        let cipher = test_cipher();
+        let path = "/tests/encryptionbackfill/legacy";
+        seed_legacy_plaintext_secret(&pool, path, "legacy-secret").await;
+
+        encrypt_stored_secrets(&pool, &cipher).await.unwrap();
+
+        let (_, sealed, classification) = stored_value(&pool, path).await;
+        assert_eq!(classification, "secret");
+        assert!(sealed.starts_with("enc:v1:"));
+        assert!(!sealed.contains("legacy-secret"));
+
+        let service = ConfigurationService::new(pool.clone(), Arc::clone(&cipher));
+        let permissions = [Permission::Read, Permission::Write];
+        let revealed = service
+            .reveal_secret(request_for_prefix(
+                RevealSecretRequest { path: path.into() },
+                "/tests/encryptionbackfill",
+                &permissions,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(revealed.value, "legacy-secret");
+
+        // Running again must not re-seal what is already sealed: a second
+        // layer would make the value unreadable.
+        encrypt_stored_secrets(&pool, &cipher).await.unwrap();
+        let (_, after, _) = stored_value(&pool, path).await;
+        assert_eq!(after, sealed);
+
+        clear_test_paths(&pool, &["/tests/encryptionbackfill"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn postgres_refuses_to_start_against_a_secret_it_cannot_read() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/encryptionwrongkey"]).await;
+        let path = "/tests/encryptionwrongkey/token";
+        seed_legacy_plaintext_secret(&pool, path, "placeholder").await;
+        let (content_id, _, _) = stored_value(&pool, path).await;
+
+        // Stand in for a database whose secrets were sealed under a key this
+        // server no longer has. Sealing just this row keeps the rest of the
+        // shared test database readable, so the pass fails for exactly one
+        // reason.
+        let foreign = cipher_seeded(0x11)
+            .encrypt(content_id, "secret", "sealed-under-another-key")
+            .unwrap();
+        sqlx::query("UPDATE configuration_value_contents SET value = $2 WHERE id = $1")
+            .bind(content_id)
+            .bind(&foreign)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Startup must stop rather than run on and fail every reveal — or,
+        // worse, seal a second layer over data that is perfectly intact under
+        // the right key.
+        let error = encrypt_stored_secrets(&pool, &test_cipher())
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("unreadable"),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains(&content_id.to_string()));
+        assert!(!message.contains("sealed-under-another-key"));
+        assert!(!message.contains(&foreign));
+
+        let (_, unchanged, _) = stored_value(&pool, path).await;
+        assert_eq!(unchanged, foreign);
+
+        clear_test_paths(&pool, &["/tests/encryptionwrongkey"]).await;
         pool.close().await;
     }
 }
