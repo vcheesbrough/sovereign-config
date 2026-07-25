@@ -448,7 +448,7 @@ async fn tools_list_exposes_the_implemented_surface_including_aliases() {
 }
 
 #[tokio::test]
-async fn alias_add_creates_the_new_path_without_widening() {
+async fn alias_add_passes_the_exact_paths_to_the_backend() {
     let out = run_script(
         MockBackend::healthy(),
         &[call(

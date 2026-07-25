@@ -574,6 +574,7 @@ fn map_status(status: &tonic::Status) -> ClientError {
         Code::FailedPrecondition => RpcCode::FailedPrecondition,
         Code::InvalidArgument => RpcCode::InvalidArgument,
         Code::NotFound => RpcCode::NotFound,
+        Code::AlreadyExists => RpcCode::AlreadyExists,
         Code::Aborted | Code::Cancelled | Code::DeadlineExceeded | Code::Unavailable => {
             RpcCode::Unavailable
         }

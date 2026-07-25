@@ -672,6 +672,9 @@ pub enum ErrorKind {
     IncompatibleProtocol,
     InvalidRequest,
     NotFound,
+    /// The request cannot apply because the target is already taken, such as
+    /// aliasing a value onto an occupied path.
+    Conflict,
     Unavailable,
     Internal,
 }

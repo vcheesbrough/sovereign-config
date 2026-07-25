@@ -1810,14 +1810,17 @@ fn cancel_add_path() {
 }
 
 async fn add_selected_path() {
+    // Inspect the target without consuming it so a malformed path can be
+    // corrected in place, then take it before awaiting: a second activation
+    // while the request is in flight would otherwise send the same alias twice,
+    // and the duplicate's conflict would report a failure for a mutation that
+    // actually succeeded.
     let Some(target) = ADD_PATH_TARGET.with_borrow(Clone::clone) else {
         return;
     };
     let entered = element::<HtmlInputElement>("add-path-input")
         .map(|input| input.value())
         .unwrap_or_default();
-    // Keep the dialog open on a malformed path so the operator can correct it
-    // without losing the value they selected.
     let Ok(new_path) = ConfigPath::parse_operation(entered.trim()) else {
         set_text(
             "add-path-error",
@@ -1827,6 +1830,8 @@ async fn add_selected_path() {
         focus("add-path-input");
         return;
     };
+    ADD_PATH_TARGET.with_borrow_mut(Option::take);
+    set_button_disabled("confirm-add-path", true);
     clear_error();
     let result = async {
         let config = app_config()?;
@@ -1835,7 +1840,9 @@ async fn add_selected_path() {
             .await
     }
     .await;
-    ADD_PATH_TARGET.with_borrow_mut(Option::take);
+    // Re-enable for the next time the dialog opens; the target stays consumed so
+    // a retry starts from the row, as a failed delete does.
+    set_button_disabled("confirm-add-path", false);
     close_add_path_dialog();
     match result {
         Ok(_) => {
@@ -3607,6 +3614,7 @@ fn grpc_status_code(status: u16) -> RpcCode {
     match status {
         3 => RpcCode::InvalidArgument,
         5 => RpcCode::NotFound,
+        6 => RpcCode::AlreadyExists,
         7 => RpcCode::PermissionDenied,
         9 => RpcCode::FailedPrecondition,
         10 | 14 => RpcCode::Unavailable,

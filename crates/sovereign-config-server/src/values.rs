@@ -51,6 +51,13 @@ struct PathContentRow {
 }
 
 #[derive(FromRow)]
+struct PathContentClassRow {
+    content_id: i64,
+    classification: String,
+    path_count: i64,
+}
+
+#[derive(FromRow)]
 struct DeletedPathRow {
     content_id: i64,
 }
@@ -215,14 +222,39 @@ impl Configuration for ConfigurationService {
             .map_err(|_| storage_unavailable())?;
         lock_mutation_path(&mut transaction, &path).await?;
         let now = OffsetDateTime::from(SystemTime::now());
-        let existing = sqlx::query_scalar::<_, i64>(
-            "SELECT content_id FROM configuration_paths WHERE path = $1",
+        let existing = sqlx::query_as::<_, PathContentClassRow>(
+            r"
+            SELECT
+                p.content_id,
+                c.classification,
+                (
+                    SELECT COUNT(*)
+                    FROM configuration_paths siblings
+                    WHERE siblings.content_id = p.content_id
+                ) AS path_count
+            FROM configuration_paths p
+            JOIN configuration_value_contents c ON c.id = p.content_id
+            WHERE p.path = $1
+            ",
         )
         .bind(path.as_str())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| storage_unavailable())?;
-        let row = if let Some(content_id) = existing {
+        let row = if let Some(existing) = existing {
+            // Classification belongs to the stored value, so it cannot differ
+            // between aliases. Rather than let a write through one path silently
+            // change how the value is exposed at every other path — including
+            // paths the caller may not be able to see — refuse the change while
+            // more than one path resolves to it. Rotating a value in place, and
+            // changing classification while a single path remains, both still
+            // work.
+            if existing.path_count > 1 && existing.classification != classification {
+                return Err(Status::invalid_argument(
+                    "configuration value has multiple paths and cannot change classification",
+                ));
+            }
+            let content_id = existing.content_id;
             // Writing through any path updates the shared content, so every
             // other path aliasing it observes the new value.
             sqlx::query_as::<_, MutationRow>(
@@ -391,6 +423,21 @@ impl Configuration for ConfigurationService {
         .await
         .map_err(|_| storage_unavailable())?;
         prune_orphan_contents(&mut transaction, &content_ids(&cleared)).await?;
+        // Several paths in the subtree can alias one stored value, and the
+        // subtree representation exposes every one of them. Resolve each
+        // mutation to its content before writing so a shared value is written
+        // exactly once: applying one update per path would let the last path in
+        // sort order overwrite the others, silently discarding an edit while
+        // still reporting success. Ascending content id also gives concurrent
+        // replacements a common write order.
+        // The map must stay ordered by content id: iterating it ascending is
+        // what gives concurrent replacements a common row-lock order. Values
+        // cross-aliased between disjoint subtrees (X at /a/1 and /b/2, Y at /a/2
+        // and /b/1) would otherwise lock X-then-Y in one transaction and
+        // Y-then-X in the other and deadlock, since their path locks are
+        // disjoint. Do not swap this for a HashMap.
+        let mut shared: BTreeMap<i64, &String> = BTreeMap::new();
+        let mut fresh: Vec<(&String, &String)> = Vec::new();
         for value in &values {
             let Some(sub_tree_mutation_value::Content::PlainValue(content)) =
                 value.content.as_ref()
@@ -404,24 +451,41 @@ impl Configuration for ConfigurationService {
             .fetch_optional(&mut *transaction)
             .await
             .map_err(|_| storage_unavailable())?;
-            if let Some(content_id) = existing {
-                sqlx::query(
-                    r"
-                    UPDATE configuration_value_contents
-                    SET value = $2, classification = 'plain', updated_at = $3
-                    WHERE id = $1
-                    ",
-                )
-                .bind(content_id)
-                .bind(content)
-                .bind(now)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|_| storage_unavailable())?;
-            } else {
-                let inserted = insert_content(&mut transaction, content, "plain", now).await?;
-                insert_path(&mut transaction, &value.path, inserted.id, now).await?;
+            match existing {
+                Some(content_id) => match shared.get(&content_id) {
+                    // Aliases of one value must agree; a genuine conflict is
+                    // ambiguous, so reject it rather than pick a winner.
+                    Some(assigned) if *assigned != content => {
+                        return Err(Status::invalid_argument(
+                            "configuration subtree assigns conflicting values to one stored value",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        shared.insert(content_id, content);
+                    }
+                },
+                None => fresh.push((&value.path, content)),
             }
+        }
+        for (content_id, content) in &shared {
+            sqlx::query(
+                r"
+                UPDATE configuration_value_contents
+                SET value = $2, classification = 'plain', updated_at = $3
+                WHERE id = $1
+                ",
+            )
+            .bind(content_id)
+            .bind(content)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| storage_unavailable())?;
+        }
+        for (path, content) in fresh {
+            let inserted = insert_content(&mut transaction, content, "plain", now).await?;
+            insert_path(&mut transaction, path, inserted.id, now).await?;
         }
         transaction
             .commit()
@@ -710,6 +774,20 @@ async fn prune_orphan_contents(
 ) -> Result<(), Status> {
     if content_ids.is_empty() {
         return Ok(());
+    }
+    // Path locks do not serialize deletions of aliases under unrelated
+    // hierarchies, so two transactions each removing one of a value's last two
+    // paths would both still see the other's uncommitted path row and skip
+    // pruning, orphaning the content permanently. Lock each affected content
+    // first. `content_ids` arrives sorted and deduplicated, so concurrent
+    // pruners take these in a common order and cannot deadlock; every path lock
+    // in a transaction is already held before any content lock.
+    for content_id in content_ids {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('content:' || $1::TEXT, 0))")
+            .bind(content_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| storage_unavailable())?;
     }
     sqlx::query(
         r"
@@ -1955,6 +2033,408 @@ mod tests {
         assert_eq!(orphaned, 0);
 
         clear_test_paths(&pool, &["/tests/alias"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn postgres_refuses_to_reclassify_a_value_with_multiple_paths() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/aliasclass"]).await;
+        let service = ConfigurationService::new(pool.clone());
+        let read_write = [Permission::Read, Permission::Write];
+
+        service
+            .put_value(request_for_prefix(
+                secret_put("/tests/aliasclass/credential", "secret-sentinel"),
+                "/tests/aliasclass",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+        service
+            .add_value_path(request_for_prefix(
+                AddValuePathRequest {
+                    source_path: "/tests/aliasclass/credential".into(),
+                    new_path: "/tests/aliasclass/mirror".into(),
+                },
+                "/tests/aliasclass",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+
+        // Demoting the secret through either alias would change how the value is
+        // exposed at the other path, so it is refused while both exist.
+        for path in ["/tests/aliasclass/credential", "/tests/aliasclass/mirror"] {
+            let refused = service
+                .put_value(request_for_prefix(
+                    plain_put(path, "demoted"),
+                    "/tests/aliasclass",
+                    &read_write,
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code(), Code::InvalidArgument);
+        }
+        let classification = sqlx::query_scalar::<_, String>(
+            r"
+            SELECT c.classification
+            FROM configuration_paths p
+            JOIN configuration_value_contents c ON c.id = p.content_id
+            WHERE p.path = '/tests/aliasclass/credential'
+            ",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(classification, "secret");
+
+        // Rotating the secret in place is unaffected by the alias.
+        service
+            .put_value(request_for_prefix(
+                secret_put("/tests/aliasclass/credential", "rotated-sentinel"),
+                "/tests/aliasclass",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .reveal_secret(request_for_prefix(
+                    RevealSecretRequest {
+                        path: "/tests/aliasclass/mirror".into(),
+                    },
+                    "/tests/aliasclass",
+                    &[Permission::Read],
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .value,
+            "rotated-sentinel"
+        );
+
+        // Once a single path remains, classification can change again.
+        service
+            .delete_values(request_for_prefix(
+                DeleteValuesRequest {
+                    path: "/tests/aliasclass/mirror".into(),
+                    recurse: false,
+                },
+                "/tests/aliasclass",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        service
+            .put_value(request_for_prefix(
+                plain_put("/tests/aliasclass/credential", "now-plain"),
+                "/tests/aliasclass",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+
+        clear_test_paths(&pool, &["/tests/aliasclass"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_replaces_cross_aliased_subtrees_without_deadlock() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let service = ConfigurationService::new(pool.clone());
+        let read_write = [Permission::Read, Permission::Write];
+        let replace = [Permission::Write, Permission::Manage];
+
+        // Two values, each aliased across both subtrees in opposite positions:
+        // updating by path order would lock them in opposite orders.
+        for round in 0..6 {
+            clear_test_paths(&pool, &["/tests/crossleft", "/tests/crossright"]).await;
+            let left_first = format!("/tests/crossleft/one-{round}");
+            let left_second = format!("/tests/crossleft/two-{round}");
+            let right_first = format!("/tests/crossright/one-{round}");
+            let right_second = format!("/tests/crossright/two-{round}");
+            for (source, alias) in [(&left_first, &right_second), (&left_second, &right_first)] {
+                service
+                    .put_value(request_with_grants(
+                        plain_put(source, "seed"),
+                        &[("/", &read_write)],
+                    ))
+                    .await
+                    .unwrap();
+                service
+                    .add_value_path(request_with_grants(
+                        AddValuePathRequest {
+                            source_path: source.clone(),
+                            new_path: alias.clone(),
+                        },
+                        &[("/", &read_write)],
+                    ))
+                    .await
+                    .unwrap();
+            }
+
+            let left_service = service.clone();
+            let right_service = service.clone();
+            let left_values = vec![
+                plain_mutation(&left_first, "left"),
+                plain_mutation(&left_second, "left"),
+            ];
+            let right_values = vec![
+                plain_mutation(&right_first, "right"),
+                plain_mutation(&right_second, "right"),
+            ];
+            let left_task = tokio::spawn(async move {
+                left_service
+                    .replace_sub_tree(request_with_grants(
+                        ReplaceSubTreeRequest {
+                            path: "/tests/crossleft".into(),
+                            values: left_values,
+                        },
+                        &[("/", &replace)],
+                    ))
+                    .await
+            });
+            let right_task = tokio::spawn(async move {
+                right_service
+                    .replace_sub_tree(request_with_grants(
+                        ReplaceSubTreeRequest {
+                            path: "/tests/crossright".into(),
+                            values: right_values,
+                        },
+                        &[("/", &replace)],
+                    ))
+                    .await
+            });
+
+            // A deadlock would abort one transaction; both must commit.
+            for task in [left_task, right_task] {
+                timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_or_else(|error| {
+                        panic!("cross-aliased replacement failed in round {round}: {error:?}")
+                    });
+            }
+        }
+
+        clear_test_paths(&pool, &["/tests/crossleft", "/tests/crossright"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn postgres_prunes_content_when_last_aliases_are_deleted_concurrently() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let service = ConfigurationService::new(pool.clone());
+        let read_write = [Permission::Read, Permission::Write];
+
+        // The two aliases sit under unrelated hierarchies, so the path locks
+        // deliberately do not serialize these deletions. Repeat the race to make
+        // an unsynchronized prune overwhelmingly likely to be observed.
+        for round in 0..8 {
+            clear_test_paths(&pool, &["/tests/aliasrace-left", "/tests/aliasrace-right"]).await;
+            let left = format!("/tests/aliasrace-left/value-{round}");
+            let right = format!("/tests/aliasrace-right/value-{round}");
+            service
+                .put_value(request_with_grants(
+                    plain_put(&left, "shared"),
+                    &[("/", &read_write)],
+                ))
+                .await
+                .unwrap();
+            service
+                .add_value_path(request_with_grants(
+                    AddValuePathRequest {
+                        source_path: left.clone(),
+                        new_path: right.clone(),
+                    },
+                    &[("/", &read_write)],
+                ))
+                .await
+                .unwrap();
+            let content_id: i64 =
+                sqlx::query_scalar("SELECT content_id FROM configuration_paths WHERE path = $1")
+                    .bind(&left)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+
+            let first = service.clone();
+            let second = service.clone();
+            let left_task = tokio::spawn(async move {
+                first
+                    .delete_values(request_with_grants(
+                        DeleteValuesRequest {
+                            path: left,
+                            recurse: false,
+                        },
+                        &[("/", &[Permission::Write])],
+                    ))
+                    .await
+            });
+            let right_task = tokio::spawn(async move {
+                second
+                    .delete_values(request_with_grants(
+                        DeleteValuesRequest {
+                            path: right,
+                            recurse: false,
+                        },
+                        &[("/", &[Permission::Write])],
+                    ))
+                    .await
+            });
+            for task in [left_task, right_task] {
+                timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+
+            // Every path is gone, so the value must be gone with it: an
+            // unreachable content row would retain secret plaintext forever.
+            let orphaned: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM configuration_value_contents WHERE id = $1",
+            )
+            .bind(content_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                orphaned, 0,
+                "content survived its last paths in round {round}"
+            );
+        }
+
+        clear_test_paths(&pool, &["/tests/aliasrace-left", "/tests/aliasrace-right"]).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn postgres_subtree_replacement_writes_a_shared_value_once() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/aliasreplace"]).await;
+        let service = ConfigurationService::new(pool.clone());
+        let read_write = [Permission::Read, Permission::Write];
+        let replace = [Permission::Write, Permission::Manage];
+
+        service
+            .put_value(request_for_prefix(
+                plain_put("/tests/aliasreplace/first", "original"),
+                "/tests/aliasreplace",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+        service
+            .add_value_path(request_for_prefix(
+                AddValuePathRequest {
+                    source_path: "/tests/aliasreplace/first".into(),
+                    new_path: "/tests/aliasreplace/second".into(),
+                },
+                "/tests/aliasreplace",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+
+        // Editing one alias while the other still carries the old value is
+        // ambiguous: rejected rather than silently resolved by sort order.
+        let conflicting = service
+            .replace_sub_tree(request_for_prefix(
+                ReplaceSubTreeRequest {
+                    path: "/tests/aliasreplace".into(),
+                    values: vec![
+                        plain_mutation("/tests/aliasreplace/first", "edited"),
+                        plain_mutation("/tests/aliasreplace/second", "original"),
+                    ],
+                },
+                "/tests/aliasreplace",
+                &replace,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(conflicting.code(), Code::InvalidArgument);
+        let unchanged = sqlx::query_scalar::<_, String>(
+            r"
+            SELECT c.value
+            FROM configuration_paths p
+            JOIN configuration_value_contents c ON c.id = p.content_id
+            WHERE p.path = '/tests/aliasreplace/first'
+            ",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged, "original");
+
+        // Agreeing aliases collapse to a single write, and both paths survive.
+        service
+            .replace_sub_tree(request_for_prefix(
+                ReplaceSubTreeRequest {
+                    path: "/tests/aliasreplace".into(),
+                    values: vec![
+                        plain_mutation("/tests/aliasreplace/first", "edited"),
+                        plain_mutation("/tests/aliasreplace/second", "edited"),
+                    ],
+                },
+                "/tests/aliasreplace",
+                &replace,
+            ))
+            .await
+            .unwrap();
+        let stored = sqlx::query_scalar::<_, String>(
+            r"
+            SELECT c.value
+            FROM configuration_paths p
+            JOIN configuration_value_contents c ON c.id = p.content_id
+            WHERE p.path = ANY(ARRAY['/tests/aliasreplace/first', '/tests/aliasreplace/second'])
+            GROUP BY c.value
+            ",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, ["edited"]);
+        let contents: i64 = sqlx::query_scalar(
+            r"
+            SELECT COUNT(DISTINCT p.content_id)
+            FROM configuration_paths p
+            WHERE p.path LIKE '/tests/aliasreplace/%'
+            ",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(contents, 1);
+
+        clear_test_paths(&pool, &["/tests/aliasreplace"]).await;
         pool.close().await;
     }
 

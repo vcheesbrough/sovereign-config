@@ -55,7 +55,9 @@ impl From<ClientError> for ProviderError {
             ErrorKind::Unauthenticated => Self::AuthenticationFailed,
             ErrorKind::PermissionDenied => Self::PermissionDenied,
             ErrorKind::IncompatibleProtocol => Self::IncompatibleProtocol,
-            ErrorKind::InvalidRequest => Self::InvalidRequest,
+            // The provider only reads configuration, so it never targets an
+            // occupied path; a conflict would still be a rejected request.
+            ErrorKind::InvalidRequest | ErrorKind::Conflict => Self::InvalidRequest,
             ErrorKind::NotFound => Self::NotFound,
             ErrorKind::Unavailable => Self::Unavailable,
             ErrorKind::Internal => Self::Internal,
