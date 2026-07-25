@@ -1,6 +1,7 @@
 mod auth;
 mod authentik;
 mod config;
+mod encryption;
 mod managed;
 mod metrics;
 mod values;
@@ -32,7 +33,7 @@ use sovereign_config_proto::sovereign::config::v3::{
     managed_connections_server::ManagedConnectionsServer,
     system_server::{System, SystemServer},
 };
-use values::ConfigurationService;
+use values::{ConfigurationService, encrypt_stored_secrets};
 use web::WebAssetsLayer;
 
 const SYSTEM_SERVICE_NAME: &str = "sovereign.config.v3.System";
@@ -168,6 +169,9 @@ async fn main() -> Result<()> {
         .await
         .context("database migration failed")?;
 
+    let value_cipher = Arc::new(config.value_cipher);
+    encrypt_stored_secrets(&database, &value_cipher).await?;
+
     let state = AppState {
         database,
         authentication_metrics: Arc::clone(&authentication_metrics),
@@ -209,6 +213,7 @@ async fn main() -> Result<()> {
         .add_service(SystemServer::new(SystemService))
         .add_service(ConfigurationServer::new(ConfigurationService::new(
             state.database.clone(),
+            Arc::clone(&value_cipher),
         )))
         .add_service(ManagedConnectionsServer::new(
             ManagedConnectionsService::new(

@@ -12,6 +12,7 @@ anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
+chacha20poly1305.workspace = true
 getrandom.workspace = true
 http.workspace = true
 http-body-util.workspace = true
@@ -31,6 +32,7 @@ tonic-web.workspace = true
 tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
 sovereign-config-proto = { path = "../sovereign-config-proto" }
 sovereign-config-core = { path = "../sovereign-config-core" }
 
