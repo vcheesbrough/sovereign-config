@@ -606,6 +606,7 @@ fn expected_kind(kind: &str) -> ErrorKind {
     match kind {
         "InvalidRequest" => ErrorKind::InvalidRequest,
         "NotFound" => ErrorKind::NotFound,
+        "Conflict" => ErrorKind::Conflict,
         "PermissionDenied" => ErrorKind::PermissionDenied,
         "IncompatibleProtocol" => ErrorKind::IncompatibleProtocol,
         "Unavailable" => ErrorKind::Unavailable,
@@ -620,6 +621,7 @@ fn contract_code(status: u16) -> Code {
         2 => Code::Unknown,
         3 => Code::InvalidArgument,
         5 => Code::NotFound,
+        6 => Code::AlreadyExists,
         7 => Code::PermissionDenied,
         9 => Code::FailedPrecondition,
         10 => Code::Aborted,

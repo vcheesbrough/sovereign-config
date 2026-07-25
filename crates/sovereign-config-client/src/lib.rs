@@ -16,6 +16,7 @@ pub enum RpcCode {
     FailedPrecondition,
     InvalidArgument,
     NotFound,
+    AlreadyExists,
     Unavailable,
     Other,
 }
@@ -37,6 +38,9 @@ pub fn map_rpc_status(code: RpcCode) -> ClientError {
             ClientError::new(ErrorKind::InvalidRequest, "request is invalid")
         }
         RpcCode::NotFound => ClientError::new(ErrorKind::NotFound, "configuration value not found"),
+        RpcCode::AlreadyExists => {
+            ClientError::new(ErrorKind::Conflict, "configuration path already exists")
+        }
         RpcCode::Unavailable => ClientError::new(ErrorKind::Unavailable, "service is unavailable"),
         RpcCode::Other => ClientError::new(ErrorKind::Internal, "request failed"),
     }

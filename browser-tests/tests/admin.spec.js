@@ -207,6 +207,7 @@ async function mockValues(page, initial = {}) {
   const requests = [];
   let delayedSubtree;
   let delayedReveal;
+  let delayedAddPath;
   await page.route('**/sovereign.config.v3.Configuration/*', async route => {
     const method = route.request().url().split('/').pop();
     const body = route.request().postDataBuffer();
@@ -289,6 +290,11 @@ async function mockValues(page, initial = {}) {
       });
     }
     if (method === 'AddValuePath') {
+      if (delayedAddPath) {
+        const delay = delayedAddPath;
+        delayedAddPath = undefined;
+        await delay.promise;
+      }
       const source = fields.get(1);
       const added = fields.get(2);
       const value = stored.get(source);
@@ -350,6 +356,12 @@ async function mockValues(page, initial = {}) {
       let release;
       const promise = new Promise(resolve => { release = resolve; });
       delayedReveal = { promise };
+      return release;
+    },
+    delayNextAddPath() {
+      let release;
+      const promise = new Promise(resolve => { release = resolve; });
+      delayedAddPath = { promise };
       return release;
     },
     setValue(path, value, secret = false) {
@@ -1127,6 +1139,35 @@ test('grid adds another path to an existing value', async ({ page }) => {
   expect(requests.map(request => request.method)).toEqual([
     'ListValues', 'AddValuePath', 'ListValues'
   ]);
+});
+
+test('a second add-path activation while the request is in flight is ignored', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  const values = await mockValues(page, {
+    '/apps/api/feature-flag': { value: 'aliased-value-sentinel' }
+  });
+  await page.goto('/configuration/apps/api');
+
+  const row = page.getByRole('row').filter({ has: page.getByLabel('Value for feature-flag') });
+  await row.getByRole('button', { name: 'Add a path to feature-flag' }).click();
+  await page.getByLabel('New absolute path').fill('/apps/worker/feature-flag');
+
+  // Hold the RPC open so both activations land while it is still in flight. A
+  // duplicate would create the path once and then report the second request's
+  // conflict, showing an error for a mutation that actually succeeded.
+  const release = values.delayNextAddPath();
+  const confirm = page.getByRole('button', { name: 'Add path', exact: true });
+  await confirm.click();
+  await expect(confirm).toBeDisabled();
+  await confirm.click({ force: true });
+  release();
+
+  await expect(page.getByText('Path added', { exact: true })).toBeVisible();
+  expect(values.requests.filter(request => request.method === 'AddValuePath')).toHaveLength(1);
+  await expect(page.locator('#error')).toBeHidden();
+  const refreshed = page.getByRole('row').filter({ has: page.getByLabel('Value for feature-flag') });
+  await expect(refreshed.getByText('/apps/worker/feature-flag', { exact: true })).toBeVisible();
 });
 
 // Two paths of one value can both sit directly under the selected namespace.
