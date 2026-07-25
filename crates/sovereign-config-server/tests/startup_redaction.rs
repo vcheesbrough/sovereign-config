@@ -3,6 +3,9 @@ use std::process::{Command, Output};
 const SECRET: &str = "startup-redaction-sentinel-4d9a9fd8";
 const INTROSPECTION_SECRET: &str = "introspection-redaction-sentinel-a91c5e72";
 const MANAGER_SECRET: &str = "manager-redaction-sentinel-e3b7c1f4";
+// A real 32-byte key, base64-encoded, so the server gets past key validation
+// on the paths that are meant to fail somewhere else.
+const VALUE_ENCRYPTION_KEY: &str = "dmFsdWUtZW5jcnlwdGlvbi1zZW50aW5lbC1rZXktMDE=";
 
 fn run_server(environment: &[(&str, String)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sovereign-config-server"));
@@ -32,6 +35,10 @@ fn assert_secret_is_redacted(output: &Output) {
     assert!(
         !output.contains(MANAGER_SECRET),
         "startup output exposed the manager credential: {output}"
+    );
+    assert!(
+        !output.contains(VALUE_ENCRYPTION_KEY),
+        "startup output exposed the value encryption key: {output}"
     );
 }
 
@@ -85,6 +92,10 @@ fn configured_environment(grpc_addr: &str) -> Vec<(&'static str, String)> {
             "SOVEREIGN_CONFIG_MANAGER_API_TOKEN",
             MANAGER_SECRET.to_owned(),
         ),
+        (
+            "SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY",
+            VALUE_ENCRYPTION_KEY.to_owned(),
+        ),
     ];
     environment.extend(authentication_environment());
     environment
@@ -126,4 +137,40 @@ fn invalid_public_origin_fails_startup_without_echoing_values() {
     let output = run_server(&environment);
 
     assert_secret_is_redacted(&output);
+}
+
+#[test]
+fn missing_value_encryption_key_fails_startup_without_echoing_values() {
+    let environment = configured_environment("127.0.0.1:50051")
+        .into_iter()
+        .filter(|(name, _)| *name != "SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY")
+        .collect::<Vec<_>>();
+    let output = run_server(&environment);
+
+    assert_secret_is_redacted(&output);
+}
+
+#[test]
+fn malformed_value_encryption_key_fails_startup_without_echoing_values() {
+    // A key of the wrong length must be rejected before it is ever used, and
+    // the rejection must describe the shape rather than quote the key.
+    let short_key = "c2hvcnQta2V5";
+    let mut environment = configured_environment("127.0.0.1:50051");
+    for entry in &mut environment {
+        if entry.0 == "SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY" {
+            entry.1 = short_key.to_owned();
+        }
+    }
+    let output = run_server(&environment);
+
+    assert_secret_is_redacted(&output);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !rendered.contains(short_key),
+        "startup output echoed the supplied key: {rendered}"
+    );
 }
