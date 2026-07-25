@@ -1105,6 +1105,13 @@ pub(crate) async fn encrypt_stored_secrets(
         .context("unable to begin the configuration secret encryption pass")?;
     // Replicas start concurrently, and two of them rewriting the same row would
     // race. The lock is held for the transaction, so it is released either way.
+    //
+    // It excludes other encryption passes, not live traffic: this assumes no
+    // other instance is already serving. The deployment runs one container, so
+    // the pass completes before anything can write. Anyone adding a replica or
+    // a rolling deploy must revisit this — a `put_value` landing between the
+    // SELECT below and its UPDATE would be overwritten by the sealed older
+    // value. Locking the rows (`FOR UPDATE`) is the fix at that point.
     sqlx::query(
         "SELECT pg_advisory_xact_lock(hashtextextended('sovereign-config:encrypt-stored-secrets', 0))",
     )

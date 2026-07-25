@@ -86,10 +86,16 @@ pub(crate) struct ValueCipher {
 }
 
 impl ValueCipher {
-    /// Builds a cipher from raw key bytes, wiping the caller's copy.
+    /// Builds a cipher from raw key bytes, wiping every copy it makes.
+    ///
+    /// The caller's buffer and the intermediate `Key` are both cleared: `Key`
+    /// is a plain array type with no zeroizing drop, so it would otherwise
+    /// leave the key sitting in this stack frame. The cipher's own copy is
+    /// wiped by `XChaCha20Poly1305`'s `ZeroizeOnDrop`.
     pub(crate) fn new(key_bytes: &mut [u8; KEY_LEN]) -> Self {
-        let key = Key::from(*key_bytes);
+        let mut key = Key::from(*key_bytes);
         let cipher = XChaCha20Poly1305::new(&key);
+        key.zeroize();
         key_bytes.zeroize();
         Self { cipher }
     }
