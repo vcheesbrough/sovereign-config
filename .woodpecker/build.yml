@@ -1,6 +1,8 @@
 # Two entry points; validate-authentik-version is the only step on both.
 #
-# push (dev): compute-version (allocate+tag the semver) → build-server →
+# push (dev): compute-version (allocate+tag the semver) → build-server ∥
+#   build-broker (two images, one semver — every docker build MUST pass
+#   --target, see the Dockerfile) →
 #   publish-dev-image (workspace-validation ∥ browser-validation also gate it) →
 #   apply-authentik-blueprint-auto-dev → validate-authentik-manager-live →
 #   auto-deploy-dev → tag-release-auto-dev (push the git tag).
@@ -41,7 +43,7 @@ steps:
       - event: push
     image: docker.io/koalaman/shellcheck-alpine@sha256:e19ed93c22423970d56568e171b4512c9244fc75dd9114045016b4a0073ac4b7
     commands:
-      - shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh
+      - shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh scripts/migrate-openbao-woodpecker-secrets.sh
 
   workspace-validation:
     depends_on: []
@@ -100,12 +102,32 @@ steps:
       - |
         RELEASE_TAG=$$(cat .release-tag)
         IMAGE=sovereign-config-ci:$$CI_COMMIT_SHA
-        docker build --platform linux/amd64 --build-arg RELEASE_VERSION="$$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
+        docker build --platform linux/amd64 --target server-runtime --build-arg RELEASE_VERSION="$$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
+        docker image inspect "$$IMAGE" >/dev/null
+
+  # The Woodpecker CI secrets extension, published as a second image under the
+  # same semver. `--target` is mandatory on both image builds: broker-runtime is
+  # the last stage in the Dockerfile, so an untargeted build would tag the
+  # broker as the server.
+  build-broker:
+    depends_on:
+      - compute-version
+    when:
+      - event: push
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - |
+        RELEASE_TAG=$$(cat .release-tag)
+        IMAGE=sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA
+        docker build --platform linux/amd64 --target broker-runtime --build-arg RELEASE_VERSION="$$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config-woodpecker-broker --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/crates/sovereign-config-woodpecker-broker/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
         docker image inspect "$$IMAGE" >/dev/null
 
   publish-dev-image:
     depends_on:
       - build-server
+      - build-broker
       - workspace-validation
       - browser-validation
       - shellcheck
@@ -123,9 +145,14 @@ steps:
       - |
         RELEASE_TAG=$$(cat .release-tag)
         IMAGE=registry.desync.link/sovereign-config:$$RELEASE_TAG
+        BROKER_IMAGE=registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG
         echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
         docker tag sovereign-config-ci:$$CI_COMMIT_SHA "$$IMAGE"
         docker push "$$IMAGE"
+        # Both images carry the same semver, so server and broker are always
+        # protocol-matched by construction.
+        docker tag sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA "$$BROKER_IMAGE"
+        docker push "$$BROKER_IMAGE"
 
   apply-authentik-blueprint-auto-dev:
     depends_on:
@@ -306,13 +333,19 @@ steps:
     commands:
       - |
         RELEASE_TAG=$$(cat .release-tag)
-        IMAGE=registry.desync.link/sovereign-config:$$RELEASE_TAG
         echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
-        if ! docker pull "$$IMAGE"; then
-          echo "ERROR: $$IMAGE not found in the registry." >&2
-          echo "The push pipeline (build + publish) must succeed for this commit before it can be promoted." >&2
-          exit 1
-        fi
+        # Fail closed if either image is missing: a promotion that shipped the
+        # server without its matching broker would leave CI resolving secrets
+        # against a stale extension.
+        for IMAGE in \
+          registry.desync.link/sovereign-config:$$RELEASE_TAG \
+          registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG; do
+          if ! docker pull "$$IMAGE"; then
+            echo "ERROR: $$IMAGE not found in the registry." >&2
+            echo "The push pipeline (build + publish) must succeed for this commit before it can be promoted." >&2
+            exit 1
+          fi
+        done
 
   apply-authentik-blueprint-prod:
     depends_on:

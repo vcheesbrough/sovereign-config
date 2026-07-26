@@ -122,6 +122,7 @@ fn build_and_dev_deploy_steps_run_on_push_only() {
         "workspace-validation",
         "browser-validation",
         "build-server",
+        "build-broker",
         "publish-dev-image",
         "apply-authentik-blueprint-auto-dev",
         "validate-authentik-manager-live",
@@ -137,6 +138,38 @@ fn build_and_dev_deploy_steps_run_on_push_only() {
             "{name} must be push-only so a production promotion never touches it"
         );
     }
+}
+
+/// The Dockerfile has two final stages, so an untargeted `docker build .`
+/// silently tags the *last* one. Without `--target`, `build-server` would
+/// publish the broker binary under the server's image name — a failure that
+/// would only surface at deploy time.
+#[test]
+fn each_image_build_names_its_dockerfile_target() {
+    let pipeline = pipeline();
+    for (name, target) in [
+        ("build-server", "--target server-runtime"),
+        ("build-broker", "--target broker-runtime"),
+    ] {
+        let commands = commands_text(step(&pipeline, name));
+        assert!(
+            commands.contains("docker build") && commands.contains(target),
+            "{name} must build with {target}"
+        );
+    }
+}
+
+/// Server and broker ship as one release: the same commit, the same semver, the
+/// same publish step. A tag that carries only one of them is not a release.
+#[test]
+fn the_release_publishes_both_images_under_one_semver() {
+    let publish = commands_text(step(&pipeline(), "publish-dev-image"));
+    assert!(
+        publish.contains("registry.desync.link/sovereign-config:$$RELEASE_TAG")
+            && publish
+                .contains("registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG"),
+        "publish-dev-image must push both images at the allocated release tag"
+    );
 }
 
 #[test]
@@ -182,6 +215,13 @@ fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
             && verify_cmd.contains("registry.desync.link/sovereign-config:")
             && !verify_cmd.contains("docker build"),
         "verify-image must pull the already-published image and never build"
+    );
+    // A release publishes the server and the Woodpecker broker under one semver.
+    // Promoting the server without its matching broker would leave CI resolving
+    // secrets against a stale extension, so the gate must cover both.
+    assert!(
+        verify_cmd.contains("registry.desync.link/sovereign-config-woodpecker-broker:"),
+        "verify-image must also prove the broker image was published for this tag"
     );
     // validate-authentik-version has no `when`, so it still gates both the dev
     // and prod blueprint applies.

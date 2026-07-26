@@ -58,6 +58,20 @@ async fn rooted_path_constraint_accepts_only_rooted_values(pool: &PgPool) {
     .bind(content_id)
     .execute(pool)
     .await;
+    // 0008 widened the segment grammar to permit `_` while still rejecting
+    // everything outside [a-z0-9_-].
+    let underscored_path = sqlx::query(
+        "INSERT INTO configuration_paths (path, content_id, created_at, updated_at) VALUES ('/woodpecker/global/github_token', $1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .bind(content_id)
+    .execute(pool)
+    .await;
+    let dotted_path = sqlx::query(
+        "INSERT INTO configuration_paths (path, content_id, created_at, updated_at) VALUES ('/woodpecker/global/github.token', $1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .bind(content_id)
+    .execute(pool)
+    .await;
     let retained_values: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM configuration_paths")
         .fetch_one(pool)
         .await
@@ -65,7 +79,9 @@ async fn rooted_path_constraint_accepts_only_rooted_values(pool: &PgPool) {
 
     assert!(invalid_path.is_err());
     assert!(rooted_path.is_ok());
-    assert_eq!(retained_values, 1);
+    assert!(underscored_path.is_ok());
+    assert!(dotted_path.is_err());
+    assert_eq!(retained_values, 2);
 }
 
 async fn classification_is_explicit_and_constrained(pool: &PgPool) {
@@ -115,6 +131,12 @@ async fn managed_connection_constraints_are_enforced(pool: &PgPool) {
     )
     .execute(pool)
     .await;
+    // 0008: a connection may be rooted at an underscored path.
+    let underscored_root = sqlx::query(
+        "INSERT INTO managed_connections (connection_id, display_name, root, state, created_at, updated_at) VALUES ('abcdefghij0123456789abcdefghij06', 'Woodpecker broker', '/woodpecker/repos/vcheesbrough/sovereign_config', 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .execute(pool)
+    .await;
 
     assert!(valid.is_ok());
     assert!(global_root.is_ok());
@@ -122,6 +144,7 @@ async fn managed_connection_constraints_are_enforced(pool: &PgPool) {
     assert!(invalid_state.is_err());
     assert!(invalid_root.is_err());
     assert!(padded_name.is_err());
+    assert!(underscored_root.is_ok());
 
     // A row inserted without the permissions column defaults to read-only.
     let backfilled: String = sqlx::query_scalar(
@@ -379,7 +402,7 @@ async fn migrations_are_repeatable_against_postgresql() {
     .fetch_one(&pool)
     .await
     .expect("credential column inventory must be readable");
-    assert_eq!(applied_migrations, 7);
+    assert_eq!(applied_migrations, 8);
     assert_eq!(metadata_rows, 1);
     assert_eq!(authorization_tables, 0);
     assert!(legacy_value_table.is_none());
