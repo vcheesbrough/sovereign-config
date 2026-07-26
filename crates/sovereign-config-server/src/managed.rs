@@ -1993,7 +1993,8 @@ mod tests {
             (&"x".repeat(101), "/apps"),
             ("control\nname", "/apps"),
             ("Valid", "not-rooted"),
-            ("Valid", "/Apps/Bad_Name"),
+            // `_` became a legal segment character in 2.15.0; `.` did not.
+            ("Valid", "/Apps/Bad.Name"),
         ] {
             let status = create(&service, name, root, &global)
                 .await

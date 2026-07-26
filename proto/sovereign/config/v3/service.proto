@@ -1,5 +1,20 @@
 syntax = "proto3";
 
+// Canonical configuration paths.
+//
+// Every `path`, `source_path`, `new_path`, and managed-connection `root` in
+// this file is a canonical absolute path matching `^/[a-z0-9_-]+(/[a-z0-9_-]+)*$`,
+// or the bare tree root `/` where a request selects rather than operates.
+// Requests are ASCII-case-insensitive; the service stores and returns the single
+// lowercase canonical form. Nothing else is accepted — no `.`, `+`, whitespace,
+// percent encoding, or non-ASCII.
+//
+// `_` was added to the segment character set in release 2.15.0. This widened
+// the v3 grammar without changing any signature: every previously valid path
+// remains valid. It is not backward compatible for clients, however — a client
+// built before 2.15.0 rejects a path containing `_` and fails the entire
+// response carrying it. Upgrade clients before storing an underscored path.
+
 package sovereign.config.v3;
 
 import "google/protobuf/timestamp.proto";

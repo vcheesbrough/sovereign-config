@@ -216,12 +216,18 @@ impl Configuration for ConfigurationService {
         request: Request<GetSubTreeRequest>,
     ) -> Result<Response<GetSubTreeResponse>, Status> {
         let path = authorize(&request, &[Permission::Read], true)?;
+        // Subtree matching uses starts_with, never LIKE: `_` is a legal path
+        // segment character (since 2.15.0) and a single-character LIKE
+        // wildcard, so `LIKE '/a/b_c/%'` would also match the sibling subtree
+        // `/a/bXc/` that authorize() never checked. This applies to every
+        // prefix match in this file. Do not "optimize" it back to LIKE for the
+        // btree prefix scan.
         let rows = sqlx::query_as::<_, SubTreeRow>(
             r"
             SELECT p.path, c.value, c.classification
             FROM configuration_paths p
             JOIN configuration_value_contents c ON c.id = p.content_id
-            WHERE $1 = '/' OR p.path = $1 OR p.path LIKE $1 || '/%'
+            WHERE $1 = '/' OR p.path = $1 OR starts_with(p.path, $1 || '/')
             ORDER BY p.path
             ",
         )
@@ -399,8 +405,8 @@ impl Configuration for ConfigurationService {
               AND (
                     $1 = '/'
                     OR p.path = $1
-                    OR p.path LIKE $1 || '/%'
-                    OR $1 LIKE p.path || '/%'
+                    OR starts_with(p.path, $1 || '/')
+                    OR starts_with($1, p.path || '/')
                   )
             ORDER BY p.path
             ",
@@ -462,7 +468,7 @@ impl Configuration for ConfigurationService {
             DELETE FROM configuration_paths p
             USING configuration_value_contents c
             WHERE p.content_id = c.id
-              AND ($1 = '/' OR p.path = $1 OR p.path LIKE $1 || '/%')
+              AND ($1 = '/' OR p.path = $1 OR starts_with(p.path, $1 || '/'))
               AND c.classification = 'plain'
               AND NOT (p.path = ANY($2::TEXT[]))
             RETURNING p.content_id
@@ -569,7 +575,7 @@ impl Configuration for ConfigurationService {
         lock_mutation_path(&mut transaction, &path).await?;
         let deleted = if recurse {
             sqlx::query_as::<_, DeletedPathRow>(
-                "DELETE FROM configuration_paths WHERE $1 = '/' OR path = $1 OR path LIKE $1 || '/%' RETURNING content_id",
+                "DELETE FROM configuration_paths WHERE $1 = '/' OR path = $1 OR starts_with(path, $1 || '/') RETURNING content_id",
             )
             .bind(path.as_str())
             .fetch_all(&mut *transaction)
@@ -771,7 +777,7 @@ async fn path_collides(
         SELECT path
         FROM configuration_paths
         WHERE path <> $1
-          AND (path LIKE $1 || '/%' OR $1 LIKE path || '/%')
+          AND (starts_with(path, $1 || '/') OR starts_with($1, path || '/'))
         LIMIT 1
         ",
     )
@@ -1335,7 +1341,7 @@ mod tests {
         let mut ids: Vec<i64> = Vec::new();
         for prefix in prefixes {
             let mut removed = sqlx::query_scalar::<_, i64>(
-                "DELETE FROM configuration_paths WHERE path = $1 OR path LIKE $1 || '/%' RETURNING content_id",
+                "DELETE FROM configuration_paths WHERE path = $1 OR starts_with(path, $1 || '/') RETURNING content_id",
             )
             .bind(prefix)
             .fetch_all(pool)
@@ -2910,6 +2916,85 @@ mod tests {
         assert_eq!(stored, "db.internal");
 
         clear_test_paths(&pool, &["/tests/encryptionplain"]).await;
+        pool.close().await;
+    }
+
+    // `_` is a single-character wildcard in SQL LIKE. Every subtree match in
+    // this file must therefore use starts_with, or a path containing `_` would
+    // reach across into a sibling subtree that authorize() never checked —
+    // silently widening reads and, worse, recursive deletes.
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    async fn postgres_treats_underscore_as_a_literal_not_a_wildcard() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/underscore"]).await;
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
+        let permissions = [Permission::Read, Permission::Write, Permission::Manage];
+
+        // `a_b` and `axb` are distinct subtrees that `LIKE '/…/a_b/%'` conflates.
+        for (path, value) in [
+            ("/tests/underscore/a_b/github_token", "under"),
+            ("/tests/underscore/axb/sibling", "sibling"),
+        ] {
+            service
+                .put_value(request_for_prefix(
+                    plain_put(path, value),
+                    "/tests/underscore",
+                    &permissions,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let subtree = service
+            .get_sub_tree(request_for_prefix(
+                GetSubTreeRequest {
+                    path: "/tests/underscore/a_b".into(),
+                },
+                "/tests/underscore",
+                &permissions,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let read: Vec<String> = subtree.values.into_iter().map(|value| value.path).collect();
+        assert_eq!(read, vec!["/tests/underscore/a_b/github_token".to_owned()]);
+
+        // The recursive delete is where the wildcard would destroy data.
+        service
+            .delete_values(request_for_prefix(
+                DeleteValuesRequest {
+                    path: "/tests/underscore/a_b".into(),
+                    recurse: true,
+                },
+                "/tests/underscore",
+                &permissions,
+            ))
+            .await
+            .unwrap();
+
+        let survivors = service
+            .get_sub_tree(request_for_prefix(
+                GetSubTreeRequest {
+                    path: "/tests/underscore".into(),
+                },
+                "/tests/underscore",
+                &permissions,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let remaining: Vec<String> = survivors
+            .values
+            .into_iter()
+            .map(|value| value.path)
+            .collect();
+        assert_eq!(remaining, vec!["/tests/underscore/axb/sibling".to_owned()]);
+
+        clear_test_paths(&pool, &["/tests/underscore"]).await;
         pool.close().await;
     }
 

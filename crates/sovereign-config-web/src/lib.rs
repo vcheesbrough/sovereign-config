@@ -1389,7 +1389,7 @@ fn parse_absolute_path(value: &str) -> Result<ConfigPath, ClientError> {
 fn invalid_path() -> ClientError {
     ClientError::new(
         ErrorKind::InvalidRequest,
-        "path must begin with / and contain only letters, numbers, and hyphens",
+        "path must begin with / and contain only letters, numbers, hyphens, and underscores",
     )
 }
 
@@ -2002,7 +2002,9 @@ fn validate_connection_root_field() -> bool {
         if valid {
             None
         } else {
-            Some("path must begin with / and contain only letters, numbers, and hyphens")
+            Some(
+                "path must begin with / and contain only letters, numbers, hyphens, and underscores",
+            )
         },
     );
     valid
@@ -3131,7 +3133,7 @@ fn validate_name_field() -> bool {
     let message = if ConfigPath::root().join_name(input.value()).is_ok() {
         None
     } else {
-        Some("Name must contain only letters, numbers, and hyphens")
+        Some("Name must contain only letters, numbers, hyphens, and underscores")
     };
     set_validation("new-value-name", "new-name-error", message);
     message.is_none()
@@ -3796,7 +3798,14 @@ mod tests {
             parse_absolute_path("/Apps/API").unwrap().as_str(),
             "/apps/api"
         );
-        for invalid in ["", "apps/api", "/apps/", "/apps/bad_name", "//apps"] {
+        // `_` became a legal segment character in 2.15.0; `.` did not.
+        assert_eq!(
+            parse_absolute_path("/Woodpecker/Global/GitHub_Token")
+                .unwrap()
+                .as_str(),
+            "/woodpecker/global/github_token"
+        );
+        for invalid in ["", "apps/api", "/apps/", "/apps/bad.name", "//apps"] {
             assert!(
                 parse_absolute_path(invalid).is_err(),
                 "accepted {invalid:?}"
