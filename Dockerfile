@@ -26,8 +26,11 @@ ARG RELEASE_VERSION
 RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=sovereign-config-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=sovereign-config-cargo-target,target=/src/target \
-    SOVEREIGN_CONFIG_RELEASE="$RELEASE_VERSION" cargo build --release --locked --package sovereign-config-server \
-    && cp /src/target/release/sovereign-config-server /tmp/sovereign-config-server
+    SOVEREIGN_CONFIG_RELEASE="$RELEASE_VERSION" cargo build --release --locked \
+        --package sovereign-config-server \
+        --package sovereign-config-woodpecker-broker \
+    && cp /src/target/release/sovereign-config-server /tmp/sovereign-config-server \
+    && cp /src/target/release/sovereign-config-woodpecker-broker /tmp/sovereign-config-woodpecker-broker
 
 # Build the first-party CLI as a fully static x86_64 musl binary (ring, no
 # OpenSSL, so musl links cleanly) and wrap it in a self-extracting installer.
@@ -62,7 +65,10 @@ RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/carg
         test "$("/tmp/verify-$label/$name" --version | awk '{print $NF}')" = "$version"; \
     done
 
-FROM docker.io/library/debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
+# This file builds two images from one source tree, so every build MUST name its
+# target. `server-runtime` is not the last stage, and an unnamed `docker build .`
+# would silently produce the broker image under the server's tag.
+FROM docker.io/library/debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS server-runtime
 RUN useradd --system --uid 10001 --create-home sovereign-config
 USER sovereign-config
 COPY --from=builder /tmp/sovereign-config-server /usr/local/bin/sovereign-config-server
@@ -71,3 +77,15 @@ ENV SOVEREIGN_CONFIG_DIST_DIR=/usr/local/share/sovereign-config/dist
 HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=12 \
     CMD ["/usr/local/bin/sovereign-config-server", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/sovereign-config-server"]
+
+# The Woodpecker CI secrets extension. Published as its own image under the same
+# workspace semver as the server, so the pair is protocol-matched by
+# construction. The healthcheck calls the broker's own /health over loopback in
+# process, so the runtime image needs no curl.
+FROM docker.io/library/debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS broker-runtime
+RUN useradd --system --uid 10001 --create-home sovereign-config-broker
+USER sovereign-config-broker
+COPY --from=builder /tmp/sovereign-config-woodpecker-broker /usr/local/bin/sovereign-config-woodpecker-broker
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=12 \
+    CMD ["/usr/local/bin/sovereign-config-woodpecker-broker", "healthcheck"]
+ENTRYPOINT ["/usr/local/bin/sovereign-config-woodpecker-broker"]

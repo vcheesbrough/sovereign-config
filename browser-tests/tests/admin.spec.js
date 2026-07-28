@@ -980,10 +980,17 @@ test('path and new-value fields validate on every keystroke', async ({ page }) =
   await page.getByRole('link', { name: 'Configuration values' }).click();
   const pathInput = page.getByLabel('Selected path');
 
-  await pathInput.fill('apps/bad_path');
+  await pathInput.fill('apps/unrooted-path');
   await expect(pathInput).toHaveAttribute('aria-invalid', 'true');
-  await expect(page.getByText('path must begin with / and contain only letters, numbers, and hyphens')).toBeVisible();
+  await expect(page.getByText('path must begin with / and contain only letters, numbers, hyphens, and underscores')).toBeVisible();
   await expect(page).toHaveURL(/\/configuration\/$/);
+
+  await pathInput.fill('/apps/bad.path');
+  await expect(pathInput).toHaveAttribute('aria-invalid', 'true');
+
+  // `_` is a legal segment character since 2.15.0.
+  await pathInput.fill('/apps/github_token');
+  await expect(pathInput).toHaveAttribute('aria-invalid', 'false');
 
   await pathInput.fill('/apps/new-area');
   await expect(pathInput).toHaveAttribute('aria-invalid', 'false');
@@ -993,9 +1000,11 @@ test('path and new-value fields validate on every keystroke', async ({ page }) =
 
   await page.getByRole('button', { name: 'Add value' }).click();
   const name = page.getByLabel('Name', { exact: true });
-  await name.fill('bad_name');
+  await name.fill('bad.name');
   await expect(name).toHaveAttribute('aria-invalid', 'true');
-  await expect(page.getByText('Name must contain only letters, numbers, and hyphens')).toBeVisible();
+  await expect(page.getByText('Name must contain only letters, numbers, hyphens, and underscores')).toBeVisible();
+  await name.fill('github_token');
+  await expect(name).toHaveAttribute('aria-invalid', 'false');
   await name.fill('Feature-Flag');
   await expect(name).toHaveAttribute('aria-invalid', 'false');
 
