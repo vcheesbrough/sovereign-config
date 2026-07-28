@@ -51,10 +51,20 @@ Placeholders (the complete set; anything else fails at startup):
 | `{pipeline.branch}` | `pipeline.branch` | absent on tag pipelines |
 | `{pipeline.event}` | `pipeline.event` | |
 
-Substituted text is lowercased, characters outside `[a-z0-9_-]` fold to `-`,
-runs collapse, and leading/trailing separators are dropped. A substitution that
-reduces to nothing **skips that layer** rather than reading a truncated path —
-so a hostile `full_name` cannot escape the root or invent a path level.
+Substituted text must **already** be a canonical path segment (`[a-z0-9_-]+`).
+Anything else — a `.`, a space, an uppercase letter, a `/` — causes that layer to
+be skipped, with a warning. Nothing is normalised or folded.
+
+That is deliberate. Folding is many-to-one, and the rendered path is what decides
+whose secrets a pipeline receives, so a collision hands one repository's secrets
+to another: `a.b` and `a-b` would share a layer, as would branches `Main` and
+`main`. Refusing fails closed instead — the pipeline gets no per-repo layer
+rather than someone else's. Where a forge name cannot be a path segment, use
+`{repo.forge_id}`, a stable integer that always resolves.
+
+A placeholder the forge simply did not send (no branch on a tag pipeline) also
+skips the layer, but is logged at debug rather than warn — that is an ordinary
+absence, not a misconfiguration.
 
 A layer that is absent, or that the connection may not read, is skipped and
 logged. Any other failure is a 503; returning an empty 200 would look to
@@ -72,13 +82,20 @@ Secret names are path segments, so they map one-to-one:
 `_` in a path segment requires **release 2.15.0 or later** — see the `Upgrade`
 section of the repository README before storing one.
 
-Values shared with non-Woodpecker consumers should stay canonical outside the
-broker's root and be exposed under it with an alias, because a managed
-connection has exactly one root:
+Values shared across every repository live directly under `/woodpecker/shared`
+— write them there and nowhere else:
 
 ```sh
-sovereign-config alias add /shared/global/registry /woodpecker/shared/global/registry
+printf '%s' 'registry.desync.link' | sovereign-config put /woodpecker/shared/global/registry
 ```
+
+Earlier drafts of this crate kept such values canonical outside the broker's
+root and exposed them underneath it with `alias add`. That indirection is
+gone: a value written at `/woodpecker/shared/...` needs no second step to reach
+the broker, and there is no other location where "the shared secret" also
+lives to fall out of sync. If some other system genuinely needs the same
+value, alias it *out* of `/woodpecker/shared` into that system's own
+namespace — the canonical copy stays here.
 
 Reads cost one `GetSubTree` per layer plus one `RevealSecret` per
 secret-classified leaf, because ordinary reads return secrets masked.
@@ -99,6 +116,17 @@ secret-classified leaf, because ordinary reads return secrets masked.
 The connection URL must be a **managed** connection (client credentials) with
 `read` only, rooted at the Woodpecker namespace. A live `WOODPECKER_URL` +
 `WOODPECKER_TOKEN` takes precedence over the key file, matching the Go broker.
+
+**`WOODPECKER_URL` must address Woodpecker on the private container network**
+(e.g. `http://devops-woodpecker-server:8000`), never a routable URL over plain
+HTTP. That fetch carries `WOODPECKER_TOKEN` and returns the key the broker will
+trust for every later signature check, so an on-path observer of it could both
+steal the token and choose the verification key. Plain HTTP is accepted, and
+correct, only because that hop stays inside the same network that already
+carries the resolved secrets — the deployed stack talks to Woodpecker, OpenBao
+and the extension endpoint over in-network HTTP throughout. The deployment uses
+`WOODPECKER_PUBLIC_KEY_FILE` instead, which is preferred: it removes the fetch
+entirely and leaves the broker with no startup dependency on Woodpecker.
 
 Endpoints: `GET /health` and `POST /secrets` on the request listener;
 `GET /metrics` and `GET /readyz` on the metrics listener. Only `/secrets`
@@ -139,9 +167,15 @@ Deliberate differences from the Go broker, all verified against its source:
 - Layer templates are validated at **startup**, not per request.
 - The placeholder set is closed rather than arbitrary struct field access.
 - The body digest is actually verified (above).
-- `pull_request_metadata` is **not** in the emitted event set, matching the Go
-  broker's eight events. Woodpecker recognises it as a ninth; adding it is a
-  deliberate change, not a bug fix.
+- A brokered secret is offered to `push`, `tag`, `release`, `deployment`,
+  `cron`, and `manual` — **not** `pull_request`, `pull_request_closed`, or
+  `pull_request_metadata`. This deliberately breaks parity with the Go broker,
+  which emits all eight non-metadata events unconditionally. A PR author
+  controls `.woodpecker/*.yml` on their own branch, so exposing a secret to a
+  PR event lets that pipeline exfiltrate it (echo it transformed — Woodpecker's
+  log masking only matches the verbatim string). This is Woodpecker's own
+  native-secret default (`cli/repo/secret/secret_add.go`'s
+  `defaultSecretEvents`, v3.13.0), not a broker invention.
 
 ## Cutover runbook
 

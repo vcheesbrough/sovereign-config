@@ -22,7 +22,7 @@ mod sovereign;
 #[cfg(test)]
 mod tests;
 
-use std::{env, net::SocketAddr, process::ExitCode, sync::Arc, time::Duration};
+use std::{env, process::ExitCode, sync::Arc, time::Duration};
 
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -108,10 +108,10 @@ async fn shutdown() {
 /// Calls the broker's own `/health` over loopback so the runtime image needs no
 /// `curl`.
 async fn healthcheck() -> ExitCode {
-    let Ok(configured) = env::var("SOVEREIGN_CONFIG_BROKER_LISTEN_ADDR") else {
-        return probe("127.0.0.1:8080").await;
-    };
-    let Ok(mut address) = configured.parse::<SocketAddr>() else {
+    // Resolved through the same function the server uses, so an address the
+    // server accepts is never one the healthcheck rejects. An address that
+    // fails here would also have failed startup.
+    let Ok(mut address) = config::listen_addr(&config::ProcessEnv) else {
         return ExitCode::FAILURE;
     };
     if address.ip().is_unspecified() {

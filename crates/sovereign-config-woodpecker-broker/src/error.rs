@@ -30,6 +30,14 @@ pub(crate) enum BrokerError {
     AuthUnavailable,
     #[error("broker is overloaded")]
     Overloaded,
+    /// The reader thread has exited — typically a panic inside `fetch` — so no
+    /// request can ever be served again until the container restarts. Kept
+    /// distinct from [`Self::Overloaded`] in the metric even though the HTTP
+    /// response is identical: "shed load, retry" and "the reader is gone,
+    /// restart" call for different operator responses, and conflating them
+    /// under one label hides which one is happening.
+    #[error("secret store unavailable")]
+    ReaderGone,
 }
 
 impl BrokerError {
@@ -37,7 +45,7 @@ impl BrokerError {
         match self {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::InvalidBody | Self::MissingFields => StatusCode::BAD_REQUEST,
-            Self::Unavailable | Self::AuthUnavailable | Self::Overloaded => {
+            Self::Unavailable | Self::AuthUnavailable | Self::Overloaded | Self::ReaderGone => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
         }
@@ -50,6 +58,7 @@ impl BrokerError {
             Self::InvalidBody | Self::MissingFields => "invalid",
             Self::Unavailable | Self::AuthUnavailable => "unavailable",
             Self::Overloaded => "overloaded",
+            Self::ReaderGone => "reader_gone",
         }
     }
 }
@@ -70,10 +79,15 @@ impl IntoResponse for BrokerError {
 
 /// Maps a Sovereign Config client error onto the broker's surface.
 ///
-/// `PermissionDenied` and `NotFound` are deliberately absent: a layer the
-/// connection may not read, or that does not exist, is skipped by the reader
-/// rather than failing the request — matching the Go broker's treatment of
-/// `OpenBao` 403 and 404.
+/// `PermissionDenied` and `NotFound` on a **layer** read (`GetSubTree`) are
+/// handled before this conversion runs: a layer the connection may not read, or
+/// that does not exist, is skipped rather than failing the request, matching
+/// the Go broker's treatment of `OpenBao` 403 and 404. This impl is reached by
+/// every other error, including a `RevealSecret` failure — where `NotFound` is
+/// also skipped (the leaf was deleted between listing and reveal) but
+/// `PermissionDenied` is not: the layer was readable, so a denial on one leaf
+/// means the grant does not cover what it appears to, and that is worth
+/// surfacing rather than silently shrinking the response.
 impl From<ClientError> for BrokerError {
     fn from(error: ClientError) -> Self {
         match error.kind {
@@ -124,6 +138,11 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "secret store unavailable",
             ),
+            (
+                BrokerError::ReaderGone,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "secret store unavailable",
+            ),
         ] {
             let response = error.into_response();
             assert_eq!(response.status(), status);
@@ -131,6 +150,19 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(json["error"], body);
         }
+    }
+
+    // The HTTP response is identical to `Overloaded` — Woodpecker cannot tell
+    // "shed load" from "the reader is gone" apart, and should not need to — but
+    // the metric outcome must stay distinct, because an operator restarting a
+    // dead reader is a different response than waiting out a busy one.
+    #[test]
+    fn reader_gone_is_a_distinct_outcome_from_overloaded() {
+        assert_ne!(
+            BrokerError::ReaderGone.outcome(),
+            BrokerError::Overloaded.outcome()
+        );
+        assert_eq!(BrokerError::ReaderGone.outcome(), "reader_gone");
     }
 
     #[test]

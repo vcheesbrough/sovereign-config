@@ -17,7 +17,6 @@ umask 077
 
 APPLY=0
 ROOT=/woodpecker
-SHARED_ROOT=/shared/global
 # Newline-separated so iteration never depends on word splitting.
 REPOS=""
 
@@ -70,6 +69,18 @@ if [ -z "$REPOS" ]; then
     exit 1
 fi
 
+# Failures are recorded in a file rather than a variable: the write loop runs
+# inside a `cmd | while read` pipeline, which is a subshell, so a variable set
+# there would not survive and `exit` would end only the subshell. The script
+# exits non-zero if this file has any content, so a partial migration can never
+# report success.
+FAILURE_LOG="$(mktemp)"
+trap 'rm -f "$FAILURE_LOG"' EXIT INT TERM
+
+record_failure() {
+    echo "$1" >>"$FAILURE_LOG"
+}
+
 # Sovereign Config path segments are [a-z0-9_-]. Anything else in a KV key has
 # no representation and must be renamed by hand rather than silently mangled.
 valid_segment() {
@@ -106,10 +117,16 @@ migrate_path() {
         fi
         target="$target_namespace/$key"
         if [ "$APPLY" -eq 1 ]; then
-            printf '%s' "$data" |
+            # A failed write must not be reported as a completed migration. The
+            # value is never echoed, so only the target path appears on failure.
+            if printf '%s' "$data" |
                 jq -rj --arg key "$key" '.data.data[$key]' |
-                sovereign-config secret put "$target"
-            echo "  wrote $key -> $target"
+                sovereign-config secret put "$target"; then
+                echo "  wrote $key -> $target"
+            else
+                echo "  ERROR: write failed for $target" >&2
+                record_failure "write $target"
+            fi
         else
             echo "  would write $key -> $target"
         fi
@@ -122,20 +139,10 @@ else
     echo "DRY RUN. Nothing will be written. Re-run with --apply to perform the migration."
 fi
 
-# Shared values stay canonical outside the broker's root and are exposed under
-# it by an alias, so a single managed connection rooted at $ROOT can read them
-# without being granted anything else.
-echo "shared/global -> $SHARED_ROOT (aliased into $ROOT/shared/global)"
-migrate_path "shared/global" "$SHARED_ROOT"
-if [ "$APPLY" -eq 1 ]; then
-    kv_keys "shared/global" | while IFS= read -r key; do
-        [ -n "$key" ] || continue
-        valid_segment "$key" || continue
-        sovereign-config alias add \
-            "$SHARED_ROOT/$key" "$ROOT/shared/global/$key" ||
-            echo "  note: alias for $key already exists" >&2
-    done
-fi
+# Shared values live only under $ROOT/shared — no canonical copy elsewhere, no
+# alias step. A value written here needs nothing further to reach the broker.
+echo "shared/global -> $ROOT/shared/global"
+migrate_path "shared/global" "$ROOT/shared/global"
 
 echo "woodpecker/global -> $ROOT/global"
 migrate_path "woodpecker/global" "$ROOT/global"
@@ -147,6 +154,14 @@ printf '%s\n' "$REPOS" | while IFS= read -r repo; do
 done
 
 echo
+if [ -s "$FAILURE_LOG" ]; then
+    echo "FAILED: $(wc -l <"$FAILURE_LOG" | tr -d ' ') operation(s) did not complete:" >&2
+    sed 's/^/  /' "$FAILURE_LOG" >&2
+    echo "The migration is incomplete. Fix the cause and re-run; completed writes" >&2
+    echo "are idempotent, so re-running is safe." >&2
+    exit 1
+fi
+
 if [ "$APPLY" -eq 1 ]; then
     echo "Done. Verify with: sovereign-config get $ROOT --format json"
     echo "Secrets read back masked; that is expected."

@@ -18,7 +18,14 @@ use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
 use crate::sovereign::SovereignHandle;
 
 /// Request outcomes, matching [`crate::error::BrokerError::outcome`] plus `ok`.
-const OUTCOMES: [&str; 5] = ["ok", "unauthorized", "invalid", "unavailable", "overloaded"];
+const OUTCOMES: [&str; 6] = [
+    "ok",
+    "unauthorized",
+    "invalid",
+    "unavailable",
+    "overloaded",
+    "reader_gone",
+];
 
 const SIGNATURE_REASONS: [&str; 11] = [
     "missing_headers",
