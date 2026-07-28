@@ -29,6 +29,14 @@ pub struct DeviceAuthorization {
 pub struct TokenSet {
     pub access_token: Secret,
     pub refresh_token: Option<Secret>,
+    /// The provider-reported lifetime of `access_token`, when the token
+    /// response carried one.
+    ///
+    /// Advisory only: `expires_in` is optional in OAuth 2.0, and a provider may
+    /// revoke a token before it lapses. A caller that caches the token must
+    /// apply its own ceiling and still re-acquire on an `Unauthenticated`
+    /// response rather than trusting this value.
+    pub expires_in: Option<Duration>,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +59,7 @@ struct DeviceResponse {
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
+    expires_in: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -178,6 +187,7 @@ impl DeviceFlowClient {
                 return Ok(TokenSet {
                     access_token: Secret::new(response.access_token),
                     refresh_token: response.refresh_token.map(Secret::new),
+                    expires_in: response.expires_in.map(Duration::from_secs),
                 });
             }
             let error: OAuthError = decode(response).await?;
@@ -228,6 +238,7 @@ impl DeviceFlowClient {
         Ok(TokenSet {
             access_token: Secret::new(response.access_token),
             refresh_token: response.refresh_token.map(Secret::new),
+            expires_in: response.expires_in.map(Duration::from_secs),
         })
     }
 
@@ -262,6 +273,7 @@ impl DeviceFlowClient {
         Ok(TokenSet {
             access_token: Secret::new(response.access_token),
             refresh_token: None,
+            expires_in: response.expires_in.map(Duration::from_secs),
         })
     }
 }
@@ -313,9 +325,12 @@ fn unavailable() -> ClientError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
     };
 
     use axum::{
@@ -388,6 +403,57 @@ mod tests {
         assert_eq!(captures.load(Ordering::SeqCst), 0);
         issuer_task.abort();
         capture_task.abort();
+    }
+
+    // `expires_in` is optional in OAuth 2.0, so a caching caller must cope with
+    // both a reported lifetime and its absence.
+    #[tokio::test]
+    async fn client_credentials_reports_token_lifetime_when_the_provider_supplies_one() {
+        for (body, expected) in [
+            (
+                json!({"access_token": "token-sentinel", "expires_in": 300}),
+                Some(Duration::from_secs(300)),
+            ),
+            (json!({"access_token": "token-sentinel"}), None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let issuer = format!("http://{address}/");
+            let state = Arc::new((issuer.clone(), body));
+            let app = Router::new()
+                .route(
+                    "/.well-known/openid-configuration",
+                    get(
+                        |State(state): State<Arc<(String, serde_json::Value)>>| async move {
+                            Json(json!({"token_endpoint": format!("{}token", state.0)}))
+                        },
+                    ),
+                )
+                .route(
+                    "/token",
+                    post(
+                        |State(state): State<Arc<(String, serde_json::Value)>>| async move {
+                            Json(state.1.clone())
+                        },
+                    ),
+                )
+                .with_state(state);
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let tokens = DeviceFlowClient::discover(&issuer, "client".to_owned())
+                .await
+                .unwrap()
+                .client_credentials(&Secret::new("credential-sentinel"))
+                .await
+                .unwrap();
+
+            assert_eq!(tokens.access_token.expose(), "token-sentinel");
+            assert!(tokens.refresh_token.is_none());
+            assert_eq!(tokens.expires_in, expected);
+            task.abort();
+        }
     }
 
     async fn discovery(State(state): State<Arc<RedirectState>>) -> Json<serde_json::Value> {

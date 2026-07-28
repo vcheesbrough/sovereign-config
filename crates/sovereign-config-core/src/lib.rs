@@ -26,6 +26,17 @@ pub enum PathError {
     NonCanonical,
 }
 
+/// A canonical absolute configuration path.
+///
+/// The grammar is `/` (the tree root) or `^/[a-z0-9_-]+(/[a-z0-9_-]+)*$`. Input
+/// is ASCII-case-insensitive and normalized to the single lowercase canonical
+/// form; nothing else — `.`, `+`, whitespace, percent encoding, non-ASCII — is
+/// accepted.
+///
+/// `_` was added to the segment character set in release 2.15.0. It is a
+/// widening of the `v3` protocol's canonical path grammar: a client built before
+/// that release rejects a path containing `_` and fails the whole response it
+/// arrived in. See the `Upgrade` section of the repository README.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ConfigPath(String);
@@ -42,7 +53,7 @@ impl ConfigPath {
     ///
     /// Returns [`PathError::NonCanonical`] when the path is not rooted, a segment
     /// is empty, or it contains characters outside lowercase ASCII letters,
-    /// digits, and `-`.
+    /// digits, `-`, and `_`.
     pub fn parse(value: impl Into<String>) -> Result<Self, PathError> {
         let value = value.into();
         if value == "/"
@@ -51,7 +62,10 @@ impl ConfigPath {
                     && relative.split('/').all(|segment| {
                         !segment.is_empty()
                             && segment.bytes().all(|byte| {
-                                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                                byte.is_ascii_lowercase()
+                                    || byte.is_ascii_digit()
+                                    || byte == b'-'
+                                    || byte == b'_'
                             })
                     })
             })
@@ -68,7 +82,7 @@ impl ConfigPath {
     ///
     /// Returns [`PathError::NonCanonical`] for root or unrooted paths, empty
     /// segments, non-ASCII text, percent encoding, or characters other than
-    /// ASCII letters, digits, and `-`.
+    /// ASCII letters, digits, `-`, and `_`.
     pub fn parse_operation(value: impl AsRef<str>) -> Result<Self, PathError> {
         let value = value.as_ref();
         let Some(relative) = value.strip_prefix('/') else {
@@ -78,7 +92,10 @@ impl ConfigPath {
             || !relative.split('/').all(|segment| {
                 !segment.is_empty()
                     && segment.bytes().all(|byte| {
-                        byte.is_ascii_alphabetic() || byte.is_ascii_digit() || byte == b'-'
+                        byte.is_ascii_alphabetic()
+                            || byte.is_ascii_digit()
+                            || byte == b'-'
+                            || byte == b'_'
                     })
             })
         {
@@ -110,9 +127,9 @@ impl ConfigPath {
     pub fn join_name(&self, name: impl AsRef<str>) -> Result<Self, PathError> {
         let name = name.as_ref();
         if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphabetic() || byte.is_ascii_digit() || byte == b'-')
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_alphabetic() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+            })
         {
             return Err(PathError::NonCanonical);
         }
@@ -755,7 +772,25 @@ mod tests {
     fn paths_are_canonical_and_root_is_explicit() {
         assert_eq!(ConfigPath::root().as_str(), "/");
         assert!(ConfigPath::parse("/apps/api-v2").is_ok());
-        for invalid in ["", "apps", "/apps/", "/apps//api", "/Apps", "/apps_api"] {
+        for valid in [
+            "/apps_api",
+            "/woodpecker/global/github_token",
+            "/apps/_leading",
+            "/apps/trailing_",
+            "/apps/__",
+        ] {
+            assert!(ConfigPath::parse(valid).is_ok(), "rejected {valid:?}");
+        }
+        for invalid in [
+            "",
+            "apps",
+            "/apps/",
+            "/apps//api",
+            "/Apps",
+            "/apps.api",
+            "/apps+api",
+            "/apps api",
+        ] {
             assert!(ConfigPath::parse(invalid).is_err(), "accepted {invalid:?}");
         }
     }
@@ -767,6 +802,16 @@ mod tests {
             root.join_name("Apps-API-V2").unwrap().as_str(),
             "/teams/platform/apps-api-v2"
         );
+        assert_eq!(
+            root.join_name("Zot_CI_User").unwrap().as_str(),
+            "/teams/platform/zot_ci_user"
+        );
+        assert_eq!(
+            ConfigPath::parse_operation("/Woodpecker/Global/GitHub_Token")
+                .unwrap()
+                .as_str(),
+            "/woodpecker/global/github_token"
+        );
         for invalid in [
             "",
             "/",
@@ -777,6 +822,7 @@ mod tests {
             "..",
             "a%2fb",
             "caf\u{e9}",
+            "/apps.api",
         ] {
             assert!(
                 ConfigPath::parse_operation(invalid).is_err(),
@@ -863,6 +909,18 @@ mod tests {
             vec![mutation_value("/apps/api/api", "child")]
         );
 
+        // Underscore keys round-trip: Woodpecker `from_secret:` names such as
+        // `github_token` are stored verbatim as path segments.
+        let underscored = vec![subtree_value("/apps/api/github_token", "value")];
+        assert_eq!(
+            render_subtree_json(&selected, &underscored).unwrap(),
+            "{\n  \"github_token\": \"value\"\n}\n"
+        );
+        assert_eq!(
+            parse_subtree_json(&selected, "{\"github_token\":\"value\"}").unwrap(),
+            vec![mutation_value("/apps/api/github_token", "value")]
+        );
+
         let root = ConfigPath::root();
         assert_eq!(
             parse_subtree_json(&root, "{\"apps\":{\"enabled\":\"yes\"}}").unwrap(),
@@ -901,7 +959,7 @@ mod tests {
             "{\"enabled\":true}",
             "{\"enabled\":null}",
             "{\"enabled\":[\"value\"]}",
-            "{\"nested\":{\"bad_key\":\"value\"}}",
+            "{\"nested\":{\"bad.key\":\"value\"}}",
             "{\"enabled\":\"first\",\"enabled\":\"second\"}",
             "{\"enabled\":\"bad\\u0000value\"}",
         ] {

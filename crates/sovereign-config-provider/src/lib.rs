@@ -13,8 +13,9 @@
 //! use serde::Deserialize;
 //! use sovereign_config_provider::{Provider, ProviderError};
 //!
-//! // Field names are Sovereign Config path segments (lowercase, digits, `-`;
-//! // never `_`), so nested structs mirror the path hierarchy.
+//! // Field names are Sovereign Config path segments (lowercase, digits, `-`,
+//! // and `_`), so nested structs mirror the path hierarchy and idiomatic
+//! // snake_case field names map across directly.
 //! #[derive(Deserialize)]
 //! struct Database {
 //!     url: String,
@@ -58,6 +59,13 @@
 //! This crate is distributed as tagged workspace source and must be built from
 //! the same tag as the Sovereign Config server it talks to. It speaks the `v3`
 //! protocol and targets the workspace `rust-version`.
+//!
+//! Release 2.15.0 widened the canonical path grammar to permit `_` in segments.
+//! A build older than 2.15.0 rejects such a path as non-canonical and fails the
+//! whole response carrying it, so one underscored value breaks every
+//! [`Provider::load`] over a subtree containing it — it does not degrade to a
+//! partial result. Rebuild this crate against tag 2.15.0 or later before any
+//! underscored path is created in the configuration you consume.
 //!
 //! # Async runtime
 //!
