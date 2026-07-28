@@ -128,10 +128,32 @@ impl SovereignReader {
             let revealed = match &value.value {
                 ValueContent::Plain(plain) => RevealedSecret::new(plain.expose()),
                 ValueContent::Secret(_) => {
-                    self.with_token(async |token: Secret| {
-                        self.transport.reveal_secret(&value.path, &token).await
-                    })
-                    .await?
+                    match self
+                        .with_token(async |token: Secret| {
+                            self.transport.reveal_secret(&value.path, &token).await
+                        })
+                        .await
+                    {
+                        Ok(revealed) => revealed,
+                        // The subtree listed this leaf a moment ago, so a
+                        // NotFound here means it was deleted or re-aliased in
+                        // between. Dropping that one value beats failing the
+                        // request: Woodpecker swallows a 503 and falls back to
+                        // its own store, so one racing delete would strip every
+                        // concurrent pipeline of every secret.
+                        Err(error) if error.kind == ErrorKind::NotFound => {
+                            tracing::warn!(
+                                path = %value.path.as_str(),
+                                "value skipped: removed between listing and reveal"
+                            );
+                            continue;
+                        }
+                        // PermissionDenied is not a race. The layer itself was
+                        // readable, so a denial on one leaf means the grant does
+                        // not cover what it appears to, and silently serving a
+                        // short result would hide that.
+                        Err(error) => return Err(error.into()),
+                    }
                 }
             };
             values.push((name, revealed));

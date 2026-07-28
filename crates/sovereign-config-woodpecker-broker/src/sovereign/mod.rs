@@ -54,16 +54,21 @@ impl SovereignHandle {
     ///
     /// [`BrokerError::Overloaded`] when the reader queue is full — shedding
     /// load rather than letting the HTTP task block behind an unbounded
-    /// backlog — or the reader's own error.
+    /// backlog. [`BrokerError::ReaderGone`] when the reader thread has exited,
+    /// which is a distinct failure from being merely busy: kept as a separate
+    /// metric outcome so the two do not look like the same incident. Otherwise
+    /// the reader's own error.
     pub(crate) async fn fetch(
         &self,
         layers: Vec<ConfigPath>,
     ) -> Result<BTreeMap<String, RevealedSecret>, BrokerError> {
         let (reply, response) = oneshot::channel();
-        self.commands
-            .try_send(Command::Fetch { layers, reply })
-            .map_err(|_| BrokerError::Overloaded)?;
-        response.await.map_err(|_| BrokerError::Unavailable)?
+        match self.commands.try_send(Command::Fetch { layers, reply }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => return Err(BrokerError::Overloaded),
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(BrokerError::ReaderGone),
+        }
+        response.await.map_err(|_| BrokerError::ReaderGone)?
     }
 
     /// The configuration root this connection is confined to. Not secret.
@@ -143,4 +148,48 @@ pub(crate) enum ConnectError {
     IncompatibleProtocol,
     #[error("the reader could not be started")]
     Runtime,
+}
+
+#[cfg(test)]
+mod tests {
+    use sovereign_config_core::ConfigPath;
+    use tokio::sync::{mpsc, oneshot};
+
+    use super::{Command, SovereignHandle};
+
+    fn handle(depth: usize) -> (SovereignHandle, mpsc::Receiver<Command>) {
+        let (commands, inbox) = mpsc::channel(depth);
+        let root = ConfigPath::parse("/woodpecker").unwrap();
+        (SovereignHandle { commands, root }, inbox)
+    }
+
+    // The two ways `fetch` can fail to reach the reader are operationally
+    // different — one says "wait and retry", the other says "restart the
+    // container" — so they must not collapse onto the same metric outcome.
+    #[tokio::test]
+    async fn a_reader_that_has_exited_is_distinct_from_a_full_queue() {
+        let (live_but_full, mut inbox) = handle(1);
+        let (reply, _response) = oneshot::channel();
+        // Fill the one slot without draining it, so the next `try_send` sees
+        // `Full`, not `Closed`.
+        live_but_full
+            .commands
+            .try_send(Command::Fetch {
+                layers: Vec::new(),
+                reply,
+            })
+            .unwrap();
+        assert_eq!(
+            live_but_full.fetch(Vec::new()).await.unwrap_err().outcome(),
+            "overloaded"
+        );
+        inbox.close();
+
+        let (gone, inbox) = handle(1);
+        drop(inbox); // the reader thread has exited
+        assert_eq!(
+            gone.fetch(Vec::new()).await.unwrap_err().outcome(),
+            "reader_gone"
+        );
+    }
 }

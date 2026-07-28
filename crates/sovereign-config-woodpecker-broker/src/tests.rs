@@ -74,6 +74,12 @@ struct MockState {
     /// Number of leading `RevealSecret` calls to reject as unauthenticated,
     /// simulating a token revoked before its reported expiry.
     reject_reveals: AtomicUsize,
+    /// Paths listed by `GetSubTree` whose `RevealSecret` returns `NotFound`,
+    /// simulating a delete or re-alias that races the reveal.
+    vanished_reveals: Mutex<std::collections::HashSet<String>>,
+    /// Paths whose `RevealSecret` returns `PermissionDenied`, simulating a grant
+    /// that does not actually cover a leaf its layer could list.
+    denied_reveals: Mutex<std::collections::HashSet<String>>,
     token_requests: AtomicUsize,
     subtree_requests: AtomicUsize,
     reveal_requests: AtomicUsize,
@@ -125,6 +131,8 @@ impl MockState {
             plain,
             secrets,
             reject_reveals: AtomicUsize::new(0),
+            vanished_reveals: Mutex::new(std::collections::HashSet::new()),
+            denied_reveals: Mutex::new(std::collections::HashSet::new()),
             token_requests: AtomicUsize::new(0),
             subtree_requests: AtomicUsize::new(0),
             reveal_requests: AtomicUsize::new(0),
@@ -217,6 +225,12 @@ impl Configuration for MockConfiguration {
             return Err(Status::unauthenticated("token rejected"));
         }
         let path = request.into_inner().path;
+        if self.0.denied_reveals.lock().unwrap().contains(&path) {
+            return Err(Status::permission_denied("denied"));
+        }
+        if self.0.vanished_reveals.lock().unwrap().contains(&path) {
+            return Err(Status::not_found("no secret"));
+        }
         match self.0.secrets.get(&path) {
             Some(value) => Ok(Response::new(RevealSecretResponse {
                 value: value.clone(),
@@ -626,6 +640,54 @@ async fn a_persistently_rejected_token_reports_auth_unavailable() {
         .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"], "auth unavailable");
+}
+
+/// A leaf that `GetSubTree` lists can be deleted or re-aliased before its
+/// `RevealSecret`. That must drop the one value, not fail the whole request —
+/// Woodpecker swallows a 503 and falls back to its own store, so one racing
+/// delete would otherwise strip every concurrent pipeline of every secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_secret_removed_between_listing_and_reveal_is_dropped_not_failed() {
+    let state = MockState::happy();
+    state
+        .vanished_reveals
+        .lock()
+        .unwrap()
+        .insert("/woodpecker/global/zot_ci_password".to_owned());
+    let harness = Harness::start(Arc::new(state)).await.unwrap();
+
+    let (status, body) = harness
+        .post_secrets("vcheesbrough", "sovereign-config")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        Harness::names_and_values(&body)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
+        // zot_ci_password vanished; every other secret still resolves.
+        vec!["github_token", "registry", "zot_ci_user"]
+    );
+}
+
+/// Unlike a vanished leaf, a denied reveal is not a race: the layer itself was
+/// readable, so a denial on one of its leaves means the grant does not cover
+/// what it appears to. That is worth surfacing rather than silently dropping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_permission_denied_reveal_fails_the_whole_request() {
+    let state = MockState::happy();
+    state
+        .denied_reveals
+        .lock()
+        .unwrap()
+        .insert("/woodpecker/global/zot_ci_password".to_owned());
+    let harness = Harness::start(Arc::new(state)).await.unwrap();
+
+    let (status, body) = harness
+        .post_secrets("vcheesbrough", "sovereign-config")
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "secret store unavailable");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

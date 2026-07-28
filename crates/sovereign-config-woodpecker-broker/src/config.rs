@@ -98,11 +98,7 @@ impl Config {
             "SOVEREIGN_CONFIG_BROKER_CONNECTION_URL",
         )?);
         let layers = LayerTemplates::parse(&required(env, "SOVEREIGN_CONFIG_BROKER_LAYERS")?)?;
-        let listen_addr = socket_addr(
-            env,
-            "SOVEREIGN_CONFIG_BROKER_LISTEN_ADDR",
-            DEFAULT_LISTEN_ADDR,
-        )?;
+        let listen_addr = listen_addr(env)?;
         let metrics_addr = socket_addr(
             env,
             "SOVEREIGN_CONFIG_BROKER_METRICS_ADDR",
@@ -168,6 +164,21 @@ fn required(env: &impl Env, name: &'static str) -> Result<String, ConfigError> {
     optional(env, name).ok_or(ConfigError::Missing(name))
 }
 
+/// Resolves the request listener address.
+///
+/// Shared with the `healthcheck` subcommand so the two cannot disagree about
+/// what the variable means. They previously read it independently, and the
+/// healthcheck's stricter reading turned an empty Compose substitution into a
+/// container that ran correctly on the default while its `HEALTHCHECK` failed
+/// forever.
+pub(crate) fn listen_addr(env: &impl Env) -> Result<SocketAddr, ConfigError> {
+    socket_addr(
+        env,
+        "SOVEREIGN_CONFIG_BROKER_LISTEN_ADDR",
+        DEFAULT_LISTEN_ADDR,
+    )
+}
+
 fn socket_addr(
     env: &impl Env,
     name: &'static str,
@@ -219,7 +230,8 @@ mod tests {
     use std::{collections::BTreeMap, io::Write, net::SocketAddr};
 
     use super::{
-        Config, ConfigError, PublicKeySource, public_key_source, required_secret, socket_addr,
+        Config, ConfigError, PublicKeySource, listen_addr, public_key_source, required_secret,
+        socket_addr,
     };
 
     const URL: &str = "https://config.example.test/woodpecker#v=1&issuer=https%3A%2F%2Fauth.example.test%2Fapplication%2Fo%2Fconfig%2F&client_id=broker&client_secret=dXNlcjpwYXNz";
@@ -385,6 +397,41 @@ mod tests {
             .unwrap(),
             PublicKeySource::Fetch { .. }
         ));
+    }
+
+    // The healthcheck subcommand resolves its probe target through
+    // `listen_addr` too. If these diverged, an empty Compose substitution would
+    // give a container that serves correctly on the default while its
+    // HEALTHCHECK fails on every probe.
+    #[test]
+    fn the_healthcheck_and_the_server_agree_on_the_listener() {
+        for (value, expected) in [
+            (None, "0.0.0.0:8080"),
+            (Some(""), "0.0.0.0:8080"),
+            (Some("   "), "0.0.0.0:8080"),
+            (Some(" 127.0.0.1:9000 "), "127.0.0.1:9000"),
+        ] {
+            let mut env = base();
+            match value {
+                Some(value) => {
+                    env.insert("SOVEREIGN_CONFIG_BROKER_LISTEN_ADDR", value);
+                }
+                None => {
+                    env.remove("SOVEREIGN_CONFIG_BROKER_LISTEN_ADDR");
+                }
+            }
+            let probed = listen_addr(&env).unwrap();
+            assert_eq!(
+                probed,
+                addr(expected),
+                "listen_addr disagreed for {value:?}"
+            );
+            assert_eq!(
+                Config::resolve(&env).unwrap().listen_addr,
+                probed,
+                "the server and the healthcheck disagreed for {value:?}"
+            );
+        }
     }
 
     #[test]

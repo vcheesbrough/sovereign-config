@@ -13,21 +13,25 @@
 use serde::{Deserialize, Serialize};
 use sovereign_config_core::RevealedSecret;
 
-/// Every webhook event Woodpecker recognises, i.e. "no event filter".
+/// The events a brokered secret is exposed to.
 ///
-/// Matching the `OpenBao` broker exactly. Woodpecker also defines
-/// `pull_request_metadata`; it is omitted here for parity, so a secret is not
-/// offered to that event. Revisit deliberately, not by accident.
-pub(crate) const ALL_EVENTS: [&str; 8] = [
-    "push",
-    "pull_request",
-    "pull_request_closed",
-    "tag",
-    "release",
-    "deployment",
-    "cron",
-    "manual",
-];
+/// Deliberately **excludes** `pull_request` and `pull_request_closed`. A PR
+/// author controls `.woodpecker/*.yml` on their own branch, so any secret
+/// offered to a PR event can be exfiltrated by a step that echoes it
+/// transformed (base64, a `curl` to an external host) — Woodpecker's log
+/// masking only matches the verbatim string. This is not a broker-specific
+/// caution: it is Woodpecker's own default. `cli/repo/secret/secret_add.go`'s
+/// `defaultSecretEvents` (v3.13.0) is exactly `push, tag, release, deployment`
+/// when a secret is created without an explicit `--event` list — i.e. every
+/// event that isn't PR-triggered. `cron` and `manual` are added back here
+/// because, unlike a PR, neither runs attacker-supplied pipeline YAML: `cron`
+/// runs the config from the repository's default branch, and `manual` requires
+/// an already-authorized trigger.
+///
+/// Woodpecker also defines `pull_request_metadata`; it is omitted for the same
+/// reason as the other PR events, not merely for parity with the `OpenBao`
+/// broker. Revisit deliberately, not by accident.
+pub(crate) const ALL_EVENTS: [&str; 6] = ["push", "tag", "release", "deployment", "cron", "manual"];
 
 /// The signed request body.
 ///
@@ -77,7 +81,7 @@ pub(crate) struct SecretsResponse {
 pub(crate) struct ResponseSecret {
     pub(crate) name: String,
     pub(crate) value: String,
-    pub(crate) events: [&'static str; 8],
+    pub(crate) events: [&'static str; ALL_EVENTS.len()],
     /// Always empty: the broker applies no image allowlist.
     pub(crate) images: Vec<String>,
 }
@@ -108,7 +112,7 @@ impl SecretsResponse {
 mod tests {
     use sovereign_config_core::RevealedSecret;
 
-    use super::{SecretsRequest, SecretsResponse};
+    use super::{ALL_EVENTS, SecretsRequest, SecretsResponse};
 
     #[test]
     fn a_request_deserializes_the_fields_the_broker_reads() {
@@ -168,8 +172,23 @@ mod tests {
         assert_eq!(secrets[0]["name"], "github_token");
         assert_eq!(secrets[0]["value"], "gh");
         assert_eq!(secrets[1]["name"], "zot_ci_user");
-        assert_eq!(secrets[0]["events"].as_array().unwrap().len(), 8);
-        assert_eq!(secrets[0]["events"][0], "push");
+        let events: Vec<&str> = secrets[0]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(events, ALL_EVENTS);
+        for excluded in [
+            "pull_request",
+            "pull_request_closed",
+            "pull_request_metadata",
+        ] {
+            assert!(
+                !events.contains(&excluded),
+                "{excluded} must not be offered a brokered secret"
+            );
+        }
         assert!(secrets[0]["images"].as_array().unwrap().is_empty());
     }
 

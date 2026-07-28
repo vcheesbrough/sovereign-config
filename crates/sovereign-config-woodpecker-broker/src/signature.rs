@@ -286,6 +286,11 @@ fn validate_params(params: &str, now: SystemTime) -> Result<(), SignatureError> 
 /// This is the check the Go broker omits. Without it the signature only proves
 /// that *some* body was signed, not that this is the body that arrived.
 fn verify_digest(header: &str, body: &[u8]) -> Result<(), SignatureError> {
+    // Hashed once, outside the loop. The digest is the same for every member,
+    // and this runs before the signature is checked — recomputing it per member
+    // would let an unauthenticated caller buy arbitrary hashing with a header of
+    // one correct digest repeated.
+    let actual = Sha256::digest(body);
     let mut checked = false;
     for member in header.split(',') {
         let Some((algorithm, value)) = member.trim().split_once('=') else {
@@ -297,7 +302,6 @@ fn verify_digest(header: &str, body: &[u8]) -> Result<(), SignatureError> {
             continue;
         }
         let expected = decode_byte_sequence(value.trim()).ok_or(SignatureError::MalformedDigest)?;
-        let actual = Sha256::digest(body);
         if actual.as_slice().ct_eq(expected.as_slice()).into() {
             checked = true;
         } else {
@@ -578,6 +582,35 @@ mod tests {
             fixture.verify(&junk_input, BODY).unwrap_err(),
             SignatureError::MalformedInput
         );
+    }
+
+    // A repeated-member header is the shape that would multiply work if the
+    // body were hashed per member; it is hashed once instead. This pins the
+    // behaviour either way -- the cost is not observable from here, but a
+    // regression that reintroduced per-member hashing would have to keep this
+    // passing, and the single-member path must stay unaffected.
+    #[test]
+    fn repeated_digest_members_do_not_change_the_outcome() {
+        let fixture = Fixture::new();
+        let digest = Fixture::digest_of(BODY);
+        let mut headers = fixture.headers(None);
+
+        let repeated = std::iter::repeat_n(digest.as_str(), 64)
+            .collect::<Vec<_>>()
+            .join(", ");
+        headers.insert("content-digest", repeated.parse().unwrap());
+        // The signature covers the digest header verbatim, so a repeated header
+        // no longer matches it -- but it must fail on the signature, not spend
+        // 64 hashes first.
+        assert_eq!(
+            fixture.verify(&headers, BODY).unwrap_err(),
+            SignatureError::BadSignature
+        );
+
+        // With a single member the digest still verifies as before.
+        let mut single = fixture.headers(None);
+        single.insert("content-digest", digest.parse().unwrap());
+        assert!(fixture.verify(&single, BODY).is_ok());
     }
 
     #[test]
