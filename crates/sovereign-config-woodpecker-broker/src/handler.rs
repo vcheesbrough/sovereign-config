@@ -103,7 +103,7 @@ async fn resolve(
         }
     })?;
 
-    let layers = state.layers.render(state.sovereign.root(), &request);
+    let layers = state.layers.render(&request);
     let values = state.sovereign.fetch(layers).await?;
     Ok(SecretsResponse::build(values))
 }

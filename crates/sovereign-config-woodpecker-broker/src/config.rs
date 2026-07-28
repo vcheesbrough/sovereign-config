@@ -241,7 +241,7 @@ mod tests {
             ("SOVEREIGN_CONFIG_BROKER_CONNECTION_URL", URL),
             (
                 "SOVEREIGN_CONFIG_BROKER_LAYERS",
-                "global,repos/{repo.owner}/{repo.name}",
+                "/woodpecker/global,/woodpecker/repos/{repo.owner}/{repo.name}",
             ),
             ("WOODPECKER_PUBLIC_KEY_FILE", "/etc/woodpecker/pubkey.pem"),
         ])

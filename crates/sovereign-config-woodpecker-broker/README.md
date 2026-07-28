@@ -19,26 +19,30 @@ construction.
 ## How a repository's secrets are chosen
 
 `SOVEREIGN_CONFIG_BROKER_LAYERS` is an ordered, comma- or newline-separated list
-of paths **relative to the connection root**. Each is rendered per request from
-the metadata in the signed body, read in declared order, and merged so that
-**later layers override earlier ones** on a name collision.
-
-With root `/woodpecker` and
+of **absolute** paths — write out the full path on every layer, there is no
+implied root. Each is rendered per request from the metadata in the signed
+body, read in declared order, and merged so that **later layers override
+earlier ones** on a name collision.
 
 ```
-SOVEREIGN_CONFIG_BROKER_LAYERS=shared/global,global,repos/{repo.owner}/{repo.name}
+SOVEREIGN_CONFIG_BROKER_LAYERS=/woodpecker/shared,/woodpecker/repos/{repo.owner}/{repo.name}
 ```
 
 a pipeline for `vcheesbrough/sovereign-config` reads
 
 ```
-/woodpecker/shared/global
-/woodpecker/global
+/woodpecker/shared
 /woodpecker/repos/vcheesbrough/sovereign-config
 ```
 
-while `vcheesbrough/bored` reads its own third path. The repository identity
+while `vcheesbrough/bored` reads its own second path. The repository identity
 comes from the request, never from configuration — one broker serves every repo.
+
+A layer is not required to sit under the connection's root. Writing one that
+doesn't is not a security hole — the server enforces the grant regardless, so
+an out-of-grant layer just gets `PermissionDenied` and is skipped like any
+other unreadable layer — but it is pointless, since nothing under it will ever
+be revealed.
 
 Placeholders (the complete set; anything else fails at startup):
 
@@ -75,7 +79,7 @@ Woodpecker like "this repository has no secrets".
 Secret names are path segments, so they map one-to-one:
 
 ```
-/woodpecker/global/github_token
+/woodpecker/shared/github_token
 /woodpecker/repos/vcheesbrough/sovereign-config/zot_ci_password
 ```
 
@@ -86,16 +90,23 @@ Values shared across every repository live directly under `/woodpecker/shared`
 — write them there and nowhere else:
 
 ```sh
-printf '%s' 'registry.desync.link' | sovereign-config put /woodpecker/shared/global/registry
+printf '%s' 'registry.desync.link' | sovereign-config put /woodpecker/shared/registry
 ```
 
-Earlier drafts of this crate kept such values canonical outside the broker's
-root and exposed them underneath it with `alias add`. That indirection is
-gone: a value written at `/woodpecker/shared/...` needs no second step to reach
-the broker, and there is no other location where "the shared secret" also
-lives to fall out of sync. If some other system genuinely needs the same
-value, alias it *out* of `/woodpecker/shared` into that system's own
-namespace — the canonical copy stays here.
+Earlier drafts of this crate split global values across two layers —
+`/woodpecker/shared/global` for values also meaningful outside Woodpecker CI,
+`/woodpecker/global` for values that were not — inherited from the three-tier
+OpenBao KV layout this broker replaces. That split is gone: there is exactly
+one global layer, `/woodpecker/shared`, and every repository-independent value
+lives there regardless of whether anything else also reads it.
+
+They also kept such values canonical outside the broker's root and exposed them
+underneath it with `alias add`. That indirection is gone too: a value written
+at `/woodpecker/shared/...` needs no second step to reach the broker, and there
+is no other location where "the shared secret" also lives to fall out of sync.
+If some other system genuinely needs the same value, alias it *out* of
+`/woodpecker/shared` into that system's own namespace — the canonical copy
+stays here.
 
 Reads cost one `GetSubTree` per layer plus one `RevealSecret` per
 secret-classified leaf, because ordinary reads return secrets masked.

@@ -50,7 +50,7 @@ use crate::{
 };
 
 const ROOT: &str = "/woodpecker";
-const LAYERS: &str = "global,repos/{repo.owner}/{repo.name}";
+const LAYERS: &str = "/woodpecker/global,/woodpecker/repos/{repo.owner}/{repo.name}";
 const GITHUB_TOKEN: &str = "github-token-sentinel";
 const ZOT_PASSWORD: &str = "zot-password-sentinel";
 
