@@ -139,13 +139,18 @@ else
     echo "DRY RUN. Nothing will be written. Re-run with --apply to perform the migration."
 fi
 
-# Shared values live only under $ROOT/shared — no canonical copy elsewhere, no
-# alias step. A value written here needs nothing further to reach the broker.
-echo "shared/global -> $ROOT/shared/global"
-migrate_path "shared/global" "$ROOT/shared/global"
+# The broker now has exactly one global layer, $ROOT/shared, merging what were
+# two separate OpenBao paths (cross-stack "shared/global" and Woodpecker-only
+# "woodpecker/global"). Both migrate into the same target; migrating
+# shared/global first and woodpecker/global second preserves their original
+# precedence for any key present in both, since a later write to the same
+# target path simply overwrites the earlier one — matching how the broker's
+# old three-layer merge order let woodpecker/global win over shared/global.
+echo "shared/global -> $ROOT/shared"
+migrate_path "shared/global" "$ROOT/shared"
 
-echo "woodpecker/global -> $ROOT/global"
-migrate_path "woodpecker/global" "$ROOT/global"
+echo "woodpecker/global -> $ROOT/shared"
+migrate_path "woodpecker/global" "$ROOT/shared"
 
 printf '%s\n' "$REPOS" | while IFS= read -r repo; do
     [ -n "$repo" ] || continue

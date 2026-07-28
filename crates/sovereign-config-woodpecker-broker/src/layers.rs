@@ -22,9 +22,15 @@
 //!   secrets a pipeline receives, so a many-to-one mapping is an authorization
 //!   bug, not a convenience.
 //!
-//! Layer specs are relative to the connection root, so a broker rooted at
-//! `/woodpecker` with `global,repos/{repo.owner}/{repo.name}` reads
-//! `/woodpecker/global` then `/woodpecker/repos/vcheesbrough/sovereign-config`.
+//! Layer specs are **absolute** paths, written out in full — e.g.
+//! `/woodpecker/shared,/woodpecker/repos/{repo.owner}/{repo.name}` reads
+//! `/woodpecker/shared` then `/woodpecker/repos/vcheesbrough/sovereign-config`.
+//! Nothing here confines a layer to the connection's root; a layer outside the
+//! grant simply gets `PermissionDenied` from the server and is skipped like any
+//! other unreadable layer (see `sovereign::reader`), so a typo'd root prefix
+//! fails safe rather than fails loud. Write the root explicitly on every layer
+//! regardless — an operator reading `SOVEREIGN_CONFIG_BROKER_LAYERS` should see
+//! exactly what gets read, not a prefix implied by a different variable.
 
 use sovereign_config_core::ConfigPath;
 
@@ -140,8 +146,10 @@ pub(crate) enum LayerError {
     UnbalancedBrace { layer: String },
     #[error("layer {layer:?} uses unknown placeholder {{{placeholder}}}")]
     UnknownPlaceholder { layer: String, placeholder: String },
-    #[error("layer {layer:?} must be relative to the connection root")]
-    NotRelative { layer: String },
+    #[error(
+        "layer {layer:?} must be an absolute path beginning with '/', with no '.' or '..' segment"
+    )]
+    NotAbsolute { layer: String },
     #[error("layer {layer:?} has a literal segment that is not a valid path segment")]
     InvalidLiteral { layer: String },
 }
@@ -159,8 +167,8 @@ impl LayerTemplates {
     ///
     /// # Errors
     ///
-    /// Fails on an empty spec, an unbalanced brace, an unknown placeholder, an
-    /// absolute or dot-segmented layer, or a literal that could never form a
+    /// Fails on an empty spec, an unbalanced brace, an unknown placeholder, a
+    /// relative or dot-segmented layer, or a literal that could never form a
     /// valid path segment.
     pub(crate) fn parse(spec: &str) -> Result<Self, LayerError> {
         let mut layers = Vec::new();
@@ -183,22 +191,22 @@ impl LayerTemplates {
         &self.specs
     }
 
-    /// Renders every layer under `root`, in declared order.
+    /// Renders every layer, in declared order.
     ///
     /// A layer whose substitutions leave it empty or unrepresentable is
     /// **skipped**, not an error: an absent branch or forge id simply means
     /// that layer does not apply to this request, exactly as an absent path in
     /// the store does.
-    pub(crate) fn render(&self, root: &ConfigPath, request: &SecretsRequest) -> Vec<ConfigPath> {
+    pub(crate) fn render(&self, request: &SecretsRequest) -> Vec<ConfigPath> {
         let mut rendered = Vec::with_capacity(self.layers.len());
         for (layer, spec) in self.layers.iter().zip(&self.specs) {
-            let mut relative = String::new();
+            let mut built = String::new();
             let mut usable = true;
             for segment in layer {
                 match segment {
-                    Segment::Literal(literal) => relative.push_str(literal),
+                    Segment::Literal(literal) => built.push_str(literal),
                     Segment::Field(field) => match field.render(request) {
-                        Substitution::Value(value) => relative.push_str(&value),
+                        Substitution::Value(value) => built.push_str(&value),
                         Substitution::Absent => {
                             // Ordinary: a tag pipeline has no branch.
                             tracing::debug!(
@@ -226,12 +234,10 @@ impl LayerTemplates {
             if !usable {
                 continue;
             }
-            let absolute = if root.as_str() == "/" {
-                format!("/{relative}")
-            } else {
-                format!("{}/{relative}", root.as_str())
-            };
-            match ConfigPath::parse_operation(&absolute) {
+            // `built` is already an absolute path: `raw` was required to start
+            // with '/' at parse time, and that leading `/` is part of the first
+            // literal segment.
+            match ConfigPath::parse_operation(&built) {
                 Ok(path) => rendered.push(path),
                 Err(_) => {
                     tracing::debug!(layer = %spec, "layer skipped: not a canonical path");
@@ -243,8 +249,8 @@ impl LayerTemplates {
 }
 
 fn parse_layer(raw: &str) -> Result<Vec<Segment>, LayerError> {
-    if raw.starts_with('/') || raw.split('/').any(|part| part == "." || part == "..") {
-        return Err(LayerError::NotRelative {
+    if !raw.starts_with('/') || raw.split('/').any(|part| part == "." || part == "..") {
+        return Err(LayerError::NotAbsolute {
             layer: raw.to_owned(),
         });
     }
@@ -288,6 +294,9 @@ fn parse_layer(raw: &str) -> Result<Vec<Segment>, LayerError> {
     // the ones carrying the per-repo secrets — unchecked: every render would
     // fail `parse_operation`, the layer would be skipped, and the pipeline would
     // see a silently short result rather than a boot failure.
+    // `raw` starts with '/' (checked above), and the scan below preserves
+    // exactly `raw`'s text outside `{...}` spans, so the leading '/' is already
+    // part of the first literal segment — `probe` needs no prefix added.
     let probe: String = segments
         .iter()
         .map(|segment| match segment {
@@ -295,7 +304,7 @@ fn parse_layer(raw: &str) -> Result<Vec<Segment>, LayerError> {
             Segment::Field(_) => FIELD_PROBE,
         })
         .collect();
-    if ConfigPath::parse_operation(format!("/{probe}")).is_err() {
+    if ConfigPath::parse_operation(&probe).is_err() {
         return Err(LayerError::InvalidLiteral {
             layer: raw.to_owned(),
         });
@@ -311,8 +320,6 @@ const FIELD_PROBE: &str = "x";
 
 #[cfg(test)]
 mod tests {
-    use sovereign_config_core::ConfigPath;
-
     use super::{LayerError, LayerTemplates, Substitution};
     use crate::model::{Pipeline, Repo, SecretsRequest};
 
@@ -331,44 +338,36 @@ mod tests {
         }
     }
 
-    fn render(spec: &str, root: &str, request: &SecretsRequest) -> Vec<String> {
+    fn render(spec: &str, request: &SecretsRequest) -> Vec<String> {
         LayerTemplates::parse(spec)
             .unwrap()
-            .render(&ConfigPath::parse(root).unwrap(), request)
+            .render(request)
             .into_iter()
             .map(|path| path.as_str().to_owned())
             .collect()
     }
 
-    // The behaviour the live `OpenBao` broker provides today, path for path.
+    // The recommended live layer spec: one global layer, one per repository.
+    // Specs are absolute — the connection root is not implied by any other
+    // setting, it is written out on every layer.
     #[test]
     fn the_live_layer_spec_resolves_per_repository() {
-        let spec = "shared/global,global,repos/{repo.owner}/{repo.name}";
+        let spec = "/woodpecker/shared,/woodpecker/repos/{repo.owner}/{repo.name}";
         assert_eq!(
             render(
                 spec,
-                "/woodpecker",
                 &request("vcheesbrough", "sovereign-config", "main", "push")
             ),
             vec![
-                "/woodpecker/shared/global",
-                "/woodpecker/global",
+                "/woodpecker/shared",
                 "/woodpecker/repos/vcheesbrough/sovereign-config",
             ]
         );
         // A different repository resolves a different per-repo layer while the
-        // shared layers stay put.
+        // shared layer stays put.
         assert_eq!(
-            render(
-                spec,
-                "/woodpecker",
-                &request("vcheesbrough", "bored", "main", "push")
-            ),
-            vec![
-                "/woodpecker/shared/global",
-                "/woodpecker/global",
-                "/woodpecker/repos/vcheesbrough/bored",
-            ]
+            render(spec, &request("vcheesbrough", "bored", "main", "push")),
+            vec!["/woodpecker/shared", "/woodpecker/repos/vcheesbrough/bored"]
         );
     }
 
@@ -376,8 +375,7 @@ mod tests {
     fn full_name_spans_two_segments() {
         assert_eq!(
             render(
-                "repos/{repo.full_name}",
-                "/woodpecker",
+                "/woodpecker/repos/{repo.full_name}",
                 &request("vcheesbrough", "sovereign-config", "main", "push")
             ),
             vec!["/woodpecker/repos/vcheesbrough/sovereign-config"]
@@ -388,8 +386,7 @@ mod tests {
     fn branch_and_event_interpolate() {
         assert_eq!(
             render(
-                "branches/{pipeline.branch},events/{pipeline.event}",
-                "/woodpecker",
+                "/woodpecker/branches/{pipeline.branch},/woodpecker/events/{pipeline.event}",
                 &request("owner", "repo", "feature-new-thing", "pull_request")
             ),
             vec![
@@ -401,28 +398,45 @@ mod tests {
         // really is named `feature-x`. The event layer still resolves.
         assert_eq!(
             render(
-                "branches/{pipeline.branch},events/{pipeline.event}",
-                "/woodpecker",
+                "/woodpecker/branches/{pipeline.branch},/woodpecker/events/{pipeline.event}",
                 &request("owner", "repo", "feature/x", "pull_request")
             ),
             vec!["/woodpecker/events/pull_request"]
         );
     }
 
+    // Layers need not share a root at all — each is a fully independent
+    // absolute path, so one broker could in principle read across several
+    // trees if its connection is granted on more than one.
     #[test]
-    fn a_root_of_slash_still_produces_absolute_paths() {
+    fn layers_under_different_roots_all_resolve() {
         assert_eq!(
-            render("global", "/", &request("owner", "repo", "main", "push")),
-            vec!["/global"]
+            render(
+                "/apps/global,/tools/shared",
+                &request("owner", "repo", "main", "push")
+            ),
+            vec!["/apps/global", "/tools/shared"]
         );
+    }
+
+    // The bare tree root is a selection, not an operation target — the same
+    // rule `ConfigPath::parse_operation` applies everywhere else in the
+    // workspace. A layer spec of exactly "/" is therefore not a meaningful
+    // configuration, so it is rejected at startup rather than silently
+    // skipped on every request.
+    #[test]
+    fn a_layer_that_is_only_the_bare_root_is_rejected_at_parse_time() {
+        assert!(matches!(
+            LayerTemplates::parse("/"),
+            Err(LayerError::InvalidLiteral { .. })
+        ));
     }
 
     #[test]
     fn a_layer_with_no_value_for_a_placeholder_is_skipped_not_failed() {
         // A tag pipeline carries no branch; that layer simply does not apply.
         let rendered = render(
-            "global,branches/{pipeline.branch}",
-            "/woodpecker",
+            "/woodpecker/global,/woodpecker/branches/{pipeline.branch}",
             &request("owner", "repo", "", "tag"),
         );
         assert_eq!(rendered, vec!["/woodpecker/global"]);
@@ -430,7 +444,7 @@ mod tests {
         let mut absent_forge = request("owner", "repo", "main", "push");
         absent_forge.repo.forge_id = None;
         assert_eq!(
-            render("forges/{repo.forge_id}", "/woodpecker", &absent_forge),
+            render("/woodpecker/forges/{repo.forge_id}", &absent_forge),
             Vec::<String>::new()
         );
     }
@@ -452,9 +466,12 @@ mod tests {
                 event: "push".to_owned(),
             },
         };
-        for spec in ["repos/{repo.owner}/{repo.name}", "repos/{repo.full_name}"] {
+        for spec in [
+            "/woodpecker/repos/{repo.owner}/{repo.name}",
+            "/woodpecker/repos/{repo.full_name}",
+        ] {
             assert_eq!(
-                render(spec, "/woodpecker", &hostile),
+                render(spec, &hostile),
                 Vec::<String>::new(),
                 "{spec} did not refuse hostile metadata"
             );
@@ -462,7 +479,7 @@ mod tests {
         // `forge_id` is a stable integer, so it always resolves — the documented
         // escape hatch for a forge name that cannot be a path segment.
         assert_eq!(
-            render("forges/{repo.forge_id}", "/woodpecker", &hostile),
+            render("/woodpecker/forges/{repo.forge_id}", &hostile),
             vec!["/woodpecker/forges/1"]
         );
     }
@@ -478,8 +495,7 @@ mod tests {
         ] {
             assert_eq!(
                 render(
-                    "repos/{repo.owner}/{repo.name}",
-                    "/woodpecker",
+                    "/woodpecker/repos/{repo.owner}/{repo.name}",
                     &request(owner, name, "main", "push")
                 ),
                 Vec::<String>::new(),
@@ -489,8 +505,7 @@ mod tests {
         // A branch `Main` must not resolve onto the `main` layer.
         assert_eq!(
             render(
-                "branches/{pipeline.branch}",
-                "/woodpecker",
+                "/woodpecker/branches/{pipeline.branch}",
                 &request("o", "r", "Main", "push")
             ),
             Vec::<String>::new()
@@ -501,8 +516,7 @@ mod tests {
     fn a_well_formed_full_name_resolves_to_two_segments() {
         assert_eq!(
             render(
-                "repos/{repo.full_name}",
-                "/woodpecker",
+                "/woodpecker/repos/{repo.full_name}",
                 &request("vcheesbrough", "sovereign-config", "main", "push")
             ),
             vec!["/woodpecker/repos/vcheesbrough/sovereign-config"]
@@ -535,27 +549,34 @@ mod tests {
     #[test]
     fn templates_are_validated_at_parse_time() {
         assert!(matches!(
-            LayerTemplates::parse("repos/{repo.nickname}"),
+            LayerTemplates::parse("/repos/{repo.nickname}"),
             Err(LayerError::UnknownPlaceholder { .. })
         ));
         assert!(matches!(
-            LayerTemplates::parse("repos/{repo.owner"),
+            LayerTemplates::parse("/repos/{repo.owner"),
             Err(LayerError::UnbalancedBrace { .. })
         ));
         assert!(matches!(
-            LayerTemplates::parse("repos/repo.owner}"),
+            LayerTemplates::parse("/repos/repo.owner}"),
             Err(LayerError::UnbalancedBrace { .. })
         ));
+        // A spec that does not start with '/' is rejected outright — layers are
+        // written as full absolute paths, not joined onto a root elsewhere.
         assert!(matches!(
-            LayerTemplates::parse("/absolute"),
-            Err(LayerError::NotRelative { .. })
+            LayerTemplates::parse("relative"),
+            Err(LayerError::NotAbsolute { .. })
         ));
         assert!(matches!(
             LayerTemplates::parse("../escape"),
-            Err(LayerError::NotRelative { .. })
+            Err(LayerError::NotAbsolute { .. })
+        ));
+        // Dot-segments are rejected even once the spec is absolute.
+        assert!(matches!(
+            LayerTemplates::parse("/woodpecker/../etc"),
+            Err(LayerError::NotAbsolute { .. })
         ));
         assert!(matches!(
-            LayerTemplates::parse("bad.literal"),
+            LayerTemplates::parse("/bad.literal"),
             Err(LayerError::InvalidLiteral { .. })
         ));
         // A templated layer's literal text is validated too. Without this, the
@@ -563,11 +584,11 @@ mod tests {
         // skipped on every request, which Woodpecker reports as no secrets
         // rather than as an error.
         for templated in [
-            "repos.bad/{repo.name}",
-            "repos//{repo.name}",
-            "{repo.owner}/bad.name",
-            "{repo.owner}//{repo.name}",
-            "repos/{repo.owner} {repo.name}",
+            "/repos.bad/{repo.name}",
+            "/repos//{repo.name}",
+            "/{repo.owner}/bad.name",
+            "/{repo.owner}//{repo.name}",
+            "/repos/{repo.owner} {repo.name}",
         ] {
             assert!(
                 matches!(
@@ -580,11 +601,11 @@ mod tests {
         // Legitimate shapes still parse, including a placeholder sharing a
         // segment with literal text.
         for valid in [
-            "global",
-            "repos/{repo.owner}/{repo.name}",
-            "{repo.full_name}",
-            "repo-{repo.name}",
-            "shared/global",
+            "/global",
+            "/repos/{repo.owner}/{repo.name}",
+            "/{repo.full_name}",
+            "/repo-{repo.name}",
+            "/shared/global",
         ] {
             assert!(LayerTemplates::parse(valid).is_ok(), "rejected {valid:?}");
         }
@@ -596,11 +617,16 @@ mod tests {
 
     #[test]
     fn commas_and_newlines_both_separate_layers() {
-        let spec = "shared/global\nglobal,repos/{repo.owner}/{repo.name}\r\n";
+        let spec =
+            "/woodpecker/shared\n/woodpecker/global,/woodpecker/repos/{repo.owner}/{repo.name}\r\n";
         let templates = LayerTemplates::parse(spec).unwrap();
         assert_eq!(
             templates.specs(),
-            ["shared/global", "global", "repos/{repo.owner}/{repo.name}"]
+            [
+                "/woodpecker/shared",
+                "/woodpecker/global",
+                "/woodpecker/repos/{repo.owner}/{repo.name}",
+            ]
         );
     }
 }
