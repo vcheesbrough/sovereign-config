@@ -65,10 +65,20 @@ RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/carg
         test "$("/tmp/verify-$label/$name" --version | awk '{print $NF}')" = "$version"; \
     done
 
+# Shared base for both runtime stages below. Both the server (OIDC token
+# introspection, Authentik admin API calls) and the broker (OAuth token fetch,
+# Sovereign Config API calls) make outbound HTTPS calls, so both need a
+# trusted root store — a bare debian image ships none.
+FROM docker.io/library/debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS runtime-base
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 # This file builds two images from one source tree, so every build MUST name its
 # target. `server-runtime` is not the last stage, and an unnamed `docker build .`
 # would silently produce the broker image under the server's tag.
-FROM docker.io/library/debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS server-runtime
+FROM runtime-base AS server-runtime
 RUN useradd --system --uid 10001 --create-home sovereign-config
 USER sovereign-config
 COPY --from=builder /tmp/sovereign-config-server /usr/local/bin/sovereign-config-server
@@ -82,7 +92,7 @@ ENTRYPOINT ["/usr/local/bin/sovereign-config-server"]
 # workspace semver as the server, so the pair is protocol-matched by
 # construction. The healthcheck calls the broker's own /health over loopback in
 # process, so the runtime image needs no curl.
-FROM docker.io/library/debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS broker-runtime
+FROM runtime-base AS broker-runtime
 RUN useradd --system --uid 10001 --create-home sovereign-config-broker
 USER sovereign-config-broker
 COPY --from=builder /tmp/sovereign-config-woodpecker-broker /usr/local/bin/sovereign-config-woodpecker-broker
