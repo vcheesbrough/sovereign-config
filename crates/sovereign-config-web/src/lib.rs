@@ -2836,7 +2836,6 @@ async fn create_connection() {
             set_text("connection-state", "Connection created");
             let generation = CONNECTIONS_LOAD_GENERATION.get();
             load_current_connections().await;
-            load_tree().await;
             // If the generation advanced by more than this reload's own
             // bump, a concurrent logout or navigation happened while it was
             // in flight; opening the one-time URL dialog now would resurrect
@@ -2844,6 +2843,11 @@ async fn create_connection() {
             if CONNECTIONS_LOAD_GENERATION.get() == generation.wrapping_add(1) {
                 open_connection_url_dialog(&provisioned, &request.return_focus);
             }
+            // The sidebar's key marker is refreshed only after the one-time URL
+            // is on screen: it is the operator's single chance to copy the
+            // credential, and must not wait on a whole-estate read that could
+            // also fail and paint an error banner in front of the dialog.
+            load_tree().await;
         }
         Err(error) => {
             set_text("connection-state", "Error");
@@ -2878,13 +2882,14 @@ async fn rotate_connection() {
             set_text("connection-state", "Credential rotated");
             let generation = CONNECTIONS_LOAD_GENERATION.get();
             load_current_connections().await;
-            load_tree().await;
             // Same ordering hazard as create: a concurrent logout or
             // navigation while the reload was in flight must suppress the
             // one-time URL dialog rather than resurrect it afterward.
             if CONNECTIONS_LOAD_GENERATION.get() == generation.wrapping_add(1) {
                 open_connection_url_dialog(&provisioned, "connections-heading");
             }
+            // The tree refresh follows the dialog, as in create.
+            load_tree().await;
         }
         Err(error) => {
             // Refresh first: reloading clears the error banner, so the
