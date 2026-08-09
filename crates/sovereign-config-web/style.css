@@ -26,10 +26,27 @@ header {
 .brand-mark span:nth-child(2) { height: 19px; }
 .brand-mark span:nth-child(3) { height: 15px; }
 .session-actions { display: flex; gap: 8px; }
-.layout { min-height: calc(100vh - 64px); display: grid; grid-template-columns: 224px minmax(0, 1fr); }
-nav { padding: 24px 16px; background: #e8ecea; border-right: 1px solid #cbd3cf; }
+/* The sidebar width is a custom property so the drag handle can set it in one
+   place. The resizer sits inside the sidebar landmark, pinned to its edge. */
+.layout { --sidebar-width: 288px; min-height: calc(100vh - 64px); display: grid; grid-template-columns: var(--sidebar-width) minmax(0, 1fr); }
+.sidebar { position: relative; min-width: 0; display: flex; flex-direction: column; background: #e8ecea; }
+.nav-links { padding: 24px 16px 8px; }
 nav a { display: block; padding: 10px 12px; color: #25332d; font-size: 14px; font-weight: 650; text-decoration: none; border-left: 3px solid transparent; }
 nav a.active { color: #10211b; background: #fff; border-left-color: #b18119; }
+.sidebar-resizer { position: absolute; z-index: 1; top: 0; right: 0; bottom: 0; width: 6px; background: #cbd3cf; border: 0; cursor: col-resize; touch-action: none; }
+.sidebar-resizer:hover, .sidebar-resizer:focus-visible { background: #b18119; }
+.sidebar-resizer:focus-visible { outline: 3px solid #b66800; outline-offset: 1px; }
+.tree-panel { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; padding: 16px 16px 24px; border-top: 1px solid #cbd3cf; }
+.tree-panel h2 { font-size: 13px; font-weight: 750; text-transform: uppercase; color: #4b5953; }
+.tree-panel .status-text { font-size: 12px; }
+.config-tree { flex: 1 1 auto; list-style: none; margin: 12px 0 0; padding: 0; overflow: auto; }
+.tree-node { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 30px; padding: 4px 8px; color: #25332d; background: none; border: 0; border-radius: 4px; font: inherit; font-size: 13px; font-weight: 400; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.tree-node:hover { background: #dbe2df; }
+.tree-node.has-values { font-weight: 750; }
+.tree-node.selected { color: #10211b; background: #fff; box-shadow: inset 3px 0 0 #b18119; }
+.tree-key { flex: 0 0 auto; width: 14px; height: 14px; color: #8a6712; }
+.tree-label { min-width: 0; }
+.layout .tree-node:focus-visible { outline: 3px solid #b66800; outline-offset: -1px; }
 main { width: min(1240px, 100%); padding: 36px 48px 64px; }
 .page { min-width: 0; }
 .page-heading { display: flex; justify-content: space-between; align-items: end; gap: 24px; margin-bottom: 28px; }
@@ -153,9 +170,16 @@ dialog .actions { justify-content: flex-end; }
 @media (max-width: 760px) {
   header { padding: 0 16px; }
   .layout { width: 100%; min-width: 0; grid-template-columns: minmax(0, 1fr); }
-  nav { min-width: 0; max-width: 100%; display: flex; gap: 4px; padding: 8px 12px; overflow-x: auto; border-right: 0; border-bottom: 1px solid #cbd3cf; }
+  .sidebar { border-bottom: 1px solid #cbd3cf; }
+  .sidebar-resizer { display: none; }
+  .nav-links { min-width: 0; max-width: 100%; display: flex; gap: 4px; padding: 8px 12px; overflow-x: auto; }
   nav a { flex: 0 0 auto; border-left: 0; border-bottom: 3px solid transparent; }
   nav a.active { border-bottom-color: #b18119; }
+  /* Below the sidebar breakpoint there is no sidebar to put a tree in — the nav
+     collapses to a strip above the content — and a tree there would push the
+     Configuration form off a short screen. The path combobox remains the way to
+     move between paths on a narrow viewport. */
+  .tree-panel { display: none; }
   main { padding: 26px 18px 48px; }
   .page-heading { align-items: start; flex-direction: column; }
   .configuration-heading { gap: 6px; }

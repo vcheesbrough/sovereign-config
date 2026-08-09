@@ -40,9 +40,9 @@ use sovereign_config_proto::sovereign::config::v3::{
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    Document, Element, Event, Headers, HtmlButtonElement, HtmlDialogElement, HtmlInputElement,
-    HtmlTextAreaElement, KeyboardEvent, Request, RequestCache, RequestInit, Response, Url,
-    UrlSearchParams, window,
+    Document, Element, Event, Headers, HtmlButtonElement, HtmlDialogElement, HtmlElement,
+    HtmlInputElement, HtmlTextAreaElement, KeyboardEvent, PointerEvent, Request, RequestCache,
+    RequestInit, Response, Url, UrlSearchParams, window,
 };
 
 const STATE_KEY: &str = "sovereign-config.pkce-state";
@@ -51,7 +51,12 @@ const REFRESH_TOKEN_KEY: &str = "sovereign-config.refresh-token";
 const REFRESH_ENDPOINT_KEY: &str = "sovereign-config.refresh-endpoint";
 const REFRESH_EXPIRES_KEY: &str = "sovereign-config.refresh-expires-at";
 const RETURN_PATH_KEY: &str = "sovereign-config.return-path";
+const SIDEBAR_WIDTH_KEY: &str = "sovereign-config.sidebar-width";
 const REFRESH_LIFETIME_MS: f64 = 8.0 * 60.0 * 60.0 * 1000.0;
+const SIDEBAR_MIN_WIDTH: f64 = 200.0;
+const SIDEBAR_MAX_WIDTH: f64 = 560.0;
+const SIDEBAR_DEFAULT_WIDTH: f64 = 288.0;
+const SIDEBAR_KEY_STEP: f64 = 16.0;
 
 thread_local! {
     static TOKENS: RefCell<Option<MemoryTokens>> = const { RefCell::new(None) };
@@ -66,6 +71,13 @@ thread_local! {
     static CONNECTION_URL_SECRET: RefCell<Option<Secret>> = const { RefCell::new(None) };
     static CONNECTION_URL_RETURN_FOCUS: RefCell<Option<String>> = const { RefCell::new(None) };
     static CONNECTION_PENDING: Cell<bool> = const { Cell::new(false) };
+    static PENDING_CONNECTION: RefCell<Option<PendingConnection>> = const { RefCell::new(None) };
+    static TREE_LOAD_GENERATION: Cell<u64> = const { Cell::new(0) };
+    static TREE_NODES: RefCell<Vec<TreeNode>> = const { RefCell::new(Vec::new()) };
+    static CONNECTIONS: RefCell<Vec<ManagedConnectionMetadata>> = const { RefCell::new(Vec::new()) };
+    static PENDING_NAVIGATION: RefCell<Option<Route>> = const { RefCell::new(None) };
+    static CURRENT_URL: RefCell<String> = const { RefCell::new(String::new()) };
+    static SIDEBAR_DRAG_POINTER: Cell<Option<i32>> = const { Cell::new(None) };
 }
 
 struct DeleteTarget {
@@ -85,6 +97,101 @@ struct AddPathTarget {
 struct ConnectionTarget {
     connection_id: ConnectionId,
     return_focus: String,
+}
+
+/// A validated create-connection request awaiting its confirmation. Both the
+/// estate-wide form and the per-path form on the Configuration view fill this
+/// in, so the confirmation dialog and the mutation itself stay single-sourced.
+struct PendingConnection {
+    display_name: DisplayName,
+    root: ConfigPath,
+    permissions: ManagedPermissions,
+    /// Cleared once the connection is created, so the operator does not
+    /// accidentally create a second connection under the same name.
+    name_input_id: String,
+    return_focus: String,
+}
+
+/// One row of the sidebar configuration tree. The tree is always rendered fully
+/// expanded, so a node carries its depth rather than a list of children.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TreeNode {
+    path: ConfigPath,
+    depth: usize,
+    /// This namespace directly holds at least one value — rendered bold.
+    has_values: bool,
+    /// An access URL is rooted at exactly this path — rendered with a key.
+    has_connection: bool,
+}
+
+fn path_segments(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+/// The namespace holding `path`, or the root for a top-level value.
+fn parent_of(path: &ConfigPath) -> ConfigPath {
+    path.as_str()
+        .rsplit_once('/')
+        .filter(|(parent, _)| !parent.is_empty())
+        .and_then(|(parent, _)| ConfigPath::parse(parent).ok())
+        .unwrap_or_else(ConfigPath::root)
+}
+
+/// The namespaces a set of value paths implies: each value's parent and every
+/// ancestor of that parent, plus the tree root. This deliberately mirrors the
+/// server's own derivation of `ListValues.paths`, so both tree sources agree.
+fn namespaces_of(value_paths: &[ConfigPath]) -> BTreeSet<String> {
+    let mut namespaces = BTreeSet::new();
+    namespaces.insert("/".to_owned());
+    for path in value_paths {
+        let parent = parent_of(path);
+        let mut prefix = String::new();
+        for segment in path_segments(parent.as_str()) {
+            prefix.push('/');
+            prefix.push_str(segment);
+            namespaces.insert(prefix.clone());
+        }
+    }
+    namespaces
+}
+
+/// The namespaces that directly hold at least one value. `ListValues.paths`
+/// cannot answer this — it reports ancestors, which include namespaces holding
+/// nothing but children — so it is derived from whole-tree value paths instead.
+fn value_parents_of(value_paths: &[ConfigPath]) -> BTreeSet<String> {
+    value_paths
+        .iter()
+        .map(|path| parent_of(path).as_str().to_owned())
+        .collect()
+}
+
+/// Orders namespaces depth-first and decorates each with its sidebar markers.
+///
+/// Ordering compares segments rather than whole strings: `-` sorts before `/`,
+/// so a raw string sort would place `/a-b` between `/a` and `/a/b` and split a
+/// subtree in two.
+fn build_tree(
+    namespaces: &BTreeSet<String>,
+    value_parents: &BTreeSet<String>,
+    connection_roots: &BTreeSet<String>,
+) -> Vec<TreeNode> {
+    let mut ordered = namespaces.iter().cloned().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| path_segments(left).cmp(&path_segments(right)));
+    ordered
+        .into_iter()
+        .filter_map(|path| {
+            let depth = path_segments(&path).len();
+            let path = ConfigPath::parse(path).ok()?;
+            Some(TreeNode {
+                has_values: value_parents.contains(path.as_str()),
+                has_connection: connection_roots.contains(path.as_str()),
+                depth,
+                path,
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -598,6 +705,10 @@ pub fn start() {
                 } else if authenticated {
                     load_current_configuration().await;
                     load_current_connections().await;
+                    load_tree().await;
+                } else {
+                    // Renders the sidebar's logged-out hint in place of a tree.
+                    load_tree().await;
                 }
             }
             Err(error) => show_error(error.message()),
@@ -620,12 +731,18 @@ fn install_actions() {
     install_route_link(&document, "downloads-link", Route::Downloads);
     if let Some(browser_window) = window() {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            if has_unsaved_edits() {
+                // A history pop cannot be cancelled, so put the address bar
+                // back and ask the same question an in-app link would ask.
+                let target = route_from_location();
+                restore_current_url();
+                open_unsaved_dialog(target);
+                return;
+            }
             discard_connection_url();
             render_route(&route_from_location());
             spawn_local(async {
-                load_current_configuration().await;
-                load_current_connections().await;
-                load_downloads().await;
+                refresh_views().await;
             });
         });
         let _ = browser_window
@@ -652,6 +769,7 @@ fn install_actions() {
         let callback = Closure::<dyn FnMut(_)>::new(|_: web_sys::Event| {
             CONFIGURATION_LOAD_GENERATION.set(CONFIGURATION_LOAD_GENERATION.get().wrapping_add(1));
             CONNECTIONS_LOAD_GENERATION.set(CONNECTIONS_LOAD_GENERATION.get().wrapping_add(1));
+            TREE_LOAD_GENERATION.set(TREE_LOAD_GENERATION.get().wrapping_add(1));
             discard_connection_url();
             clear_browser_session();
             set_text("auth-value", "Logged out");
@@ -660,9 +778,14 @@ fn install_actions() {
             set_text("value-state", "Log in to view values");
             hide_new_value_row();
             clear_value_rows();
-            set_textarea("json-content", "");
+            set_loaded_textarea("json-content", "");
             set_text("value-count", "0 values");
-            clear_connection_rows();
+            clear_connection_rows(&ESTATE_CONNECTION_TABLE);
+            clear_connection_rows(&PATH_CONNECTION_TABLE);
+            CONNECTIONS.with_borrow_mut(Vec::clear);
+            TREE_NODES.with_borrow_mut(Vec::clear);
+            let _ = render_tree(&[]);
+            set_text("config-tree-state", "Log in to browse");
             set_text("connection-state", "Log in to view connections");
             focus("login");
         });
@@ -671,13 +794,132 @@ fn install_actions() {
     }
     install_configuration_actions(&document);
     install_connections_actions(&document);
+    install_unsaved_guard(&document);
+    install_sidebar_resizer(&document);
+    restore_sidebar_width();
+}
+
+fn install_unsaved_guard(document: &Document) {
+    if let Some(keep) = document.get_element_by_id("keep-editing") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| keep_editing());
+        let _ = keep.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(discard) = document.get_element_by_id("discard-changes") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| discard_changes());
+        let _ =
+            discard.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(dialog) = document.get_element_by_id("unsaved-dialog") {
+        // Escape closes a native dialog without either button; that is a
+        // decision to stay, so drop the pending route.
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            PENDING_NAVIGATION.with_borrow_mut(Option::take);
+        });
+        let _ = dialog.add_event_listener_with_callback("close", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+}
+
+/// Drag and keyboard control for the sidebar separator. The width is a CSS
+/// custom property on the layout grid, so nothing else needs to know about it.
+fn install_sidebar_resizer(document: &Document) {
+    let Some(resizer) = document.get_element_by_id("sidebar-resizer") else {
+        return;
+    };
+    let handle = resizer.clone();
+    let callback = Closure::<dyn FnMut(_)>::new(move |event: PointerEvent| {
+        event.prevent_default();
+        let _ = handle.set_pointer_capture(event.pointer_id());
+        SIDEBAR_DRAG_POINTER.set(Some(event.pointer_id()));
+    });
+    let _ =
+        resizer.add_event_listener_with_callback("pointerdown", callback.as_ref().unchecked_ref());
+    callback.forget();
+
+    let callback = Closure::<dyn FnMut(_)>::new(move |event: PointerEvent| {
+        if SIDEBAR_DRAG_POINTER.get() != Some(event.pointer_id()) {
+            return;
+        }
+        event.prevent_default();
+        // The layout grid starts at the viewport edge, so the pointer's x is
+        // the sidebar width the operator is asking for.
+        set_sidebar_width(f64::from(event.client_x()));
+    });
+    let _ =
+        resizer.add_event_listener_with_callback("pointermove", callback.as_ref().unchecked_ref());
+    callback.forget();
+
+    for event_name in ["pointerup", "pointercancel"] {
+        let handle = resizer.clone();
+        let callback = Closure::<dyn FnMut(_)>::new(move |event: PointerEvent| {
+            if SIDEBAR_DRAG_POINTER.get() == Some(event.pointer_id()) {
+                let _ = handle.release_pointer_capture(event.pointer_id());
+                SIDEBAR_DRAG_POINTER.set(None);
+            }
+        });
+        let _ =
+            resizer.add_event_listener_with_callback(event_name, callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    let callback = Closure::<dyn FnMut(_)>::new(move |event: KeyboardEvent| {
+        let step = match event.key().as_str() {
+            "ArrowLeft" => -SIDEBAR_KEY_STEP,
+            "ArrowRight" => SIDEBAR_KEY_STEP,
+            _ => return,
+        };
+        event.prevent_default();
+        set_sidebar_width(sidebar_width() + step);
+    });
+    let _ = resizer.add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref());
+    callback.forget();
+}
+
+fn sidebar_width() -> f64 {
+    window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("sidebar-resizer"))
+        .and_then(|resizer| resizer.get_attribute("aria-valuenow"))
+        .and_then(|width| width.parse::<f64>().ok())
+        .unwrap_or(SIDEBAR_DEFAULT_WIDTH)
+}
+
+fn set_sidebar_width(width: f64) {
+    let width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH).round();
+    if let Some(layout) = element::<HtmlElement>("layout") {
+        let _ = layout
+            .style()
+            .set_property("--sidebar-width", &format!("{width}px"));
+    }
+    if let Some(resizer) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("sidebar-resizer"))
+    {
+        let _ = resizer.set_attribute("aria-valuenow", &width.to_string());
+    }
+    if let Ok(storage) = local_storage() {
+        let _ = storage.set_item(SIDEBAR_WIDTH_KEY, &width.to_string());
+    }
+}
+
+fn restore_sidebar_width() {
+    let stored = local_storage()
+        .ok()
+        .and_then(|storage| storage.get_item(SIDEBAR_WIDTH_KEY).ok().flatten())
+        .and_then(|width| width.parse::<f64>().ok())
+        .filter(|width| width.is_finite());
+    if let Some(width) = stored {
+        set_sidebar_width(width);
+    }
 }
 
 fn install_route_link(document: &Document, id: &str, route: Route) {
     if let Some(link) = document.get_element_by_id(id) {
         let callback = Closure::<dyn FnMut(_)>::new(move |event: Event| {
             event.prevent_default();
-            navigate(&route);
+            guarded_navigate(route.clone());
         });
         let _ = link.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
         callback.forget();
@@ -900,7 +1142,7 @@ fn install_path_selector_actions(document: &Document) {
 fn open_selected_path() {
     if let Ok(path) = selected_namespace() {
         close_path_options();
-        navigate(&Route::Configuration(path));
+        guarded_navigate(Route::Configuration(path));
     } else {
         validate_path_field();
     }
@@ -1059,6 +1301,68 @@ fn select_active_path_option() {
     close_path_options();
 }
 
+/// Every in-app route change runs through here so an unsaved value edit can
+/// interpose a confirmation before the current view is torn down.
+fn guarded_navigate(route: Route) {
+    if has_unsaved_edits() {
+        open_unsaved_dialog(route);
+        return;
+    }
+    navigate(&route);
+}
+
+/// Reports whether any editor on the Configuration view holds text that has not
+/// been sent to the service.
+///
+/// This is derived from the DOM rather than tracked in a flag: every editable
+/// field either records what was loaded into it (`data-loaded`) or is empty when
+/// clean, so cancelling an edit clears the condition without any bookkeeping.
+fn has_unsaved_edits() -> bool {
+    let Some(document) = window().and_then(|window| window.document()) else {
+        return false;
+    };
+    if !element_is_hidden("new-value-row")
+        && (element::<HtmlInputElement>("new-value-name").is_some_and(|it| !it.value().is_empty())
+            || element::<HtmlTextAreaElement>("new-value-content")
+                .is_some_and(|it| !it.value().is_empty())
+            || element::<HtmlInputElement>("new-secret-content")
+                .is_some_and(|it| !it.value().is_empty()))
+    {
+        return true;
+    }
+    let editors = document.get_elements_by_tag_name("textarea");
+    for index in 0..editors.length() {
+        let Some(element) = editors.item(index) else {
+            continue;
+        };
+        let Some(loaded) = element.get_attribute("data-loaded") else {
+            continue;
+        };
+        if element
+            .dyn_into::<HtmlTextAreaElement>()
+            .is_ok_and(|editor| editor.value() != loaded)
+        {
+            return true;
+        }
+    }
+    let replacements = document.get_elements_by_tag_name("input");
+    for index in 0..replacements.length() {
+        let Some(element) = replacements.item(index) else {
+            continue;
+        };
+        if !element.id().starts_with("secret-replacement-") {
+            continue;
+        }
+        if element
+            .dyn_into::<HtmlInputElement>()
+            .is_ok_and(|input| !input.value().is_empty())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn navigate(route: &Route) {
     discard_connection_url();
     let url = route_url(route);
@@ -1069,13 +1373,67 @@ fn navigate(route: &Route) {
     }
     render_route(route);
     spawn_local(async {
-        load_current_configuration().await;
-        load_current_connections().await;
-        load_downloads().await;
+        refresh_views().await;
     });
 }
 
+async fn refresh_views() {
+    load_current_configuration().await;
+    load_current_connections().await;
+    load_downloads().await;
+    load_tree().await;
+}
+
+/// Re-reads the selected path after a mutation, together with the sidebar tree:
+/// adding the first value under a namespace creates a node, and removing the
+/// last one takes it away.
+async fn reload_configuration() {
+    load_current_configuration().await;
+    load_tree().await;
+}
+
+/// Holds the route the operator asked for until they choose between discarding
+/// the edit and staying put.
+fn open_unsaved_dialog(route: Route) {
+    PENDING_NAVIGATION.with_borrow_mut(|pending| *pending = Some(route));
+    if let Some(dialog) = element::<HtmlDialogElement>("unsaved-dialog") {
+        let _ = dialog.show_modal();
+        focus("keep-editing");
+    }
+}
+
+fn keep_editing() {
+    PENDING_NAVIGATION.with_borrow_mut(Option::take);
+    close_dialog("unsaved-dialog");
+}
+
+fn discard_changes() {
+    let pending = PENDING_NAVIGATION.with_borrow_mut(Option::take);
+    close_dialog("unsaved-dialog");
+    // Leaving reloads the destination, which replaces every editor; the edit is
+    // discarded by that reload rather than by clearing fields here.
+    if let Some(route) = pending {
+        navigate(&route);
+    }
+}
+
+/// Re-pushes the route currently rendered. A history pop cannot be prevented,
+/// so the guard restores the address bar and then asks the same question an
+/// in-app link would have asked before leaving.
+fn restore_current_url() {
+    let url = CURRENT_URL.with_borrow(Clone::clone);
+    if url.is_empty() {
+        return;
+    }
+    if let Some(window) = window()
+        && let Ok(history) = window.history()
+    {
+        let _ = history.push_state_with_url(&JsValue::NULL, "", Some(&url));
+    }
+}
+
 fn render_route(route: &Route) {
+    CURRENT_URL.with_borrow_mut(|url| *url = route_url(route));
     let configuration = matches!(route, Route::Configuration(_));
     let connections = matches!(route, Route::Connections);
     let downloads = matches!(route, Route::Downloads);
@@ -1100,6 +1458,12 @@ fn render_route(route: &Route) {
             input.set_value(&absolute_path(path));
         }
         validate_path_field();
+        set_text("path-connection-root", path.as_str());
+        render_path_connections();
+    }
+    let nodes = TREE_NODES.with_borrow(Clone::clone);
+    if let Err(error) = render_tree(&nodes) {
+        show_error(error.message());
     }
 }
 
@@ -1151,6 +1515,268 @@ fn route_url(route: &Route) -> String {
         Route::Connections => "/connections/".into(),
         Route::Downloads => "/downloads".into(),
     }
+}
+
+fn logged_in() -> bool {
+    TOKENS.with_borrow(Option::is_some)
+}
+
+/// The path the tree currently highlights, or `None` off the Configuration
+/// route.
+fn selected_tree_path() -> Option<ConfigPath> {
+    match route_from_location() {
+        Route::Configuration(path) => Some(path),
+        Route::System | Route::Connections | Route::Downloads => None,
+    }
+}
+
+/// Reads the whole readable configuration once per load so the sidebar can
+/// render the full namespace tree and mark the namespaces that directly hold
+/// values.
+///
+/// `ListValues.paths` already carries the namespace tree, but only as
+/// *ancestors*, which cannot distinguish a namespace holding values from one
+/// holding nothing but children. `GetSubTree` on the root answers that exactly;
+/// a principal scoped to a prefix is refused there, so the namespace list is the
+/// documented fallback and the tree simply renders without bold markers.
+async fn load_tree() {
+    let generation = TREE_LOAD_GENERATION.get().wrapping_add(1);
+    TREE_LOAD_GENERATION.set(generation);
+    if !logged_in() {
+        CONNECTIONS.with_borrow_mut(Vec::clear);
+        TREE_NODES.with_borrow_mut(Vec::clear);
+        let _ = render_tree(&[]);
+        render_path_connections();
+        set_text("config-tree-state", "Log in to browse");
+        return;
+    }
+    let Ok(config) = app_config() else {
+        set_text("config-tree-state", "Tree unavailable");
+        return;
+    };
+    set_text("config-tree-state", "Loading");
+    let selected = selected_tree_path().unwrap_or_else(ConfigPath::root);
+    // A connection listing failure must not cost the operator the whole tree;
+    // the key markers are simply absent until the next load.
+    let connections = value_client(&config)
+        .list_managed_connections()
+        .await
+        .unwrap_or_default();
+    let model = match value_client(&config).get_subtree(&ConfigPath::root()).await {
+        Ok(subtree) => {
+            let paths = subtree
+                .values
+                .into_iter()
+                .map(|value| value.path)
+                .collect::<Vec<_>>();
+            Some((namespaces_of(&paths), value_parents_of(&paths)))
+        }
+        Err(_) => value_client(&config)
+            .list_values(&selected)
+            .await
+            .ok()
+            .map(|listing| {
+                let mut namespaces = listing
+                    .paths
+                    .iter()
+                    .map(|path| path.as_str().to_owned())
+                    .collect::<BTreeSet<_>>();
+                namespaces.insert("/".to_owned());
+                (namespaces, BTreeSet::new())
+            }),
+    };
+    if TREE_LOAD_GENERATION.get() != generation {
+        return;
+    }
+    let roots = connections
+        .iter()
+        .map(|connection| connection.root.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    CONNECTIONS.with_borrow_mut(|slot| *slot = connections);
+    render_path_connections();
+    let Some((namespaces, value_parents)) = model else {
+        set_text("config-tree-state", "Tree unavailable");
+        return;
+    };
+    let nodes = build_tree(&namespaces, &value_parents, &roots);
+    let count = nodes.len();
+    TREE_NODES.with_borrow_mut(|slot| slot.clone_from(&nodes));
+    if let Err(error) = render_tree(&nodes) {
+        show_error(error.message());
+        return;
+    }
+    set_text(
+        "config-tree-state",
+        &format!("{count} path{}", if count == 1 { "" } else { "s" }),
+    );
+}
+
+fn render_tree(nodes: &[TreeNode]) -> Result<(), ClientError> {
+    let document = window()
+        .and_then(|window| window.document())
+        .ok_or_else(browser_error)?;
+    let tree = document
+        .get_element_by_id("config-tree")
+        .ok_or_else(browser_error)?;
+    tree.set_text_content(None);
+    let selected = selected_tree_path();
+    let selected_index = nodes
+        .iter()
+        .position(|node| selected.as_ref() == Some(&node.path));
+    // Exactly one node is ever in the tab order; without a selection that is the
+    // root, which is also the node the Configuration view opens on.
+    let focus_index = selected_index.or_else(|| (!nodes.is_empty()).then_some(0));
+    for (index, node) in nodes.iter().enumerate() {
+        let item = build_tree_node(&document, node, index, Some(index) == selected_index)?;
+        item.set_attribute(
+            "tabindex",
+            if Some(index) == focus_index {
+                "0"
+            } else {
+                "-1"
+            },
+        )
+        .map_err(|_| browser_error())?;
+        append(&tree, &item)?;
+    }
+    Ok(())
+}
+
+fn build_tree_node(
+    document: &Document,
+    node: &TreeNode,
+    index: usize,
+    selected: bool,
+) -> Result<Element, ClientError> {
+    let mut class = String::from("tree-node");
+    if node.has_values {
+        class.push_str(" has-values");
+    }
+    if selected {
+        class.push_str(" selected");
+    }
+    let item = create_element(document, "li", Some(&class))?;
+    let node_id = format!("tree-node-{index}");
+    let level = (node.depth + 1).to_string();
+    for (name, value) in [
+        ("role", "treeitem"),
+        ("id", node_id.as_str()),
+        ("aria-level", level.as_str()),
+        ("aria-selected", if selected { "true" } else { "false" }),
+        ("data-path", node.path.as_str()),
+    ] {
+        item.set_attribute(name, value)
+            .map_err(|_| browser_error())?;
+    }
+    if let Some(styled) = item.dyn_ref::<HtmlElement>() {
+        let indent = 8 + node.depth * 14;
+        let _ = styled
+            .style()
+            .set_property("padding-left", &format!("{indent}px"));
+    }
+    if node.has_connection {
+        append(&item, &key_icon(document)?)?;
+    }
+    let label = create_element(document, "span", Some("tree-label"))?;
+    label.set_text_content(Some(node.path.name().unwrap_or("/")));
+    append(&item, &label)?;
+    if node.has_connection {
+        let annotation = create_element(document, "span", Some("visually-hidden"))?;
+        annotation.set_text_content(Some(" has an access URL"));
+        append(&item, &annotation)?;
+    }
+
+    let target = node.path.clone();
+    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        guarded_navigate(Route::Configuration(target.clone()));
+    });
+    item.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
+
+    let activated = node.path.clone();
+    let callback =
+        Closure::<dyn FnMut(_)>::new(move |event: KeyboardEvent| match event.key().as_str() {
+            "Enter" | " " => {
+                event.prevent_default();
+                guarded_navigate(Route::Configuration(activated.clone()));
+            }
+            "ArrowDown" => {
+                event.prevent_default();
+                focus_tree_node(index.saturating_add(1));
+            }
+            "ArrowUp" => {
+                event.prevent_default();
+                focus_tree_node(index.wrapping_sub(1));
+            }
+            "Home" => {
+                event.prevent_default();
+                focus_tree_node(0);
+            }
+            "End" => {
+                event.prevent_default();
+                focus_tree_node(usize::MAX);
+            }
+            _ => {}
+        });
+    item.add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
+    Ok(item)
+}
+
+/// Moves the roving tab stop to `index`, clamped to the rendered nodes.
+fn focus_tree_node(index: usize) {
+    let count = TREE_NODES.with_borrow(Vec::len);
+    if count == 0 {
+        return;
+    }
+    let index = index.min(count - 1);
+    let Some(document) = window().and_then(|window| window.document()) else {
+        return;
+    };
+    for position in 0..count {
+        if let Some(node) = document.get_element_by_id(&format!("tree-node-{position}")) {
+            let _ = node.set_attribute("tabindex", if position == index { "0" } else { "-1" });
+        }
+    }
+    focus(&format!("tree-node-{index}"));
+}
+
+/// A small key, drawn rather than imported so the sidebar needs no icon asset.
+fn key_icon(document: &Document) -> Result<Element, ClientError> {
+    let svg = document
+        .create_element_ns(Some("http://www.w3.org/2000/svg"), "svg")
+        .map_err(|_| browser_error())?;
+    for (name, value) in [
+        ("class", "tree-key"),
+        ("viewBox", "0 0 16 16"),
+        ("fill", "none"),
+        ("stroke", "currentColor"),
+        ("stroke-width", "1.6"),
+        ("stroke-linecap", "round"),
+        ("aria-hidden", "true"),
+        ("focusable", "false"),
+    ] {
+        svg.set_attribute(name, value)
+            .map_err(|_| browser_error())?;
+    }
+    let bow = document
+        .create_element_ns(Some("http://www.w3.org/2000/svg"), "circle")
+        .map_err(|_| browser_error())?;
+    for (name, value) in [("cx", "5"), ("cy", "8"), ("r", "3.2")] {
+        bow.set_attribute(name, value)
+            .map_err(|_| browser_error())?;
+    }
+    append(&svg, &bow)?;
+    let blade = document
+        .create_element_ns(Some("http://www.w3.org/2000/svg"), "path")
+        .map_err(|_| browser_error())?;
+    blade
+        .set_attribute("d", "M8.2 8h6.3M12.5 8v2.4")
+        .map_err(|_| browser_error())?;
+    append(&svg, &blade)?;
+    Ok(svg)
 }
 
 /// One installer as described by `/dist/manifest.json`.
@@ -1407,7 +2033,7 @@ async fn load_current_configuration() {
     CONFIGURATION_LOAD_GENERATION.set(generation);
     hide_new_value_row();
     clear_value_rows();
-    set_textarea("json-content", "");
+    set_loaded_textarea("json-content", "");
     let Route::Configuration(path) = route_from_location() else {
         return;
     };
@@ -1416,7 +2042,7 @@ async fn load_current_configuration() {
     let json_mode = JSON_MODE.get();
     update_configuration_mode();
     if json_mode {
-        set_textarea("json-content", "");
+        set_loaded_textarea("json-content", "");
         set_validation("json-content", "json-error", None);
         set_text("value-count", "0 values");
     }
@@ -1449,7 +2075,7 @@ async fn load_current_configuration() {
         Ok(ConfigurationData::SubTree(subtree)) => {
             match render_subtree_json(&path, &subtree.values) {
                 Ok(json) => {
-                    set_textarea("json-content", &json);
+                    set_loaded_textarea("json-content", &json);
                     set_validation("json-content", "json-error", None);
                     let count = subtree.values.len();
                     set_text(
@@ -1525,7 +2151,7 @@ async fn save_json_subtree() {
     .await;
     match result {
         Ok(_) => {
-            load_current_configuration().await;
+            reload_configuration().await;
             set_text("value-state", "Saved");
             focus("json-content");
         }
@@ -1599,7 +2225,7 @@ async fn save_new_value() {
     match result {
         Ok(_) => {
             hide_new_value_row();
-            load_current_configuration().await;
+            reload_configuration().await;
             set_text("value-state", "Saved");
             focus("add-value");
         }
@@ -1630,7 +2256,7 @@ async fn save_existing_value(path: ConfigPath, input_id: String) {
     .await;
     match result {
         Ok(_) => {
-            load_current_configuration().await;
+            reload_configuration().await;
             set_text("value-state", "Saved");
             focus("values-heading");
         }
@@ -1652,7 +2278,7 @@ async fn save_existing_secret(path: ConfigPath, input_id: String) {
     .await;
     match result {
         Ok(_) => {
-            load_current_configuration().await;
+            reload_configuration().await;
             set_text("value-state", "Saved");
             focus("values-heading");
         }
@@ -1764,7 +2390,7 @@ async fn delete_selected_value() {
     close_delete_dialog();
     match result {
         Ok(_) => {
-            load_current_configuration().await;
+            reload_configuration().await;
             set_text("value-state", "Deleted");
             focus("add-value");
         }
@@ -1846,7 +2472,7 @@ async fn add_selected_path() {
     close_add_path_dialog();
     match result {
         Ok(_) => {
-            load_current_configuration().await;
+            reload_configuration().await;
             set_text("value-state", "Path added");
             focus("add-value");
         }
@@ -1865,20 +2491,24 @@ fn close_add_path_dialog() {
 
 #[allow(clippy::too_many_lines)]
 fn install_connections_actions(document: &Document) {
-    if let Some(form) = document.get_element_by_id("connection-form") {
-        let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
-            event.prevent_default();
-            open_create_connection();
-        });
-        let _ = form.add_event_listener_with_callback("submit", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(name) = document.get_element_by_id("connection-name") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            validate_connection_name_field();
-        });
-        let _ = name.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
-        callback.forget();
+    for form in [&ESTATE_CONNECTION_FORM, &PATH_CONNECTION_FORM] {
+        if let Some(element) = document.get_element_by_id(form.form_id) {
+            let callback = Closure::<dyn FnMut(_)>::new(move |event: Event| {
+                event.prevent_default();
+                open_create_connection(form);
+            });
+            let _ = element
+                .add_event_listener_with_callback("submit", callback.as_ref().unchecked_ref());
+            callback.forget();
+        }
+        if let Some(name) = document.get_element_by_id(form.name_id) {
+            let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+                validate_connection_name_field(form);
+            });
+            let _ =
+                name.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
+            callback.forget();
+        }
     }
     if let Some(root) = document.get_element_by_id("connection-root") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
@@ -1889,8 +2519,14 @@ fn install_connections_actions(document: &Document) {
     }
     if let Some(cancel) = document.get_element_by_id("cancel-create-connection") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            let return_focus = PENDING_CONNECTION
+                .with_borrow_mut(Option::take)
+                .map_or_else(
+                    || "create-connection".to_owned(),
+                    |pending| pending.return_focus,
+                );
             close_dialog("create-connection-dialog");
-            focus("create-connection");
+            focus(&return_focus);
         });
         let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
         callback.forget();
@@ -1972,14 +2608,50 @@ fn install_connections_actions(document: &Document) {
     }
 }
 
-fn validate_connection_name_field() -> bool {
-    let value = element::<HtmlInputElement>("connection-name").map(|input| input.value());
+/// The identifiers of one create-connection form. The Access URLs view types a
+/// root; the Configuration view takes the selected tree node instead, so its
+/// `root_id` is absent.
+struct ConnectionForm {
+    form_id: &'static str,
+    name_id: &'static str,
+    name_error_id: &'static str,
+    root_id: Option<&'static str>,
+    permission_prefix: &'static str,
+    permissions_field_id: &'static str,
+    permissions_error_id: &'static str,
+    submit_id: &'static str,
+}
+
+const ESTATE_CONNECTION_FORM: ConnectionForm = ConnectionForm {
+    form_id: "connection-form",
+    name_id: "connection-name",
+    name_error_id: "connection-name-error",
+    root_id: Some("connection-root"),
+    permission_prefix: "connection",
+    permissions_field_id: "connection-permissions",
+    permissions_error_id: "connection-permissions-error",
+    submit_id: "create-connection",
+};
+
+const PATH_CONNECTION_FORM: ConnectionForm = ConnectionForm {
+    form_id: "path-connection-form",
+    name_id: "path-connection-name",
+    name_error_id: "path-connection-name-error",
+    root_id: None,
+    permission_prefix: "path-connection",
+    permissions_field_id: "path-connection-permissions",
+    permissions_error_id: "path-connection-permissions-error",
+    submit_id: "create-path-connection",
+};
+
+fn validate_connection_name_field(form: &ConnectionForm) -> bool {
+    let value = element::<HtmlInputElement>(form.name_id).map(|input| input.value());
     let valid = value
         .as_deref()
         .is_some_and(|value| DisplayName::parse(value).is_ok());
     set_validation(
-        "connection-name",
-        "connection-name-error",
+        form.name_id,
+        form.name_error_id,
         if valid {
             None
         } else {
@@ -2010,39 +2682,53 @@ fn validate_connection_root_field() -> bool {
     valid
 }
 
-fn open_create_connection() {
-    let name_valid = validate_connection_name_field();
-    let root_valid = validate_connection_root_field();
-    let permissions_valid = validate_connection_permissions_field();
+/// Validates one create-connection form and, if it holds together, records the
+/// request for the shared confirmation dialog to act on.
+fn open_create_connection(form: &ConnectionForm) {
+    let name_valid = validate_connection_name_field(form);
+    let root_valid = form.root_id.is_none() || validate_connection_root_field();
+    let permissions_valid = validate_connection_permissions_field(form);
     if !name_valid {
-        focus("connection-name");
+        focus(form.name_id);
         return;
     }
     if !root_valid {
-        focus("connection-root");
+        focus(form.root_id.unwrap_or(form.name_id));
         return;
     }
     if !permissions_valid {
-        focus("connection-permission-read");
+        focus(&format!("{}-permission-read", form.permission_prefix));
         return;
     }
-    let Some(name) = element::<HtmlInputElement>("connection-name").map(|input| input.value())
+    let Some(Ok(display_name)) =
+        element::<HtmlInputElement>(form.name_id).map(|input| DisplayName::parse(input.value()))
     else {
         return;
     };
-    let Some(root) = element::<HtmlInputElement>("connection-root").map(|input| input.value())
-    else {
+    let root = match form.root_id {
+        Some(id) => element::<HtmlInputElement>(id)
+            .map(|input| input.value())
+            .and_then(|value| parse_absolute_path(&value).ok()),
+        None => selected_tree_path(),
+    };
+    let (Some(root), Some(permissions)) = (root, selected_connection_permissions(form)) else {
         return;
     };
-    let Some(permissions) = selected_connection_permissions() else {
-        return;
-    };
-    set_text("create-connection-name", &name);
-    set_text("create-connection-root", &root);
+    set_text("create-connection-name", display_name.as_str());
+    set_text("create-connection-root", root.as_str());
     set_text(
         "create-connection-permissions",
         &connection_permissions_phrase(&permissions),
     );
+    PENDING_CONNECTION.with_borrow_mut(|pending| {
+        *pending = Some(PendingConnection {
+            display_name,
+            root,
+            permissions,
+            name_input_id: form.name_id.to_owned(),
+            return_focus: form.submit_id.to_owned(),
+        });
+    });
     if let Some(dialog) = element::<HtmlDialogElement>("create-connection-dialog") {
         let _ = dialog.show_modal();
         focus("cancel-create-connection");
@@ -2051,25 +2737,26 @@ fn open_create_connection() {
 
 /// Reads the three permission checkboxes into a core permission set, returning
 /// `None` when the operator has selected nothing.
-fn selected_connection_permissions() -> Option<ManagedPermissions> {
+fn selected_connection_permissions(form: &ConnectionForm) -> Option<ManagedPermissions> {
     let mut selected = Vec::new();
-    for (id, permission) in [
-        ("connection-permission-read", ManagedPermission::Read),
-        ("connection-permission-write", ManagedPermission::Write),
-        ("connection-permission-manage", ManagedPermission::Manage),
+    for (name, permission) in [
+        ("read", ManagedPermission::Read),
+        ("write", ManagedPermission::Write),
+        ("manage", ManagedPermission::Manage),
     ] {
-        if element::<HtmlInputElement>(id).is_some_and(|input| input.checked()) {
+        let id = format!("{}-permission-{name}", form.permission_prefix);
+        if element::<HtmlInputElement>(&id).is_some_and(|input| input.checked()) {
             selected.push(permission);
         }
     }
     ManagedPermissions::new(selected).ok()
 }
 
-fn validate_connection_permissions_field() -> bool {
-    let valid = selected_connection_permissions().is_some();
+fn validate_connection_permissions_field(form: &ConnectionForm) -> bool {
+    let valid = selected_connection_permissions(form).is_some();
     set_validation(
-        "connection-permissions",
-        "connection-permissions-error",
+        form.permissions_field_id,
+        form.permissions_error_id,
         if valid {
             None
         } else {
@@ -2124,17 +2811,7 @@ async fn create_connection() {
     if CONNECTION_PENDING.get() {
         return;
     }
-    let (Some(name), Some(root)) = (
-        element::<HtmlInputElement>("connection-name").map(|input| input.value()),
-        element::<HtmlInputElement>("connection-root").map(|input| input.value()),
-    ) else {
-        return;
-    };
-    let (Ok(display_name), Ok(root), Some(permissions)) = (
-        DisplayName::parse(name),
-        parse_absolute_path(&root),
-        selected_connection_permissions(),
-    ) else {
+    let Some(request) = PENDING_CONNECTION.with_borrow_mut(Option::take) else {
         close_dialog("create-connection-dialog");
         return;
     };
@@ -2144,7 +2821,7 @@ async fn create_connection() {
     let result = async {
         let config = app_config()?;
         value_client(&config)
-            .create_managed_connection(&display_name, &root, &permissions)
+            .create_managed_connection(&request.display_name, &request.root, &request.permissions)
             .await
     }
     .await;
@@ -2153,24 +2830,25 @@ async fn create_connection() {
     close_dialog("create-connection-dialog");
     match result {
         Ok(provisioned) => {
-            if let Some(input) = element::<HtmlInputElement>("connection-name") {
+            if let Some(input) = element::<HtmlInputElement>(&request.name_input_id) {
                 input.set_value("");
             }
             set_text("connection-state", "Connection created");
             let generation = CONNECTIONS_LOAD_GENERATION.get();
             load_current_connections().await;
+            load_tree().await;
             // If the generation advanced by more than this reload's own
             // bump, a concurrent logout or navigation happened while it was
             // in flight; opening the one-time URL dialog now would resurrect
             // a credential after the user has already left.
             if CONNECTIONS_LOAD_GENERATION.get() == generation.wrapping_add(1) {
-                open_connection_url_dialog(&provisioned, "create-connection");
+                open_connection_url_dialog(&provisioned, &request.return_focus);
             }
         }
         Err(error) => {
             set_text("connection-state", "Error");
             show_error(error.message());
-            focus("create-connection");
+            focus(&request.return_focus);
         }
     }
 }
@@ -2200,6 +2878,7 @@ async fn rotate_connection() {
             set_text("connection-state", "Credential rotated");
             let generation = CONNECTIONS_LOAD_GENERATION.get();
             load_current_connections().await;
+            load_tree().await;
             // Same ordering hazard as create: a concurrent logout or
             // navigation while the reload was in flight must suppress the
             // one-time URL dialog rather than resurrect it afterward.
@@ -2241,6 +2920,7 @@ async fn revoke_connection() {
     // Refresh first: reloading clears the error banner, so any message must
     // be shown after the new state is rendered.
     load_current_connections().await;
+    load_tree().await;
     match result {
         Ok(()) => {
             set_text("connection-state", "Connection revoked");
@@ -2337,7 +3017,7 @@ async fn load_current_connections() {
     if !matches!(route_from_location(), Route::Connections) {
         return;
     }
-    clear_connection_rows();
+    clear_connection_rows(&ESTATE_CONNECTION_TABLE);
     clear_error();
     set_text("connection-state", "Loading");
     let result = async {
@@ -2364,24 +3044,73 @@ async fn load_current_connections() {
     }
 }
 
+/// The identifiers of one connections table. The Access URLs view lists the
+/// whole estate; the Configuration view lists only the selected path. Both share
+/// this renderer, so their row actions must not collide on element ids.
+struct ConnectionTable {
+    body_id: &'static str,
+    count_id: &'static str,
+    empty_id: &'static str,
+    prefix: &'static str,
+}
+
+const ESTATE_CONNECTION_TABLE: ConnectionTable = ConnectionTable {
+    body_id: "connections-body",
+    count_id: "connection-count",
+    empty_id: "empty-connections",
+    prefix: "",
+};
+
+const PATH_CONNECTION_TABLE: ConnectionTable = ConnectionTable {
+    body_id: "path-connections-body",
+    count_id: "path-connection-count",
+    empty_id: "empty-path-connections",
+    prefix: "path-",
+};
+
 fn render_connections(connections: &[ManagedConnectionMetadata]) -> Result<(), ClientError> {
-    clear_connection_rows();
+    render_connection_rows(connections, &ESTATE_CONNECTION_TABLE)
+}
+
+/// Lists the access URLs rooted at exactly the selected path beneath that
+/// path's values, so an operator grants access from the same place they read it.
+fn render_path_connections() {
+    let Some(path) = selected_tree_path() else {
+        return;
+    };
+    let scoped = CONNECTIONS.with_borrow(|connections| {
+        connections
+            .iter()
+            .filter(|connection| connection.root == path)
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    if let Err(error) = render_connection_rows(&scoped, &PATH_CONNECTION_TABLE) {
+        show_error(error.message());
+    }
+}
+
+fn render_connection_rows(
+    connections: &[ManagedConnectionMetadata],
+    table: &ConnectionTable,
+) -> Result<(), ClientError> {
+    clear_connection_rows(table);
     let document = window()
         .and_then(|window| window.document())
         .ok_or_else(browser_error)?;
     let body = document
-        .get_element_by_id("connections-body")
+        .get_element_by_id(table.body_id)
         .ok_or_else(browser_error)?;
     for (index, connection) in connections.iter().enumerate() {
-        let row = render_connection_row(&document, connection, index)?;
+        let row = render_connection_row(&document, connection, index, table.prefix)?;
         append(&body, &row)?;
     }
     let count = connections.len();
     set_text(
-        "connection-count",
+        table.count_id,
         &format!("{count} connection{}", if count == 1 { "" } else { "s" }),
     );
-    set_hidden("empty-connections", count != 0);
+    set_hidden(table.empty_id, count != 0);
     Ok(())
 }
 
@@ -2389,6 +3118,7 @@ fn render_connection_row(
     document: &Document,
     connection: &ManagedConnectionMetadata,
     index: usize,
+    prefix: &str,
 ) -> Result<Element, ClientError> {
     let row = create_element(document, "tr", None)?;
     let name = create_element(document, "th", None)?;
@@ -2410,7 +3140,7 @@ fn render_connection_row(
 
     let actions_cell = create_element(document, "td", None)?;
     let actions = create_element(document, "div", Some("row-actions"))?;
-    let rotate_id = format!("rotate-connection-{index}");
+    let rotate_id = format!("{prefix}rotate-connection-{index}");
     let rotate = create_button(document, &rotate_id, "Rotate", Some("secondary"))?;
     rotate
         .set_attribute(
@@ -2448,7 +3178,7 @@ fn render_connection_row(
     callback.forget();
     append(&actions, &rotate)?;
 
-    let revoke_id = format!("revoke-connection-{index}");
+    let revoke_id = format!("{prefix}revoke-connection-{index}");
     let revoke = create_button(document, &revoke_id, "Revoke", Some("danger"))?;
     revoke
         .set_attribute(
@@ -2517,17 +3247,17 @@ const fn connection_state_label(state: ManagedConnectionState) -> &'static str {
     }
 }
 
-fn clear_connection_rows() {
+fn clear_connection_rows(table: &ConnectionTable) {
     if let Some(body) = window()
         .and_then(|window| window.document())
-        .and_then(|document| document.get_element_by_id("connections-body"))
+        .and_then(|document| document.get_element_by_id(table.body_id))
     {
         while let Some(row) = body.last_element_child() {
             row.remove();
         }
     }
-    set_text("connection-count", "0 connections");
-    set_hidden("empty-connections", false);
+    set_text(table.count_id, "0 connections");
+    set_hidden(table.empty_id, false);
 }
 
 fn render_listing(listing: &ValueListing) -> Result<(), ClientError> {
@@ -2664,6 +3394,9 @@ fn render_value_row(
         .dyn_into::<HtmlTextAreaElement>()
         .map_err(|_| browser_error())?
         .set_value(value.value.display_text());
+    editor
+        .set_attribute("data-loaded", value.value.display_text())
+        .map_err(|_| browser_error())?;
     let field_error = create_element(document, "p", Some("field-error"))?;
     field_error
         .set_attribute("id", &error_id)
@@ -3695,6 +4428,16 @@ fn session_storage() -> Result<web_sys::Storage, ClientError> {
         .ok_or_else(browser_error)
 }
 
+/// Holds the sidebar width only. Nothing sensitive is ever written here: tokens
+/// stay in session storage and in memory.
+fn local_storage() -> Result<web_sys::Storage, ClientError> {
+    window()
+        .ok_or_else(browser_error)?
+        .local_storage()
+        .map_err(|_| browser_error())?
+        .ok_or_else(browser_error)
+}
+
 fn redirect_uri() -> Result<String, ClientError> {
     let location = window().ok_or_else(browser_error)?.location();
     Ok(format!(
@@ -3727,6 +4470,18 @@ fn element<T: JsCast>(id: &str) -> Option<T> {
 fn set_textarea(id: &str, value: &str) {
     if let Some(element) = element::<HtmlTextAreaElement>(id) {
         element.set_value(value);
+    }
+}
+
+/// Sets a textarea and records what was loaded into it, so [`has_unsaved_edits`]
+/// can tell an edit from the stored text by comparison.
+fn set_loaded_textarea(id: &str, value: &str) {
+    set_textarea(id, value);
+    if let Some(element) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id(id))
+    {
+        let _ = element.set_attribute("data-loaded", value);
     }
 }
 
@@ -3786,10 +4541,95 @@ mod tests {
     use sovereign_config_core::ErrorKind;
     use sovereign_config_proto::sovereign::config::v3::GetIdentityResponse;
 
+    use std::collections::BTreeSet;
+
+    use sovereign_config_core::ConfigPath;
+
     use super::{
-        Route, classify_refresh_error, decode_grpc_web, decode_grpc_web_response,
-        parse_absolute_path, route_from_path, route_url,
+        Route, build_tree, classify_refresh_error, decode_grpc_web, decode_grpc_web_response,
+        namespaces_of, parse_absolute_path, route_from_path, route_url, value_parents_of,
     };
+
+    fn paths(values: &[&str]) -> Vec<ConfigPath> {
+        values
+            .iter()
+            .map(|path| ConfigPath::parse(*path).unwrap())
+            .collect()
+    }
+
+    fn roots(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|root| (*root).to_owned()).collect()
+    }
+
+    #[test]
+    fn value_paths_imply_every_namespace_and_the_root() {
+        let namespaces = namespaces_of(&paths(&[
+            "/apps/api/enabled",
+            "/apps/api/nested/message",
+            "/top-level",
+        ]));
+
+        assert_eq!(
+            namespaces.into_iter().collect::<Vec<_>>(),
+            ["/", "/apps", "/apps/api", "/apps/api/nested"]
+        );
+    }
+
+    #[test]
+    fn only_namespaces_directly_holding_values_are_bold() {
+        // `/apps` is an ancestor of two values but holds none itself, which is
+        // exactly the distinction `ListValues.paths` cannot express.
+        let value_paths = paths(&["/apps/api/enabled", "/apps/api/nested/message", "/loose"]);
+
+        let parents = value_parents_of(&value_paths);
+
+        assert_eq!(
+            parents.into_iter().collect::<Vec<_>>(),
+            ["/", "/apps/api", "/apps/api/nested"]
+        );
+    }
+
+    #[test]
+    fn tree_orders_subtrees_contiguously_and_marks_access_urls() {
+        // `-` sorts before `/`, so a raw string sort would wedge `/apps-legacy`
+        // between `/apps` and its own children.
+        let value_paths = paths(&["/apps/api/enabled", "/apps-legacy/flag", "/apps/web/theme"]);
+        let namespaces = namespaces_of(&value_paths);
+        let parents = value_parents_of(&value_paths);
+
+        let tree = build_tree(&namespaces, &parents, &roots(&["/apps/api", "/absent"]));
+
+        let rendered = tree
+            .iter()
+            .map(|node| {
+                (
+                    node.path.as_str(),
+                    node.depth,
+                    node.has_values,
+                    node.has_connection,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered,
+            [
+                ("/", 0, false, false),
+                ("/apps", 1, false, false),
+                ("/apps/api", 2, true, true),
+                ("/apps/web", 2, true, false),
+                ("/apps-legacy", 1, true, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_estate_still_offers_the_root_node() {
+        let tree = build_tree(&namespaces_of(&[]), &BTreeSet::new(), &BTreeSet::new());
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].path.as_str(), "/");
+        assert!(!tree[0].has_values);
+    }
 
     #[test]
     fn absolute_configuration_paths_drive_canonical_routes() {
