@@ -76,6 +76,7 @@ thread_local! {
     static TREE_NODES: RefCell<Vec<TreeNode>> = const { RefCell::new(Vec::new()) };
     static CONNECTIONS: RefCell<Vec<ManagedConnectionMetadata>> = const { RefCell::new(Vec::new()) };
     static PENDING_NAVIGATION: RefCell<Option<Route>> = const { RefCell::new(None) };
+    static PENDING_FROM_HISTORY: Cell<bool> = const { Cell::new(false) };
     static CURRENT_URL: RefCell<String> = const { RefCell::new(String::new()) };
     static SIDEBAR_DRAG_POINTER: Cell<Option<i32>> = const { Cell::new(None) };
 }
@@ -736,7 +737,7 @@ fn install_actions() {
                 // back and ask the same question an in-app link would ask.
                 let target = route_from_location();
                 restore_current_url();
-                open_unsaved_dialog(target);
+                open_unsaved_dialog(target, true);
                 return;
             }
             discard_connection_url();
@@ -794,12 +795,26 @@ fn install_actions() {
     }
     install_configuration_actions(&document);
     install_connections_actions(&document);
+    install_tree_actions(&document);
     install_unsaved_guard(&document);
     install_sidebar_resizer(&document);
     restore_sidebar_width();
 }
 
 fn install_unsaved_guard(document: &Document) {
+    // In-app links, tree clicks, and Back are guarded by the modal below, but a
+    // reload, a tab close, or a typed URL never reaches any of them. Only the
+    // browser's own prompt can interpose there; its wording is not ours to set.
+    if let Some(browser_window) = window() {
+        let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
+            if has_unsaved_edits() {
+                event.prevent_default();
+            }
+        });
+        let _ = browser_window
+            .add_event_listener_with_callback("beforeunload", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
     if let Some(keep) = document.get_element_by_id("keep-editing") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| keep_editing());
         let _ = keep.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
@@ -843,9 +858,10 @@ fn install_sidebar_resizer(document: &Document) {
             return;
         }
         event.prevent_default();
-        // The layout grid starts at the viewport edge, so the pointer's x is
-        // the sidebar width the operator is asking for.
-        set_sidebar_width(f64::from(event.client_x()));
+        // Measure from the grid's own left edge rather than the viewport's, so
+        // any future gutter or centred shell does not silently offset the
+        // handle from the pointer by exactly that width.
+        set_sidebar_width(f64::from(event.client_x()) - layout_left());
     });
     let _ =
         resizer.add_event_listener_with_callback("pointermove", callback.as_ref().unchecked_ref());
@@ -875,6 +891,10 @@ fn install_sidebar_resizer(document: &Document) {
     });
     let _ = resizer.add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref());
     callback.forget();
+}
+
+fn layout_left() -> f64 {
+    element::<HtmlElement>("layout").map_or(0.0, |layout| layout.get_bounding_client_rect().left())
 }
 
 fn sidebar_width() -> f64 {
@@ -1305,7 +1325,7 @@ fn select_active_path_option() {
 /// interpose a confirmation before the current view is torn down.
 fn guarded_navigate(route: Route) {
     if has_unsaved_edits() {
-        open_unsaved_dialog(route);
+        open_unsaved_dialog(route, false);
         return;
     }
     navigate(&route);
@@ -1318,9 +1338,6 @@ fn guarded_navigate(route: Route) {
 /// field either records what was loaded into it (`data-loaded`) or is empty when
 /// clean, so cancelling an edit clears the condition without any bookkeeping.
 fn has_unsaved_edits() -> bool {
-    let Some(document) = window().and_then(|window| window.document()) else {
-        return false;
-    };
     if !element_is_hidden("new-value-row")
         && (element::<HtmlInputElement>("new-value-name").is_some_and(|it| !it.value().is_empty())
             || element::<HtmlTextAreaElement>("new-value-content")
@@ -1330,32 +1347,39 @@ fn has_unsaved_edits() -> bool {
     {
         return true;
     }
-    let editors = document.get_elements_by_tag_name("textarea");
+    // Scoped to the value rows and the JSON editor rather than swept from the
+    // document: everything editable here lives in one of those two places, and
+    // the page now carries two connection forms whose fields must never be
+    // mistaken for a value edit.
+    if element::<HtmlTextAreaElement>("json-content")
+        .as_ref()
+        .is_some_and(edited_textarea)
+    {
+        return true;
+    }
+    let Some(rows) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("values-body"))
+    else {
+        return false;
+    };
+    let editors = rows.get_elements_by_tag_name("textarea");
     for index in 0..editors.length() {
-        let Some(element) = editors.item(index) else {
-            continue;
-        };
-        let Some(loaded) = element.get_attribute("data-loaded") else {
-            continue;
-        };
-        if element
-            .dyn_into::<HtmlTextAreaElement>()
-            .is_ok_and(|editor| editor.value() != loaded)
+        if editors
+            .item(index)
+            .and_then(|editor| editor.dyn_into::<HtmlTextAreaElement>().ok())
+            .as_ref()
+            .is_some_and(edited_textarea)
         {
             return true;
         }
     }
-    let replacements = document.get_elements_by_tag_name("input");
+    let replacements = rows.get_elements_by_tag_name("input");
     for index in 0..replacements.length() {
-        let Some(element) = replacements.item(index) else {
-            continue;
-        };
-        if !element.id().starts_with("secret-replacement-") {
-            continue;
-        }
-        if element
-            .dyn_into::<HtmlInputElement>()
-            .is_ok_and(|input| !input.value().is_empty())
+        if replacements
+            .item(index)
+            .and_then(|input| input.dyn_into::<HtmlInputElement>().ok())
+            .is_some_and(|input| input.type_() == "password" && !input.value().is_empty())
         {
             return true;
         }
@@ -1363,13 +1387,29 @@ fn has_unsaved_edits() -> bool {
     false
 }
 
+/// A textarea holds an edit when its text differs from what was loaded into it.
+/// One without a loaded marker — a revealed secret, say — is never an edit.
+fn edited_textarea(editor: &HtmlTextAreaElement) -> bool {
+    editor
+        .get_attribute("data-loaded")
+        .is_some_and(|loaded| editor.value() != loaded)
+}
+
 fn navigate(route: &Route) {
+    navigate_with(route, false);
+}
+
+fn navigate_with(route: &Route, replace: bool) {
     discard_connection_url();
     let url = route_url(route);
     if let Some(window) = window()
         && let Ok(history) = window.history()
     {
-        let _ = history.push_state_with_url(&JsValue::NULL, "", Some(&url));
+        let _ = if replace {
+            history.replace_state_with_url(&JsValue::NULL, "", Some(&url))
+        } else {
+            history.push_state_with_url(&JsValue::NULL, "", Some(&url))
+        };
     }
     render_route(route);
     spawn_local(async {
@@ -1393,9 +1433,11 @@ async fn reload_configuration() {
 }
 
 /// Holds the route the operator asked for until they choose between discarding
-/// the edit and staying put.
-fn open_unsaved_dialog(route: Route) {
+/// the edit and staying put. `from_history` records that a Back or Forward press
+/// asked for it, which changes how discarding has to reach the destination.
+fn open_unsaved_dialog(route: Route, from_history: bool) {
     PENDING_NAVIGATION.with_borrow_mut(|pending| *pending = Some(route));
+    PENDING_FROM_HISTORY.set(from_history);
     if let Some(dialog) = element::<HtmlDialogElement>("unsaved-dialog") {
         let _ = dialog.show_modal();
         focus("keep-editing");
@@ -1404,16 +1446,22 @@ fn open_unsaved_dialog(route: Route) {
 
 fn keep_editing() {
     PENDING_NAVIGATION.with_borrow_mut(Option::take);
+    PENDING_FROM_HISTORY.set(false);
     close_dialog("unsaved-dialog");
 }
 
 fn discard_changes() {
     let pending = PENDING_NAVIGATION.with_borrow_mut(Option::take);
+    let from_history = PENDING_FROM_HISTORY.replace(false);
     close_dialog("unsaved-dialog");
     // Leaving reloads the destination, which replaces every editor; the edit is
     // discarded by that reload rather than by clearing fields here.
     if let Some(route) = pending {
-        navigate(&route);
+        // A pop already moved history; the guard then pushed the source back so
+        // the operator could decide. Overwrite that restored entry rather than
+        // appending a third, or the next Back would return to the page they
+        // just chose to leave instead of continuing backward.
+        navigate_with(&route, from_history);
     }
 }
 
@@ -1458,6 +1506,14 @@ fn render_route(route: &Route) {
             input.set_value(&absolute_path(path));
         }
         validate_path_field();
+        if element::<HtmlElement>("path-connection-root")
+            .is_some_and(|root| root.text_content().as_deref() != Some(path.as_str()))
+        {
+            // The form is now aimed at a different namespace. A half-filled
+            // draft carried over would be armed to grant standing access to a
+            // root the operator never chose it for.
+            reset_path_connection_form();
+        }
         set_text("path-connection-root", path.as_str());
         render_path_connections();
     }
@@ -1554,14 +1610,19 @@ async fn load_tree() {
         set_text("config-tree-state", "Tree unavailable");
         return;
     };
-    set_text("config-tree-state", "Loading");
+    // `#config-tree-state` is a live region, and the tree reloads on every
+    // navigation. Announcing "Loading" each time would narrate an ambient count
+    // the operator did not ask about, so only say it when there is nothing on
+    // screen yet to reload.
+    if TREE_NODES.with_borrow(Vec::is_empty) {
+        set_text("config-tree-state", "Loading");
+    }
     let selected = selected_tree_path().unwrap_or_else(ConfigPath::root);
-    // A connection listing failure must not cost the operator the whole tree;
-    // the key markers are simply absent until the next load.
-    let connections = value_client(&config)
-        .list_managed_connections()
-        .await
-        .unwrap_or_default();
+    // A connection listing failure must not cost the operator the whole tree,
+    // but it must not be reported as an empty estate either: an authoritative
+    // "0 connections" at a path that actually has one invites minting a second,
+    // redundant credential. Keep the last good listing and say it is stale.
+    let listed = value_client(&config).list_managed_connections().await.ok();
     let model = match value_client(&config).get_subtree(&ConfigPath::root()).await {
         Ok(subtree) => {
             let paths = subtree
@@ -1588,12 +1649,20 @@ async fn load_tree() {
     if TREE_LOAD_GENERATION.get() != generation {
         return;
     }
-    let roots = connections
-        .iter()
-        .map(|connection| connection.root.as_str().to_owned())
-        .collect::<BTreeSet<_>>();
-    CONNECTIONS.with_borrow_mut(|slot| *slot = connections);
+    let listed_failed = listed.is_none();
+    if let Some(connections) = listed {
+        CONNECTIONS.with_borrow_mut(|slot| *slot = connections);
+    }
+    let roots = CONNECTIONS.with_borrow(|connections| {
+        connections
+            .iter()
+            .map(|connection| connection.root.as_str().to_owned())
+            .collect::<BTreeSet<_>>()
+    });
     render_path_connections();
+    if listed_failed {
+        set_text("path-connection-count", "Access URLs unavailable");
+    }
     let Some((namespaces, value_parents)) = model else {
         set_text("config-tree-state", "Tree unavailable");
         return;
@@ -1605,10 +1674,12 @@ async fn load_tree() {
         show_error(error.message());
         return;
     }
-    set_text(
-        "config-tree-state",
-        &format!("{count} path{}", if count == 1 { "" } else { "s" }),
-    );
+    // Only write the count when it actually changed, so an unchanged tree does
+    // not re-announce itself after every click.
+    let summary = format!("{count} path{}", if count == 1 { "" } else { "s" });
+    if current_text("config-tree-state").as_deref() != Some(summary.as_str()) {
+        set_text("config-tree-state", &summary);
+    }
 }
 
 fn render_tree(nodes: &[TreeNode]) -> Result<(), ClientError> {
@@ -1618,6 +1689,13 @@ fn render_tree(nodes: &[TreeNode]) -> Result<(), ClientError> {
     let tree = document
         .get_element_by_id("config-tree")
         .ok_or_else(browser_error)?;
+    // Rebuilding replaces every node, including whichever one holds focus.
+    // Activating a node navigates and re-renders, and the tree reloads
+    // asynchronously as well, so without this a keyboard user is dropped onto
+    // `<body>` mid-interaction and has to tab all the way back in.
+    let had_focus = document
+        .active_element()
+        .is_some_and(|active| tree.contains(Some(&active)));
     tree.set_text_content(None);
     let selected = selected_tree_path();
     let selected_index = nodes
@@ -1627,7 +1705,18 @@ fn render_tree(nodes: &[TreeNode]) -> Result<(), ClientError> {
     // root, which is also the node the Configuration view opens on.
     let focus_index = selected_index.or_else(|| (!nodes.is_empty()).then_some(0));
     for (index, node) in nodes.iter().enumerate() {
-        let item = build_tree_node(&document, node, index, Some(index) == selected_index)?;
+        // Preorder ordering means a node has children exactly when the next one
+        // is deeper. The tree never collapses, so parents are always expanded.
+        let has_children = nodes
+            .get(index + 1)
+            .is_some_and(|next| next.depth > node.depth);
+        let item = build_tree_node(
+            &document,
+            node,
+            index,
+            Some(index) == selected_index,
+            has_children,
+        )?;
         item.set_attribute(
             "tabindex",
             if Some(index) == focus_index {
@@ -1639,6 +1728,9 @@ fn render_tree(nodes: &[TreeNode]) -> Result<(), ClientError> {
         .map_err(|_| browser_error())?;
         append(&tree, &item)?;
     }
+    if had_focus && let Some(index) = focus_index {
+        focus(&format!("tree-node-{index}"));
+    }
     Ok(())
 }
 
@@ -1647,6 +1739,7 @@ fn build_tree_node(
     node: &TreeNode,
     index: usize,
     selected: bool,
+    has_children: bool,
 ) -> Result<Element, ClientError> {
     let mut class = String::from("tree-node");
     if node.has_values {
@@ -1668,6 +1761,10 @@ fn build_tree_node(
         item.set_attribute(name, value)
             .map_err(|_| browser_error())?;
     }
+    if has_children {
+        item.set_attribute("aria-expanded", "true")
+            .map_err(|_| browser_error())?;
+    }
     if let Some(styled) = item.dyn_ref::<HtmlElement>() {
         let indent = 8 + node.depth * 14;
         let _ = styled
@@ -1686,20 +1783,48 @@ fn build_tree_node(
         append(&item, &annotation)?;
     }
 
-    let target = node.path.clone();
-    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
-        guarded_navigate(Route::Configuration(target.clone()));
+    Ok(item)
+}
+
+/// Resolves the tree node an event landed on. Listeners live on the tree itself
+/// rather than on each node, so a render allocates nothing: the tree is rebuilt
+/// twice per navigation over the whole estate, and per-node closures would have
+/// to be leaked every time to stay callable from JavaScript.
+fn event_tree_node(event: &Event) -> Option<(usize, ConfigPath)> {
+    let item = event
+        .target()
+        .and_then(|target| target.dyn_into::<Element>().ok())
+        .and_then(|target| target.closest("[data-path]").ok().flatten())?;
+    let path = ConfigPath::parse(item.get_attribute("data-path")?).ok()?;
+    let index = item
+        .id()
+        .strip_prefix("tree-node-")
+        .and_then(|index| index.parse::<usize>().ok())?;
+    Some((index, path))
+}
+
+/// Installs the tree's two delegated listeners. Nodes carry `data-path` and a
+/// positional id, which is everything either handler needs.
+fn install_tree_actions(document: &Document) {
+    let Some(tree) = document.get_element_by_id("config-tree") else {
+        return;
+    };
+    let callback = Closure::<dyn FnMut(_)>::new(move |event: Event| {
+        if let Some((_, path)) = event_tree_node(&event) {
+            guarded_navigate(Route::Configuration(path));
+        }
     });
-    item.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
+    let _ = tree.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
     callback.forget();
 
-    let activated = node.path.clone();
-    let callback =
-        Closure::<dyn FnMut(_)>::new(move |event: KeyboardEvent| match event.key().as_str() {
+    let callback = Closure::<dyn FnMut(_)>::new(move |event: KeyboardEvent| {
+        let Some((index, path)) = event_tree_node(event.as_ref()) else {
+            return;
+        };
+        match event.key().as_str() {
             "Enter" | " " => {
                 event.prevent_default();
-                guarded_navigate(Route::Configuration(activated.clone()));
+                guarded_navigate(Route::Configuration(path));
             }
             "ArrowDown" => {
                 event.prevent_default();
@@ -1707,7 +1832,10 @@ fn build_tree_node(
             }
             "ArrowUp" => {
                 event.prevent_default();
-                focus_tree_node(index.wrapping_sub(1));
+                // Neither direction wraps, per the WAI-ARIA tree pattern: a
+                // tree is not the path-picker listbox, where wrapping is the
+                // convention.
+                focus_tree_node(index.saturating_sub(1));
             }
             "Home" => {
                 event.prevent_default();
@@ -1718,11 +1846,10 @@ fn build_tree_node(
                 focus_tree_node(usize::MAX);
             }
             _ => {}
-        });
-    item.add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
+        }
+    });
+    let _ = tree.add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref());
     callback.forget();
-    Ok(item)
 }
 
 /// Moves the roving tab stop to `index`, clamped to the rendered nodes.
@@ -2569,6 +2696,18 @@ fn install_connections_actions(document: &Document) {
             confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
         callback.forget();
     }
+    if let Some(dialog) = document.get_element_by_id("create-connection-dialog") {
+        // Escape closes a native dialog without either button. Treat that as the
+        // cancel it is, so a credential draft — display name, root, and grants —
+        // does not outlive the decision not to create it.
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            if let Some(pending) = PENDING_CONNECTION.with_borrow_mut(Option::take) {
+                focus(&pending.return_focus);
+            }
+        });
+        let _ = dialog.add_event_listener_with_callback("close", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
     if let Some(reveal) = document.get_element_by_id("reveal-connection-url") {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
             toggle_connection_url_reveal();
@@ -2886,7 +3025,7 @@ async fn rotate_connection() {
             // navigation while the reload was in flight must suppress the
             // one-time URL dialog rather than resurrect it afterward.
             if CONNECTIONS_LOAD_GENERATION.get() == generation.wrapping_add(1) {
-                open_connection_url_dialog(&provisioned, "connections-heading");
+                open_connection_url_dialog(&provisioned, &target.return_focus);
             }
             // The tree refresh follows the dialog, as in create.
             load_tree().await;
@@ -2897,7 +3036,7 @@ async fn rotate_connection() {
             load_current_connections().await;
             set_text("connection-state", "Error");
             show_error(error.message());
-            focus("connections-heading");
+            focus(&target.return_focus);
         }
     }
 }
@@ -2935,7 +3074,47 @@ async fn revoke_connection() {
             show_error(error.message());
         }
     }
-    focus("connections-heading");
+    // The row the action started from is gone, so fall back to the heading of
+    // whichever table it belonged to; `connections-heading` lives on the hidden
+    // Access URLs page whenever the action came from the Configuration view.
+    focus(connections_heading_for(&target.return_focus));
+}
+
+/// Clears the per-path access-URL draft so it cannot follow the operator to
+/// another namespace.
+fn reset_path_connection_form() {
+    if let Some(name) = element::<HtmlInputElement>(PATH_CONNECTION_FORM.name_id) {
+        name.set_value("");
+    }
+    for (suffix, checked) in [("read", true), ("write", false), ("manage", false)] {
+        let id = format!(
+            "{}-permission-{suffix}",
+            PATH_CONNECTION_FORM.permission_prefix
+        );
+        if let Some(choice) = element::<HtmlInputElement>(&id) {
+            choice.set_checked(checked);
+        }
+    }
+    set_validation(
+        PATH_CONNECTION_FORM.name_id,
+        PATH_CONNECTION_FORM.name_error_id,
+        None,
+    );
+    set_validation(
+        PATH_CONNECTION_FORM.permissions_field_id,
+        PATH_CONNECTION_FORM.permissions_error_id,
+        None,
+    );
+}
+
+/// The heading owning `return_focus`: the per-path table on the Configuration
+/// view, or the estate-wide one on the Access URLs view.
+fn connections_heading_for(return_focus: &str) -> &'static str {
+    if return_focus.starts_with(PATH_CONNECTION_TABLE.prefix) {
+        "path-connections-heading"
+    } else {
+        "connections-heading"
+    }
 }
 
 /// Opens the one-time result surface with the URL masked; the secret lives
@@ -3394,13 +3573,16 @@ fn render_value_row(
     editor
         .set_attribute("aria-describedby", &error_id)
         .map_err(|_| browser_error())?;
-    editor
+    let text = editor
         .clone()
         .dyn_into::<HtmlTextAreaElement>()
-        .map_err(|_| browser_error())?
-        .set_value(value.value.display_text());
+        .map_err(|_| browser_error())?;
+    text.set_value(value.value.display_text());
+    // Record what the control holds, not what was assigned to it: a textarea
+    // normalizes CRLF to LF, so a stored value with CRLF would never compare
+    // equal to its own source and every row of it would read as unsaved.
     editor
-        .set_attribute("data-loaded", value.value.display_text())
+        .set_attribute("data-loaded", &text.value())
         .map_err(|_| browser_error())?;
     let field_error = create_element(document, "p", Some("field-error"))?;
     field_error
@@ -4455,6 +4637,13 @@ fn location_search() -> Option<String> {
     window()?.location().search().ok()
 }
 
+fn current_text(id: &str) -> Option<String> {
+    window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id(id))
+        .and_then(|element| element.text_content())
+}
+
 fn set_text(id: &str, text: &str) {
     if let Some(element) = window()
         .and_then(|window| window.document())
@@ -4482,11 +4671,17 @@ fn set_textarea(id: &str, value: &str) {
 /// can tell an edit from the stored text by comparison.
 fn set_loaded_textarea(id: &str, value: &str) {
     set_textarea(id, value);
+    // Read the text back off the control rather than trusting `value`: a
+    // textarea normalizes CRLF to LF, and a mismatch here would read as an
+    // unsaved edit on a document nobody has touched.
+    let Some(loaded) = element::<HtmlTextAreaElement>(id).map(|editor| editor.value()) else {
+        return;
+    };
     if let Some(element) = window()
         .and_then(|window| window.document())
         .and_then(|document| document.get_element_by_id(id))
     {
-        let _ = element.set_attribute("data-loaded", value);
+        let _ = element.set_attribute("data-loaded", &loaded);
     }
 }
 
