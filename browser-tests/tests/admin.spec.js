@@ -1023,6 +1023,46 @@ test('the sidebar is drag resizable and keeps its width across a reload', async 
     .toBeGreaterThan(initial + 60);
 });
 
+test('a tall tree scrolls inside the sidebar rather than lengthening the page', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, Object.fromEntries(
+    Array.from({ length: 60 }, (_, index) => [`/services/service-${index + 1}/enabled`, 'true'])
+  ));
+  await openConfiguration(page);
+  await expect(page.getByRole('tree').getByRole('treeitem')).toHaveCount(62);
+
+  const viewport = page.viewportSize().height;
+  const sidebar = await page.locator('#sidebar').boundingBox();
+  // The sidebar claims the viewport below the header and no more, however many
+  // nodes the tree holds.
+  expect(sidebar.y).toBeCloseTo(64, 0);
+  expect(sidebar.y + sidebar.height).toBeLessThanOrEqual(viewport + 1);
+
+  const tree = page.locator('#config-tree');
+  expect(await tree.evaluate(list => list.scrollHeight > list.clientHeight)).toBe(true);
+
+  // Scrolling the tree moves the tree, not the document.
+  await tree.evaluate(list => { list.scrollTop = 300; });
+  expect(await tree.evaluate(list => list.scrollTop)).toBeGreaterThan(0);
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
+
+  // The page's height is driven by the main column, never by the tree: laid out
+  // in full, 60-odd nodes are far taller than the document ever becomes.
+  const heights = await page.evaluate(() => ({
+    document: document.documentElement.scrollHeight,
+    tree: document.getElementById('config-tree').scrollHeight
+  }));
+  expect(heights.tree).toBeGreaterThan(heights.document);
+
+  // With enough main content to scroll, the sidebar stays pinned in view.
+  await page.locator('#config-tree [data-path="/services/service-1"]').click();
+  await page.evaluate(() => window.scrollTo(0, 400));
+  const scrolled = await page.locator('#sidebar').boundingBox();
+  expect(scrolled.y).toBeGreaterThanOrEqual(0);
+  expect(scrolled.y).toBeLessThanOrEqual(64);
+});
+
 test('access URLs are listed and created at the selected tree node', async ({ page }) => {
   const connections = await mockConnections(page, {
     connections: [{ id: CONNECTION_ID, name: 'Pipeline reader', root: '/apps/api' }]
