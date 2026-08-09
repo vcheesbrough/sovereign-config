@@ -374,6 +374,17 @@ async function mockValues(page, initial = {}) {
 }
 
 async function mockApplication(page) {
+  // The sidebar tree reads the whole configuration and the connection list on
+  // every load, including on views a test is not otherwise exercising. These
+  // empty replies keep those reads off the network; Playwright matches routes in
+  // reverse registration order, so mockValues/mockConnections still win.
+  for (const service of ['Configuration', 'ManagedConnections']) {
+    await page.route(`**/sovereign.config.v3.${service}/*`, route => route.fulfill({
+      status: 200,
+      headers: { 'content-type': 'application/grpc-web+proto' },
+      body: grpcFrame(Buffer.alloc(0))
+    }));
+  }
   await page.route('**/app-config.js', route => route.fulfill({
     contentType: 'text/javascript',
     body: configScript
@@ -404,11 +415,13 @@ async function mockApplication(page) {
 const CONNECTION_ID = 'a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8';
 const APP_PASSWORD_SENTINEL = 'browser-app-password-sentinel';
 
-function connectionUrl(password = APP_PASSWORD_SENTINEL) {
+// The URL's path is the connection's root; the client rejects a provisioned URL
+// whose root disagrees with the returned metadata, exactly as the service would.
+function connectionUrl(password = APP_PASSWORD_SENTINEL, root = '/apps/api') {
   const credential = Buffer.from(`sc-managed-${CONNECTION_ID}:${password}`)
     .toString('base64url');
   const issuer = encodeURIComponent('https://auth.example.test/application/o/config/');
-  return `https://config.example.test/apps/api#v=1&issuer=${issuer}`
+  return `https://config.example.test${root === '/' ? '' : root}#v=1&issuer=${issuer}`
     + `&client_id=sovereign-config&client_secret=${credential}`;
 }
 
@@ -483,7 +496,7 @@ async function mockConnections(page, options = {}) {
         ...(permissions.length ? { permissions } : {})
       };
       state.connections = [...state.connections, created];
-      return reply(provisionedReply(connectionUrl(), created));
+      return reply(provisionedReply(connectionUrl(APP_PASSWORD_SENTINEL, created.root), created));
     }
     if (method === 'RotateManagedConnection') {
       state.rotations += 1;
@@ -844,6 +857,483 @@ test('configuration grid is accessible and contained on desktop and mobile', asy
   });
 });
 
+const TREE_VALUES = {
+  '/apps/api/enabled': 'true',
+  '/apps/api/nested/message': 'hello',
+  '/apps/worker/concurrency': '4',
+  '/top-level': 'value'
+};
+
+function treeNode(page, path) {
+  return page.locator(`#config-tree [data-path="${path}"]`);
+}
+
+async function openConfiguration(page) {
+  await page.getByRole('link', { name: 'Configuration values' }).click();
+  await expect(page).toHaveURL(/\/configuration\/$/);
+}
+
+test('the sidebar tree lists every namespace and selects one on a single click', async ({ page }) => {
+  await mockConnections(page, {
+    connections: [{ name: 'Pipeline reader', root: '/apps/api', permissions: [1] }]
+  });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+
+  const tree = page.getByRole('tree', { name: 'Configuration tree' });
+  await expect(tree.getByRole('treeitem')).toHaveCount(5);
+  for (const path of ['/', '/apps', '/apps/api', '/apps/api/nested', '/apps/worker']) {
+    await expect(treeNode(page, path)).toHaveCount(1);
+  }
+  // `/apps` is only an ancestor: it holds no value of its own and is not bold.
+  await expect(treeNode(page, '/apps')).not.toHaveClass(/has-values/);
+  await expect(treeNode(page, '/apps/api')).toHaveClass(/has-values/);
+  await expect(treeNode(page, '/')).toHaveClass(/has-values/);
+  const weights = await page.evaluate(() => ['/apps', '/apps/api'].map(path => (
+    getComputedStyle(document.querySelector(`#config-tree [data-path="${path}"]`)).fontWeight
+  )));
+  expect(Number(weights[1])).toBeGreaterThan(Number(weights[0]));
+
+  // Only the access URL's own root is keyed, and the key carries a name.
+  await expect(page.locator('#config-tree .tree-key')).toHaveCount(1);
+  await expect(treeNode(page, '/apps/api')).toHaveAccessibleName(/access URL/);
+
+  // Parents are marked expanded; leaves carry no expansion state at all.
+  await expect(treeNode(page, '/apps')).toHaveAttribute('aria-expanded', 'true');
+  await expect(treeNode(page, '/apps/api')).toHaveAttribute('aria-expanded', 'true');
+  expect(await treeNode(page, '/apps/worker').evaluate(node => node.hasAttribute('aria-expanded')))
+    .toBe(false);
+
+  // Nothing deeper is selected, so the root node holds the selection.
+  await expect(treeNode(page, '/')).toHaveAttribute('aria-selected', 'true');
+
+  await treeNode(page, '/apps/worker').click();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+  await expect(page.getByRole('row', { name: /concurrency/ })).toBeVisible();
+  await expect(treeNode(page, '/apps/worker')).toHaveAttribute('aria-selected', 'true');
+  await expect(treeNode(page, '/')).toHaveAttribute('aria-selected', 'false');
+  await expect(page.getByLabel('Selected path')).toHaveValue('/apps/worker');
+
+  // The tree is one tab stop and moves with the arrow keys.
+  await treeNode(page, '/apps/worker').press('ArrowUp');
+  await expect(treeNode(page, '/apps/api/nested')).toBeFocused();
+
+  // Neither boundary wraps, per the WAI-ARIA tree pattern.
+  await treeNode(page, '/apps/api/nested').press('Home');
+  await expect(treeNode(page, '/')).toBeFocused();
+  await treeNode(page, '/').press('ArrowUp');
+  await expect(treeNode(page, '/')).toBeFocused();
+  await treeNode(page, '/').press('End');
+  await expect(treeNode(page, '/apps/worker')).toBeFocused();
+  await treeNode(page, '/apps/worker').press('ArrowDown');
+  await expect(treeNode(page, '/apps/worker')).toBeFocused();
+
+  // Activating rebuilds the tree; focus must land on the node just selected
+  // rather than being dropped onto the document.
+  await treeNode(page, '/apps/worker').press('ArrowUp');
+  await treeNode(page, '/apps/api/nested').press('Enter');
+  await expect(page).toHaveURL(/\/configuration\/apps\/api\/nested$/);
+  await expect(treeNode(page, '/apps/api/nested')).toBeFocused();
+  // Still true once the asynchronous reload has replaced the nodes again.
+  await expect.poll(async () => page.evaluate(() => document.activeElement.dataset.path))
+    .toBe('/apps/api/nested');
+
+  const accessibility = await new AxeBuilder({ page }).analyze();
+  expect(accessibility.violations).toEqual([]);
+});
+
+test('the tree gains a node for a new namespace and loses an emptied one', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, { '/apps/api/enabled': 'true' });
+  await openConfiguration(page);
+  await expect(treeNode(page, '/apps/worker')).toHaveCount(0);
+
+  await page.getByLabel('Selected path').fill('/apps/worker');
+  await page.getByRole('button', { name: 'Open' }).click();
+  await page.getByRole('button', { name: 'Add value' }).click();
+  await page.getByPlaceholder('value-name').fill('concurrency');
+  await page.getByLabel('Value', { exact: true }).fill('4');
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(treeNode(page, '/apps/worker')).toHaveCount(1);
+
+  await page.getByRole('button', { name: 'Delete' }).click();
+  await page.locator('#confirm-delete').click();
+  await expect(treeNode(page, '/apps/worker')).toHaveCount(0);
+  await expect(treeNode(page, '/apps/api')).toHaveCount(1);
+});
+
+test('leaving a path with an unsaved value is guarded by a confirmation', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+  await treeNode(page, '/apps/api').click();
+  const editor = page.getByLabel('Value for enabled');
+  await editor.fill('edited-but-unsaved');
+
+  await treeNode(page, '/apps/worker').click();
+  const dialog = page.locator('#unsaved-dialog');
+  await expect(dialog).toBeVisible();
+  await page.locator('#keep-editing').click();
+  await expect(dialog).toBeHidden();
+  await expect(page).toHaveURL(/\/configuration\/apps\/api$/);
+  await expect(editor).toHaveValue('edited-but-unsaved');
+
+  // The browser Back button cannot be cancelled, so the guard restores the URL.
+  await page.goBack();
+  await expect(dialog).toBeVisible();
+  await expect(page).toHaveURL(/\/configuration\/apps\/api$/);
+  await page.locator('#keep-editing').click();
+  await expect(editor).toHaveValue('edited-but-unsaved');
+
+  // Restoring the stored text makes the row clean again, so navigation is free.
+  await editor.fill('true');
+  await treeNode(page, '/apps/worker').click();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+
+  // Discarding after a Back press must not leave a duplicate entry behind, or
+  // the next Back would return to the page just left instead of going further.
+  await treeNode(page, '/apps/api').click();
+  await page.getByLabel('Value for enabled').fill('edited-again');
+  await page.goBack();
+  await expect(dialog).toBeVisible();
+  await page.locator('#discard-changes').click();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+  await page.goBack();
+  await expect(page).not.toHaveURL(/\/configuration\/apps\/api$/);
+
+  // Back on the edited path for the nav-link case below.
+  await treeNode(page, '/apps/api').click();
+  await page.getByLabel('Value for enabled').fill('edited-but-unsaved');
+
+  // A nav link out of the view is guarded on the same terms.
+  await page.getByRole('link', { name: 'System status' }).click();
+  await expect(dialog).toBeVisible();
+  await page.locator('#discard-changes').click();
+  await expect(page).toHaveURL(/\/$/);
+
+  // The discarded edit is gone; the stored value is what comes back.
+  await openConfiguration(page);
+  await treeNode(page, '/apps/api').click();
+  await expect(page.getByLabel('Value for enabled')).toHaveValue('true');
+  await treeNode(page, '/apps/worker').click();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+});
+
+test('a value with CRLF line endings is not mistaken for an unsaved edit', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, {
+    '/apps/api/script': 'line-one\r\nline-two',
+    '/apps/worker/concurrency': '4'
+  });
+  await openConfiguration(page);
+  await treeNode(page, '/apps/api').click();
+
+  // A textarea normalizes CRLF to LF, so the loaded marker has to come from the
+  // control rather than from the stored string it was assigned.
+  const editor = page.getByLabel('Value for script');
+  await expect(editor).toHaveValue('line-one\nline-two');
+  expect(await editor.evaluate(field => field.value === field.getAttribute('data-loaded'))).toBe(true);
+
+  // Nothing was edited, so leaving must not ask.
+  await treeNode(page, '/apps/worker').click();
+  await expect(page.locator('#unsaved-dialog')).toBeHidden();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+});
+
+test('escaping the guard keeps the edit and abandons the route it was holding', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+  await treeNode(page, '/apps/api').click();
+  const editor = page.getByLabel('Value for enabled');
+  await editor.fill('edited-but-unsaved');
+
+  // Escape is neither button, so it must read as a decision to stay.
+  await treeNode(page, '/apps/api/nested').click();
+  const dialog = page.locator('#unsaved-dialog');
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(page).toHaveURL(/\/configuration\/apps\/api$/);
+  await expect(editor).toHaveValue('edited-but-unsaved');
+
+  // The abandoned route must not survive: discarding later has to go where the
+  // operator asked then, not where they declined to go before.
+  await treeNode(page, '/apps/worker').click();
+  await expect(dialog).toBeVisible();
+  await page.locator('#discard-changes').click();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+});
+
+test('a full-page exit is guarded only while an edit is unsaved', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+  await treeNode(page, '/apps/api').click();
+
+  // The browser's own prompt is not scriptable, so assert on the signal the
+  // handler produces: a cancelled beforeunload event.
+  const cancelled = () => page.evaluate(() => {
+    const event = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
+  expect(await cancelled()).toBe(false);
+
+  await page.getByLabel('Value for enabled').fill('edited-but-unsaved');
+  expect(await cancelled()).toBe(true);
+
+  await page.getByLabel('Value for enabled').fill('true');
+  expect(await cancelled()).toBe(false);
+});
+
+test('a saved edit leaves nothing to guard', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+  await treeNode(page, '/apps/api').click();
+  await page.getByLabel('Value for enabled').fill('false');
+  await page.getByRole('button', { name: 'Save', exact: true }).first().click();
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+
+  await treeNode(page, '/apps/worker').click();
+  await expect(page.locator('#unsaved-dialog')).toBeHidden();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+});
+
+test('the sidebar is drag resizable and keeps its width across a reload', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+
+  const sidebar = page.locator('#sidebar');
+  const initial = (await sidebar.boundingBox()).width;
+  // Wider than the fixed 224px the sidebar used before the tree moved in.
+  expect(initial).toBeGreaterThan(224);
+
+  const handle = await page.locator('#sidebar-resizer').boundingBox();
+  await page.mouse.move(handle.x + handle.width / 2, handle.y + 100);
+  await page.mouse.down();
+  await page.mouse.move(initial + 120, handle.y + 100, { steps: 10 });
+  await page.mouse.up();
+  const dragged = (await sidebar.boundingBox()).width;
+  expect(dragged).toBeGreaterThan(initial + 80);
+
+  // The separator is operable from the keyboard too.
+  await page.locator('#sidebar-resizer').focus();
+  await page.keyboard.press('ArrowLeft');
+  expect((await sidebar.boundingBox()).width).toBeCloseTo(dragged - 16, 0);
+
+  await page.reload();
+  await expect.poll(async () => (await page.locator('#sidebar').boundingBox()).width)
+    .toBeGreaterThan(initial + 60);
+});
+
+test('a tall sidebar scrolls as a whole rather than lengthening the page', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, Object.fromEntries(
+    Array.from({ length: 60 }, (_, index) => [`/services/service-${index + 1}/enabled`, 'true'])
+  ));
+  await openConfiguration(page);
+  await expect(page.getByRole('tree').getByRole('treeitem')).toHaveCount(62);
+
+  const viewport = page.viewportSize().height;
+  const sidebar = await page.locator('#sidebar').boundingBox();
+  // The sidebar claims the viewport below the header and no more, however many
+  // nodes the tree holds.
+  expect(sidebar.y).toBeCloseTo(64, 0);
+  expect(sidebar.y + sidebar.height).toBeLessThanOrEqual(viewport + 1);
+
+  // The sidebar scrolls as a whole, so the nav links travel with the tree
+  // rather than staying pinned above it.
+  const scroller = page.locator('#sidebar-scroll');
+  expect(await scroller.evaluate(box => box.scrollHeight > box.clientHeight)).toBe(true);
+  expect(await page.locator('#config-tree').evaluate(list => list.scrollHeight <= list.clientHeight))
+    .toBe(true);
+
+  const linkBefore = (await page.getByRole('link', { name: 'System status' }).boundingBox()).y;
+  await scroller.evaluate(box => { box.scrollTop = 300; });
+  expect(await scroller.evaluate(box => box.scrollTop)).toBeGreaterThan(0);
+  const linkAfter = (await page.getByRole('link', { name: 'System status' }).boundingBox()).y;
+  expect(linkBefore - linkAfter).toBeGreaterThan(200);
+
+  // Scrolling the sidebar moves the sidebar, not the document.
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
+
+  // The page's height is driven by the main column, never by the sidebar: laid
+  // out in full, 60-odd nodes are far taller than the document ever becomes.
+  const heights = await page.evaluate(() => ({
+    document: document.documentElement.scrollHeight,
+    sidebar: document.getElementById('sidebar-scroll').scrollHeight
+  }));
+  expect(heights.sidebar).toBeGreaterThan(heights.document);
+
+  // With enough main content to scroll, the sidebar stays pinned in view.
+  await page.locator('#config-tree [data-path="/services/service-1"]').click();
+  await page.evaluate(() => window.scrollTo(0, 400));
+  const scrolled = await page.locator('#sidebar').boundingBox();
+  expect(scrolled.y).toBeGreaterThanOrEqual(0);
+  expect(scrolled.y).toBeLessThanOrEqual(64);
+});
+
+test('access URLs are listed and created at the selected tree node', async ({ page }) => {
+  const connections = await mockConnections(page, {
+    connections: [{ id: CONNECTION_ID, name: 'Pipeline reader', root: '/apps/api' }]
+  });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+  await treeNode(page, '/apps/api').click();
+
+  await expect(page.locator('#path-connection-count')).toHaveText('1 connection');
+  await expect(page.locator('#path-connections-body')).toContainText('Pipeline reader');
+
+  // A sibling path shows none of it, and offers its own root instead.
+  await treeNode(page, '/apps/worker').click();
+  await expect(page.locator('#path-connection-count')).toHaveText('0 connections');
+  await expect(page.locator('#empty-path-connections')).toBeVisible();
+  await expect(page.locator('#path-connection-root')).toHaveText('/apps/worker');
+
+  // A draft must not follow the operator to another namespace: it would be
+  // armed to grant standing access to a root it was never aimed at.
+  await page.locator('#path-connection-name').fill('Half-typed draft');
+  await page.locator('#path-connection-permission-manage').check();
+  await treeNode(page, '/apps/api').click();
+  await treeNode(page, '/apps/worker').click();
+  await expect(page.locator('#path-connection-name')).toHaveValue('');
+  await expect(page.locator('#path-connection-permission-manage')).not.toBeChecked();
+  await expect(page.locator('#path-connection-permission-read')).toBeChecked();
+
+  await page.locator('#path-connection-name').fill('Worker reader');
+  await page.getByRole('button', { name: 'Create access URL here' }).click();
+  const confirmation = page.locator('#create-connection-dialog');
+  await expect(confirmation).toBeVisible();
+  // The selected node is the root; no root was typed anywhere.
+  await expect(confirmation.locator('#create-connection-root')).toHaveText('/apps/worker');
+  await confirmation.locator('#confirm-create-connection').click();
+
+  await expect(page.locator('#connection-url-dialog')).toBeVisible();
+  const created = connections.requests.find(request => request.method === 'CreateManagedConnection');
+  expect(created.fields.get(1)).toBe('Worker reader');
+  expect(created.fields.get(2)).toBe('/apps/worker');
+  await page.locator('#close-connection-url').click();
+
+  await expect(page.locator('#path-connection-count')).toHaveText('1 connection');
+  await expect(page.locator('#path-connection-name')).toHaveValue('');
+  // The tree now marks the path the new access URL is rooted at.
+  await expect(treeNode(page, '/apps/worker').locator('.tree-key')).toHaveCount(1);
+
+  // Rotating returns focus to the row it started from, not to the estate-wide
+  // heading, which lives on the hidden Access URLs page.
+  await page.locator('#path-rotate-connection-0').click();
+  await page.locator('#confirm-rotate-connection').click();
+  await expect(page.locator('#connection-url-dialog')).toBeVisible();
+  await page.locator('#close-connection-url').click();
+  await expect(page.locator('#path-rotate-connection-0')).toBeFocused();
+
+  // Revoking from the same panel removes both the row and the key, and falls
+  // back to this table's own heading because the row is gone.
+  await page.locator('#path-revoke-connection-0').click();
+  await page.locator('#confirm-revoke-connection').click();
+  await expect(page.locator('#path-connection-count')).toHaveText('0 connections');
+  await expect(page.locator('#path-connections-heading')).toBeFocused();
+  await expect(treeNode(page, '/apps/worker').locator('.tree-key')).toHaveCount(0);
+});
+
+test('a path-scoped access URL requires a name and a permission', async ({ page }) => {
+  const connections = await mockConnections(page, { connections: [] });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+  await treeNode(page, '/apps/worker').click();
+
+  await page.getByRole('button', { name: 'Create access URL here' }).click();
+  await expect(page.locator('#create-connection-dialog')).toBeHidden();
+  await expect(page.locator('#path-connection-name-error')).toBeVisible();
+
+  await page.locator('#path-connection-name').fill('Worker reader');
+  await page.locator('#path-connection-permission-read').uncheck();
+  await page.getByRole('button', { name: 'Create access URL here' }).click();
+  await expect(page.locator('#create-connection-dialog')).toBeHidden();
+  await expect(page.locator('#path-connection-permissions-error')).toBeVisible();
+
+  expect(connections.requests.map(request => request.method))
+    .not.toContain('CreateManagedConnection');
+});
+
+test('a failed access-URL listing is reported rather than shown as none', async ({ page }) => {
+  await mockConnections(page, {
+    connections: [{ id: CONNECTION_ID, name: 'Pipeline reader', root: '/apps/api' }]
+  });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+  await treeNode(page, '/apps/api').click();
+  await expect(page.locator('#path-connection-count')).toHaveText('1 connection');
+  await expect(treeNode(page, '/apps/api').locator('.tree-key')).toHaveCount(1);
+
+  // The listing now fails. An empty panel would read as authoritative and could
+  // prompt a second, redundant credential for a root that already has one.
+  await page.route('**/sovereign.config.v3.ManagedConnections/ListManagedConnections', route =>
+    route.fulfill({
+      status: 200,
+      headers: { 'content-type': 'application/grpc-web+proto' },
+      body: grpcFrame(Buffer.alloc(0), 14)
+    }));
+  await treeNode(page, '/apps/worker').click();
+  await treeNode(page, '/apps/api').click();
+
+  await expect(page.locator('#path-connection-count')).toHaveText('Access URLs unavailable');
+  await expect(page.locator('#path-connections-body')).toContainText('Pipeline reader');
+  // The tree itself still renders, markers and all.
+  await expect(page.getByRole('tree').getByRole('treeitem')).toHaveCount(5);
+  await expect(treeNode(page, '/apps/api').locator('.tree-key')).toHaveCount(1);
+});
+
+test('the tree still renders when the estate cannot be read whole', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  // A principal scoped to a prefix is refused the root subtree; the namespace
+  // list ListValues returns still carries the shape of the tree.
+  await page.route('**/sovereign.config.v3.Configuration/GetSubTree', route => route.fulfill({
+    status: 200,
+    headers: { 'content-type': 'application/grpc-web+proto' },
+    body: grpcFrame(Buffer.alloc(0), 7)
+  }));
+  await openConfiguration(page);
+
+  await expect(treeNode(page, '/apps/api')).toHaveCount(1);
+  await expect(treeNode(page, '/apps/worker')).toHaveCount(1);
+  // Without the whole estate the value marker cannot be known, so none is shown.
+  await expect(page.locator('#config-tree .has-values')).toHaveCount(0);
+});
+
+test('logging out empties the sidebar tree', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+  await expect(page.getByRole('tree').getByRole('treeitem')).toHaveCount(5);
+
+  await page.getByRole('button', { name: 'Log out' }).click();
+  await expect(page.getByRole('tree').getByRole('treeitem')).toHaveCount(0);
+  await expect(page.locator('#config-tree-state')).toHaveText('Log in to browse');
+});
+
 test('JSON mode reads and replaces subtrees without exposing row deletion', async ({ page }) => {
   await openCallback(page);
   await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
@@ -879,9 +1369,12 @@ test('JSON mode reads and replaces subtrees without exposing row deletion', asyn
   await expect(editor).toHaveValue(
     '{\n  "enabled": "false",\n  "new-value": "new"\n}\n'
   );
-  expect(requests.slice(-2).map(request => request.method)).toEqual([
-    'ReplaceSubTree', 'GetSubTree'
+  // A save re-reads the edited subtree, then the sidebar tree re-reads the root
+  // so a namespace the save created or emptied appears or disappears.
+  expect(requests.slice(-3).map(request => request.method)).toEqual([
+    'ReplaceSubTree', 'GetSubTree', 'GetSubTree'
   ]);
+  expect(requests.slice(-2).map(request => request.fields.get(1))).toEqual(['/apps/api', '/']);
 
   const pathInput = page.getByLabel('Selected path');
   await pathInput.fill('/apps/api/enabled');
@@ -1031,8 +1524,9 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
   const editor = page.getByLabel('Value for feature-flag');
   await expect(editor).toHaveValue('plain-value-sentinel');
-  expect(requests.at(-2).fields.get(1)).toBe('/apps/api/feature-flag');
-  expect(requests.at(-2).fields.get(2)).toBe('plain-value-sentinel');
+  const put = requests.find(request => request.method === 'PutValue');
+  expect(put.fields.get(1)).toBe('/apps/api/feature-flag');
+  expect(put.fields.get(2)).toBe('plain-value-sentinel');
 
   await editor.fill('updated-value-sentinel');
   await page.getByRole('row', { name: /feature-flag/ }).getByRole('button', { name: 'Save' }).click();
@@ -1053,9 +1547,12 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
   await page.getByRole('dialog').getByRole('button', { name: 'Delete' }).click();
   await expect(page.getByText('Deleted', { exact: true })).toBeVisible();
   await expect(page.getByText('No values at this path.')).toBeVisible();
-  expect(requests.map(request => request.method)).toEqual([
-    'ListValues', 'PutValue', 'ListValues', 'PutValue', 'ListValues', 'DeleteValues', 'ListValues'
-  ]);
+  // GetSubTree is filtered out: it is the sidebar tree's own whole-estate read,
+  // not part of the grid's mutation sequence.
+  expect(requests.map(request => request.method).filter(method => method !== 'GetSubTree'))
+    .toEqual([
+      'ListValues', 'PutValue', 'ListValues', 'PutValue', 'ListValues', 'DeleteValues', 'ListValues'
+    ]);
 });
 
 test('grid lists every alias path and removes one without deleting the value', async ({ page }) => {
@@ -1097,9 +1594,8 @@ test('grid lists every alias path and removes one without deleting the value', a
   await expect(refreshedRow.getByText('/shared/feature-flag', { exact: true })).toBeVisible();
   await expect(refreshedRow.getByText('/apps/api/legacy-flag', { exact: true })).toHaveCount(0);
   await expect(page.getByLabel('Value for feature-flag')).toHaveValue('aliased-value-sentinel');
-  expect(requests.map(request => request.method)).toEqual([
-    'ListValues', 'DeleteValues', 'ListValues'
-  ]);
+  expect(requests.map(request => request.method).filter(method => method !== 'GetSubTree'))
+    .toEqual(['ListValues', 'DeleteValues', 'ListValues']);
 });
 
 test('grid adds another path to an existing value', async ({ page }) => {
@@ -1145,9 +1641,10 @@ test('grid adds another path to an existing value', async ({ page }) => {
   await expect(refreshedRow.getByText('/apps/api/feature-flag', { exact: true })).toBeVisible();
   await expect(refreshedRow.getByText('/apps/worker/feature-flag', { exact: true })).toBeVisible();
   await expect(page.getByLabel('Value for feature-flag')).toHaveValue('aliased-value-sentinel');
-  expect(requests.map(request => request.method)).toEqual([
-    'ListValues', 'AddValuePath', 'ListValues'
-  ]);
+  // The sidebar tree's own whole-estate read is a separate concern; what
+  // matters here is that the flow performed exactly one aliasing mutation.
+  expect(requests.map(request => request.method).filter(method => method !== 'GetSubTree'))
+    .toEqual(['ListValues', 'AddValuePath', 'ListValues']);
 });
 
 test('a second add-path activation while the request is in flight is ignored', async ({ page }) => {
@@ -1325,6 +1822,8 @@ test('secret values stay masked, rotate explicitly, and survive JSON edits', asy
   await page.getByLabel('Store as secret').check();
   await page.getByLabel('Secret value', { exact: true }).fill(unsubmittedSecret);
   await page.getByRole('link', { name: 'System status' }).click();
+  // An unsubmitted secret is an unsaved value, so leaving now asks first.
+  await page.locator('#discard-changes').click();
   await expect(page.locator('body')).not.toContainText(unsubmittedSecret);
   await page.goBack();
   await expect(page.getByRole('row', { name: /api-token/ })).toBeVisible();
@@ -1453,7 +1952,7 @@ test('creating a connection confirms the exact root and reveals the URL once', a
   await page.getByLabel('Display name').fill('Pipeline reader');
   await page.getByLabel('Root').fill('/apps/api');
   // Read is selected by default; also grant write for this URL.
-  await page.getByLabel('Write').check();
+  await page.locator('#connection-permissions').getByLabel('Write').check();
   await page.getByRole('button', { name: 'Create access URL' }).click();
 
   // The confirmation names the exact root and the selected grant.
@@ -1605,7 +2104,9 @@ test('ambiguous rotation reports a bounded error and returns no URL', async ({ p
   await expect(page.locator('#error')).toHaveText('service is unavailable');
   await expect(page.locator('#connection-url-dialog')).toBeHidden();
   await expect(page.locator('body')).not.toContainText(APP_PASSWORD_SENTINEL);
-  await expect(page.locator('#connections-heading')).toBeFocused();
+  // A failed rotation leaves the row in place, so focus returns to the control
+  // that started it rather than to the heading above it.
+  await expect(page.locator('#rotate-connection-0')).toBeFocused();
 });
 
 test('a conflicting rotation reports the bounded in-progress error', async ({ page }) => {
@@ -1653,7 +2154,7 @@ test('creating an access URL requires at least one permission', async ({ page })
   await page.getByLabel('Display name').fill('Pipeline reader');
   await page.getByLabel('Root').fill('/apps/api');
   // Clear the default Read selection so nothing is granted.
-  await page.getByLabel('Read').uncheck();
+  await page.locator('#connection-permissions').getByLabel('Read').uncheck();
   await page.getByRole('button', { name: 'Create access URL' }).click();
 
   await expect(page.locator('#create-connection-dialog')).toBeHidden();
@@ -1662,7 +2163,7 @@ test('creating an access URL requires at least one permission', async ({ page })
     .not.toContain('CreateManagedConnection');
 
   // Selecting Manage alone unblocks creation and grants exactly that.
-  await page.getByLabel('Manage').check();
+  await page.locator('#connection-permissions').getByLabel('Manage').check();
   await page.getByRole('button', { name: 'Create access URL' }).click();
   const confirmation = page.locator('#create-connection-dialog');
   await expect(confirmation).toBeVisible();
