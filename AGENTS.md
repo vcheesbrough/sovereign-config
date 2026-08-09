@@ -61,7 +61,23 @@ In addition to baseline §3 (git safety) and §7 (MCP/secrets):
 
 ## 3. Protocol Compatibility
 
-This software uses the native gRPC `System.GetVersion` endpoint to verify protocol compatibility. However it is likely that the client cli/mcp/provider will be using an earlier version of the protocol. It is acceptable make breaking protocol change as a last resort but should be avoided whenever possible. If a breaking change is unavoidable, it should be documented and communicated to all clients. If a breaking change is unavoidable, it should be documented. If required we can add protocol versions but the server must support older versions too. A protocol version defines not only the signature/datatypes etc but also key behaviour of endpoints, earlier behaviour contracts cannot be broken without a protocol version change. Any change in protocol must be request and permission given.
+Protocol compatibility is verified via the native gRPC `System.GetVersion`
+endpoint. Clients (cli/mcp/provider) are likely running an **earlier** protocol
+version than the server.
+
+- **Any protocol change requires explicit permission, requested up front.**
+  Raise it as the first thing when planning or estimating the work — before
+  implementation, while there is still a decision to make. Never let a protocol
+  change surface mid-implementation or be discovered in the diff.
+- Treat a card's "no protocol change / client-side only" scope as a **claim to
+  verify**, not an assumption. If the work turns out to need one, stop and ask.
+- A protocol version defines not only signatures/datatypes but also the **key
+  behaviour** of endpoints. Earlier behaviour contracts cannot be broken without
+  a protocol version change.
+- Breaking changes are a **last resort** and must be avoided wherever possible.
+  If unavoidable: document it and communicate it to all clients.
+- New protocol versions may be added, but **the server must continue to support
+  older versions.**
 
 *Kanban workflow and automated test coverage follow the agent-shared baseline
 unchanged — see baseline §1 and §6. Start a card with the **`start-iteration`**
