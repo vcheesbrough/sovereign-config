@@ -40,19 +40,21 @@ header {
    `align-self: start` stops the grid stretching it to the row height, which is
    set by whatever the main column holds. */
 .sidebar { position: sticky; z-index: 2; top: 64px; align-self: start; height: calc(100vh - 64px); min-width: 0; display: flex; flex-direction: column; background: #e8ecea; }
+/* The sidebar scrolls as a whole — links and tree together — rather than
+   pinning the links and scrolling only the tree. `min-height: 0` is what lets
+   this flex child shrink below its content so the overflow is scrolled here
+   instead of escaping onto the page. */
+.sidebar-scroll { flex: 1 1 auto; min-height: 0; overflow: hidden auto; overscroll-behavior: contain; }
 .nav-links { padding: 24px 16px 8px; }
 nav a { display: block; padding: 10px 12px; color: #25332d; font-size: 14px; font-weight: 650; text-decoration: none; border-left: 3px solid transparent; }
 nav a.active { color: #10211b; background: #fff; border-left-color: #b18119; }
 .sidebar-resizer { position: absolute; z-index: 1; top: 0; right: 0; bottom: 0; width: 6px; background: #cbd3cf; border: 0; cursor: col-resize; touch-action: none; }
 .sidebar-resizer:hover, .sidebar-resizer:focus-visible { background: #b18119; }
 .sidebar-resizer:focus-visible { outline: 3px solid #b66800; outline-offset: 1px; }
-/* `min-height: 0` on both the panel and the list is what actually lets the tree
-   scroll: a flex item defaults to `min-height: auto`, so without it neither box
-   shrinks below its content and the overflow escapes onto the page instead. */
-.tree-panel { min-width: 0; min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; padding: 16px 16px 24px; border-top: 1px solid #cbd3cf; }
+.tree-panel { min-width: 0; padding: 16px 16px 24px; border-top: 1px solid #cbd3cf; }
 .tree-panel h2 { font-size: 13px; font-weight: 750; text-transform: uppercase; color: #4b5953; }
 .tree-panel .status-text { font-size: 12px; }
-.config-tree { flex: 1 1 auto; min-height: 0; list-style: none; margin: 12px 0 0; padding: 0; overflow-y: auto; overscroll-behavior: contain; }
+.config-tree { list-style: none; margin: 12px 0 0; padding: 0; }
 .tree-node { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 30px; padding: 4px 8px; color: #25332d; background: none; border: 0; border-radius: 4px; font: inherit; font-size: 13px; font-weight: 400; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
 .tree-node:hover { background: #dbe2df; }
 .tree-node.has-values { font-weight: 750; }
@@ -187,6 +189,9 @@ dialog .actions { justify-content: flex-end; }
      with the page as it did before, and the header keeps its full height back. */
   header { position: static; }
   .sidebar { position: static; height: auto; border-bottom: 1px solid #cbd3cf; }
+  /* Nothing to scroll here — the tree is hidden and the nav strip scrolls
+     horizontally on its own, which an `auto` overflow-y would interfere with. */
+  .sidebar-scroll { overflow: visible; }
   .sidebar-resizer { display: none; }
   .nav-links { min-width: 0; max-width: 100%; display: flex; gap: 4px; padding: 8px 12px; overflow-x: auto; }
   nav a { flex: 0 0 auto; border-left: 0; border-bottom: 3px solid transparent; }
