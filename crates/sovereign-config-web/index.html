@@ -22,16 +22,21 @@
     </header>
     <div id="layout" class="layout">
       <nav id="sidebar" class="sidebar" aria-label="Administration">
-        <div class="nav-links">
-          <a id="system-status-link" href="/">System status</a>
-          <a id="configuration-values-link" href="/configuration/">Configuration values</a>
-          <a id="managed-connections-link" href="/connections/">Access URLs</a>
-          <a id="downloads-link" href="/downloads">Downloads</a>
-        </div>
-        <div class="tree-panel">
-          <h2 id="config-tree-heading">Configuration tree</h2>
-          <p id="config-tree-state" class="status-text" aria-live="polite">Log in to browse</p>
-          <ul id="config-tree" class="config-tree" role="tree" aria-labelledby="config-tree-heading"></ul>
+        <!-- Links and tree share one scroll area so the sidebar scrolls as a
+             whole. The resizer stays outside it, pinned to the sidebar edge, so
+             the drag handle cannot scroll out of reach. -->
+        <div id="sidebar-scroll" class="sidebar-scroll">
+          <div class="nav-links">
+            <a id="system-status-link" href="/">System status</a>
+            <a id="configuration-values-link" href="/configuration/">Configuration values</a>
+            <a id="managed-connections-link" href="/connections/">Access URLs</a>
+            <a id="downloads-link" href="/downloads">Downloads</a>
+          </div>
+          <div class="tree-panel">
+            <h2 id="config-tree-heading">Configuration tree</h2>
+            <p id="config-tree-state" class="status-text" aria-live="polite">Log in to browse</p>
+            <ul id="config-tree" class="config-tree" role="tree" aria-labelledby="config-tree-heading"></ul>
+          </div>
         </div>
         <div id="sidebar-resizer" class="sidebar-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Sidebar width" aria-valuemin="200" aria-valuemax="560" aria-valuenow="288"></div>
       </nav>

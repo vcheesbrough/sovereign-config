@@ -1023,7 +1023,7 @@ test('the sidebar is drag resizable and keeps its width across a reload', async 
     .toBeGreaterThan(initial + 60);
 });
 
-test('a tall tree scrolls inside the sidebar rather than lengthening the page', async ({ page }) => {
+test('a tall sidebar scrolls as a whole rather than lengthening the page', async ({ page }) => {
   await openCallback(page);
   await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
   await mockValues(page, Object.fromEntries(
@@ -1039,21 +1039,29 @@ test('a tall tree scrolls inside the sidebar rather than lengthening the page', 
   expect(sidebar.y).toBeCloseTo(64, 0);
   expect(sidebar.y + sidebar.height).toBeLessThanOrEqual(viewport + 1);
 
-  const tree = page.locator('#config-tree');
-  expect(await tree.evaluate(list => list.scrollHeight > list.clientHeight)).toBe(true);
+  // The sidebar scrolls as a whole, so the nav links travel with the tree
+  // rather than staying pinned above it.
+  const scroller = page.locator('#sidebar-scroll');
+  expect(await scroller.evaluate(box => box.scrollHeight > box.clientHeight)).toBe(true);
+  expect(await page.locator('#config-tree').evaluate(list => list.scrollHeight <= list.clientHeight))
+    .toBe(true);
 
-  // Scrolling the tree moves the tree, not the document.
-  await tree.evaluate(list => { list.scrollTop = 300; });
-  expect(await tree.evaluate(list => list.scrollTop)).toBeGreaterThan(0);
+  const linkBefore = (await page.getByRole('link', { name: 'System status' }).boundingBox()).y;
+  await scroller.evaluate(box => { box.scrollTop = 300; });
+  expect(await scroller.evaluate(box => box.scrollTop)).toBeGreaterThan(0);
+  const linkAfter = (await page.getByRole('link', { name: 'System status' }).boundingBox()).y;
+  expect(linkBefore - linkAfter).toBeGreaterThan(200);
+
+  // Scrolling the sidebar moves the sidebar, not the document.
   expect(await page.evaluate(() => window.scrollY)).toBe(0);
 
-  // The page's height is driven by the main column, never by the tree: laid out
-  // in full, 60-odd nodes are far taller than the document ever becomes.
+  // The page's height is driven by the main column, never by the sidebar: laid
+  // out in full, 60-odd nodes are far taller than the document ever becomes.
   const heights = await page.evaluate(() => ({
     document: document.documentElement.scrollHeight,
-    tree: document.getElementById('config-tree').scrollHeight
+    sidebar: document.getElementById('sidebar-scroll').scrollHeight
   }));
-  expect(heights.tree).toBeGreaterThan(heights.document);
+  expect(heights.sidebar).toBeGreaterThan(heights.document);
 
   // With enough main content to scroll, the sidebar stays pinned in view.
   await page.locator('#config-tree [data-path="/services/service-1"]').click();
