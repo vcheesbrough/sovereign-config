@@ -8,7 +8,13 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; }
+/* Sticky so the sidebar below it can claim exactly the rest of the viewport and
+   keep that height however far the content scrolls. Its stacking order stays
+   below the path-picker popup, which must be able to overlay it. */
 header {
+  position: sticky;
+  z-index: 5;
+  top: 0;
   height: 64px;
   display: flex;
   align-items: center;
@@ -29,17 +35,24 @@ header {
 /* The sidebar width is a custom property so the drag handle can set it in one
    place. The resizer sits inside the sidebar landmark, pinned to its edge. */
 .layout { --sidebar-width: 288px; min-height: calc(100vh - 64px); display: grid; grid-template-columns: var(--sidebar-width) minmax(0, 1fr); }
-.sidebar { position: relative; min-width: 0; display: flex; flex-direction: column; background: #e8ecea; }
+/* Pinned under the header and exactly as tall as the rest of the viewport, so a
+   tall tree scrolls inside `.config-tree` instead of lengthening the page.
+   `align-self: start` stops the grid stretching it to the row height, which is
+   set by whatever the main column holds. */
+.sidebar { position: sticky; z-index: 2; top: 64px; align-self: start; height: calc(100vh - 64px); min-width: 0; display: flex; flex-direction: column; background: #e8ecea; }
 .nav-links { padding: 24px 16px 8px; }
 nav a { display: block; padding: 10px 12px; color: #25332d; font-size: 14px; font-weight: 650; text-decoration: none; border-left: 3px solid transparent; }
 nav a.active { color: #10211b; background: #fff; border-left-color: #b18119; }
 .sidebar-resizer { position: absolute; z-index: 1; top: 0; right: 0; bottom: 0; width: 6px; background: #cbd3cf; border: 0; cursor: col-resize; touch-action: none; }
 .sidebar-resizer:hover, .sidebar-resizer:focus-visible { background: #b18119; }
 .sidebar-resizer:focus-visible { outline: 3px solid #b66800; outline-offset: 1px; }
-.tree-panel { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; padding: 16px 16px 24px; border-top: 1px solid #cbd3cf; }
+/* `min-height: 0` on both the panel and the list is what actually lets the tree
+   scroll: a flex item defaults to `min-height: auto`, so without it neither box
+   shrinks below its content and the overflow escapes onto the page instead. */
+.tree-panel { min-width: 0; min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; padding: 16px 16px 24px; border-top: 1px solid #cbd3cf; }
 .tree-panel h2 { font-size: 13px; font-weight: 750; text-transform: uppercase; color: #4b5953; }
 .tree-panel .status-text { font-size: 12px; }
-.config-tree { flex: 1 1 auto; list-style: none; margin: 12px 0 0; padding: 0; overflow: auto; }
+.config-tree { flex: 1 1 auto; min-height: 0; list-style: none; margin: 12px 0 0; padding: 0; overflow-y: auto; overscroll-behavior: contain; }
 .tree-node { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 30px; padding: 4px 8px; color: #25332d; background: none; border: 0; border-radius: 4px; font: inherit; font-size: 13px; font-weight: 400; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
 .tree-node:hover { background: #dbe2df; }
 .tree-node.has-values { font-weight: 750; }
@@ -170,7 +183,10 @@ dialog .actions { justify-content: flex-end; }
 @media (max-width: 760px) {
   header { padding: 0 16px; }
   .layout { width: 100%; min-width: 0; grid-template-columns: minmax(0, 1fr); }
-  .sidebar { border-bottom: 1px solid #cbd3cf; }
+  /* No sidebar column at this width, so nothing to pin: the nav strip scrolls
+     with the page as it did before, and the header keeps its full height back. */
+  header { position: static; }
+  .sidebar { position: static; height: auto; border-bottom: 1px solid #cbd3cf; }
   .sidebar-resizer { display: none; }
   .nav-links { min-width: 0; max-width: 100%; display: flex; gap: 4px; padding: 8px 12px; overflow-x: auto; }
   nav a { flex: 0 0 auto; border-left: 0; border-bottom: 3px solid transparent; }
