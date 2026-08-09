@@ -900,6 +900,12 @@ test('the sidebar tree lists every namespace and selects one on a single click',
   await expect(page.locator('#config-tree .tree-key')).toHaveCount(1);
   await expect(treeNode(page, '/apps/api')).toHaveAccessibleName(/access URL/);
 
+  // Parents are marked expanded; leaves carry no expansion state at all.
+  await expect(treeNode(page, '/apps')).toHaveAttribute('aria-expanded', 'true');
+  await expect(treeNode(page, '/apps/api')).toHaveAttribute('aria-expanded', 'true');
+  expect(await treeNode(page, '/apps/worker').evaluate(node => node.hasAttribute('aria-expanded')))
+    .toBe(false);
+
   // Nothing deeper is selected, so the root node holds the selection.
   await expect(treeNode(page, '/')).toHaveAttribute('aria-selected', 'true');
 
@@ -913,8 +919,26 @@ test('the sidebar tree lists every namespace and selects one on a single click',
   // The tree is one tab stop and moves with the arrow keys.
   await treeNode(page, '/apps/worker').press('ArrowUp');
   await expect(treeNode(page, '/apps/api/nested')).toBeFocused();
+
+  // Neither boundary wraps, per the WAI-ARIA tree pattern.
+  await treeNode(page, '/apps/api/nested').press('Home');
+  await expect(treeNode(page, '/')).toBeFocused();
+  await treeNode(page, '/').press('ArrowUp');
+  await expect(treeNode(page, '/')).toBeFocused();
+  await treeNode(page, '/').press('End');
+  await expect(treeNode(page, '/apps/worker')).toBeFocused();
+  await treeNode(page, '/apps/worker').press('ArrowDown');
+  await expect(treeNode(page, '/apps/worker')).toBeFocused();
+
+  // Activating rebuilds the tree; focus must land on the node just selected
+  // rather than being dropped onto the document.
+  await treeNode(page, '/apps/worker').press('ArrowUp');
   await treeNode(page, '/apps/api/nested').press('Enter');
   await expect(page).toHaveURL(/\/configuration\/apps\/api\/nested$/);
+  await expect(treeNode(page, '/apps/api/nested')).toBeFocused();
+  // Still true once the asynchronous reload has replaced the nodes again.
+  await expect.poll(async () => page.evaluate(() => document.activeElement.dataset.path))
+    .toBe('/apps/api/nested');
 
   const accessibility = await new AxeBuilder({ page }).analyze();
   expect(accessibility.violations).toEqual([]);
@@ -965,6 +989,26 @@ test('leaving a path with an unsaved value is guarded by a confirmation', async 
   await page.locator('#keep-editing').click();
   await expect(editor).toHaveValue('edited-but-unsaved');
 
+  // Restoring the stored text makes the row clean again, so navigation is free.
+  await editor.fill('true');
+  await treeNode(page, '/apps/worker').click();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+
+  // Discarding after a Back press must not leave a duplicate entry behind, or
+  // the next Back would return to the page just left instead of going further.
+  await treeNode(page, '/apps/api').click();
+  await page.getByLabel('Value for enabled').fill('edited-again');
+  await page.goBack();
+  await expect(dialog).toBeVisible();
+  await page.locator('#discard-changes').click();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+  await page.goBack();
+  await expect(page).not.toHaveURL(/\/configuration\/apps\/api$/);
+
+  // Back on the edited path for the nav-link case below.
+  await treeNode(page, '/apps/api').click();
+  await page.getByLabel('Value for enabled').fill('edited-but-unsaved');
+
   // A nav link out of the view is guarded on the same terms.
   await page.getByRole('link', { name: 'System status' }).click();
   await expect(dialog).toBeVisible();
@@ -977,6 +1021,77 @@ test('leaving a path with an unsaved value is guarded by a confirmation', async 
   await expect(page.getByLabel('Value for enabled')).toHaveValue('true');
   await treeNode(page, '/apps/worker').click();
   await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+});
+
+test('a value with CRLF line endings is not mistaken for an unsaved edit', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, {
+    '/apps/api/script': 'line-one\r\nline-two',
+    '/apps/worker/concurrency': '4'
+  });
+  await openConfiguration(page);
+  await treeNode(page, '/apps/api').click();
+
+  // A textarea normalizes CRLF to LF, so the loaded marker has to come from the
+  // control rather than from the stored string it was assigned.
+  const editor = page.getByLabel('Value for script');
+  await expect(editor).toHaveValue('line-one\nline-two');
+  expect(await editor.evaluate(field => field.value === field.getAttribute('data-loaded'))).toBe(true);
+
+  // Nothing was edited, so leaving must not ask.
+  await treeNode(page, '/apps/worker').click();
+  await expect(page.locator('#unsaved-dialog')).toBeHidden();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+});
+
+test('escaping the guard keeps the edit and abandons the route it was holding', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+  await treeNode(page, '/apps/api').click();
+  const editor = page.getByLabel('Value for enabled');
+  await editor.fill('edited-but-unsaved');
+
+  // Escape is neither button, so it must read as a decision to stay.
+  await treeNode(page, '/apps/api/nested').click();
+  const dialog = page.locator('#unsaved-dialog');
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(page).toHaveURL(/\/configuration\/apps\/api$/);
+  await expect(editor).toHaveValue('edited-but-unsaved');
+
+  // The abandoned route must not survive: discarding later has to go where the
+  // operator asked then, not where they declined to go before.
+  await treeNode(page, '/apps/worker').click();
+  await expect(dialog).toBeVisible();
+  await page.locator('#discard-changes').click();
+  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+});
+
+test('a full-page exit is guarded only while an edit is unsaved', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+  await treeNode(page, '/apps/api').click();
+
+  // The browser's own prompt is not scriptable, so assert on the signal the
+  // handler produces: a cancelled beforeunload event.
+  const cancelled = () => page.evaluate(() => {
+    const event = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
+  expect(await cancelled()).toBe(false);
+
+  await page.getByLabel('Value for enabled').fill('edited-but-unsaved');
+  expect(await cancelled()).toBe(true);
+
+  await page.getByLabel('Value for enabled').fill('true');
+  expect(await cancelled()).toBe(false);
 });
 
 test('a saved edit leaves nothing to guard', async ({ page }) => {
@@ -1090,6 +1205,16 @@ test('access URLs are listed and created at the selected tree node', async ({ pa
   await expect(page.locator('#empty-path-connections')).toBeVisible();
   await expect(page.locator('#path-connection-root')).toHaveText('/apps/worker');
 
+  // A draft must not follow the operator to another namespace: it would be
+  // armed to grant standing access to a root it was never aimed at.
+  await page.locator('#path-connection-name').fill('Half-typed draft');
+  await page.locator('#path-connection-permission-manage').check();
+  await treeNode(page, '/apps/api').click();
+  await treeNode(page, '/apps/worker').click();
+  await expect(page.locator('#path-connection-name')).toHaveValue('');
+  await expect(page.locator('#path-connection-permission-manage')).not.toBeChecked();
+  await expect(page.locator('#path-connection-permission-read')).toBeChecked();
+
   await page.locator('#path-connection-name').fill('Worker reader');
   await page.getByRole('button', { name: 'Create access URL here' }).click();
   const confirmation = page.locator('#create-connection-dialog');
@@ -1109,10 +1234,20 @@ test('access URLs are listed and created at the selected tree node', async ({ pa
   // The tree now marks the path the new access URL is rooted at.
   await expect(treeNode(page, '/apps/worker').locator('.tree-key')).toHaveCount(1);
 
-  // Revoking from the same panel removes both the row and the key.
+  // Rotating returns focus to the row it started from, not to the estate-wide
+  // heading, which lives on the hidden Access URLs page.
+  await page.locator('#path-rotate-connection-0').click();
+  await page.locator('#confirm-rotate-connection').click();
+  await expect(page.locator('#connection-url-dialog')).toBeVisible();
+  await page.locator('#close-connection-url').click();
+  await expect(page.locator('#path-rotate-connection-0')).toBeFocused();
+
+  // Revoking from the same panel removes both the row and the key, and falls
+  // back to this table's own heading because the row is gone.
   await page.locator('#path-revoke-connection-0').click();
   await page.locator('#confirm-revoke-connection').click();
   await expect(page.locator('#path-connection-count')).toHaveText('0 connections');
+  await expect(page.locator('#path-connections-heading')).toBeFocused();
   await expect(treeNode(page, '/apps/worker').locator('.tree-key')).toHaveCount(0);
 });
 
@@ -1136,6 +1271,36 @@ test('a path-scoped access URL requires a name and a permission', async ({ page 
 
   expect(connections.requests.map(request => request.method))
     .not.toContain('CreateManagedConnection');
+});
+
+test('a failed access-URL listing is reported rather than shown as none', async ({ page }) => {
+  await mockConnections(page, {
+    connections: [{ id: CONNECTION_ID, name: 'Pipeline reader', root: '/apps/api' }]
+  });
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+  await treeNode(page, '/apps/api').click();
+  await expect(page.locator('#path-connection-count')).toHaveText('1 connection');
+  await expect(treeNode(page, '/apps/api').locator('.tree-key')).toHaveCount(1);
+
+  // The listing now fails. An empty panel would read as authoritative and could
+  // prompt a second, redundant credential for a root that already has one.
+  await page.route('**/sovereign.config.v3.ManagedConnections/ListManagedConnections', route =>
+    route.fulfill({
+      status: 200,
+      headers: { 'content-type': 'application/grpc-web+proto' },
+      body: grpcFrame(Buffer.alloc(0), 14)
+    }));
+  await treeNode(page, '/apps/worker').click();
+  await treeNode(page, '/apps/api').click();
+
+  await expect(page.locator('#path-connection-count')).toHaveText('Access URLs unavailable');
+  await expect(page.locator('#path-connections-body')).toContainText('Pipeline reader');
+  // The tree itself still renders, markers and all.
+  await expect(page.getByRole('tree').getByRole('treeitem')).toHaveCount(5);
+  await expect(treeNode(page, '/apps/api').locator('.tree-key')).toHaveCount(1);
 });
 
 test('the tree still renders when the estate cannot be read whole', async ({ page }) => {
@@ -1939,7 +2104,9 @@ test('ambiguous rotation reports a bounded error and returns no URL', async ({ p
   await expect(page.locator('#error')).toHaveText('service is unavailable');
   await expect(page.locator('#connection-url-dialog')).toBeHidden();
   await expect(page.locator('body')).not.toContainText(APP_PASSWORD_SENTINEL);
-  await expect(page.locator('#connections-heading')).toBeFocused();
+  // A failed rotation leaves the row in place, so focus returns to the control
+  // that started it rather than to the heading above it.
+  await expect(page.locator('#rotate-connection-0')).toBeFocused();
 });
 
 test('a conflicting rotation reports the bounded in-progress error', async ({ page }) => {
