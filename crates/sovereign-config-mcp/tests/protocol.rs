@@ -168,8 +168,10 @@ impl Backend for MockBackend {
             .push(path.as_str().to_owned());
         self.guard()?;
         Ok(ValueListing {
+            // Mixed case on purpose: the mock stands in for a server response,
+            // and the host must see this exactly as written, not folded.
             values: vec![ListedValue {
-                path: ConfigPath::parse("/apps/api/name").unwrap(),
+                path: ConfigPath::parse_operation("/Apps/API/Name").unwrap(),
                 value: ValueContent::Plain(PlainValue::new("payments")),
                 created_at: Timestamp {
                     seconds: 1,
@@ -181,7 +183,7 @@ impl Backend for MockBackend {
                 },
                 alias_paths: vec![],
             }],
-            paths: vec![ConfigPath::parse("/apps/api").unwrap()],
+            paths: vec![ConfigPath::parse_operation("/Apps/API").unwrap()],
         })
     }
 
@@ -664,6 +666,20 @@ async fn adapter_passes_requests_through_without_widening() {
     assert!(!is_error(&out[0]));
     // The one-time URL is the authorized product of create and must be present.
     assert!(result_text(&out[0]).contains("connection_url:"));
+}
+
+#[tokio::test]
+async fn list_returns_display_form_paths_to_the_host() {
+    let out = run_script(
+        MockBackend::healthy(),
+        &[call(1, "list", json!({ "path": "/apps/api" }))],
+    )
+    .await;
+    assert!(!is_error(&out[0]));
+    let text = result_text(&out[0]);
+    let rendered: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(rendered["values"][0]["path"], "/Apps/API/Name");
+    assert_eq!(rendered["paths"][0], "/Apps/API");
 }
 
 #[tokio::test]

@@ -186,6 +186,22 @@ function parentPath(path) {
   return split <= 0 ? '/' : path.slice(0, split);
 }
 
+// The real server resolves paths case-insensitively while returning them in
+// whatever case they were stored with (card #294); this mock has to do the
+// same fold comparison or a route built from a tree node's fold-only
+// `data-path` (e.g. "/zone/alpha") would never match a stored path whose
+// case differs (e.g. "/Zone/alpha/one").
+function foldEquals(left, right) {
+  return left.toLowerCase() === right.toLowerCase();
+}
+
+function isAtOrBelowFold(path, selected) {
+  if (selected === '/') return true;
+  const folded = path.toLowerCase();
+  const selectedFolded = selected.toLowerCase();
+  return folded === selectedFolded || folded.startsWith(`${selectedFolded}/`);
+}
+
 function existingPaths(values) {
   const paths = new Set();
   for (const path of values.keys()) {
@@ -223,7 +239,7 @@ async function mockValues(page, initial = {}) {
     }
     if (method === 'ListValues') {
       const selected = fields.get(1) || '/';
-      const values = [...stored].filter(([path]) => parentPath(path) === selected);
+      const values = [...stored].filter(([path]) => foldEquals(parentPath(path), selected));
       return route.fulfill({
         status: 200,
         headers: { 'content-type': 'application/grpc-web+proto' },
@@ -237,9 +253,7 @@ async function mockValues(page, initial = {}) {
         await delay.promise;
       }
       const selected = fields.get(1) || '/';
-      const values = [...stored].filter(([path]) => (
-        selected === '/' || path === selected || path.startsWith(`${selected}/`)
-      ));
+      const values = [...stored].filter(([path]) => isAtOrBelowFold(path, selected));
       return route.fulfill({
         status: 200,
         headers: { 'content-type': 'application/grpc-web+proto' },
@@ -758,10 +772,13 @@ test('configuration path is deep-linked, selectable, and restored by browser his
   await expect(page.getByRole('row', { name: /feature-flag/ })).toBeVisible();
   await expect(page.locator('#existing-paths [role="option"]')).toHaveCount(4);
 
+  // The field and the URL both echo back exactly what was typed — case is
+  // retained, not folded — even though the request underneath resolves the
+  // path case-insensitively (card #294).
   await pathInput.fill('/Apps/Worker');
   await page.getByRole('button', { name: 'Open' }).click();
-  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
-  await expect(pathInput).toHaveValue('/apps/worker');
+  await expect(page).toHaveURL(/\/configuration\/Apps\/Worker$/);
+  await expect(pathInput).toHaveValue('/Apps/Worker');
   await expect(page.getByRole('row', { name: /concurrency/ })).toBeVisible();
 
   await page.goBack();
@@ -790,6 +807,27 @@ test('path selector refreshes external paths and Enter opens the selected path',
   await pathInput.press('Enter');
   await expect(page).toHaveURL(/\/configuration\/services\/worker$/);
   await expect(page.getByRole('row', { name: /concurrency/ })).toBeVisible();
+});
+
+test('path selector autocomplete finds and does not duplicate a mixed-case namespace', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, {
+    '/Apps/API/serverIP': '10.0.0.1'
+  });
+  // The URL segment is always lowercase; the value's namespace was
+  // established as "/Apps/API". Before this fix the selector listed both
+  // spellings as separate rows, and typing the lowercase query found
+  // neither (card #294 follow-up).
+  await page.goto('/configuration/apps/api');
+  const pathInput = page.getByLabel('Selected path');
+  await pathInput.focus();
+  const option = page.locator('#existing-paths [role="option"][data-path="/Apps/API"]');
+  await expect(option).toHaveCount(1);
+
+  await pathInput.fill('/a');
+  await expect(option).toBeVisible();
+  await expect(option).toHaveText('/Apps/API');
 });
 
 test('path selector popup uses the available viewport height', async ({ page }) => {
@@ -942,6 +980,39 @@ test('the sidebar tree lists every namespace and selects one on a single click',
 
   const accessibility = await new AxeBuilder({ page }).analyze();
   expect(accessibility.violations).toEqual([]);
+});
+
+test('the tree renders a namespace label in the case of its fold-smallest contributing path', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  // "/Zone/alpha/one" and "/zone/beta/two" disagree on "/zone"'s case.
+  // "alpha" sorts before "beta" as a fold key, so "/Zone/alpha/one" is the
+  // fold-smallest path sharing that ancestor and its case wins the label —
+  // deterministic, and independent of write order (card #294).
+  await mockValues(page, {
+    '/Zone/alpha/one': '1',
+    '/zone/beta/two': '2'
+  });
+  await openConfiguration(page);
+
+  const tree = page.getByRole('tree', { name: 'Configuration tree' });
+  await expect(tree.getByRole('treeitem')).toHaveCount(4);
+  await expect(treeNode(page, '/zone').locator('.tree-label')).toHaveText('Zone');
+  await expect(treeNode(page, '/zone/alpha').locator('.tree-label')).toHaveText('alpha');
+  await expect(treeNode(page, '/zone/beta').locator('.tree-label')).toHaveText('beta');
+
+  await treeNode(page, '/zone/alpha').click();
+  await expect(page.getByRole('row', { name: /one/ })).toBeVisible();
+});
+
+test('the grid shows a value under the case it was written with', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, { '/apps/api/serverIP': '10.0.0.1' });
+  await page.goto('/configuration/apps/api');
+  await expect(page.getByRole('row', { name: /serverIP/ })).toBeVisible();
+  await expect(page.locator('.value-name')).toHaveText('serverIP');
+  await expect(page.locator('.full-path')).toHaveText('/apps/api/serverIP');
 });
 
 test('the tree gains a node for a new namespace and loses an emptied one', async ({ page }) => {
@@ -1517,28 +1588,31 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
   await page.goto('/configuration/apps/api');
   await expect(page.getByText('No values at this path.')).toBeVisible();
 
+  // The name is typed as "Feature-Flag" and, per card #294, that case is
+  // established and retained end to end: in the request, the field label,
+  // and the delete confirmation — not folded to lowercase.
   await page.getByRole('button', { name: 'Add value' }).click();
   await page.getByLabel('Name', { exact: true }).fill('Feature-Flag');
   await page.getByLabel('Value', { exact: true }).fill('plain-value-sentinel');
   await page.locator('#new-value-row').getByRole('button', { name: 'Save' }).click();
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
-  const editor = page.getByLabel('Value for feature-flag');
+  const editor = page.getByLabel('Value for Feature-Flag');
   await expect(editor).toHaveValue('plain-value-sentinel');
   const put = requests.find(request => request.method === 'PutValue');
-  expect(put.fields.get(1)).toBe('/apps/api/feature-flag');
+  expect(put.fields.get(1)).toBe('/apps/api/Feature-Flag');
   expect(put.fields.get(2)).toBe('plain-value-sentinel');
 
   await editor.fill('updated-value-sentinel');
-  await page.getByRole('row', { name: /feature-flag/ }).getByRole('button', { name: 'Save' }).click();
+  await page.getByRole('row', { name: /feature-flag/i }).getByRole('button', { name: 'Save' }).click();
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
-  await expect(page.getByLabel('Value for feature-flag')).toHaveValue('updated-value-sentinel');
+  await expect(page.getByLabel('Value for Feature-Flag')).toHaveValue('updated-value-sentinel');
 
-  const row = page.getByRole('row', { name: /feature-flag/ });
+  const row = page.getByRole('row', { name: /feature-flag/i });
   const remove = row.getByRole('button', { name: 'Delete' });
   await remove.click();
   const dialog = page.getByRole('dialog');
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByText('/apps/api/feature-flag')).toBeVisible();
+  await expect(dialog.getByText('/apps/api/Feature-Flag')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Cancel' })).toBeFocused();
   await page.getByRole('button', { name: 'Cancel' }).click();
   await expect(remove).toBeFocused();
@@ -1763,6 +1837,9 @@ test('secret values stay masked, rotate explicitly, and survive JSON edits', asy
   expect(values.getValue('/apps/api/api-token')).toEqual({ value: rotatedSecret, secret: true });
   await expect(page.locator('body')).not.toContainText(rotatedSecret);
 
+  // Named "Signing-Key"; per card #294 that case is established and retained
+  // — including through the JSON round trip below, where the same key is
+  // resubmitted lowercase and must still resolve to it without renaming it.
   await page.getByRole('button', { name: 'Add value' }).click();
   await page.getByLabel('Name', { exact: true }).fill('Signing-Key');
   await page.getByLabel('Store as secret').check();
@@ -1771,21 +1848,23 @@ test('secret values stay masked, rotate explicitly, and survive JSON edits', asy
   await newSecret.fill(addedSecret);
   await page.locator('#new-value-row').getByRole('button', { name: 'Save' }).click();
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
-  expect(values.getValue('/apps/api/signing-key')).toEqual({ value: addedSecret, secret: true });
+  expect(values.getValue('/apps/api/Signing-Key')).toEqual({ value: addedSecret, secret: true });
   await expect(page.locator('body')).not.toContainText(addedSecret);
 
   const mode = page.getByRole('switch', { name: 'JSON' });
   await mode.check();
   const editor = page.getByLabel('JSON subtree');
   await expect(editor).toHaveValue(
-    '{\n  "api-token": "********",\n  "enabled": "true",\n  "signing-key": "********"\n}\n'
+    '{\n  "api-token": "********",\n  "enabled": "true",\n  "Signing-Key": "********"\n}\n'
   );
   await expect(editor).not.toHaveValue(new RegExp(`${rotatedSecret}|${addedSecret}`));
   await editor.fill('{"api-token":"********","enabled":"false","signing-key":"********"}');
   await page.getByRole('button', { name: 'Save JSON' }).click();
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
   expect(values.getValue('/apps/api/api-token')).toEqual({ value: rotatedSecret, secret: true });
-  expect(values.getValue('/apps/api/signing-key')).toEqual({ value: addedSecret, secret: true });
+  // The established case survives a lowercase-keyed rewrite: rule 2 keeps the
+  // display form put down by the first write.
+  expect(values.getValue('/apps/api/Signing-Key')).toEqual({ value: addedSecret, secret: true });
   expect(values.getValue('/apps/api/enabled')).toEqual({ value: 'false', secret: false });
 
   await mode.uncheck();

@@ -402,7 +402,7 @@ async fn migrations_are_repeatable_against_postgresql() {
     .fetch_one(&pool)
     .await
     .expect("credential column inventory must be readable");
-    assert_eq!(applied_migrations, 8);
+    assert_eq!(applied_migrations, 9);
     assert_eq!(metadata_rows, 1);
     assert_eq!(authorization_tables, 0);
     assert!(legacy_value_table.is_none());

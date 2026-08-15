@@ -34,6 +34,7 @@ pub(crate) struct ConfigurationService {
 #[derive(FromRow)]
 struct ListedValueRow {
     path: String,
+    lowercase_path: String,
     content_id: i64,
     value: String,
     classification: String,
@@ -48,9 +49,18 @@ struct SubTreeRow {
     classification: String,
 }
 
+/// A row's fold key, selected under the name `path` — the caller already
+/// treats the result as an opaque fold-key string (a collision probe, a
+/// secret-path set), never as anything meant for display.
 #[derive(FromRow)]
 struct PathRow {
     path: String,
+}
+
+#[derive(FromRow)]
+struct PathWithFoldRow {
+    path: String,
+    lowercase_path: String,
 }
 
 #[derive(FromRow)]
@@ -69,7 +79,9 @@ struct StoredSecretRow {
 #[derive(FromRow)]
 struct PathContentRow {
     path: String,
+    lowercase_path: String,
     content_id: i64,
+    created_at: OffsetDateTime,
 }
 
 #[derive(FromRow)]
@@ -131,14 +143,14 @@ impl Configuration for ConfigurationService {
         &self,
         request: Request<ListValuesRequest>,
     ) -> Result<Response<ListValuesResponse>, Status> {
-        let selected = ConfigPath::parse(&request.get_ref().path)
+        let selected = ConfigPath::parse_selection(&request.get_ref().path)
             .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
         let principal = request
             .extensions()
             .get::<AuthenticatedPrincipal>()
             .ok_or_else(|| Status::unauthenticated("authentication required"))?;
         let candidates = sqlx::query_as::<_, PathContentRow>(
-            "SELECT path, content_id FROM configuration_paths ORDER BY path",
+            "SELECT path, lowercase_path, content_id, created_at FROM configuration_paths ORDER BY lowercase_path",
         )
         .fetch_all(&self.database)
         .await
@@ -147,22 +159,28 @@ impl Configuration for ConfigurationService {
         // Group every readable path by the content it resolves to so a listed
         // value can advertise its other authorized aliases, even ones outside
         // the selected namespace. Candidates arrive sorted, so each group stays
-        // sorted too.
-        let mut content_paths: BTreeMap<i64, Vec<String>> = BTreeMap::new();
-        let mut paths = BTreeSet::new();
+        // sorted too. Each pair is (fold key, display form): the fold key is
+        // what excludes a listing's own path from its alias list, the display
+        // form is what the alias is actually reported as.
+        let mut content_paths: BTreeMap<i64, Vec<(String, String)>> = BTreeMap::new();
+        // Ancestor namespace paths, keyed by fold: each maps to the earliest
+        // `created_at` among candidates sharing that ancestor and the display
+        // form that row established it with — the "first-created row's case"
+        // decision recorded on card #294.
+        let mut paths: BTreeMap<String, (OffsetDateTime, String)> = BTreeMap::new();
         let mut direct = Vec::new();
         for row in candidates {
-            let path = ConfigPath::parse(&row.path).map_err(|_| storage_unavailable())?;
+            let path = ConfigPath::parse(&row.lowercase_path).map_err(|_| storage_unavailable())?;
             if !principal.allows(&path, Permission::Read) {
                 continue;
             }
             content_paths
                 .entry(row.content_id)
                 .or_default()
-                .push(row.path.clone());
-            add_parent_paths(&mut paths, &path);
-            if parent_path(&path) == selected.as_str() {
-                direct.push(row.path);
+                .push((row.lowercase_path.clone(), row.path.clone()));
+            add_parent_paths(&mut paths, &row.lowercase_path, &row.path, row.created_at);
+            if parent_path(&row.lowercase_path) == selected.fold() {
+                direct.push(row.lowercase_path);
             }
         }
 
@@ -170,11 +188,11 @@ impl Configuration for ConfigurationService {
         if !direct.is_empty() {
             let rows = sqlx::query_as::<_, ListedValueRow>(
                 r"
-                SELECT p.path, p.content_id, c.value, c.classification, c.created_at, c.updated_at
+                SELECT p.path, p.lowercase_path, p.content_id, c.value, c.classification, c.created_at, c.updated_at
                 FROM configuration_paths p
                 JOIN configuration_value_contents c ON c.id = p.content_id
-                WHERE p.path = ANY($1::TEXT[])
-                ORDER BY p.path
+                WHERE p.lowercase_path = ANY($1::TEXT[])
+                ORDER BY p.lowercase_path
                 ",
             )
             .bind(&direct)
@@ -189,8 +207,8 @@ impl Configuration for ConfigurationService {
                     .map(|siblings| {
                         siblings
                             .iter()
-                            .filter(|candidate| *candidate != &row.path)
-                            .cloned()
+                            .filter(|(fold, _)| fold != &row.lowercase_path)
+                            .map(|(_, display)| display.clone())
                             .collect()
                     })
                     .unwrap_or_default();
@@ -207,7 +225,7 @@ impl Configuration for ConfigurationService {
 
         Ok(Response::new(ListValuesResponse {
             values,
-            paths: paths.into_iter().collect(),
+            paths: paths.into_values().map(|(_, display)| display).collect(),
         }))
     }
 
@@ -227,11 +245,11 @@ impl Configuration for ConfigurationService {
             SELECT p.path, c.value, c.classification
             FROM configuration_paths p
             JOIN configuration_value_contents c ON c.id = p.content_id
-            WHERE $1 = '/' OR p.path = $1 OR starts_with(p.path, $1 || '/')
-            ORDER BY p.path
+            WHERE $1 = '/' OR p.lowercase_path = $1 OR starts_with(p.lowercase_path, $1 || '/')
+            ORDER BY p.lowercase_path
             ",
         )
-        .bind(path.as_str())
+        .bind(path.fold())
         .fetch_all(&self.database)
         .await
         .map_err(|_| storage_unavailable())?;
@@ -283,10 +301,10 @@ impl Configuration for ConfigurationService {
                 ) AS path_count
             FROM configuration_paths p
             JOIN configuration_value_contents c ON c.id = p.content_id
-            WHERE p.path = $1
+            WHERE p.lowercase_path = $1
             ",
         )
-        .bind(path.as_str())
+        .bind(path.fold())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| storage_unavailable())?;
@@ -327,7 +345,7 @@ impl Configuration for ConfigurationService {
             .await
             .map_err(|_| storage_unavailable())?
         } else {
-            if path_collides(&mut transaction, path.as_str()).await? {
+            if path_collides(&mut transaction, &path.fold()).await? {
                 return Err(Status::invalid_argument(
                     "configuration value collides with an existing value",
                 ));
@@ -336,6 +354,7 @@ impl Configuration for ConfigurationService {
             let stored = self.stored_representation(content_id, classification, value)?;
             let content =
                 insert_content(&mut transaction, content_id, &stored, classification, now).await?;
+            // The path exactly as written establishes its display case.
             insert_path(&mut transaction, path.as_str(), content.id, now).await?;
             MutationRow {
                 created_at: content.created_at,
@@ -359,12 +378,17 @@ impl Configuration for ConfigurationService {
     ) -> Result<Response<ReplaceSubTreeResponse>, Status> {
         let path = authorize(&request, &[Permission::Write, Permission::Manage], true)?;
         let mut values = request.get_ref().values.clone();
-        values.sort_by(|first, second| first.path.cmp(&second.path));
-        let mut accepted_paths = BTreeSet::new();
-        for value in &values {
-            let value_path = ConfigPath::parse(&value.path)
+        // Parse and fold every path up front, before sorting or the
+        // ancestor-collision walk below: both depend on paths comparing and
+        // ordering by fold key, not by raw (possibly mixed-case) bytes. Each
+        // value's `path` field is normalized in place to its fold form here,
+        // so every line below this loop keeps the same fold-only invariant it
+        // always has; `displays` is consulted only where a path is written.
+        let mut displays: BTreeMap<String, String> = BTreeMap::new();
+        for value in &mut values {
+            let value_path = ConfigPath::parse_operation(&value.path)
                 .map_err(|_| Status::invalid_argument("configuration subtree is invalid"))?;
-            if value_path.as_str() == "/" || !value_path.is_at_or_below(&path) {
+            if !value_path.is_at_or_below(&path) {
                 return Err(Status::invalid_argument("configuration subtree is invalid"));
             }
             match value.content.as_ref() {
@@ -373,6 +397,15 @@ impl Configuration for ConfigurationService {
                 Some(sub_tree_mutation_value::Content::PreserveSecret(_)) => {}
                 _ => return Err(Status::invalid_argument("configuration subtree is invalid")),
             }
+            let fold = value_path.fold();
+            if fold != value_path.as_str() {
+                displays.insert(fold.clone(), value_path.as_str().to_owned());
+            }
+            value.path = fold;
+        }
+        values.sort_by(|first, second| first.path.cmp(&second.path));
+        let mut accepted_paths = BTreeSet::new();
+        for value in &values {
             let mut ancestor = value.path.as_str();
             let mut has_stored_ancestor = false;
             while let Some((parent, _)) = ancestor.rsplit_once('/') {
@@ -398,20 +431,20 @@ impl Configuration for ConfigurationService {
         lock_mutation_path(&mut transaction, &path).await?;
         let secret_rows = sqlx::query_as::<_, PathRow>(
             r"
-            SELECT p.path
+            SELECT p.lowercase_path AS path
             FROM configuration_paths p
             JOIN configuration_value_contents c ON c.id = p.content_id
             WHERE c.classification = 'secret'
               AND (
                     $1 = '/'
-                    OR p.path = $1
-                    OR starts_with(p.path, $1 || '/')
-                    OR starts_with($1, p.path || '/')
+                    OR p.lowercase_path = $1
+                    OR starts_with(p.lowercase_path, $1 || '/')
+                    OR starts_with($1, p.lowercase_path || '/')
                   )
-            ORDER BY p.path
+            ORDER BY p.lowercase_path
             ",
         )
-        .bind(path.as_str())
+        .bind(path.fold())
         .fetch_all(&mut *transaction)
         .await
         .map_err(|_| storage_unavailable())?;
@@ -468,13 +501,13 @@ impl Configuration for ConfigurationService {
             DELETE FROM configuration_paths p
             USING configuration_value_contents c
             WHERE p.content_id = c.id
-              AND ($1 = '/' OR p.path = $1 OR starts_with(p.path, $1 || '/'))
+              AND ($1 = '/' OR p.lowercase_path = $1 OR starts_with(p.lowercase_path, $1 || '/'))
               AND c.classification = 'plain'
-              AND NOT (p.path = ANY($2::TEXT[]))
+              AND NOT (p.lowercase_path = ANY($2::TEXT[]))
             RETURNING p.content_id
             ",
         )
-        .bind(path.as_str())
+        .bind(path.fold())
         .bind(&plain_paths)
         .fetch_all(&mut *transaction)
         .await
@@ -502,7 +535,7 @@ impl Configuration for ConfigurationService {
                 continue;
             };
             let existing = sqlx::query_scalar::<_, i64>(
-                "SELECT content_id FROM configuration_paths WHERE path = $1",
+                "SELECT content_id FROM configuration_paths WHERE lowercase_path = $1",
             )
             .bind(&value.path)
             .fetch_optional(&mut *transaction)
@@ -549,7 +582,8 @@ impl Configuration for ConfigurationService {
             let content_id = reserve_content_id(&mut transaction).await?;
             let inserted =
                 insert_content(&mut transaction, content_id, content, PLAIN, now).await?;
-            insert_path(&mut transaction, path, inserted.id, now).await?;
+            let display = displays.get(path).map_or(path.as_str(), String::as_str);
+            insert_path(&mut transaction, display, inserted.id, now).await?;
         }
         transaction
             .commit()
@@ -575,17 +609,17 @@ impl Configuration for ConfigurationService {
         lock_mutation_path(&mut transaction, &path).await?;
         let deleted = if recurse {
             sqlx::query_as::<_, DeletedPathRow>(
-                "DELETE FROM configuration_paths WHERE $1 = '/' OR path = $1 OR starts_with(path, $1 || '/') RETURNING content_id",
+                "DELETE FROM configuration_paths WHERE $1 = '/' OR lowercase_path = $1 OR starts_with(lowercase_path, $1 || '/') RETURNING content_id",
             )
-            .bind(path.as_str())
+            .bind(path.fold())
             .fetch_all(&mut *transaction)
             .await
             .map_err(|_| storage_unavailable())?
         } else {
             sqlx::query_as::<_, DeletedPathRow>(
-                "DELETE FROM configuration_paths WHERE path = $1 RETURNING content_id",
+                "DELETE FROM configuration_paths WHERE lowercase_path = $1 RETURNING content_id",
             )
-            .bind(path.as_str())
+            .bind(path.fold())
             .fetch_all(&mut *transaction)
             .await
             .map_err(|_| storage_unavailable())?
@@ -618,10 +652,10 @@ impl Configuration for ConfigurationService {
             SELECT p.content_id, c.value, c.classification
             FROM configuration_paths p
             JOIN configuration_value_contents c ON c.id = p.content_id
-            WHERE p.path = $1
+            WHERE p.lowercase_path = $1
             ",
         )
-        .bind(path.as_str())
+        .bind(path.fold())
         .fetch_optional(&self.database)
         .await
         .map_err(|_| storage_unavailable())?
@@ -664,7 +698,10 @@ impl Configuration for ConfigurationService {
                 "configuration operation is not permitted",
             ));
         }
-        if source.as_str() == new_path.as_str() {
+        // `==`/`<=` on `ConfigPath` compare the fold, so this rejects a
+        // fold-equal alias (however it's cased) and picks a lock order that
+        // agrees with what `lock_mutation_path` actually locks.
+        if source == new_path {
             return Err(Status::invalid_argument(
                 "configuration value already has that path",
             ));
@@ -677,7 +714,7 @@ impl Configuration for ConfigurationService {
             .map_err(|_| storage_unavailable())?;
         // Lock both mutation hierarchies in a canonical order so concurrent
         // aliasing in either direction cannot deadlock.
-        let (first, second) = if source.as_str() <= new_path.as_str() {
+        let (first, second) = if source <= new_path {
             (&source, &new_path)
         } else {
             (&new_path, &source)
@@ -686,29 +723,31 @@ impl Configuration for ConfigurationService {
         lock_mutation_path(&mut transaction, second).await?;
 
         let content_id = sqlx::query_scalar::<_, i64>(
-            "SELECT content_id FROM configuration_paths WHERE path = $1",
+            "SELECT content_id FROM configuration_paths WHERE lowercase_path = $1",
         )
-        .bind(source.as_str())
+        .bind(source.fold())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| storage_unavailable())?
         .ok_or_else(|| Status::not_found("configuration value not found"))?;
-        let occupied =
-            sqlx::query_scalar::<_, String>("SELECT path FROM configuration_paths WHERE path = $1")
-                .bind(new_path.as_str())
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(|_| storage_unavailable())?
-                .is_some();
+        let occupied = sqlx::query_scalar::<_, String>(
+            "SELECT path FROM configuration_paths WHERE lowercase_path = $1",
+        )
+        .bind(new_path.fold())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| storage_unavailable())?
+        .is_some();
         if occupied {
             return Err(Status::already_exists("configuration path already exists"));
         }
-        if path_collides(&mut transaction, new_path.as_str()).await? {
+        if path_collides(&mut transaction, &new_path.fold()).await? {
             return Err(Status::invalid_argument(
                 "configuration value collides with an existing value",
             ));
         }
         let now = OffsetDateTime::from(SystemTime::now());
+        // The path exactly as written establishes this alias's display case.
         insert_path(&mut transaction, new_path.as_str(), content_id, now).await?;
         transaction
             .commit()
@@ -729,15 +768,15 @@ impl Configuration for ConfigurationService {
             .get::<AuthenticatedPrincipal>()
             .ok_or_else(|| Status::unauthenticated("authentication required"))?;
         let content_id = sqlx::query_scalar::<_, i64>(
-            "SELECT content_id FROM configuration_paths WHERE path = $1",
+            "SELECT content_id FROM configuration_paths WHERE lowercase_path = $1",
         )
-        .bind(path.as_str())
+        .bind(path.fold())
         .fetch_optional(&self.database)
         .await
         .map_err(|_| storage_unavailable())?
         .ok_or_else(|| Status::not_found("configuration value not found"))?;
-        let rows = sqlx::query_as::<_, PathRow>(
-            "SELECT path FROM configuration_paths WHERE content_id = $1 ORDER BY path",
+        let rows = sqlx::query_as::<_, PathWithFoldRow>(
+            "SELECT path, lowercase_path FROM configuration_paths WHERE content_id = $1 ORDER BY lowercase_path",
         )
         .bind(content_id)
         .fetch_all(&self.database)
@@ -747,7 +786,8 @@ impl Configuration for ConfigurationService {
         // paths outside the caller's grants.
         let mut paths = Vec::new();
         for row in rows {
-            let candidate = ConfigPath::parse(&row.path).map_err(|_| storage_unavailable())?;
+            let candidate =
+                ConfigPath::parse(&row.lowercase_path).map_err(|_| storage_unavailable())?;
             if principal.allows(&candidate, Permission::Read) {
                 paths.push(row.path);
             }
@@ -776,8 +816,8 @@ async fn path_collides(
         r"
         SELECT path
         FROM configuration_paths
-        WHERE path <> $1
-          AND (starts_with(path, $1 || '/') OR starts_with($1, path || '/'))
+        WHERE lowercase_path <> $1
+          AND (starts_with(lowercase_path, $1 || '/') OR starts_with($1, lowercase_path || '/'))
         LIMIT 1
         ",
     )
@@ -833,6 +873,9 @@ async fn insert_content(
     .map_err(|_| storage_unavailable())
 }
 
+/// Inserts a path row. `path` is the exact case it was written with;
+/// `lowercase_path` is computed by Postgres and must never appear here — the
+/// generated column rejects any attempt to write it directly.
 async fn insert_path(
     transaction: &mut Transaction<'_, Postgres>,
     path: &str,
@@ -908,9 +951,14 @@ async fn lock_mutation_path(
     transaction: &mut Transaction<'_, Postgres>,
     path: &ConfigPath,
 ) -> Result<(), Status> {
-    if path.as_str() != "/" {
+    // Locks are hashed by this string, so two concurrent writes to the same
+    // fold key — spelled differently — must hash to the same lock or they
+    // would never serialize against each other. Always the fold, never
+    // `path.as_str()` (display).
+    let fold = path.fold();
+    if fold != "/" {
         lock_path(transaction, "/", false).await?;
-        let parent = parent_path(path);
+        let parent = parent_path(&fold);
         if parent != "/" {
             let mut prefix = String::new();
             for segment in parent.trim_start_matches('/').split('/') {
@@ -920,7 +968,7 @@ async fn lock_mutation_path(
             }
         }
     }
-    lock_path(transaction, path.as_str(), true).await
+    lock_path(transaction, &fold, true).await
 }
 
 async fn lock_path(
@@ -1045,24 +1093,75 @@ fn subtree_content(value: String, classification: &str) -> Option<(i32, sub_tree
     }
 }
 
-fn parent_path(path: &ConfigPath) -> &str {
-    path.as_str().rsplit_once('/').map_or(
+/// The parent of a fold path. Takes `&str`, not `&ConfigPath`, so a caller
+/// must explicitly hand in a fold key (e.g. `path.fold()` or a
+/// `lowercase_path` column) rather than one that might carry display case.
+fn parent_path(fold_path: &str) -> &str {
+    fold_path.rsplit_once('/').map_or(
         "/",
         |(parent, _)| if parent.is_empty() { "/" } else { parent },
     )
 }
 
-fn add_parent_paths(paths: &mut BTreeSet<String>, path: &ConfigPath) {
-    let parent = parent_path(path);
-    paths.insert("/".into());
-    if parent == "/" {
+/// Records every ancestor namespace of `fold_path` (a stored row's fold key),
+/// keyed by fold, mapped to the earliest `created_at` among rows sharing that
+/// ancestor and the matching prefix of `display_path`.
+///
+/// `fold_path` and `display_path` always have the same segment count and byte
+/// length per segment — display case never adds, removes, or resizes a
+/// segment — so their segments can be walked in lockstep by index.
+fn add_parent_paths(
+    paths: &mut BTreeMap<String, (OffsetDateTime, String)>,
+    fold_path: &str,
+    display_path: &str,
+    created_at: OffsetDateTime,
+) {
+    upsert_ancestor(paths, "/".to_owned(), created_at, "/".to_owned());
+    let fold_parent =
+        fold_path.rsplit_once('/').map_or(
+            "/",
+            |(parent, _)| if parent.is_empty() { "/" } else { parent },
+        );
+    if fold_parent == "/" {
         return;
     }
-    let mut prefix = String::new();
-    for segment in parent.trim_start_matches('/').split('/') {
-        prefix.push('/');
-        prefix.push_str(segment);
-        paths.insert(prefix.clone());
+    let fold_segments: Vec<&str> = fold_parent.trim_start_matches('/').split('/').collect();
+    let display_segments: Vec<&str> = display_path.trim_start_matches('/').split('/').collect();
+    let mut fold_prefix = String::new();
+    let mut display_prefix = String::new();
+    for index in 0..fold_segments.len() {
+        fold_prefix.push('/');
+        fold_prefix.push_str(fold_segments[index]);
+        display_prefix.push('/');
+        display_prefix.push_str(display_segments[index]);
+        upsert_ancestor(
+            paths,
+            fold_prefix.clone(),
+            created_at,
+            display_prefix.clone(),
+        );
+    }
+}
+
+/// Keeps the display form from whichever row established this ancestor
+/// first — ties break on the display string itself, so the choice stays
+/// deterministic without depending on row iteration order.
+fn upsert_ancestor(
+    paths: &mut BTreeMap<String, (OffsetDateTime, String)>,
+    fold: String,
+    created_at: OffsetDateTime,
+    display: String,
+) {
+    use std::collections::btree_map::Entry;
+    match paths.entry(fold) {
+        Entry::Vacant(entry) => {
+            entry.insert((created_at, display));
+        }
+        Entry::Occupied(mut entry) => {
+            if (created_at, display.as_str()) < (entry.get().0, entry.get().1.as_str()) {
+                entry.insert((created_at, display));
+            }
+        }
     }
 }
 
@@ -1325,7 +1424,7 @@ mod tests {
             SELECT p.content_id, c.value, c.classification
             FROM configuration_paths p
             JOIN configuration_value_contents c ON c.id = p.content_id
-            WHERE p.path = $1
+            WHERE p.lowercase_path = $1
             ",
         )
         .bind(path)
@@ -1341,7 +1440,7 @@ mod tests {
         let mut ids: Vec<i64> = Vec::new();
         for prefix in prefixes {
             let mut removed = sqlx::query_scalar::<_, i64>(
-                "DELETE FROM configuration_paths WHERE path = $1 OR starts_with(path, $1 || '/') RETURNING content_id",
+                "DELETE FROM configuration_paths WHERE lowercase_path = $1 OR starts_with(lowercase_path, $1 || '/') RETURNING content_id",
             )
             .bind(prefix)
             .fetch_all(pool)
@@ -1480,10 +1579,16 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(listing.values.len(), 1);
-        assert_eq!(listing.values[0].path, "/tests/exact/key");
+        // The stored value's path keeps the case it was written with, even
+        // though it resolves and lists under a lowercase-typed query path.
+        assert_eq!(listing.values[0].path, "/Tests/Exact/Key");
+        // "/tests" and "/tests/exact" take the display case established by
+        // "/Tests/Exact/Key" — the only readable row under either ancestor,
+        // written before "/tests/exact/nested/child". "/tests/exact/nested"
+        // has only the latter as a contributor, so it stays lowercase.
         assert_eq!(
             listing.paths,
-            ["/", "/tests", "/tests/exact", "/tests/exact/nested"]
+            ["/", "/Tests", "/Tests/Exact", "/tests/exact/nested"]
         );
         let nested_only = service
             .list_values(request_for_prefix(
@@ -1536,7 +1641,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(stored.values.len(), 2);
-        assert_eq!(stored.values[0].path, "/tests/exact/key");
+        assert_eq!(stored.values[0].path, "/Tests/Exact/Key");
         assert!(matches!(
             stored.values[0].content.as_ref(),
             Some(sub_tree_value::Content::PlainValue(value)) if value == "value-sentinel-one"
@@ -1769,6 +1874,128 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(unavailable.code(), Code::Unavailable);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_retains_established_display_case_across_writes_and_folds_uniqueness() {
+        let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL")
+            .expect("SOVEREIGN_CONFIG_TEST_DATABASE_URL must be configured");
+        let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        clear_test_paths(&pool, &["/tests/case"]).await;
+        let service = ConfigurationService::new(pool.clone(), test_cipher());
+        let read_write = [Permission::Read, Permission::Write];
+
+        // The first write of a fold key establishes its display form.
+        service
+            .put_value(request_for_prefix(
+                plain_put("/tests/case/serverIP", "value-one"),
+                "/tests/case",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+        let (_, stored_value, _) = stored_value(&pool, "/tests/case/serverip").await;
+        assert_eq!(stored_value, "value-one");
+        let established = service
+            .get_sub_tree(request_for_prefix(
+                GetSubTreeRequest {
+                    path: "/tests/case/serverip".into(),
+                },
+                "/tests/case",
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(established.values[0].path, "/tests/case/serverIP");
+
+        // A later write through a differently-cased spelling of the same fold
+        // key updates the value but leaves the established display form.
+        service
+            .put_value(request_for_prefix(
+                plain_put("/TESTS/CASE/SERVERIP", "value-two"),
+                "/tests/case",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+        let unchanged_case = service
+            .get_sub_tree(request_for_prefix(
+                GetSubTreeRequest {
+                    path: "/tests/case/serverip".into(),
+                },
+                "/tests/case",
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(unchanged_case.values[0].path, "/tests/case/serverIP");
+        assert!(matches!(
+            unchanged_case.values[0].content.as_ref(),
+            Some(sub_tree_value::Content::PlainValue(value)) if value == "value-two"
+        ));
+
+        // A fold-colliding alias — even spelled in yet another case — is
+        // rejected as an existing path, not created as a second value.
+        service
+            .put_value(request_for_prefix(
+                plain_put("/tests/case/other", "other-value"),
+                "/tests/case",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+        let aliasing_collision = service
+            .add_value_path(request_for_prefix(
+                AddValuePathRequest {
+                    source_path: "/tests/case/other".into(),
+                    new_path: "/TESTS/case/ServerIp".into(),
+                },
+                "/tests/case",
+                &read_write,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(aliasing_collision.code(), Code::AlreadyExists);
+
+        // Delete then recreate is the only way to change established case.
+        service
+            .delete_values(request_for_prefix(
+                DeleteValuesRequest {
+                    path: "/tests/case/serverip".into(),
+                    recurse: false,
+                },
+                "/tests/case",
+                &[Permission::Write],
+            ))
+            .await
+            .unwrap();
+        service
+            .put_value(request_for_prefix(
+                plain_put("/tests/case/SERVERIP", "value-three"),
+                "/tests/case",
+                &read_write,
+            ))
+            .await
+            .unwrap();
+        let recreated = service
+            .get_sub_tree(request_for_prefix(
+                GetSubTreeRequest {
+                    path: "/tests/case/serverip".into(),
+                },
+                "/tests/case",
+                &[Permission::Read],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(recreated.values[0].path, "/tests/case/SERVERIP");
+
+        pool.close().await;
     }
 
     #[tokio::test]
@@ -2080,7 +2307,7 @@ mod tests {
             .await
             .unwrap();
         let retained: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM configuration_paths WHERE path = '/tests/secrets/credential'",
+            "SELECT COUNT(*) FROM configuration_paths WHERE lowercase_path = '/tests/secrets/credential'",
         )
         .fetch_one(&pool)
         .await
@@ -2105,7 +2332,7 @@ mod tests {
 
         let mut blocker = pool.begin().await.unwrap();
         sqlx::query(
-            "SELECT path FROM configuration_paths WHERE path = '/tests/concurrent/existing' FOR UPDATE",
+            "SELECT path FROM configuration_paths WHERE lowercase_path = '/tests/concurrent/existing' FOR UPDATE",
         )
         .fetch_one(&mut *blocker)
         .await
@@ -2183,7 +2410,7 @@ mod tests {
         }
 
         let paths = sqlx::query_scalar::<_, String>(
-            "SELECT path FROM configuration_paths WHERE path LIKE '/tests/concurrent/%' ORDER BY path",
+            "SELECT path FROM configuration_paths WHERE lowercase_path LIKE '/tests/concurrent/%' ORDER BY lowercase_path",
         )
         .fetch_all(&pool)
         .await
@@ -2269,12 +2496,13 @@ mod tests {
         ));
 
         // Deleting one path keeps the value reachable via the other.
-        let content_id: i64 =
-            sqlx::query_scalar("SELECT content_id FROM configuration_paths WHERE path = $1")
-                .bind("/tests/alias/primary")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let content_id: i64 = sqlx::query_scalar(
+            "SELECT content_id FROM configuration_paths WHERE lowercase_path = $1",
+        )
+        .bind("/tests/alias/primary")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         service
             .delete_values(request_for_prefix(
                 DeleteValuesRequest {
@@ -2379,7 +2607,7 @@ mod tests {
             SELECT c.classification
             FROM configuration_paths p
             JOIN configuration_value_contents c ON c.id = p.content_id
-            WHERE p.path = '/tests/aliasclass/credential'
+            WHERE p.lowercase_path = '/tests/aliasclass/credential'
             ",
         )
         .fetch_one(&pool)
@@ -2568,12 +2796,13 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let content_id: i64 =
-                sqlx::query_scalar("SELECT content_id FROM configuration_paths WHERE path = $1")
-                    .bind(&left)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let content_id: i64 = sqlx::query_scalar(
+                "SELECT content_id FROM configuration_paths WHERE lowercase_path = $1",
+            )
+            .bind(&left)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
             let first = service.clone();
             let second = service.clone();
@@ -2680,7 +2909,7 @@ mod tests {
             SELECT c.value
             FROM configuration_paths p
             JOIN configuration_value_contents c ON c.id = p.content_id
-            WHERE p.path = '/tests/aliasreplace/first'
+            WHERE p.lowercase_path = '/tests/aliasreplace/first'
             ",
         )
         .fetch_one(&pool)
@@ -2708,7 +2937,7 @@ mod tests {
             SELECT c.value
             FROM configuration_paths p
             JOIN configuration_value_contents c ON c.id = p.content_id
-            WHERE p.path = ANY(ARRAY['/tests/aliasreplace/first', '/tests/aliasreplace/second'])
+            WHERE p.lowercase_path = ANY(ARRAY['/tests/aliasreplace/first', '/tests/aliasreplace/second'])
             GROUP BY c.value
             ",
         )
@@ -2720,7 +2949,7 @@ mod tests {
             r"
             SELECT COUNT(DISTINCT p.content_id)
             FROM configuration_paths p
-            WHERE p.path LIKE '/tests/aliasreplace/%'
+            WHERE p.lowercase_path LIKE '/tests/aliasreplace/%'
             ",
         )
         .fetch_one(&pool)

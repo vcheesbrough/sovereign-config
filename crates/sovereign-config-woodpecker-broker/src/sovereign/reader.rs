@@ -193,17 +193,19 @@ impl SovereignReader {
 
 /// The final segment of `path`, when `path` is a direct child of `layer`.
 ///
-/// Comparison is on whole segments: `/a/b` is not a child of `/a/bc`.
+/// Comparison is on whole segments: `/a/b` is not a child of `/a/bc`. Always
+/// the fold, never `as_str()` (display): Woodpecker matches `from_secret:`
+/// names by exact lowercase string, so the name returned here must be the
+/// fold key regardless of the case a value was actually written with.
 fn direct_child_name(layer: &ConfigPath, path: &ConfigPath) -> Option<String> {
-    let prefix = if layer.as_str() == "/" {
-        "/"
+    let layer_fold = layer.fold();
+    let path_fold = path.fold();
+    let relative = if layer_fold == "/" {
+        path_fold.strip_prefix('/')?
     } else {
-        layer.as_str()
-    };
-    let relative = if prefix == "/" {
-        path.as_str().strip_prefix('/')?
-    } else {
-        path.as_str().strip_prefix(prefix)?.strip_prefix('/')?
+        path_fold
+            .strip_prefix(layer_fold.as_str())?
+            .strip_prefix('/')?
     };
     (!relative.is_empty() && !relative.contains('/')).then(|| relative.to_owned())
 }
@@ -245,6 +247,24 @@ mod tests {
                 &path("/woodpecker/global/nested/token")
             ),
             None
+        );
+    }
+
+    // Card #294: the server may now return a value's path in whatever case it
+    // was written with (`/Stacks/Monitoring/FOO`), not always lowercase. Both
+    // `layer` and `path` reach this function already folded by
+    // `ConfigPath::parse_operation`/`parse_selection` at the transport
+    // boundary, so `.as_str()` here is always the fold key on both sides —
+    // the strip never sees mismatched case and the secret is never dropped.
+    // The returned name also stays fold-cased, matching Woodpecker's
+    // exact-lowercase `from_secret:` grammar.
+    #[test]
+    fn a_mixed_case_stored_path_under_a_lowercase_layer_still_yields_its_value() {
+        let layer = ConfigPath::parse("/stacks/monitoring").unwrap();
+        let mixed_case_path = ConfigPath::parse_operation("/Stacks/Monitoring/FOO").unwrap();
+        assert_eq!(
+            direct_child_name(&layer, &mixed_case_path),
+            Some("foo".to_owned())
         );
     }
 

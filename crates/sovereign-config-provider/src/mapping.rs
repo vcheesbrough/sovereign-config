@@ -85,18 +85,23 @@ fn leaf_text(
     }
 }
 
+/// Always the fold, never `as_str()` (display): a typed struct's field names
+/// are lowercase Rust identifiers, so the JSON tree this builds has to be
+/// keyed by fold regardless of the case a value was actually written with —
+/// unlike `sovereign_config_core::render_subtree_json`, which is deliberately
+/// display-cased for CLI/UI output. See card #294's README note on `render`.
 fn relative_segments(root: &ConfigPath, path: &ConfigPath) -> Result<Vec<String>, ProviderError> {
-    if root.as_str() == "/" {
+    if root.fold() == "/" {
         return Ok(path
-            .as_str()
+            .fold()
             .trim_start_matches('/')
             .split('/')
             .map(str::to_owned)
             .collect());
     }
-    let relative = path
-        .as_str()
-        .strip_prefix(root.as_str())
+    let path_fold = path.fold();
+    let relative = path_fold
+        .strip_prefix(root.fold().as_str())
         .and_then(|suffix| suffix.strip_prefix('/'))
         .ok_or(ProviderError::InvalidConversion)?;
     Ok(relative.split('/').map(str::to_owned).collect())

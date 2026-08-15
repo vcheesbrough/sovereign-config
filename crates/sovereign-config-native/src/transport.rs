@@ -66,10 +66,11 @@ impl ValueTransport for TonicTransport {
                 let alias_paths = value
                     .alias_paths
                     .into_iter()
-                    .map(|path| ConfigPath::parse(path).map_err(|_| invalid_response()))
+                    .map(|path| ConfigPath::parse_operation(path).map_err(|_| invalid_response()))
                     .collect::<Result<Vec<_>, ClientError>>()?;
                 Ok(ListedValue {
-                    path: ConfigPath::parse(value.path).map_err(|_| invalid_response())?,
+                    path: ConfigPath::parse_operation(value.path)
+                        .map_err(|_| invalid_response())?,
                     value: listed_content(value.classification, value.content)?,
                     created_at: timestamp(created_at.seconds, created_at.nanos)?,
                     updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
@@ -80,7 +81,7 @@ impl ValueTransport for TonicTransport {
         let paths = response
             .paths
             .into_iter()
-            .map(|path| ConfigPath::parse(path).map_err(|_| invalid_response()))
+            .map(|path| ConfigPath::parse_selection(path).map_err(|_| invalid_response()))
             .collect::<Result<Vec<_>, ClientError>>()?;
         Ok(ValueListing { values, paths })
     }
@@ -105,8 +106,9 @@ impl ValueTransport for TonicTransport {
             .values
             .into_iter()
             .map(|value| {
-                let value_path = ConfigPath::parse(value.path).map_err(|_| invalid_response())?;
-                if value_path.as_str() == "/" || !value_path.is_at_or_below(path) {
+                let value_path =
+                    ConfigPath::parse_operation(value.path).map_err(|_| invalid_response())?;
+                if !value_path.is_at_or_below(path) {
                     return Err(invalid_response());
                 }
                 Ok(SubTreeValue {
@@ -306,7 +308,7 @@ impl ValueTransport for TonicTransport {
         let paths = response
             .paths
             .into_iter()
-            .map(|path| ConfigPath::parse(path).map_err(|_| invalid_response()))
+            .map(|path| ConfigPath::parse_operation(path).map_err(|_| invalid_response()))
             .collect::<Result<Vec<_>, ClientError>>()?;
         Ok(ValuePaths { paths })
     }
@@ -404,7 +406,7 @@ fn managed_metadata(
         connection_id: ConnectionId::parse(metadata.connection_id)
             .map_err(|_| invalid_response())?,
         display_name: DisplayName::parse(metadata.display_name).map_err(|_| invalid_response())?,
-        root: ConfigPath::parse(metadata.root).map_err(|_| invalid_response())?,
+        root: ConfigPath::parse_selection(metadata.root).map_err(|_| invalid_response())?,
         state: managed_state(metadata.state)?,
         permissions: ManagedPermissions::from_proto(&metadata.permissions)
             .map_err(|_| invalid_response())?,
