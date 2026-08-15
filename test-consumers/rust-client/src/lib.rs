@@ -291,6 +291,11 @@ mod tests {
             },
             ConsumerAuthentication,
         );
+        // Mixed case on purpose: the path is written as "/Apps/API/Feature"
+        // and every read below must give that exact case back, even though
+        // the listing is queried with an all-lowercase root and `==` on
+        // `ConfigPath` compares fold keys only (card #294) — the case
+        // assertions are what actually exercise retention here.
         let path = ConfigPath::parse_operation("/Apps/API/Feature").unwrap();
         let value = PlainValue::new("consumer-value-sentinel");
 
@@ -301,6 +306,18 @@ mod tests {
             .unwrap();
         assert_eq!(listing.values.len(), 1);
         assert_eq!(listing.values[0].path, path);
+        assert_eq!(listing.values[0].path.display_str(), "/Apps/API/Feature");
+        assert_eq!(
+            client
+                .get_subtree(&ConfigPath::parse_operation("/apps/api").unwrap())
+                .await
+                .unwrap()
+                .values[0]
+                .path
+                .display_str(),
+            "/Apps/API/Feature",
+            "a lowercase-typed query must still return the established display case"
+        );
         assert_eq!(
             client.get_subtree(&path).await.unwrap().values[0]
                 .value

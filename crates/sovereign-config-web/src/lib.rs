@@ -2,7 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
 };
 
 use async_trait::async_trait;
@@ -118,6 +118,11 @@ struct PendingConnection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TreeNode {
     path: ConfigPath,
+    /// The label to render: the last segment of whichever display form this
+    /// namespace was established with, `/` for the tree root. `path` itself
+    /// stays fold-only — it is what `data-path` round-trips and what every
+    /// lookup against `has_values`/`has_connection` compares.
+    display: String,
     depth: usize,
     /// This namespace directly holds at least one value — rendered bold.
     has_values: bool,
@@ -140,22 +145,58 @@ fn parent_of(path: &ConfigPath) -> ConfigPath {
         .unwrap_or_else(ConfigPath::root)
 }
 
-/// The namespaces a set of value paths implies: each value's parent and every
-/// ancestor of that parent, plus the tree root. This deliberately mirrors the
-/// server's own derivation of `ListValues.paths`, so both tree sources agree.
-fn namespaces_of(value_paths: &[ConfigPath]) -> BTreeSet<String> {
-    let mut namespaces = BTreeSet::new();
-    namespaces.insert("/".to_owned());
-    for path in value_paths {
-        let parent = parent_of(path);
-        let mut prefix = String::new();
-        for segment in path_segments(parent.as_str()) {
-            prefix.push('/');
-            prefix.push_str(segment);
-            namespaces.insert(prefix.clone());
+/// The parent of `path`, in both forms. Byte offsets align between the fold
+/// key and the display form because letter case never changes a segment's
+/// length — `path.as_str()` and `path.display_str()` always split at the same
+/// boundary.
+fn parent_forms(path: &ConfigPath) -> (String, String) {
+    match path.as_str().rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => {
+            let boundary = parent.len();
+            (parent.to_owned(), path.display_str()[..boundary].to_owned())
+        }
+        _ => ("/".to_owned(), "/".to_owned()),
+    }
+}
+
+/// The namespace labels a set of value paths implies: each value's parent and
+/// every ancestor of that parent, plus the tree root — keyed by fold, mapped
+/// to the display form contributed by whichever value path is fold-smallest
+/// under it.
+///
+/// This deliberately mirrors the server's own derivation of `ListValues.paths`
+/// (`add_parent_paths` in `sovereign-config-server`), except for the
+/// tie-break: `GetSubTree` carries no creation timestamp, so "whichever row
+/// was created first" — the rule the server uses — is not available here, and
+/// the fold-smallest contributing path is used instead. Both rules are
+/// deterministic; they can disagree only when two differently-cased writes
+/// share an ancestor, which is purely a label choice with no effect on stored
+/// data.
+fn namespace_labels(value_paths: &[ConfigPath]) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert("/".to_owned(), "/".to_owned());
+    let mut sorted = value_paths.iter().collect::<Vec<_>>();
+    sorted.sort_by_key(|path| path.as_str());
+    for path in sorted {
+        let (fold_parent, display_parent) = parent_forms(path);
+        if fold_parent == "/" {
+            continue;
+        }
+        let fold_segments = path_segments(&fold_parent);
+        let display_segments = path_segments(&display_parent);
+        let mut fold_prefix = String::new();
+        let mut display_prefix = String::new();
+        for index in 0..fold_segments.len() {
+            fold_prefix.push('/');
+            fold_prefix.push_str(fold_segments[index]);
+            display_prefix.push('/');
+            display_prefix.push_str(display_segments[index]);
+            labels
+                .entry(fold_prefix.clone())
+                .or_insert_with(|| display_prefix.clone());
         }
     }
-    namespaces
+    labels
 }
 
 /// The namespaces that directly hold at least one value. `ListValues.paths`
@@ -174,21 +215,29 @@ fn value_parents_of(value_paths: &[ConfigPath]) -> BTreeSet<String> {
 /// so a raw string sort would place `/a-b` between `/a` and `/a/b` and split a
 /// subtree in two.
 fn build_tree(
-    namespaces: &BTreeSet<String>,
+    labels: &BTreeMap<String, String>,
     value_parents: &BTreeSet<String>,
     connection_roots: &BTreeSet<String>,
 ) -> Vec<TreeNode> {
-    let mut ordered = namespaces.iter().cloned().collect::<Vec<_>>();
+    let mut ordered = labels.keys().cloned().collect::<Vec<_>>();
     ordered.sort_by(|left, right| path_segments(left).cmp(&path_segments(right)));
     ordered
         .into_iter()
-        .filter_map(|path| {
-            let depth = path_segments(&path).len();
-            let path = ConfigPath::parse(path).ok()?;
+        .filter_map(|fold| {
+            let depth = path_segments(&fold).len();
+            let display = labels.get(&fold).map_or(fold.as_str(), String::as_str);
+            let label = display
+                .rsplit('/')
+                .next()
+                .filter(|segment| !segment.is_empty())
+                .unwrap_or("/")
+                .to_owned();
+            let path = ConfigPath::parse(fold).ok()?;
             Some(TreeNode {
                 has_values: value_parents.contains(path.as_str()),
                 has_connection: connection_roots.contains(path.as_str()),
                 depth,
+                display: label,
                 path,
             })
         })
@@ -299,7 +348,7 @@ impl ValueTransport for BrowserTransport {
         let response: ListValuesResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/ListValues",
             &ListValuesRequest {
-                path: path.as_str().to_owned(),
+                path: path.display_str().to_owned(),
             },
             Some(bearer),
         )
@@ -311,10 +360,10 @@ impl ValueTransport for BrowserTransport {
                 let alias_paths = value
                     .alias_paths
                     .into_iter()
-                    .map(|path| ConfigPath::parse(path).map_err(|_| browser_error()))
+                    .map(|path| ConfigPath::parse_operation(path).map_err(|_| browser_error()))
                     .collect::<Result<Vec<_>, ClientError>>()?;
                 Ok(ListedValue {
-                    path: ConfigPath::parse(value.path).map_err(|_| browser_error())?,
+                    path: ConfigPath::parse_operation(value.path).map_err(|_| browser_error())?,
                     value: listed_content(value.classification, value.content)?,
                     created_at: proto_timestamp(value.created_at)?,
                     updated_at: proto_timestamp(value.updated_at)?,
@@ -325,7 +374,7 @@ impl ValueTransport for BrowserTransport {
         let paths = response
             .paths
             .into_iter()
-            .map(|path| ConfigPath::parse(path).map_err(|_| browser_error()))
+            .map(|path| ConfigPath::parse_selection(path).map_err(|_| browser_error()))
             .collect::<Result<Vec<_>, ClientError>>()?;
         Ok(ValueListing { values, paths })
     }
@@ -338,7 +387,7 @@ impl ValueTransport for BrowserTransport {
         let response: GetSubTreeResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/GetSubTree",
             &GetSubTreeRequest {
-                path: path.as_str().to_owned(),
+                path: path.display_str().to_owned(),
             },
             Some(bearer),
         )
@@ -347,8 +396,9 @@ impl ValueTransport for BrowserTransport {
             .values
             .into_iter()
             .map(|value| {
-                let value_path = ConfigPath::parse(value.path).map_err(|_| browser_error())?;
-                if value_path.as_str() == "/" || !value_path.is_at_or_below(path) {
+                let value_path =
+                    ConfigPath::parse_operation(value.path).map_err(|_| browser_error())?;
+                if !value_path.is_at_or_below(path) {
                     return Err(browser_error());
                 }
                 Ok(SubTreeValue {
@@ -369,7 +419,7 @@ impl ValueTransport for BrowserTransport {
         let response: PutValueResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/PutValue",
             &PutValueRequest {
-                path: path.as_str().to_owned(),
+                path: path.display_str().to_owned(),
                 content: Some(put_value_request::Content::PlainValue(
                     value.expose().to_owned(),
                 )),
@@ -392,7 +442,7 @@ impl ValueTransport for BrowserTransport {
         let response: PutValueResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/PutValue",
             &PutValueRequest {
-                path: path.as_str().to_owned(),
+                path: path.display_str().to_owned(),
                 content: Some(put_value_request::Content::SecretValue(
                     value.expose().to_owned(),
                 )),
@@ -415,11 +465,11 @@ impl ValueTransport for BrowserTransport {
         let response: ReplaceSubTreeResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/ReplaceSubTree",
             &ReplaceSubTreeRequest {
-                path: path.as_str().to_owned(),
+                path: path.display_str().to_owned(),
                 values: values
                     .iter()
                     .map(|value| ProtoSubTreeMutationValue {
-                        path: value.path.as_str().to_owned(),
+                        path: value.path.display_str().to_owned(),
                         content: Some(match &value.value {
                             SubTreeMutationContent::Plain(value) => {
                                 sub_tree_mutation_value::Content::PlainValue(
@@ -451,7 +501,7 @@ impl ValueTransport for BrowserTransport {
         let response: DeleteValuesResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/DeleteValues",
             &DeleteValuesRequest {
-                path: path.as_str().to_owned(),
+                path: path.display_str().to_owned(),
                 recurse,
             },
             Some(bearer),
@@ -471,7 +521,7 @@ impl ValueTransport for BrowserTransport {
         let response: RevealSecretResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/RevealSecret",
             &RevealSecretRequest {
-                path: path.as_str().to_owned(),
+                path: path.display_str().to_owned(),
             },
             Some(bearer),
         )
@@ -491,8 +541,8 @@ impl ValueTransport for BrowserTransport {
         let response: AddValuePathResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/AddValuePath",
             &AddValuePathRequest {
-                source_path: source.as_str().to_owned(),
-                new_path: new_path.as_str().to_owned(),
+                source_path: source.display_str().to_owned(),
+                new_path: new_path.display_str().to_owned(),
             },
             Some(bearer),
         )
@@ -510,7 +560,7 @@ impl ValueTransport for BrowserTransport {
         let response: ListValuePathsResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/ListValuePaths",
             &ListValuePathsRequest {
-                path: path.as_str().to_owned(),
+                path: path.display_str().to_owned(),
             },
             Some(bearer),
         )
@@ -518,7 +568,7 @@ impl ValueTransport for BrowserTransport {
         let paths = response
             .paths
             .into_iter()
-            .map(|path| ConfigPath::parse(path).map_err(|_| browser_error()))
+            .map(|path| ConfigPath::parse_operation(path).map_err(|_| browser_error()))
             .collect::<Result<Vec<_>, ClientError>>()?;
         Ok(ValuePaths { paths })
     }
@@ -602,7 +652,7 @@ fn managed_metadata(
     Ok(ManagedConnectionMetadata {
         connection_id: ConnectionId::parse(metadata.connection_id).map_err(|_| browser_error())?,
         display_name: DisplayName::parse(metadata.display_name).map_err(|_| browser_error())?,
-        root: ConfigPath::parse(metadata.root).map_err(|_| browser_error())?,
+        root: ConfigPath::parse_selection(metadata.root).map_err(|_| browser_error())?,
         state: managed_state(metadata.state)?,
         permissions: ManagedPermissions::from_proto(&metadata.permissions)
             .map_err(|_| browser_error())?,
@@ -1630,20 +1680,23 @@ async fn load_tree() {
                 .into_iter()
                 .map(|value| value.path)
                 .collect::<Vec<_>>();
-            Some((namespaces_of(&paths), value_parents_of(&paths)))
+            Some((namespace_labels(&paths), value_parents_of(&paths)))
         }
         Err(_) => value_client(&config)
             .list_values(&selected)
             .await
             .ok()
             .map(|listing| {
-                let mut namespaces = listing
+                // `listing.paths` already carries the server's display form for
+                // each namespace (its first-created row's case), so this is a
+                // direct copy, not a re-derivation.
+                let mut labels = listing
                     .paths
                     .iter()
-                    .map(|path| path.as_str().to_owned())
-                    .collect::<BTreeSet<_>>();
-                namespaces.insert("/".to_owned());
-                (namespaces, BTreeSet::new())
+                    .map(|path| (path.as_str().to_owned(), path.display_str().to_owned()))
+                    .collect::<BTreeMap<_, _>>();
+                labels.insert("/".to_owned(), "/".to_owned());
+                (labels, BTreeSet::new())
             }),
     };
     if TREE_LOAD_GENERATION.get() != generation {
@@ -1663,11 +1716,11 @@ async fn load_tree() {
     if listed_failed {
         set_text("path-connection-count", "Access URLs unavailable");
     }
-    let Some((namespaces, value_parents)) = model else {
+    let Some((labels, value_parents)) = model else {
         set_text("config-tree-state", "Tree unavailable");
         return;
     };
-    let nodes = build_tree(&namespaces, &value_parents, &roots);
+    let nodes = build_tree(&labels, &value_parents, &roots);
     let count = nodes.len();
     TREE_NODES.with_borrow_mut(|slot| slot.clone_from(&nodes));
     if let Err(error) = render_tree(&nodes) {
@@ -1775,7 +1828,7 @@ fn build_tree_node(
         append(&item, &key_icon(document)?)?;
     }
     let label = create_element(document, "span", Some("tree-label"))?;
-    label.set_text_content(Some(node.path.name().unwrap_or("/")));
+    label.set_text_content(Some(&node.display));
     append(&item, &label)?;
     if node.has_connection {
         let annotation = create_element(document, "span", Some("visually-hidden"))?;
@@ -2122,7 +2175,7 @@ fn human_size(size: Option<f64>) -> String {
 }
 
 fn absolute_path(path: &ConfigPath) -> String {
-    path.as_str().to_owned()
+    path.display_str().to_owned()
 }
 
 fn selected_namespace() -> Result<ConfigPath, ClientError> {
@@ -3543,9 +3596,8 @@ fn render_value_row(
         .map_err(|_| browser_error())?;
     let name = value
         .path
-        .as_str()
-        .rsplit_once('/')
-        .map_or(value.path.as_str(), |(_, name)| name);
+        .display_name()
+        .unwrap_or_else(|| value.path.display_str());
     let name_text = create_element(document, "span", Some("value-name"))?;
     name_text.set_text_content(Some(name));
     let full_path = create_element(document, "span", Some("full-path"))?;
@@ -3675,7 +3727,7 @@ fn render_secret_value_row(
     let row = create_element(document, "tr", None)?;
     row.set_attribute("data-value-row", "")
         .map_err(|_| browser_error())?;
-    let name = value.path.name().ok_or_else(browser_error)?;
+    let name = value.path.display_name().ok_or_else(browser_error)?;
 
     let name_cell = create_element(document, "th", None)?;
     name_cell
@@ -4747,7 +4799,7 @@ mod tests {
 
     use super::{
         Route, build_tree, classify_refresh_error, decode_grpc_web, decode_grpc_web_response,
-        namespaces_of, parse_absolute_path, route_from_path, route_url, value_parents_of,
+        namespace_labels, parse_absolute_path, route_from_path, route_url, value_parents_of,
     };
 
     fn paths(values: &[&str]) -> Vec<ConfigPath> {
@@ -4763,15 +4815,34 @@ mod tests {
 
     #[test]
     fn value_paths_imply_every_namespace_and_the_root() {
-        let namespaces = namespaces_of(&paths(&[
+        let labels = namespace_labels(&paths(&[
             "/apps/api/enabled",
             "/apps/api/nested/message",
             "/top-level",
         ]));
 
         assert_eq!(
-            namespaces.into_iter().collect::<Vec<_>>(),
+            labels.into_keys().collect::<Vec<_>>(),
             ["/", "/apps", "/apps/api", "/apps/api/nested"]
+        );
+    }
+
+    #[test]
+    fn namespace_labels_use_the_fold_smallest_contributing_path() {
+        // `/Apps/API/enabled` and `/apps/api/other` share the fold ancestor
+        // `/apps/api`; "/Apps/API" (uppercase) sorts before "/apps/api"
+        // (lowercase) as a fold key, so its case wins the ancestor's label —
+        // deterministic without needing a creation timestamp, which
+        // `GetSubTree` does not carry.
+        let mixed = vec![
+            ConfigPath::parse_operation("/apps/api/other").unwrap(),
+            ConfigPath::parse_operation("/Apps/API/enabled").unwrap(),
+        ];
+        let labels = namespace_labels(&mixed);
+        assert_eq!(labels.get("/apps").map(String::as_str), Some("/Apps"));
+        assert_eq!(
+            labels.get("/apps/api").map(String::as_str),
+            Some("/Apps/API")
         );
     }
 
@@ -4794,10 +4865,10 @@ mod tests {
         // `-` sorts before `/`, so a raw string sort would wedge `/apps-legacy`
         // between `/apps` and its own children.
         let value_paths = paths(&["/apps/api/enabled", "/apps-legacy/flag", "/apps/web/theme"]);
-        let namespaces = namespaces_of(&value_paths);
+        let labels = namespace_labels(&value_paths);
         let parents = value_parents_of(&value_paths);
 
-        let tree = build_tree(&namespaces, &parents, &roots(&["/apps/api", "/absent"]));
+        let tree = build_tree(&labels, &parents, &roots(&["/apps/api", "/absent"]));
 
         let rendered = tree
             .iter()
@@ -4824,7 +4895,7 @@ mod tests {
 
     #[test]
     fn an_empty_estate_still_offers_the_root_node() {
-        let tree = build_tree(&namespaces_of(&[]), &BTreeSet::new(), &BTreeSet::new());
+        let tree = build_tree(&namespace_labels(&[]), &BTreeSet::new(), &BTreeSet::new());
 
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].path.as_str(), "/");
