@@ -8,7 +8,13 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; }
+/* Sticky so the sidebar below it can claim exactly the rest of the viewport and
+   keep that height however far the content scrolls. Its stacking order stays
+   below the path-picker popup, which must be able to overlay it. */
 header {
+  position: sticky;
+  z-index: 5;
+  top: 0;
   height: 64px;
   display: flex;
   align-items: center;
@@ -26,10 +32,36 @@ header {
 .brand-mark span:nth-child(2) { height: 19px; }
 .brand-mark span:nth-child(3) { height: 15px; }
 .session-actions { display: flex; gap: 8px; }
-.layout { min-height: calc(100vh - 64px); display: grid; grid-template-columns: 224px minmax(0, 1fr); }
-nav { padding: 24px 16px; background: #e8ecea; border-right: 1px solid #cbd3cf; }
+/* The sidebar width is a custom property so the drag handle can set it in one
+   place. The resizer sits inside the sidebar landmark, pinned to its edge. */
+.layout { --sidebar-width: 288px; min-height: calc(100vh - 64px); display: grid; grid-template-columns: var(--sidebar-width) minmax(0, 1fr); }
+/* Pinned under the header and exactly as tall as the rest of the viewport, so a
+   tall tree scrolls inside `.config-tree` instead of lengthening the page.
+   `align-self: start` stops the grid stretching it to the row height, which is
+   set by whatever the main column holds. */
+.sidebar { position: sticky; z-index: 2; top: 64px; align-self: start; height: calc(100vh - 64px); min-width: 0; display: flex; flex-direction: column; background: #e8ecea; }
+/* The sidebar scrolls as a whole — links and tree together — rather than
+   pinning the links and scrolling only the tree. `min-height: 0` is what lets
+   this flex child shrink below its content so the overflow is scrolled here
+   instead of escaping onto the page. */
+.sidebar-scroll { flex: 1 1 auto; min-height: 0; overflow: hidden auto; overscroll-behavior: contain; }
+.nav-links { padding: 24px 16px 8px; }
 nav a { display: block; padding: 10px 12px; color: #25332d; font-size: 14px; font-weight: 650; text-decoration: none; border-left: 3px solid transparent; }
 nav a.active { color: #10211b; background: #fff; border-left-color: #b18119; }
+.sidebar-resizer { position: absolute; z-index: 1; top: 0; right: 0; bottom: 0; width: 6px; background: #cbd3cf; border: 0; cursor: col-resize; touch-action: none; }
+.sidebar-resizer:hover, .sidebar-resizer:focus-visible { background: #b18119; }
+.sidebar-resizer:focus-visible { outline: 3px solid #b66800; outline-offset: 1px; }
+.tree-panel { min-width: 0; padding: 16px 16px 24px; border-top: 1px solid #cbd3cf; }
+.tree-panel h2 { font-size: 13px; font-weight: 750; text-transform: uppercase; color: #4b5953; }
+.tree-panel .status-text { font-size: 12px; }
+.config-tree { list-style: none; margin: 12px 0 0; padding: 0; }
+.tree-node { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 30px; padding: 4px 8px; color: #25332d; background: none; border: 0; border-radius: 4px; font: inherit; font-size: 13px; font-weight: 400; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.tree-node:hover { background: #dbe2df; }
+.tree-node.has-values { font-weight: 750; }
+.tree-node.selected { color: #10211b; background: #fff; box-shadow: inset 3px 0 0 #b18119; }
+.tree-key { flex: 0 0 auto; width: 14px; height: 14px; color: #8a6712; }
+.tree-label { min-width: 0; }
+.layout .tree-node:focus-visible { outline: 3px solid #b66800; outline-offset: -1px; }
 main { width: min(1240px, 100%); padding: 36px 48px 64px; }
 .page { min-width: 0; }
 .page-heading { display: flex; justify-content: space-between; align-items: end; gap: 24px; margin-bottom: 28px; }
@@ -153,9 +185,22 @@ dialog .actions { justify-content: flex-end; }
 @media (max-width: 760px) {
   header { padding: 0 16px; }
   .layout { width: 100%; min-width: 0; grid-template-columns: minmax(0, 1fr); }
-  nav { min-width: 0; max-width: 100%; display: flex; gap: 4px; padding: 8px 12px; overflow-x: auto; border-right: 0; border-bottom: 1px solid #cbd3cf; }
+  /* No sidebar column at this width, so nothing to pin: the nav strip scrolls
+     with the page as it did before, and the header keeps its full height back. */
+  header { position: static; }
+  .sidebar { position: static; height: auto; border-bottom: 1px solid #cbd3cf; }
+  /* Nothing to scroll here — the tree is hidden and the nav strip scrolls
+     horizontally on its own, which an `auto` overflow-y would interfere with. */
+  .sidebar-scroll { overflow: visible; }
+  .sidebar-resizer { display: none; }
+  .nav-links { min-width: 0; max-width: 100%; display: flex; gap: 4px; padding: 8px 12px; overflow-x: auto; }
   nav a { flex: 0 0 auto; border-left: 0; border-bottom: 3px solid transparent; }
   nav a.active { border-bottom-color: #b18119; }
+  /* Below the sidebar breakpoint there is no sidebar to put a tree in — the nav
+     collapses to a strip above the content — and a tree there would push the
+     Configuration form off a short screen. The path combobox remains the way to
+     move between paths on a narrow viewport. */
+  .tree-panel { display: none; }
   main { padding: 26px 18px 48px; }
   .page-heading { align-items: start; flex-direction: column; }
   .configuration-heading { gap: 6px; }

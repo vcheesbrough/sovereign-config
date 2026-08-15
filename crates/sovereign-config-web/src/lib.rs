@@ -137,9 +137,13 @@ fn path_segments(path: &str) -> Vec<&str> {
 }
 
 /// The namespace holding `path`, or the root for a top-level value.
+///
+/// Splits on the fold, never `as_str()` (display): `ConfigPath::parse` only
+/// accepts lowercase text, so splitting on display case would fail (and
+/// silently collapse to root via `.ok()`) for any mixed-case path.
 fn parent_of(path: &ConfigPath) -> ConfigPath {
-    path.as_str()
-        .rsplit_once('/')
+    let fold = path.fold();
+    fold.rsplit_once('/')
         .filter(|(parent, _)| !parent.is_empty())
         .and_then(|(parent, _)| ConfigPath::parse(parent).ok())
         .unwrap_or_else(ConfigPath::root)
@@ -147,13 +151,14 @@ fn parent_of(path: &ConfigPath) -> ConfigPath {
 
 /// The parent of `path`, in both forms. Byte offsets align between the fold
 /// key and the display form because letter case never changes a segment's
-/// length — `path.as_str()` and `path.display_str()` always split at the same
+/// length — `path.fold()` and `path.as_str()` always split at the same
 /// boundary.
 fn parent_forms(path: &ConfigPath) -> (String, String) {
-    match path.as_str().rsplit_once('/') {
+    let fold = path.fold();
+    match fold.rsplit_once('/') {
         Some((parent, _)) if !parent.is_empty() => {
             let boundary = parent.len();
-            (parent.to_owned(), path.display_str()[..boundary].to_owned())
+            (parent.to_owned(), path.as_str()[..boundary].to_owned())
         }
         _ => ("/".to_owned(), "/".to_owned()),
     }
@@ -176,7 +181,7 @@ fn namespace_labels(value_paths: &[ConfigPath]) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     labels.insert("/".to_owned(), "/".to_owned());
     let mut sorted = value_paths.iter().collect::<Vec<_>>();
-    sorted.sort_by_key(|path| path.as_str());
+    sorted.sort_by_key(|path| path.fold());
     for path in sorted {
         let (fold_parent, display_parent) = parent_forms(path);
         if fold_parent == "/" {
@@ -348,7 +353,7 @@ impl ValueTransport for BrowserTransport {
         let response: ListValuesResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/ListValues",
             &ListValuesRequest {
-                path: path.display_str().to_owned(),
+                path: path.as_str().to_owned(),
             },
             Some(bearer),
         )
@@ -387,7 +392,7 @@ impl ValueTransport for BrowserTransport {
         let response: GetSubTreeResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/GetSubTree",
             &GetSubTreeRequest {
-                path: path.display_str().to_owned(),
+                path: path.as_str().to_owned(),
             },
             Some(bearer),
         )
@@ -419,7 +424,7 @@ impl ValueTransport for BrowserTransport {
         let response: PutValueResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/PutValue",
             &PutValueRequest {
-                path: path.display_str().to_owned(),
+                path: path.as_str().to_owned(),
                 content: Some(put_value_request::Content::PlainValue(
                     value.expose().to_owned(),
                 )),
@@ -442,7 +447,7 @@ impl ValueTransport for BrowserTransport {
         let response: PutValueResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/PutValue",
             &PutValueRequest {
-                path: path.display_str().to_owned(),
+                path: path.as_str().to_owned(),
                 content: Some(put_value_request::Content::SecretValue(
                     value.expose().to_owned(),
                 )),
@@ -465,11 +470,11 @@ impl ValueTransport for BrowserTransport {
         let response: ReplaceSubTreeResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/ReplaceSubTree",
             &ReplaceSubTreeRequest {
-                path: path.display_str().to_owned(),
+                path: path.as_str().to_owned(),
                 values: values
                     .iter()
                     .map(|value| ProtoSubTreeMutationValue {
-                        path: value.path.display_str().to_owned(),
+                        path: value.path.as_str().to_owned(),
                         content: Some(match &value.value {
                             SubTreeMutationContent::Plain(value) => {
                                 sub_tree_mutation_value::Content::PlainValue(
@@ -501,7 +506,7 @@ impl ValueTransport for BrowserTransport {
         let response: DeleteValuesResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/DeleteValues",
             &DeleteValuesRequest {
-                path: path.display_str().to_owned(),
+                path: path.as_str().to_owned(),
                 recurse,
             },
             Some(bearer),
@@ -521,7 +526,7 @@ impl ValueTransport for BrowserTransport {
         let response: RevealSecretResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/RevealSecret",
             &RevealSecretRequest {
-                path: path.display_str().to_owned(),
+                path: path.as_str().to_owned(),
             },
             Some(bearer),
         )
@@ -541,8 +546,8 @@ impl ValueTransport for BrowserTransport {
         let response: AddValuePathResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/AddValuePath",
             &AddValuePathRequest {
-                source_path: source.display_str().to_owned(),
-                new_path: new_path.display_str().to_owned(),
+                source_path: source.as_str().to_owned(),
+                new_path: new_path.as_str().to_owned(),
             },
             Some(bearer),
         )
@@ -560,7 +565,7 @@ impl ValueTransport for BrowserTransport {
         let response: ListValuePathsResponse = grpc_unary(
             "/sovereign.config.v3.Configuration/ListValuePaths",
             &ListValuePathsRequest {
-                path: path.display_str().to_owned(),
+                path: path.as_str().to_owned(),
             },
             Some(bearer),
         )
@@ -1285,9 +1290,12 @@ fn filter_path_options() {
     };
     let query = input.value().to_ascii_lowercase();
     for option in path_option_elements() {
+        // `data-path` carries the display form (card #294), so the comparison
+        // must fold it too, or a mixed-case namespace becomes unfindable by
+        // typing its lowercase spelling.
         let visible = option
             .get_attribute("data-path")
-            .is_some_and(|path| path.starts_with(&query));
+            .is_some_and(|path| path.to_ascii_lowercase().starts_with(&query));
         if visible {
             let _ = option.remove_attribute("hidden");
         } else {
@@ -1693,7 +1701,7 @@ async fn load_tree() {
                 let mut labels = listing
                     .paths
                     .iter()
-                    .map(|path| (path.as_str().to_owned(), path.display_str().to_owned()))
+                    .map(|path| (path.fold(), path.as_str().to_owned()))
                     .collect::<BTreeMap<_, _>>();
                 labels.insert("/".to_owned(), "/".to_owned());
                 (labels, BTreeSet::new())
@@ -2175,7 +2183,7 @@ fn human_size(size: Option<f64>) -> String {
 }
 
 fn absolute_path(path: &ConfigPath) -> String {
-    path.display_str().to_owned()
+    path.as_str().to_owned()
 }
 
 fn selected_namespace() -> Result<ConfigPath, ClientError> {
@@ -3528,16 +3536,24 @@ fn render_path_options(listing: &ValueListing) -> Result<(), ClientError> {
         .get_element_by_id("existing-paths")
         .ok_or_else(browser_error)?;
     options.set_text_content(None);
+    // Keyed by fold, valued by display: two namespaces differing only by case
+    // are one option, ordered by fold — not by the raw bytes of whichever
+    // case happens to be displayed (card #294).
     let mut paths = listing
         .paths
         .iter()
-        .map(absolute_path)
-        .collect::<BTreeSet<_>>();
-    paths.insert("/".into());
+        .map(|path| (path.fold(), path.as_str().to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    paths.insert("/".to_owned(), "/".to_owned());
     if let Ok(selected) = selected_namespace() {
-        paths.insert(absolute_path(&selected));
+        // Only fills a namespace the listing doesn't already know about —
+        // matches the original `BTreeSet::insert` behavior, which was a
+        // no-op whenever the (then case-invariant) entry already existed.
+        paths
+            .entry(selected.fold())
+            .or_insert_with(|| selected.as_str().to_owned());
     }
-    for (index, path) in paths.into_iter().enumerate() {
+    for (index, (_, path)) in paths.into_iter().enumerate() {
         let option = document
             .create_element("div")
             .map_err(|_| browser_error())?;
@@ -3594,10 +3610,7 @@ fn render_value_row(
     name_cell
         .set_attribute("scope", "row")
         .map_err(|_| browser_error())?;
-    let name = value
-        .path
-        .display_name()
-        .unwrap_or_else(|| value.path.display_str());
+    let name = value.path.name().unwrap_or_else(|| value.path.as_str());
     let name_text = create_element(document, "span", Some("value-name"))?;
     name_text.set_text_content(Some(name));
     let full_path = create_element(document, "span", Some("full-path"))?;
@@ -3727,7 +3740,7 @@ fn render_secret_value_row(
     let row = create_element(document, "tr", None)?;
     row.set_attribute("data-value-row", "")
         .map_err(|_| browser_error())?;
-    let name = value.path.display_name().ok_or_else(browser_error)?;
+    let name = value.path.name().ok_or_else(browser_error)?;
 
     let name_cell = create_element(document, "th", None)?;
     name_cell
@@ -4903,18 +4916,18 @@ mod tests {
     }
 
     #[test]
-    fn absolute_configuration_paths_drive_canonical_routes() {
+    fn absolute_configuration_paths_retain_case() {
         assert_eq!(parse_absolute_path("/").unwrap().as_str(), "/");
         assert_eq!(
             parse_absolute_path("/Apps/API").unwrap().as_str(),
-            "/apps/api"
+            "/Apps/API"
         );
         // `_` became a legal segment character in 2.15.0; `.` did not.
         assert_eq!(
             parse_absolute_path("/Woodpecker/Global/GitHub_Token")
                 .unwrap()
                 .as_str(),
-            "/woodpecker/global/github_token"
+            "/Woodpecker/Global/GitHub_Token"
         );
         for invalid in ["", "apps/api", "/apps/", "/apps/bad.name", "//apps"] {
             assert!(
@@ -4922,8 +4935,10 @@ mod tests {
                 "accepted {invalid:?}"
             );
         }
+        // Routes retain the case the operator navigated to, same as the path
+        // field: this is card #294's whole point, not lossy canonicalization.
         let route = route_from_path("/configuration/Apps/API");
-        assert_eq!(route_url(&route), "/configuration/apps/api");
+        assert_eq!(route_url(&route), "/configuration/Apps/API");
         assert!(matches!(route_from_path("/unknown"), Route::System));
     }
 

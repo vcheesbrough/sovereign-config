@@ -179,7 +179,7 @@ impl Configuration for ConfigurationService {
                 .or_default()
                 .push((row.lowercase_path.clone(), row.path.clone()));
             add_parent_paths(&mut paths, &row.lowercase_path, &row.path, row.created_at);
-            if parent_path(&path) == selected.as_str() {
+            if parent_path(&row.lowercase_path) == selected.fold() {
                 direct.push(row.lowercase_path);
             }
         }
@@ -249,7 +249,7 @@ impl Configuration for ConfigurationService {
             ORDER BY p.lowercase_path
             ",
         )
-        .bind(path.as_str())
+        .bind(path.fold())
         .fetch_all(&self.database)
         .await
         .map_err(|_| storage_unavailable())?;
@@ -304,7 +304,7 @@ impl Configuration for ConfigurationService {
             WHERE p.lowercase_path = $1
             ",
         )
-        .bind(path.as_str())
+        .bind(path.fold())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| storage_unavailable())?;
@@ -345,7 +345,7 @@ impl Configuration for ConfigurationService {
             .await
             .map_err(|_| storage_unavailable())?
         } else {
-            if path_collides(&mut transaction, path.as_str()).await? {
+            if path_collides(&mut transaction, &path.fold()).await? {
                 return Err(Status::invalid_argument(
                     "configuration value collides with an existing value",
                 ));
@@ -354,7 +354,8 @@ impl Configuration for ConfigurationService {
             let stored = self.stored_representation(content_id, classification, value)?;
             let content =
                 insert_content(&mut transaction, content_id, &stored, classification, now).await?;
-            insert_path(&mut transaction, path.display_str(), content.id, now).await?;
+            // The path exactly as written establishes its display case.
+            insert_path(&mut transaction, path.as_str(), content.id, now).await?;
             MutationRow {
                 created_at: content.created_at,
                 updated_at: content.updated_at,
@@ -396,13 +397,11 @@ impl Configuration for ConfigurationService {
                 Some(sub_tree_mutation_value::Content::PreserveSecret(_)) => {}
                 _ => return Err(Status::invalid_argument("configuration subtree is invalid")),
             }
-            if value_path.display_str() != value_path.as_str() {
-                displays.insert(
-                    value_path.as_str().to_owned(),
-                    value_path.display_str().to_owned(),
-                );
+            let fold = value_path.fold();
+            if fold != value_path.as_str() {
+                displays.insert(fold.clone(), value_path.as_str().to_owned());
             }
-            value_path.as_str().clone_into(&mut value.path);
+            value.path = fold;
         }
         values.sort_by(|first, second| first.path.cmp(&second.path));
         let mut accepted_paths = BTreeSet::new();
@@ -445,7 +444,7 @@ impl Configuration for ConfigurationService {
             ORDER BY p.lowercase_path
             ",
         )
-        .bind(path.as_str())
+        .bind(path.fold())
         .fetch_all(&mut *transaction)
         .await
         .map_err(|_| storage_unavailable())?;
@@ -508,7 +507,7 @@ impl Configuration for ConfigurationService {
             RETURNING p.content_id
             ",
         )
-        .bind(path.as_str())
+        .bind(path.fold())
         .bind(&plain_paths)
         .fetch_all(&mut *transaction)
         .await
@@ -612,7 +611,7 @@ impl Configuration for ConfigurationService {
             sqlx::query_as::<_, DeletedPathRow>(
                 "DELETE FROM configuration_paths WHERE $1 = '/' OR lowercase_path = $1 OR starts_with(lowercase_path, $1 || '/') RETURNING content_id",
             )
-            .bind(path.as_str())
+            .bind(path.fold())
             .fetch_all(&mut *transaction)
             .await
             .map_err(|_| storage_unavailable())?
@@ -620,7 +619,7 @@ impl Configuration for ConfigurationService {
             sqlx::query_as::<_, DeletedPathRow>(
                 "DELETE FROM configuration_paths WHERE lowercase_path = $1 RETURNING content_id",
             )
-            .bind(path.as_str())
+            .bind(path.fold())
             .fetch_all(&mut *transaction)
             .await
             .map_err(|_| storage_unavailable())?
@@ -656,7 +655,7 @@ impl Configuration for ConfigurationService {
             WHERE p.lowercase_path = $1
             ",
         )
-        .bind(path.as_str())
+        .bind(path.fold())
         .fetch_optional(&self.database)
         .await
         .map_err(|_| storage_unavailable())?
@@ -699,7 +698,10 @@ impl Configuration for ConfigurationService {
                 "configuration operation is not permitted",
             ));
         }
-        if source.as_str() == new_path.as_str() {
+        // `==`/`<=` on `ConfigPath` compare the fold, so this rejects a
+        // fold-equal alias (however it's cased) and picks a lock order that
+        // agrees with what `lock_mutation_path` actually locks.
+        if source == new_path {
             return Err(Status::invalid_argument(
                 "configuration value already has that path",
             ));
@@ -712,7 +714,7 @@ impl Configuration for ConfigurationService {
             .map_err(|_| storage_unavailable())?;
         // Lock both mutation hierarchies in a canonical order so concurrent
         // aliasing in either direction cannot deadlock.
-        let (first, second) = if source.as_str() <= new_path.as_str() {
+        let (first, second) = if source <= new_path {
             (&source, &new_path)
         } else {
             (&new_path, &source)
@@ -723,7 +725,7 @@ impl Configuration for ConfigurationService {
         let content_id = sqlx::query_scalar::<_, i64>(
             "SELECT content_id FROM configuration_paths WHERE lowercase_path = $1",
         )
-        .bind(source.as_str())
+        .bind(source.fold())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| storage_unavailable())?
@@ -731,7 +733,7 @@ impl Configuration for ConfigurationService {
         let occupied = sqlx::query_scalar::<_, String>(
             "SELECT path FROM configuration_paths WHERE lowercase_path = $1",
         )
-        .bind(new_path.as_str())
+        .bind(new_path.fold())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| storage_unavailable())?
@@ -739,13 +741,14 @@ impl Configuration for ConfigurationService {
         if occupied {
             return Err(Status::already_exists("configuration path already exists"));
         }
-        if path_collides(&mut transaction, new_path.as_str()).await? {
+        if path_collides(&mut transaction, &new_path.fold()).await? {
             return Err(Status::invalid_argument(
                 "configuration value collides with an existing value",
             ));
         }
         let now = OffsetDateTime::from(SystemTime::now());
-        insert_path(&mut transaction, new_path.display_str(), content_id, now).await?;
+        // The path exactly as written establishes this alias's display case.
+        insert_path(&mut transaction, new_path.as_str(), content_id, now).await?;
         transaction
             .commit()
             .await
@@ -767,7 +770,7 @@ impl Configuration for ConfigurationService {
         let content_id = sqlx::query_scalar::<_, i64>(
             "SELECT content_id FROM configuration_paths WHERE lowercase_path = $1",
         )
-        .bind(path.as_str())
+        .bind(path.fold())
         .fetch_optional(&self.database)
         .await
         .map_err(|_| storage_unavailable())?
@@ -948,9 +951,14 @@ async fn lock_mutation_path(
     transaction: &mut Transaction<'_, Postgres>,
     path: &ConfigPath,
 ) -> Result<(), Status> {
-    if path.as_str() != "/" {
+    // Locks are hashed by this string, so two concurrent writes to the same
+    // fold key — spelled differently — must hash to the same lock or they
+    // would never serialize against each other. Always the fold, never
+    // `path.as_str()` (display).
+    let fold = path.fold();
+    if fold != "/" {
         lock_path(transaction, "/", false).await?;
-        let parent = parent_path(path);
+        let parent = parent_path(&fold);
         if parent != "/" {
             let mut prefix = String::new();
             for segment in parent.trim_start_matches('/').split('/') {
@@ -960,7 +968,7 @@ async fn lock_mutation_path(
             }
         }
     }
-    lock_path(transaction, path.as_str(), true).await
+    lock_path(transaction, &fold, true).await
 }
 
 async fn lock_path(
@@ -1085,8 +1093,11 @@ fn subtree_content(value: String, classification: &str) -> Option<(i32, sub_tree
     }
 }
 
-fn parent_path(path: &ConfigPath) -> &str {
-    path.as_str().rsplit_once('/').map_or(
+/// The parent of a fold path. Takes `&str`, not `&ConfigPath`, so a caller
+/// must explicitly hand in a fold key (e.g. `path.fold()` or a
+/// `lowercase_path` column) rather than one that might carry display case.
+fn parent_path(fold_path: &str) -> &str {
+    fold_path.rsplit_once('/').map_or(
         "/",
         |(parent, _)| if parent.is_empty() { "/" } else { parent },
     )

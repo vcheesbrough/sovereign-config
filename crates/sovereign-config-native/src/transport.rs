@@ -50,7 +50,7 @@ impl ValueTransport for TonicTransport {
         let response = client
             .list_values(authenticated_request(
                 ListValuesRequest {
-                    path: path.display_str().to_owned(),
+                    path: path.as_str().to_owned(),
                 },
                 bearer,
             )?)
@@ -95,7 +95,7 @@ impl ValueTransport for TonicTransport {
         let response = client
             .get_sub_tree(authenticated_request(
                 GetSubTreeRequest {
-                    path: path.display_str().to_owned(),
+                    path: path.as_str().to_owned(),
                 },
                 bearer,
             )?)
@@ -130,7 +130,7 @@ impl ValueTransport for TonicTransport {
         let response = client
             .put_value(authenticated_request(
                 PutValueRequest {
-                    path: path.display_str().to_owned(),
+                    path: path.as_str().to_owned(),
                     content: Some(put_value_request::Content::PlainValue(
                         value.expose().to_owned(),
                     )),
@@ -158,7 +158,7 @@ impl ValueTransport for TonicTransport {
         let response = client
             .put_value(authenticated_request(
                 PutValueRequest {
-                    path: path.display_str().to_owned(),
+                    path: path.as_str().to_owned(),
                     content: Some(put_value_request::Content::SecretValue(
                         value.expose().to_owned(),
                     )),
@@ -186,11 +186,11 @@ impl ValueTransport for TonicTransport {
         let response = client
             .replace_sub_tree(authenticated_request(
                 ReplaceSubTreeRequest {
-                    path: path.display_str().to_owned(),
+                    path: path.as_str().to_owned(),
                     values: values
                         .iter()
                         .map(|value| ProtoSubTreeMutationValue {
-                            path: value.path.display_str().to_owned(),
+                            path: value.path.as_str().to_owned(),
                             content: Some(match &value.value {
                                 SubTreeMutationContent::Plain(value) => {
                                     sub_tree_mutation_value::Content::PlainValue(
@@ -228,7 +228,7 @@ impl ValueTransport for TonicTransport {
         let response = client
             .delete_values(authenticated_request(
                 DeleteValuesRequest {
-                    path: path.display_str().to_owned(),
+                    path: path.as_str().to_owned(),
                     recurse,
                 },
                 bearer,
@@ -252,7 +252,7 @@ impl ValueTransport for TonicTransport {
         let response = client
             .reveal_secret(authenticated_request(
                 RevealSecretRequest {
-                    path: path.display_str().to_owned(),
+                    path: path.as_str().to_owned(),
                 },
                 bearer,
             )?)
@@ -275,8 +275,8 @@ impl ValueTransport for TonicTransport {
         let response = client
             .add_value_path(authenticated_request(
                 AddValuePathRequest {
-                    source_path: source.display_str().to_owned(),
-                    new_path: new_path.display_str().to_owned(),
+                    source_path: source.as_str().to_owned(),
+                    new_path: new_path.as_str().to_owned(),
                 },
                 bearer,
             )?)
@@ -298,7 +298,7 @@ impl ValueTransport for TonicTransport {
         let response = client
             .list_value_paths(authenticated_request(
                 ListValuePathsRequest {
-                    path: path.display_str().to_owned(),
+                    path: path.as_str().to_owned(),
                 },
                 bearer,
             )?)

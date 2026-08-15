@@ -97,12 +97,16 @@ impl AuthenticationFailure {
 
 impl AuthenticatedPrincipal {
     pub(crate) fn allows(&self, path: &ConfigPath, permission: Permission) -> bool {
+        // `Grant::prefix` is always the fold key (`canonical_prefix` folds it
+        // on the way in), so this must compare the fold, never `as_str()`
+        // (display) — otherwise a grant stops covering any value whose
+        // established case differs from how the grant itself was written.
+        let fold = path.fold();
         self.grants.iter().any(|grant| {
             grant.permissions.contains(&permission)
                 && (grant.prefix == "/"
-                    || path.as_str() == grant.prefix
-                    || path
-                        .as_str()
+                    || fold == grant.prefix
+                    || fold
                         .strip_prefix(&grant.prefix)
                         .is_some_and(|suffix| suffix.starts_with('/')))
         })
@@ -371,7 +375,7 @@ fn validate_grants(raw_grants: Vec<RawGrant>) -> Result<Vec<Grant>, Authenticati
 fn canonical_prefix(prefix: &str) -> Option<String> {
     ConfigPath::parse_selection(prefix)
         .ok()
-        .map(|path| path.as_str().to_owned())
+        .map(|path| path.fold())
 }
 
 fn is_operational_rpc(path: &str) -> bool {

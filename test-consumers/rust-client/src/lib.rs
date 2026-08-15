@@ -60,11 +60,8 @@ mod tests {
                 .borrow()
                 .iter()
                 .filter(|(candidate, _)| {
-                    candidate
-                        .as_str()
-                        .rsplit_once('/')
-                        .map_or("", |(parent, _)| parent)
-                        == path.as_str()
+                    let fold = candidate.fold();
+                    fold.rsplit_once('/').map_or("", |(parent, _)| parent) == path.fold()
                 })
                 .map(|(path, value)| ListedValue {
                     path: path.clone(),
@@ -306,7 +303,7 @@ mod tests {
             .unwrap();
         assert_eq!(listing.values.len(), 1);
         assert_eq!(listing.values[0].path, path);
-        assert_eq!(listing.values[0].path.display_str(), "/Apps/API/Feature");
+        assert_eq!(listing.values[0].path.as_str(), "/Apps/API/Feature");
         assert_eq!(
             client
                 .get_subtree(&ConfigPath::parse_operation("/apps/api").unwrap())
@@ -314,7 +311,7 @@ mod tests {
                 .unwrap()
                 .values[0]
                 .path
-                .display_str(),
+                .as_str(),
             "/Apps/API/Feature",
             "a lowercase-typed query must still return the established display case"
         );
