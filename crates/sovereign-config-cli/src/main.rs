@@ -470,7 +470,7 @@ async fn alias_value(connection: &ConnectionUrl, command: AliasCommand) -> Resul
                 .list_value_paths(&path)
                 .await?;
             for path in paths.paths {
-                println!("{}", path.as_str());
+                println!("{}", path.display_str());
             }
         }
     }
@@ -491,12 +491,12 @@ async fn delete_values(
         if recurse {
             eprint!(
                 "Permanently delete {} and all descendants? Type 'delete' to confirm: ",
-                path.as_str()
+                path.display_str()
             );
         } else {
             eprint!(
                 "Permanently delete {}? Type 'delete' to confirm: ",
-                path.as_str()
+                path.display_str()
             );
         }
         let mut confirmation = String::new();
