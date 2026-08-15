@@ -28,26 +28,47 @@ pub enum PathError {
 
 /// A canonical absolute configuration path.
 ///
-/// The grammar is `/` (the tree root) or `^/[a-z0-9_-]+(/[a-z0-9_-]+)*$`. Input
-/// is ASCII-case-insensitive and normalized to the single lowercase canonical
-/// form; nothing else — `.`, `+`, whitespace, percent encoding, non-ASCII — is
-/// accepted.
+/// The grammar is `/` (the tree root) or `^/[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$`.
+/// A `ConfigPath` stores exactly one string — `path`, exactly as it was
+/// written — and nothing else. There is no second, independently-stored
+/// "fold key" field: fold is a pure function of `path`
+/// (`to_ascii_lowercase`), so storing it separately would be redundant data
+/// that a future constructor could compute wrong or forget to update — as one
+/// once did (`Deserialize`, before it was fixed to have nothing to forget).
+/// [`ConfigPath::fold`] derives it on every call instead; comparison and
+/// ordering (`Eq`, `Ord`) also derive it inline, without allocating one.
+///
+/// This is case-**retentive**, not case-sensitive: the service stores and
+/// reports the letter case it was given, but two paths differing only in case
+/// remain one value — resolution, uniqueness, and authorization all compare
+/// on the fold. Case retention was added in release 2.18.0; a client built
+/// before that release assumes every response path is already lowercase and
+/// fails the whole response it arrived in once one is not. See the `Upgrade`
+/// section of the repository README.
 ///
 /// `_` was added to the segment character set in release 2.15.0. It is a
 /// widening of the `v3` protocol's canonical path grammar: a client built before
 /// that release rejects a path containing `_` and fails the whole response it
 /// arrived in. See the `Upgrade` section of the repository README.
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct ConfigPath(String);
+#[derive(Clone, Debug)]
+pub struct ConfigPath {
+    path: String,
+}
 
 impl ConfigPath {
     #[must_use]
     pub fn root() -> Self {
-        Self("/".into())
+        Self { path: "/".into() }
     }
 
-    /// Parses a rooted lowercase path, including the `/` root path.
+    /// Parses a rooted, already fold-cased (lowercase) path, including the `/`
+    /// root path.
+    ///
+    /// Use this only for input already known to be canonical —
+    /// round-tripping a stored fold key, a literal in code, a connection
+    /// root — never for text a caller typed, which should go through
+    /// [`ConfigPath::parse_operation`] or [`ConfigPath::parse_selection`] to
+    /// retain its case.
     ///
     /// # Errors
     ///
@@ -70,13 +91,14 @@ impl ConfigPath {
                     })
             })
         {
-            Ok(Self(value))
+            Ok(Self { path: value })
         } else {
             Err(PathError::NonCanonical)
         }
     }
 
-    /// Parses a non-root absolute operation path and normalizes ASCII letters to lowercase.
+    /// Parses a non-root absolute operation path, retaining the case it was
+    /// written with.
     ///
     /// # Errors
     ///
@@ -101,11 +123,13 @@ impl ConfigPath {
         {
             return Err(PathError::NonCanonical);
         }
-        Self::parse(value.to_ascii_lowercase())
+        Ok(Self {
+            path: value.to_owned(),
+        })
     }
 
-    /// Parses an absolute operation selection, including the tree root, and
-    /// normalizes ASCII letters to lowercase.
+    /// Parses an absolute operation selection, including the tree root,
+    /// retaining case as [`ConfigPath::parse_operation`] does.
     ///
     /// # Errors
     ///
@@ -118,7 +142,8 @@ impl ConfigPath {
         Self::parse_operation(value)
     }
 
-    /// Appends one value name to a canonical rooted namespace.
+    /// Appends one value name to a canonical rooted namespace, retaining the
+    /// case `name` was given as that segment's display form.
     ///
     /// # Errors
     ///
@@ -133,32 +158,95 @@ impl ConfigPath {
         {
             return Err(PathError::NonCanonical);
         }
-        let name = name.to_ascii_lowercase();
-        if self.0 == "/" {
-            Self::parse(format!("/{name}"))
+        let path = if self.path == "/" {
+            format!("/{name}")
         } else {
-            Self::parse(format!("{}/{name}", self.0))
-        }
+            format!("{}/{name}", self.path)
+        };
+        Ok(Self { path })
     }
 
+    /// The path exactly as written.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.path
+    }
+
+    /// The fold key: ASCII letters lowercased. Used for comparison, lookup,
+    /// and every other match — never for display. Derived on every call, not
+    /// stored: there is nothing here that can drift from `as_str()`.
+    #[must_use]
+    pub fn fold(&self) -> String {
+        self.path.to_ascii_lowercase()
     }
 
     #[must_use]
     pub fn is_at_or_below(&self, root: &Self) -> bool {
-        root.as_str() == "/"
-            || self == root
-            || self
-                .as_str()
-                .strip_prefix(root.as_str())
-                .is_some_and(|suffix| suffix.starts_with('/'))
+        if root.path == "/" {
+            return true;
+        }
+        let prefix_len = root.path.len();
+        // ASCII-only by grammar, so byte indexing never splits a character.
+        self.path.len() >= prefix_len
+            && self.path.as_bytes()[..prefix_len].eq_ignore_ascii_case(root.path.as_bytes())
+            && (self.path.len() == prefix_len || self.path.as_bytes()[prefix_len] == b'/')
     }
 
+    /// The final segment, exactly as written.
     #[must_use]
     pub fn name(&self) -> Option<&str> {
-        self.0.rsplit('/').next().filter(|name| !name.is_empty())
+        self.path.rsplit('/').next().filter(|name| !name.is_empty())
+    }
+}
+
+/// Compares on the fold, derived inline byte-by-byte — no allocation, and
+/// nothing stored that could disagree with `as_str()`.
+impl PartialEq for ConfigPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.path.eq_ignore_ascii_case(&other.path)
+    }
+}
+
+impl Eq for ConfigPath {}
+
+impl PartialOrd for ConfigPath {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ConfigPath {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.path
+            .bytes()
+            .map(|byte| byte.to_ascii_lowercase())
+            .cmp(other.path.bytes().map(|byte| byte.to_ascii_lowercase()))
+    }
+}
+
+/// Serializes the path exactly as written, matching this type's historical
+/// `#[serde(transparent)]` wire shape.
+impl Serialize for ConfigPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.path)
+    }
+}
+
+/// Deserializes without validation, matching this type's historical
+/// `#[serde(transparent)]` behavior — round-trips only, never for untrusted
+/// text. Untrusted input must go through [`ConfigPath::parse_operation`] or
+/// [`ConfigPath::parse_selection`].
+impl<'de> Deserialize<'de> for ConfigPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self {
+            path: String::deserialize(deserializer)?,
+        })
     }
 }
 
@@ -439,14 +527,54 @@ pub struct ValuePaths {
 
 impl fmt::Display for ConfigPath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.path)
+    }
+}
+
+/// A JSON object key, ordered and deduplicated by its fold (ASCII-lowercased)
+/// form but rendered exactly as written — the same single-field, derive-not-store
+/// split as [`ConfigPath`], so a JSON object's key order follows the same fold
+/// ordering as everything else, regardless of which segments happen to carry
+/// mixed case. `Eq`/`Ord` are both derived from `path` inline, so — unlike a
+/// stored-fold-plus-derived-`PartialEq` design — they cannot disagree.
+#[derive(Clone, Debug)]
+struct JsonKey {
+    path: String,
+}
+
+impl JsonKey {
+    fn new(path: impl Into<String>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+impl PartialEq for JsonKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.path.eq_ignore_ascii_case(&other.path)
+    }
+}
+
+impl Eq for JsonKey {}
+
+impl Ord for JsonKey {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.path
+            .bytes()
+            .map(|byte| byte.to_ascii_lowercase())
+            .cmp(other.path.bytes().map(|byte| byte.to_ascii_lowercase()))
+    }
+}
+
+impl PartialOrd for JsonKey {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum JsonNode {
     String(String),
-    Object(BTreeMap<String, Self>),
+    Object(BTreeMap<JsonKey, Self>),
 }
 
 impl Serialize for JsonNode {
@@ -454,9 +582,17 @@ impl Serialize for JsonNode {
     where
         S: serde::Serializer,
     {
+        use serde::ser::SerializeMap;
+
         match self {
             Self::String(value) => serializer.serialize_str(value),
-            Self::Object(values) => values.serialize(serializer),
+            Self::Object(values) => {
+                let mut map = serializer.serialize_map(Some(values.len()))?;
+                for (key, value) in values {
+                    map.serialize_entry(&key.path, value)?;
+                }
+                map.end()
+            }
         }
     }
 }
@@ -495,7 +631,11 @@ impl<'de> Deserialize<'de> for JsonNode {
             {
                 let mut object = BTreeMap::new();
                 while let Some((key, value)) = values.next_entry::<String, JsonNode>()? {
-                    if object.insert(key, value).is_some() {
+                    // Two keys differing only by case fold to the same path,
+                    // so this rejects them exactly as a byte-identical
+                    // duplicate would have been rejected before — a JSON
+                    // object cannot express which case should win.
+                    if object.insert(JsonKey::new(key), value).is_some() {
                         return Err(serde::de::Error::custom("duplicate JSON object key"));
                     }
                 }
@@ -567,6 +707,13 @@ pub fn parse_subtree_json(
     Ok(values)
 }
 
+/// Splits `path`'s segments below `root`, exactly as written.
+///
+/// The boundary between `root` and the relative segments is found
+/// case-insensitively (case never changes a segment's byte length, so plain
+/// byte slicing stays valid), then that same byte offset slices `path` as
+/// written — so JSON object keys carry whatever case the value's path was
+/// stored with, even when it differs from how `root` itself was cased.
 fn json_segments(root: &ConfigPath, path: &ConfigPath) -> Result<Vec<String>, ClientError> {
     if root.as_str() == "/" {
         return Ok(path
@@ -576,33 +723,42 @@ fn json_segments(root: &ConfigPath, path: &ConfigPath) -> Result<Vec<String>, Cl
             .map(str::to_owned)
             .collect());
     }
-    let relative = path
-        .as_str()
-        .strip_prefix(root.as_str())
-        .and_then(|suffix| suffix.strip_prefix('/'))
-        .ok_or_else(invalid_subtree)?;
+    let prefix_len = root.as_str().len();
+    let path_str = path.as_str();
+    let matches_root = path_str.len() > prefix_len
+        && path_str.as_bytes()[..prefix_len].eq_ignore_ascii_case(root.as_str().as_bytes())
+        && path_str.as_bytes()[prefix_len] == b'/';
+    if !matches_root {
+        return Err(invalid_subtree());
+    }
+    let relative = &path_str[prefix_len + 1..];
     Ok(relative.split('/').map(str::to_owned).collect())
 }
 
 fn insert_json_value(
-    object: &mut BTreeMap<String, JsonNode>,
+    object: &mut BTreeMap<JsonKey, JsonNode>,
     segments: &[String],
     value: &str,
 ) -> Result<(), ClientError> {
     let Some((segment, remaining)) = segments.split_first() else {
         return Err(invalid_subtree());
     };
+    let key = JsonKey::new(segment.clone());
     if remaining.is_empty() {
         if object
-            .insert(segment.clone(), JsonNode::String(value.to_owned()))
+            .insert(key, JsonNode::String(value.to_owned()))
             .is_some()
         {
             return Err(invalid_subtree());
         }
         return Ok(());
     }
+    // If an ancestor at this fold key already exists (two leaves disagreeing
+    // on that ancestor's established case), `entry` matches by fold and keeps
+    // whichever display form got here first — deterministic because `values`
+    // arrives fold-ordered.
     let node = object
-        .entry(segment.clone())
+        .entry(key)
         .or_insert_with(|| JsonNode::Object(BTreeMap::new()));
     let JsonNode::Object(child) = node else {
         return Err(invalid_subtree());
@@ -612,11 +768,11 @@ fn insert_json_value(
 
 fn flatten_json_object(
     root: &ConfigPath,
-    object: BTreeMap<String, JsonNode>,
+    object: BTreeMap<JsonKey, JsonNode>,
     values: &mut Vec<SubTreeMutationValue>,
 ) -> Result<(), ClientError> {
-    for (name, node) in object {
-        let path = root.join_name(name).map_err(|_| invalid_json())?;
+    for (key, node) in object {
+        let path = root.join_name(key.path).map_err(|_| invalid_json())?;
         flatten_json_node(&path, node, values)?;
     }
     Ok(())
@@ -799,17 +955,17 @@ mod tests {
     fn operation_paths_normalize_ascii_case_and_join_to_roots() {
         let root = ConfigPath::parse("/teams/platform").unwrap();
         assert_eq!(
-            root.join_name("Apps-API-V2").unwrap().as_str(),
+            root.join_name("Apps-API-V2").unwrap().fold(),
             "/teams/platform/apps-api-v2"
         );
         assert_eq!(
-            root.join_name("Zot_CI_User").unwrap().as_str(),
+            root.join_name("Zot_CI_User").unwrap().fold(),
             "/teams/platform/zot_ci_user"
         );
         assert_eq!(
             ConfigPath::parse_operation("/Woodpecker/Global/GitHub_Token")
                 .unwrap()
-                .as_str(),
+                .fold(),
             "/woodpecker/global/github_token"
         );
         for invalid in [
@@ -835,7 +991,7 @@ mod tests {
             ConfigPath::root()
         );
         assert_eq!(
-            ConfigPath::parse_selection("/Apps/API").unwrap().as_str(),
+            ConfigPath::parse_selection("/Apps/API").unwrap().fold(),
             "/apps/api"
         );
         assert!(
@@ -852,6 +1008,37 @@ mod tests {
             !ConfigPath::parse("/foo/second/abc")
                 .unwrap()
                 .is_at_or_below(&ConfigPath::parse("/foo/s").unwrap())
+        );
+    }
+
+    #[test]
+    fn paths_retain_display_case_while_folding_for_comparison() {
+        let mixed = ConfigPath::parse_operation("/Apps/serverIP").unwrap();
+        assert_eq!(mixed.as_str(), "/Apps/serverIP");
+        assert_eq!(mixed.fold(), "/apps/serverip");
+        assert_eq!(mixed.name(), Some("serverIP"));
+
+        let lower = ConfigPath::parse_operation("/apps/serverip").unwrap();
+        assert_eq!(mixed, lower, "fold-equal paths must compare equal");
+        assert_eq!(lower.as_str(), "/apps/serverip");
+
+        let root_selection = ConfigPath::parse_selection("/Apps").unwrap();
+        assert_eq!(root_selection.as_str(), "/Apps");
+        assert_eq!(root_selection.fold(), "/apps");
+
+        let joined = root_selection.join_name("Server_IP").unwrap();
+        assert_eq!(joined.as_str(), "/Apps/Server_IP");
+        assert_eq!(joined.fold(), "/apps/server_ip");
+
+        let mut ordered = [
+            ConfigPath::parse_operation("/b").unwrap(),
+            ConfigPath::parse_operation("/A").unwrap(),
+        ];
+        ordered.sort();
+        assert_eq!(
+            ordered.iter().map(ConfigPath::fold).collect::<Vec<_>>(),
+            ["/a", "/b"],
+            "ordering must follow the fold key, not the display form"
         );
     }
 
@@ -928,6 +1115,57 @@ mod tests {
         );
         assert_eq!(render_subtree_json(&selected, &[]).unwrap(), "{}\n");
         assert!(parse_subtree_json(&selected, "{}").unwrap().is_empty());
+    }
+
+    #[test]
+    fn subtree_json_keys_retain_display_case() {
+        let selected = ConfigPath::parse_operation("/Apps/API").unwrap();
+        let leaf = selected.join_name("serverIP").unwrap();
+        let values = vec![SubTreeValue {
+            path: leaf,
+            value: ValueContent::Plain(PlainValue::new("value")),
+        }];
+        let json = render_subtree_json(&selected, &values).unwrap();
+        assert_eq!(json, "{\n  \"serverIP\": \"value\"\n}\n");
+
+        let parsed = parse_subtree_json(&selected, &json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path.as_str(), "/Apps/API/serverIP");
+        assert_eq!(parsed[0].path.fold(), "/apps/api/serverip");
+
+        // A lowercase key still resolves to the same established fold key.
+        let refolded = parse_subtree_json(&selected, "{\"serverip\":\"value\"}").unwrap();
+        assert_eq!(refolded[0].path, parsed[0].path);
+    }
+
+    #[test]
+    fn subtree_json_object_keys_order_by_fold_not_display_bytes() {
+        // Byte order would put "Signing-Key" (uppercase 'S') before
+        // "api-token" (lowercase 'a'); fold order — what every other JSON key
+        // comparison in this system uses — puts it after, matching the order
+        // an operator actually expects.
+        let selected = ConfigPath::parse_operation("/apps/api").unwrap();
+        let values = vec![
+            SubTreeValue {
+                path: ConfigPath::parse_operation("/apps/api/Signing-Key").unwrap(),
+                value: ValueContent::Plain(PlainValue::new("one")),
+            },
+            SubTreeValue {
+                path: ConfigPath::parse_operation("/apps/api/api-token").unwrap(),
+                value: ValueContent::Plain(PlainValue::new("two")),
+            },
+        ];
+        let json = render_subtree_json(&selected, &values).unwrap();
+        assert_eq!(
+            json,
+            "{\n  \"api-token\": \"two\",\n  \"Signing-Key\": \"one\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn subtree_json_rejects_case_variant_duplicate_keys() {
+        let selected = ConfigPath::parse("/apps/api").unwrap();
+        assert!(parse_subtree_json(&selected, "{\"Foo\":\"a\",\"foo\":\"b\"}").is_err());
     }
 
     #[test]

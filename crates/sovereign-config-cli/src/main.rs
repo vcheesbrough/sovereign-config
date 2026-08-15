@@ -348,11 +348,15 @@ fn operation_path(connection: &ConnectionUrl, path: &str, allow_root: bool) -> R
     } else {
         ConfigPath::parse_operation(path).context("path must name a configuration value")?
     };
+    // The confinement check must compare folds: `path` retains whatever case
+    // the caller typed, but a connection's root is always fold-only, so a
+    // byte-exact comparison would reject an in-root path typed in different
+    // case.
     let root = connection.root().as_str();
+    let fold = path.fold();
     if root != "/"
-        && path.as_str() != root
-        && !path
-            .as_str()
+        && fold != root
+        && !fold
             .strip_prefix(root)
             .is_some_and(|suffix| suffix.starts_with('/'))
     {

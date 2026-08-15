@@ -97,12 +97,16 @@ impl AuthenticationFailure {
 
 impl AuthenticatedPrincipal {
     pub(crate) fn allows(&self, path: &ConfigPath, permission: Permission) -> bool {
+        // `Grant::prefix` is always the fold key (`canonical_prefix` folds it
+        // on the way in), so this must compare the fold, never `as_str()`
+        // (display) — otherwise a grant stops covering any value whose
+        // established case differs from how the grant itself was written.
+        let fold = path.fold();
         self.grants.iter().any(|grant| {
             grant.permissions.contains(&permission)
                 && (grant.prefix == "/"
-                    || path.as_str() == grant.prefix
-                    || path
-                        .as_str()
+                    || fold == grant.prefix
+                    || fold
                         .strip_prefix(&grant.prefix)
                         .is_some_and(|suffix| suffix.starts_with('/')))
         })
@@ -339,13 +343,18 @@ fn audience_contains(audience: &serde_json::Value, expected: &str) -> bool {
 fn validate_grants(raw_grants: Vec<RawGrant>) -> Result<Vec<Grant>, AuthenticationFailure> {
     let mut grants: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();
     for raw_grant in raw_grants {
-        if !is_canonical_prefix(&raw_grant.prefix) || raw_grant.permissions.is_empty() {
+        let Some(prefix) = canonical_prefix(&raw_grant.prefix) else {
+            return Err(AuthenticationFailure::unauthenticated(
+                AuthenticationResult::InvalidClaims,
+            ));
+        };
+        if raw_grant.permissions.is_empty() {
             return Err(AuthenticationFailure::unauthenticated(
                 AuthenticationResult::InvalidClaims,
             ));
         }
         grants
-            .entry(raw_grant.prefix)
+            .entry(prefix)
             .or_default()
             .extend(raw_grant.permissions);
     }
@@ -358,8 +367,15 @@ fn validate_grants(raw_grants: Vec<RawGrant>) -> Result<Vec<Grant>, Authenticati
         .collect())
 }
 
-fn is_canonical_prefix(prefix: &str) -> bool {
-    ConfigPath::parse(prefix).is_ok()
+/// Folds a grant prefix to its fold key, accepting any letter case so an
+/// operator writing `/apps/Example` in an Authentik grant attribute gets the
+/// same coverage as `/apps/example`. `Grant::prefix` is always the fold key:
+/// [`AuthenticatedPrincipal::allows`] compares it byte-exact against a fold
+/// key, never a display form.
+fn canonical_prefix(prefix: &str) -> Option<String> {
+    ConfigPath::parse_selection(prefix)
+        .ok()
+        .map(|path| path.fold())
 }
 
 fn is_operational_rpc(path: &str) -> bool {
@@ -517,8 +533,8 @@ mod tests {
 
     use super::{
         AuthenticatedPrincipal, AuthenticationLayer, Authenticator, Grant, IntrospectionResponse,
-        Permission, bearer_token, grpc_authentication_layer, is_canonical_prefix,
-        is_operational_rpc, is_web_asset_request, require_rs256, validate_introspection,
+        Permission, bearer_token, canonical_prefix, grpc_authentication_layer, is_operational_rpc,
+        is_web_asset_request, require_rs256, validate_introspection,
     };
     use crate::{config::AuthenticationConfig, metrics::AuthenticationMetrics};
 
@@ -826,26 +842,31 @@ mod tests {
     #[test]
     fn grants_require_canonical_prefixes_and_known_permissions() {
         for prefix in ["/", "/apps", "/apps/my-api", "/a1/b-2"] {
-            assert!(is_canonical_prefix(prefix));
+            assert!(canonical_prefix(prefix).is_some());
         }
-        for prefix in ["", "apps", "/apps/", "/apps//api", "/Apps/api", "/apps/."] {
-            assert!(!is_canonical_prefix(prefix));
+        for prefix in ["", "apps", "/apps/", "/apps//api", "/apps/."] {
+            assert!(canonical_prefix(prefix).is_none());
         }
 
+        // An uppercase prefix folds rather than being rejected — an operator
+        // writing `/Apps/api` in an Authentik grant attribute gets the same
+        // coverage as `/apps/api`.
+        assert_eq!(canonical_prefix("/Apps/api").as_deref(), Some("/apps/api"));
         let mut response = valid_response();
         response.sovereign_config_grants =
             Some(json!([{"prefix": "/Apps/api", "permissions": ["read"]}]));
-        assert_eq!(
-            validate_introspection(
-                response,
-                "https://issuer.example/application/o/sovereign-config/",
-                "sovereign-config",
-            )
-            .unwrap_err()
-            .result
-            .reason(),
-            "invalid_claims"
-        );
+        let principal = validate_introspection(
+            response,
+            "https://issuer.example/application/o/sovereign-config/",
+            "sovereign-config",
+        )
+        .unwrap();
+        assert_eq!(principal.grants.len(), 1);
+        assert_eq!(principal.grants[0].prefix, "/apps/api");
+        let api = ConfigPath::parse("/apps/api").unwrap();
+        let mixed_case_child = ConfigPath::parse_operation("/Apps/API/child").unwrap();
+        assert!(principal.allows(&api, Permission::Read));
+        assert!(principal.allows(&mixed_case_child, Permission::Read));
 
         let mut response = valid_response();
         response.sovereign_config_grants =

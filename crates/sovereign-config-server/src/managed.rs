@@ -235,6 +235,13 @@ impl ManagedConnectionsService {
             .map_err(|_| invalid_request())?;
         let root =
             ConfigPath::parse_selection(&request.get_ref().root).map_err(|_| invalid_request())?;
+        // Managed connection roots are out of scope for case retention (card
+        // #294): `managed_connections.root` has no display column, and
+        // `ConnectionUrl` requires an exactly-lowercase root to round-trip.
+        // Fold immediately so every use below — the stored row, the
+        // Authentik grant attribute, the connection URL — sees only the fold,
+        // regardless of the case the caller requested it in.
+        let root = ConfigPath::parse(root.fold()).expect("a fold of a valid path is valid");
         // A non-empty selection is required; an empty or malformed set is a
         // client error, never a silent default.
         let permissions = ManagedPermissions::from_proto(&request.get_ref().permissions)
