@@ -772,12 +772,12 @@ test('configuration path is deep-linked, selectable, and restored by browser his
   await expect(page.getByRole('row', { name: /feature-flag/ })).toBeVisible();
   await expect(page.locator('#existing-paths [role="option"]')).toHaveCount(4);
 
-  // The field echoes back exactly what was typed — case is retained, not
-  // folded — even though the URL and the request underneath are resolved
-  // case-insensitively (card #294).
+  // The field and the URL both echo back exactly what was typed — case is
+  // retained, not folded — even though the request underneath resolves the
+  // path case-insensitively (card #294).
   await pathInput.fill('/Apps/Worker');
   await page.getByRole('button', { name: 'Open' }).click();
-  await expect(page).toHaveURL(/\/configuration\/apps\/worker$/);
+  await expect(page).toHaveURL(/\/configuration\/Apps\/Worker$/);
   await expect(pathInput).toHaveValue('/Apps/Worker');
   await expect(page.getByRole('row', { name: /concurrency/ })).toBeVisible();
 
@@ -807,6 +807,27 @@ test('path selector refreshes external paths and Enter opens the selected path',
   await pathInput.press('Enter');
   await expect(page).toHaveURL(/\/configuration\/services\/worker$/);
   await expect(page.getByRole('row', { name: /concurrency/ })).toBeVisible();
+});
+
+test('path selector autocomplete finds and does not duplicate a mixed-case namespace', async ({ page }) => {
+  await openCallback(page);
+  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await mockValues(page, {
+    '/Apps/API/serverIP': '10.0.0.1'
+  });
+  // The URL segment is always lowercase; the value's namespace was
+  // established as "/Apps/API". Before this fix the selector listed both
+  // spellings as separate rows, and typing the lowercase query found
+  // neither (card #294 follow-up).
+  await page.goto('/configuration/apps/api');
+  const pathInput = page.getByLabel('Selected path');
+  await pathInput.focus();
+  const option = page.locator('#existing-paths [role="option"][data-path="/Apps/API"]');
+  await expect(option).toHaveCount(1);
+
+  await pathInput.fill('/a');
+  await expect(option).toBeVisible();
+  await expect(option).toHaveText('/Apps/API');
 });
 
 test('path selector popup uses the available viewport height', async ({ page }) => {

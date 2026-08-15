@@ -233,7 +233,7 @@ impl<B: Backend> Server<B> {
                 new_path,
             } => {
                 self.backend.add_value_path(&source_path, &new_path).await?;
-                Ok(format!("Alias created at {}", new_path.display_str()))
+                Ok(format!("Alias created at {}", new_path.as_str()))
             }
             ToolCall::AliasList { path } => {
                 let paths = self.backend.list_value_paths(&path).await?;
@@ -378,7 +378,7 @@ fn render_listing(listing: &ValueListing) -> String {
         .iter()
         .map(|value| {
             json!({
-                "path": value.path.display_str(),
+                "path": value.path.as_str(),
                 "classification": classification(&value.value),
                 "value": value.value.display_text(),
             })
@@ -387,7 +387,7 @@ fn render_listing(listing: &ValueListing) -> String {
     let paths: Vec<&str> = listing
         .paths
         .iter()
-        .map(sovereign_config_core::ConfigPath::display_str)
+        .map(sovereign_config_core::ConfigPath::as_str)
         .collect();
     to_pretty(&json!({ "values": values, "paths": paths }))
 }
@@ -396,7 +396,7 @@ fn render_value_paths(paths: &ValuePaths) -> String {
     let paths: Vec<&str> = paths
         .paths
         .iter()
-        .map(sovereign_config_core::ConfigPath::display_str)
+        .map(sovereign_config_core::ConfigPath::as_str)
         .collect();
     to_pretty(&json!({ "paths": paths }))
 }

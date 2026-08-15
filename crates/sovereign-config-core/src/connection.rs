@@ -268,7 +268,12 @@ fn serialize(
     if let Some(client_secret) = client_secret.filter(|_| !redacted) {
         fragment.append_pair("client_secret", client_secret);
     }
-    let mut serialized = format!("{endpoint}{}#{}", root.as_str(), fragment.finish());
+    // Connection roots are always fold-only (out of scope for case
+    // retention); folding explicitly here means a URL can never be built
+    // with a mixed-case root even if some future caller forgets to fold
+    // first — the round-trip check below would just reject it anyway, but
+    // there is no reason to rely on that as the only guard.
+    let mut serialized = format!("{endpoint}{}#{}", root.fold(), fragment.finish());
     if redacted {
         serialized.push_str("&client_secret=*");
     }

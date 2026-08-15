@@ -193,17 +193,19 @@ impl SovereignReader {
 
 /// The final segment of `path`, when `path` is a direct child of `layer`.
 ///
-/// Comparison is on whole segments: `/a/b` is not a child of `/a/bc`.
+/// Comparison is on whole segments: `/a/b` is not a child of `/a/bc`. Always
+/// the fold, never `as_str()` (display): Woodpecker matches `from_secret:`
+/// names by exact lowercase string, so the name returned here must be the
+/// fold key regardless of the case a value was actually written with.
 fn direct_child_name(layer: &ConfigPath, path: &ConfigPath) -> Option<String> {
-    let prefix = if layer.as_str() == "/" {
-        "/"
+    let layer_fold = layer.fold();
+    let path_fold = path.fold();
+    let relative = if layer_fold == "/" {
+        path_fold.strip_prefix('/')?
     } else {
-        layer.as_str()
-    };
-    let relative = if prefix == "/" {
-        path.as_str().strip_prefix('/')?
-    } else {
-        path.as_str().strip_prefix(prefix)?.strip_prefix('/')?
+        path_fold
+            .strip_prefix(layer_fold.as_str())?
+            .strip_prefix('/')?
     };
     (!relative.is_empty() && !relative.contains('/')).then(|| relative.to_owned())
 }

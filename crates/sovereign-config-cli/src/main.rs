@@ -348,11 +348,15 @@ fn operation_path(connection: &ConnectionUrl, path: &str, allow_root: bool) -> R
     } else {
         ConfigPath::parse_operation(path).context("path must name a configuration value")?
     };
+    // The confinement check must compare folds: `path` retains whatever case
+    // the caller typed, but a connection's root is always fold-only, so a
+    // byte-exact comparison would reject an in-root path typed in different
+    // case.
     let root = connection.root().as_str();
+    let fold = path.fold();
     if root != "/"
-        && path.as_str() != root
-        && !path
-            .as_str()
+        && fold != root
+        && !fold
             .strip_prefix(root)
             .is_some_and(|suffix| suffix.starts_with('/'))
     {
@@ -470,7 +474,7 @@ async fn alias_value(connection: &ConnectionUrl, command: AliasCommand) -> Resul
                 .list_value_paths(&path)
                 .await?;
             for path in paths.paths {
-                println!("{}", path.display_str());
+                println!("{}", path.as_str());
             }
         }
     }
@@ -491,12 +495,12 @@ async fn delete_values(
         if recurse {
             eprint!(
                 "Permanently delete {} and all descendants? Type 'delete' to confirm: ",
-                path.display_str()
+                path.as_str()
             );
         } else {
             eprint!(
                 "Permanently delete {}? Type 'delete' to confirm: ",
-                path.display_str()
+                path.as_str()
             );
         }
         let mut confirmation = String::new();
