@@ -51,6 +51,7 @@ const REFRESH_TOKEN_KEY: &str = "sovereign-config.refresh-token";
 const REFRESH_ENDPOINT_KEY: &str = "sovereign-config.refresh-endpoint";
 const REFRESH_EXPIRES_KEY: &str = "sovereign-config.refresh-expires-at";
 const RETURN_PATH_KEY: &str = "sovereign-config.return-path";
+const IDENTITY_NAME_KEY: &str = "sovereign-config.identity-name";
 const SIDEBAR_WIDTH_KEY: &str = "sovereign-config.sidebar-width";
 const REFRESH_LIFETIME_MS: f64 = 8.0 * 60.0 * 60.0 * 1000.0;
 const SIDEBAR_MIN_WIDTH: f64 = 200.0;
@@ -251,7 +252,6 @@ fn build_tree(
 
 #[derive(Clone)]
 enum Route {
-    System,
     Configuration(ConfigPath),
     Connections,
     Downloads,
@@ -776,8 +776,7 @@ fn install_actions() {
     let Some(document) = window().and_then(|window| window.document()) else {
         return;
     };
-    install_route_link(&document, "brand-link", Route::System);
-    install_route_link(&document, "system-status-link", Route::System);
+    install_brand_menu(&document);
     install_route_link(
         &document,
         "configuration-values-link",
@@ -787,6 +786,12 @@ fn install_actions() {
     install_route_link(&document, "downloads-link", Route::Downloads);
     if let Some(browser_window) = window() {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            // Every other route change closes the menu before anything else —
+            // `guarded_navigate` does it first, even ahead of its own unsaved-edits
+            // check — and a history pop is a route change too. Without this the
+            // panel outlives the page it was opened on, floating over whatever
+            // Back or Forward lands on next.
+            close_brand_menu();
             if has_unsaved_edits() {
                 // A history pop cannot be cancelled, so put the address bar
                 // back and ask the same question an in-app link would ask.
@@ -828,7 +833,7 @@ fn install_actions() {
             TREE_LOAD_GENERATION.set(TREE_LOAD_GENERATION.get().wrapping_add(1));
             discard_connection_url();
             clear_browser_session();
-            set_text("auth-value", "Logged out");
+            render_identity(false);
             set_hidden("login", false);
             set_hidden("logout", true);
             set_text("value-state", "Log in to view values");
@@ -843,6 +848,7 @@ fn install_actions() {
             let _ = render_tree(&[]);
             set_text("config-tree-state", "Log in to browse");
             set_text("connection-state", "Log in to view connections");
+            close_brand_menu();
             focus("login");
         });
         let _ = logout.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
@@ -987,6 +993,132 @@ fn restore_sidebar_width() {
         .filter(|width| width.is_finite());
     if let Some(width) = stored {
         set_sidebar_width(width);
+    }
+}
+
+/// The operator's display name as advertised by the OIDC ID token issued
+/// alongside the access token.
+///
+/// The token is decoded, not verified: this name only ever labels the header.
+/// Every authorization decision belongs to the service, which validates the
+/// access token itself — a forged claim here buys nothing but a wrong label.
+fn identity_display_name(id_token: &str) -> Option<String> {
+    let payload = id_token.split('.').nth(1)?;
+    let claims: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
+    // Only claims a person would recognise. `sub` is deliberately not among
+    // them: the provider issues it hashed, so falling back to it labels the
+    // session with a hex digest that names nobody. An unlabelled header — the
+    // Log out button alone — says strictly more than that.
+    ["name", "preferred_username", "email"]
+        .into_iter()
+        .find_map(|claim| {
+            let value = claims.get(claim)?.as_str()?.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        })
+}
+
+fn identity_name_from_token_response(json: &JsValue) -> Option<String> {
+    identity_display_name(&optional_string_property(json, "id_token")?)
+}
+
+fn store_identity_name(name: Option<String>) {
+    let Ok(storage) = session_storage() else {
+        return;
+    };
+    match name {
+        Some(name) => {
+            let _ = storage.set_item(IDENTITY_NAME_KEY, &name);
+        }
+        None => {
+            let _ = storage.remove_item(IDENTITY_NAME_KEY);
+        }
+    }
+}
+
+/// Shows the stored display name in the header, or hides the slot entirely.
+/// `signed_in` is the service's answer, not the browser's: a name left over
+/// from a session the service has stopped honouring must not still be on show.
+fn render_identity(signed_in: bool) {
+    let name = signed_in
+        .then(|| {
+            session_storage()
+                .ok()
+                .and_then(|storage| storage.get_item(IDENTITY_NAME_KEY).ok().flatten())
+        })
+        .flatten()
+        .filter(|name| !name.is_empty());
+    set_text("identity-name", name.as_deref().unwrap_or_default());
+    set_hidden("identity-name", name.is_none());
+}
+
+/// The brand mark is a disclosure button for the views that are not the
+/// configuration tree. Opening is a pointer or keyboard action on the button;
+/// closing is anything that leaves it — Escape, a click elsewhere, or a
+/// navigation.
+fn install_brand_menu(document: &Document) {
+    let Some(button) = document.get_element_by_id("brand-menu-button") else {
+        return;
+    };
+    let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+        set_brand_menu_open(!brand_menu_open());
+    });
+    let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+    callback.forget();
+
+    // A pointerdown anywhere outside the button or the panel dismisses the
+    // menu. `pointerdown` rather than `click` so the menu is already gone by
+    // the time whatever was underneath it takes the press.
+    let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
+        if !brand_menu_open() {
+            return;
+        }
+        let inside = event
+            .target()
+            .and_then(|target| target.dyn_into::<Element>().ok())
+            .is_some_and(|target| {
+                target
+                    .closest("#brand-menu, #brand-menu-button")
+                    .ok()
+                    .flatten()
+                    .is_some()
+            });
+        if !inside {
+            close_brand_menu();
+        }
+    });
+    let _ =
+        document.add_event_listener_with_callback("pointerdown", callback.as_ref().unchecked_ref());
+    callback.forget();
+
+    let callback = Closure::<dyn FnMut(_)>::new(|event: KeyboardEvent| {
+        if event.key() == "Escape" && brand_menu_open() {
+            event.prevent_default();
+            close_brand_menu();
+            focus("brand-menu-button");
+        }
+    });
+    let _ = document.add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref());
+    callback.forget();
+}
+
+fn brand_menu_open() -> bool {
+    !element_is_hidden("brand-menu")
+}
+
+fn set_brand_menu_open(open: bool) {
+    set_hidden("brand-menu", !open);
+    if let Some(button) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("brand-menu-button"))
+    {
+        let _ = button.set_attribute("aria-expanded", if open { "true" } else { "false" });
+    }
+}
+
+fn close_brand_menu() {
+    if brand_menu_open() {
+        set_brand_menu_open(false);
     }
 }
 
@@ -1382,6 +1514,7 @@ fn select_active_path_option() {
 /// Every in-app route change runs through here so an unsaved value edit can
 /// interpose a confirmation before the current view is torn down.
 fn guarded_navigate(route: Route) {
+    close_brand_menu();
     if has_unsaved_edits() {
         open_unsaved_dialog(route, false);
         return;
@@ -1432,12 +1565,19 @@ fn has_unsaved_edits() -> bool {
             return true;
         }
     }
-    let replacements = rows.get_elements_by_tag_name("input");
-    for index in 0..replacements.length() {
-        if replacements
+    // Only the padlocked secret fields carry `data-loaded` among the inputs
+    // here, and they carry it in both states: empty while locked, the revealed
+    // secret once opened. Either way an edit is a value that differs from it.
+    let secrets = rows.get_elements_by_tag_name("input");
+    for index in 0..secrets.length() {
+        if secrets
             .item(index)
             .and_then(|input| input.dyn_into::<HtmlInputElement>().ok())
-            .is_some_and(|input| input.type_() == "password" && !input.value().is_empty())
+            .is_some_and(|input| {
+                input
+                    .get_attribute("data-loaded")
+                    .is_some_and(|loaded| input.value() != loaded)
+            })
         {
             return true;
         }
@@ -1543,12 +1683,9 @@ fn render_route(route: &Route) {
     let configuration = matches!(route, Route::Configuration(_));
     let connections = matches!(route, Route::Connections);
     let downloads = matches!(route, Route::Downloads);
-    let system = matches!(route, Route::System);
-    set_hidden("system-page", !system);
     set_hidden("configuration-page", !configuration);
     set_hidden("connections-page", !connections);
     set_hidden("downloads-page", !downloads);
-    set_active("system-status-link", system);
     set_active("configuration-values-link", configuration);
     set_active("managed-connections-link", connections);
     set_active("downloads-link", downloads);
@@ -1558,7 +1695,16 @@ fn render_route(route: &Route) {
             && window.location().pathname().ok().as_deref() != Some(canonical_url.as_str())
             && let Ok(history) = window.history()
         {
-            let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&canonical_url));
+            // The query string survives the rewrite. The OIDC callback lands on
+            // an unrecognized path and so is normalized here like any other,
+            // but its `?code=` has not been read yet — `finish_login` consumes
+            // it moments later and clears it then.
+            let search = window.location().search().unwrap_or_default();
+            let _ = history.replace_state_with_url(
+                &JsValue::NULL,
+                "",
+                Some(&format!("{canonical_url}{search}")),
+            );
         }
         if let Some(input) = element::<HtmlInputElement>("selected-path") {
             input.set_value(&absolute_path(path));
@@ -1618,12 +1764,14 @@ fn route_from_path(path: &str) -> Route {
     {
         return Route::Configuration(path);
     }
-    Route::System
+    // Including `/`: with no System view left, the configuration root is the
+    // landing view, and `render_route` rewrites the address to its canonical
+    // `/configuration/` form.
+    Route::Configuration(ConfigPath::root())
 }
 
 fn route_url(route: &Route) -> String {
     match route {
-        Route::System => "/".into(),
         Route::Configuration(path) if path.as_str() == "/" => "/configuration/".into(),
         Route::Configuration(path) => format!("/configuration{}", path.as_str()),
         Route::Connections => "/connections/".into(),
@@ -1640,7 +1788,7 @@ fn logged_in() -> bool {
 fn selected_tree_path() -> Option<ConfigPath> {
     match route_from_location() {
         Route::Configuration(path) => Some(path),
-        Route::System | Route::Connections | Route::Downloads => None,
+        Route::Connections | Route::Downloads => None,
     }
 }
 
@@ -1765,6 +1913,13 @@ fn render_tree(nodes: &[TreeNode]) -> Result<(), ClientError> {
     // Exactly one node is ever in the tab order; without a selection that is the
     // root, which is also the node the Configuration view opens on.
     let focus_index = selected_index.or_else(|| (!nodes.is_empty()).then_some(0));
+    // `tree_guides` returns exactly one row per node (pinned by
+    // `tree_guides_handle_the_empty_and_root_only_cases` and its neighbours
+    // below), so `guides[index]` never runs past the end here — kept as a
+    // direct index rather than a defensive `.get` because that invariant is
+    // structural, not incidental: every push onto `guides` happens in the same
+    // loop, over the same `nodes`, with no branch that skips one.
+    let guides = tree_guides(nodes);
     for (index, node) in nodes.iter().enumerate() {
         // Preorder ordering means a node has children exactly when the next one
         // is deeper. The tree never collapses, so parents are always expanded.
@@ -1777,6 +1932,7 @@ fn render_tree(nodes: &[TreeNode]) -> Result<(), ClientError> {
             index,
             Some(index) == selected_index,
             has_children,
+            &guides[index],
         )?;
         item.set_attribute(
             "tabindex",
@@ -1795,12 +1951,88 @@ fn render_tree(nodes: &[TreeNode]) -> Result<(), ClientError> {
     Ok(())
 }
 
+/// One cell of a node's ancestry column, one per level of depth.
+///
+/// These were box-drawing characters until the joins gave them away: a glyph
+/// only paints inside its own line box, so a trunk assembled from `\u{2502}`
+/// breaks at every row boundary by however much the row exceeds the font's em
+/// box — and by how much depended on whichever monospace font the browser had
+/// resolved. Each cell is now an empty span, and CSS rules it with a line
+/// stretched across the whole row, so consecutive trunks meet exactly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TreeGuide {
+    /// An ancestor whose last child has already been drawn: nothing here.
+    Blank,
+    /// An ancestor with siblings still to come: a trunk through the whole row.
+    Trunk,
+    /// This node, with siblings after it: trunk through, elbow out.
+    Branch,
+    /// This node, the last of its siblings: the trunk ends at the elbow.
+    Corner,
+}
+
+impl TreeGuide {
+    fn class(self) -> &'static str {
+        match self {
+            Self::Blank => "tree-guide",
+            Self::Trunk => "tree-guide trunk",
+            Self::Branch => "tree-guide branch",
+            Self::Corner => "tree-guide corner",
+        }
+    }
+}
+
+/// Lays out each node's ancestry the way a terminal tree listing does. Nodes
+/// arrive in preorder carrying their depth, which is all this needs: a node is
+/// the last of its siblings when the next node at or above its depth is
+/// shallower, and every level in between contributes either a continuing trunk
+/// or the blank that follows a closed one.
+fn tree_guides(nodes: &[TreeNode]) -> Vec<Vec<TreeGuide>> {
+    let last: Vec<bool> = (0..nodes.len())
+        .map(|index| is_last_sibling(nodes, index))
+        .collect();
+    let mut guides = Vec::with_capacity(nodes.len());
+    // Indexed by depth: whether the node currently open at that depth was the
+    // last of its siblings, and so whether its trunk is still being drawn.
+    let mut ancestors: Vec<bool> = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        ancestors.truncate(node.depth);
+        let mut row = Vec::with_capacity(node.depth);
+        for level in 1..node.depth {
+            row.push(if ancestors.get(level).copied().unwrap_or(true) {
+                TreeGuide::Blank
+            } else {
+                TreeGuide::Trunk
+            });
+        }
+        if node.depth > 0 {
+            row.push(if last[index] {
+                TreeGuide::Corner
+            } else {
+                TreeGuide::Branch
+            });
+        }
+        ancestors.push(last[index]);
+        guides.push(row);
+    }
+    guides
+}
+
+fn is_last_sibling(nodes: &[TreeNode], index: usize) -> bool {
+    let depth = nodes[index].depth;
+    !nodes[index + 1..]
+        .iter()
+        .take_while(|node| node.depth >= depth)
+        .any(|node| node.depth == depth)
+}
+
 fn build_tree_node(
     document: &Document,
     node: &TreeNode,
     index: usize,
     selected: bool,
     has_children: bool,
+    guides: &[TreeGuide],
 ) -> Result<Element, ClientError> {
     let mut class = String::from("tree-node");
     if node.has_values {
@@ -1826,14 +2058,23 @@ fn build_tree_node(
         item.set_attribute("aria-expanded", "true")
             .map_err(|_| browser_error())?;
     }
-    if let Some(styled) = item.dyn_ref::<HtmlElement>() {
-        let indent = 8 + node.depth * 14;
-        let _ = styled
-            .style()
-            .set_property("padding-left", &format!("{indent}px"));
+    if !guides.is_empty() {
+        // The shape these guides draw is already in `aria-level`; repeating it
+        // as punctuation would only make every node announce its own scaffold.
+        let column = create_element(document, "span", Some("tree-guides"))?;
+        column
+            .set_attribute("aria-hidden", "true")
+            .map_err(|_| browser_error())?;
+        for guide in guides {
+            append(
+                &column,
+                &create_element(document, "span", Some(guide.class()))?,
+            )?;
+        }
+        append(&item, &column)?;
     }
     if node.has_connection {
-        append(&item, &key_icon(document)?)?;
+        append(&item, &icon_svg(document, Icon::Key, "tree-key")?)?;
     }
     let label = create_element(document, "span", Some("tree-label"))?;
     label.set_text_content(Some(&node.display));
@@ -1931,40 +2172,112 @@ fn focus_tree_node(index: usize) {
     focus(&format!("tree-node-{index}"));
 }
 
-/// A small key, drawn rather than imported so the sidebar needs no icon asset.
-fn key_icon(document: &Document) -> Result<Element, ClientError> {
+/// The icon set, drawn rather than imported so the app needs no icon asset and
+/// no font beyond the two it already uses. Every glyph is a 16x16 stroke path
+/// on `currentColor`, so a button's own colour carries through.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Icon {
+    Save,
+    AddPath,
+    Delete,
+    RemovePath,
+    Rotate,
+    Revoke,
+    LockClosed,
+    LockOpen,
+    Key,
+}
+
+const fn icon_paths(icon: Icon) -> &'static [&'static str] {
+    match icon {
+        Icon::Save => &["m3 8.5 3.6 3.6L13 4.5"],
+        Icon::AddPath => &["M8 3.5v9", "M3.5 8h9"],
+        Icon::Delete => &[
+            "M3 4.5h10",
+            "M6.25 4.5V3.25h3.5V4.5",
+            "m4.6 4.5.6 8.1a1 1 0 0 0 1 .9h3.6a1 1 0 0 0 1-.9l.6-8.1",
+        ],
+        Icon::RemovePath => &["M3.5 8h9"],
+        Icon::Rotate => &["M13.2 8a5.2 5.2 0 1 1-1.5-3.7", "M11.7 1.8v2.7H9"],
+        Icon::Revoke => &[
+            "M8 2.3a5.7 5.7 0 1 0 0 11.4 5.7 5.7 0 0 0 0-11.4",
+            "m4 12 8-8",
+        ],
+        Icon::LockClosed => &["M3.75 7.25h8.5v6h-8.5z", "M6 7.25V5.25a2 2 0 0 1 4 0v2"],
+        Icon::LockOpen => &["M3.75 7.25h8.5v6h-8.5z", "M6 7.25V5.25a2 2 0 0 1 3.8-.85"],
+        Icon::Key => &[
+            "M5 4.8a3.2 3.2 0 1 0 0 6.4 3.2 3.2 0 0 0 0-6.4",
+            "M8.2 8h6.3M12.5 8v2.4",
+        ],
+    }
+}
+
+fn icon_svg(document: &Document, icon: Icon, class_name: &str) -> Result<Element, ClientError> {
     let svg = document
         .create_element_ns(Some("http://www.w3.org/2000/svg"), "svg")
         .map_err(|_| browser_error())?;
     for (name, value) in [
-        ("class", "tree-key"),
+        ("class", class_name),
         ("viewBox", "0 0 16 16"),
         ("fill", "none"),
         ("stroke", "currentColor"),
-        ("stroke-width", "1.6"),
+        ("stroke-width", "1.5"),
         ("stroke-linecap", "round"),
+        ("stroke-linejoin", "round"),
+        // Decoration only: every icon button states itself in `aria-label`.
         ("aria-hidden", "true"),
         ("focusable", "false"),
     ] {
         svg.set_attribute(name, value)
             .map_err(|_| browser_error())?;
     }
-    let bow = document
-        .create_element_ns(Some("http://www.w3.org/2000/svg"), "circle")
-        .map_err(|_| browser_error())?;
-    for (name, value) in [("cx", "5"), ("cy", "8"), ("r", "3.2")] {
-        bow.set_attribute(name, value)
+    for definition in icon_paths(icon) {
+        let path = document
+            .create_element_ns(Some("http://www.w3.org/2000/svg"), "path")
+            .map_err(|_| browser_error())?;
+        path.set_attribute("d", definition)
+            .map_err(|_| browser_error())?;
+        append(&svg, &path)?;
+    }
+    Ok(svg)
+}
+
+/// An icon-only action. `label` is both the accessible name and the pointer
+/// tooltip, so the two can never drift apart.
+fn create_icon_button(
+    document: &Document,
+    id: &str,
+    label: &str,
+    icon: Icon,
+    modifier: Option<&str>,
+) -> Result<Element, ClientError> {
+    let class = modifier.map_or_else(
+        || "icon-button".to_owned(),
+        |modifier| format!("icon-button {modifier}"),
+    );
+    let button = create_element(document, "button", Some(&class))?;
+    for (name, value) in [
+        ("id", id),
+        ("type", "button"),
+        ("aria-label", label),
+        ("title", label),
+    ] {
+        button
+            .set_attribute(name, value)
             .map_err(|_| browser_error())?;
     }
-    append(&svg, &bow)?;
-    let blade = document
-        .create_element_ns(Some("http://www.w3.org/2000/svg"), "path")
-        .map_err(|_| browser_error())?;
-    blade
-        .set_attribute("d", "M8.2 8h6.3M12.5 8v2.4")
-        .map_err(|_| browser_error())?;
-    append(&svg, &blade)?;
-    Ok(svg)
+    append(&button, &icon_svg(document, icon, "icon")?)?;
+    Ok(button)
+}
+
+fn set_icon_button_icon(button: &Element, icon: Icon) -> Result<(), ClientError> {
+    let document = window()
+        .and_then(|window| window.document())
+        .ok_or_else(browser_error)?;
+    // An icon button holds nothing but its glyph, so replacing the lot is both
+    // the simplest and the only correct thing to do.
+    button.set_text_content(None);
+    append(button, &icon_svg(&document, icon, "icon")?)
 }
 
 /// One installer as described by `/dist/manifest.json`.
@@ -2452,12 +2765,25 @@ async fn save_existing_value(path: ConfigPath, input_id: String) {
     }
 }
 
+/// Writes whatever the padlocked field holds as the value's new secret. The
+/// field is cleared before the request goes out, so a failure cannot leave the
+/// typed secret sitting in the DOM.
 async fn save_existing_secret(path: ConfigPath, input_id: String) {
     clear_error();
     let result = async {
         let config = app_config()?;
         let input = element::<HtmlInputElement>(&input_id).ok_or_else(browser_error)?;
         let value = input.value();
+        // A locked box reads as filled — its placeholder is `********` — but it
+        // holds nothing until the padlock is opened or a replacement is typed.
+        // The server accepts an empty secret without complaint, so a stray
+        // click on Save must not turn that emptiness into the stored value.
+        if value.is_empty() {
+            return Err(ClientError::new(
+                ErrorKind::InvalidRequest,
+                "type a replacement secret before saving",
+            ));
+        }
         input.set_value("");
         value_client(&config)
             .put_secret(&path, &SecretInput::new(value))
@@ -2479,14 +2805,16 @@ async fn save_existing_secret(path: ConfigPath, input_id: String) {
     }
 }
 
-async fn reveal_existing_secret(path: ConfigPath, output_id: String, button_id: String) {
+/// Opens a secret's padlock: fetches the stored value into the field and leaves
+/// it unmasked and editable, so a replacement is typed over what is there.
+async fn reveal_existing_secret(path: ConfigPath, input_id: String, button_id: String) {
     let generation = CONFIGURATION_LOAD_GENERATION.get();
     let route_path = match route_from_location() {
         Route::Configuration(path) => path,
-        Route::System | Route::Connections | Route::Downloads => return,
+        Route::Connections | Route::Downloads => return,
     };
     clear_error();
-    hide_revealed_secret(&output_id, &button_id);
+    lock_secret_field(&input_id, &button_id);
     let result = async {
         let config = app_config()?;
         value_client(&config).reveal_secret(&path).await
@@ -2494,45 +2822,89 @@ async fn reveal_existing_secret(path: ConfigPath, output_id: String, button_id: 
     .await;
     let current_path = match route_from_location() {
         Route::Configuration(path) => path,
-        Route::System | Route::Connections | Route::Downloads => return,
+        Route::Connections | Route::Downloads => return,
     };
     if generation != CONFIGURATION_LOAD_GENERATION.get() || current_path != route_path {
         return;
     }
     match result {
         Ok(value) => {
-            if let Some(output) = element::<HtmlTextAreaElement>(&output_id) {
-                output.set_value(value.expose());
-            }
-            set_hidden(&output_id, false);
-            set_text(&button_id, "Hide");
-            if let Some(button) = window()
-                .and_then(|window| window.document())
-                .and_then(|document| document.get_element_by_id(&button_id))
-            {
-                let _ = button.set_attribute("aria-expanded", "true");
-            }
-            focus(&output_id);
+            let Some(input) = element::<HtmlInputElement>(&input_id) else {
+                return;
+            };
+            input.set_value(value.expose());
+            input.set_type("text");
+            let _ = input.set_attribute("data-secret-state", "revealed");
+            // What the field now holds is exactly what the service holds, so an
+            // untouched revealed box is not an unsaved edit.
+            //
+            // Accepted tradeoff: unlike `.value`, an attribute serializes into
+            // `outerHTML`, so a revealed secret is briefly readable through
+            // DOM-inspection tooling (devtools, a snapshot, `page.content()`) in
+            // a way the old textarea-based control never was. Not remotely
+            // reachable — CSP is `script-src 'self' 'wasm-unsafe-eval'`, and the
+            // plaintext is already on screen at this point regardless — and
+            // `lock_secret_field` scrubs it back to `""` on close, error,
+            // logout, reload and navigation, same as the field itself. Judged
+            // not worth a Rust-side baseline map to close a window this narrow.
+            let _ = input.set_attribute("data-loaded", value.expose());
+            set_secret_toggle(&button_id, true);
+            focus(&input_id);
         }
         Err(error) => {
-            hide_revealed_secret(&output_id, &button_id);
+            lock_secret_field(&input_id, &button_id);
             show_error(error.message());
         }
     }
 }
 
-fn hide_revealed_secret(output_id: &str, button_id: &str) {
-    if let Some(output) = element::<HtmlTextAreaElement>(output_id) {
-        output.set_value("");
+fn secret_field_revealed(input_id: &str) -> bool {
+    element::<HtmlInputElement>(input_id).is_some_and(|input| {
+        input.get_attribute("data-secret-state").as_deref() == Some("revealed")
+    })
+}
+
+/// Closes a secret's padlock, discarding whatever the field held. Any plaintext
+/// is dropped from both the value and the `data-loaded` marker, so nothing
+/// survives in the DOM once the lock is shut.
+fn lock_secret_field(input_id: &str, button_id: &str) {
+    if let Some(input) = element::<HtmlInputElement>(input_id) {
+        input.set_value("");
+        input.set_type("password");
+        let _ = input.set_attribute("data-secret-state", "locked");
+        let _ = input.set_attribute("data-loaded", "");
     }
-    set_hidden(output_id, true);
-    set_text(button_id, "Reveal");
-    if let Some(button) = window()
+    set_secret_toggle(button_id, false);
+}
+
+/// Puts a padlock button into its locked or revealed state. Both labels are
+/// carried on the button itself, so this serves the per-row padlocks and the
+/// new-value row's alike.
+fn set_secret_toggle(button_id: &str, revealed: bool) {
+    let Some(button) = window()
         .and_then(|window| window.document())
         .and_then(|document| document.get_element_by_id(button_id))
-    {
-        let _ = button.set_attribute("aria-expanded", "false");
+    else {
+        return;
+    };
+    let attribute = if revealed {
+        "data-label-revealed"
+    } else {
+        "data-label-locked"
+    };
+    if let Some(label) = button.get_attribute(attribute) {
+        let _ = button.set_attribute("aria-label", &label);
+        let _ = button.set_attribute("title", &label);
     }
+    let _ = button.set_attribute("aria-pressed", if revealed { "true" } else { "false" });
+    let _ = set_icon_button_icon(
+        &button,
+        if revealed {
+            Icon::LockOpen
+        } else {
+            Icon::LockClosed
+        },
+    );
 }
 
 fn element_is_hidden(id: &str) -> bool {
@@ -3386,13 +3758,13 @@ fn render_connection_row(
     let actions_cell = create_element(document, "td", None)?;
     let actions = create_element(document, "div", Some("row-actions"))?;
     let rotate_id = format!("{prefix}rotate-connection-{index}");
-    let rotate = create_button(document, &rotate_id, "Rotate", Some("secondary"))?;
-    rotate
-        .set_attribute(
-            "aria-label",
-            &format!("Rotate credential for {}", connection.display_name.as_str()),
-        )
-        .map_err(|_| browser_error())?;
+    let rotate = create_icon_button(
+        document,
+        &rotate_id,
+        &format!("Rotate credential for {}", connection.display_name.as_str()),
+        Icon::Rotate,
+        None,
+    )?;
     if !matches!(
         connection.state,
         ManagedConnectionState::Active | ManagedConnectionState::RotationUnknown
@@ -3424,13 +3796,13 @@ fn render_connection_row(
     append(&actions, &rotate)?;
 
     let revoke_id = format!("{prefix}revoke-connection-{index}");
-    let revoke = create_button(document, &revoke_id, "Revoke", Some("danger"))?;
-    revoke
-        .set_attribute(
-            "aria-label",
-            &format!("Revoke {}", connection.display_name.as_str()),
-        )
-        .map_err(|_| browser_error())?;
+    let revoke = create_icon_button(
+        document,
+        &revoke_id,
+        &format!("Revoke {}", connection.display_name.as_str()),
+        Icon::Revoke,
+        Some("danger"),
+    )?;
     let revoke_target = connection.connection_id.clone();
     let revoke_name = connection.display_name.as_str().to_owned();
     let revoke_root = connection.root.as_str().to_owned();
@@ -3668,14 +4040,29 @@ fn render_value_row(
     let actions_cell = create_element(document, "td", None)?;
     let actions = create_element(document, "div", Some("row-actions"))?;
     let save_id = format!("save-listed-value-{index}");
-    let save = create_button(document, &save_id, "Save", None)?;
+    let save = create_icon_button(
+        document,
+        &save_id,
+        &format!("Save {name}"),
+        Icon::Save,
+        Some("primary"),
+    )?;
     let add_path_id = format!("add-path-listed-value-{index}");
-    let add_path = create_button(document, &add_path_id, "Add path", Some("secondary"))?;
-    add_path
-        .set_attribute("aria-label", &format!("Add a path to {name}"))
-        .map_err(|_| browser_error())?;
+    let add_path = create_icon_button(
+        document,
+        &add_path_id,
+        &format!("Add a path to {name}"),
+        Icon::AddPath,
+        None,
+    )?;
     let remove_id = format!("delete-listed-value-{index}");
-    let remove = create_button(document, &remove_id, "Delete", Some("danger"))?;
+    let remove = create_icon_button(
+        document,
+        &remove_id,
+        &format!("Delete {name}"),
+        Icon::Delete,
+        Some("danger"),
+    )?;
     append(&actions, &save)?;
     append(&actions, &add_path)?;
     append(&actions, &remove)?;
@@ -3754,81 +4141,84 @@ fn render_secret_value_row(
     append(&name_cell, &full_path)?;
     append_alias_paths(document, &name_cell, value, index)?;
 
+    // One box does both jobs: it shows the stored secret once the padlock is
+    // opened, and it is where a replacement is typed. Left locked it stays
+    // empty behind a masked placeholder, so writing a new secret never needs
+    // the permission to read the current one.
     let value_cell = create_element(document, "td", None)?;
-    let kind = create_element(document, "span", Some("secret-kind"))?;
-    kind.set_text_content(Some("Secret"));
-    let mask = create_element(document, "span", Some("secret-mask"))?;
-    mask.set_text_content(Some(value.value.display_text()));
-    mask.set_attribute("aria-label", &format!("Secret value for {name} is hidden"))
-        .map_err(|_| browser_error())?;
-    append(&value_cell, &kind)?;
-    append(&value_cell, &mask)?;
-
-    let input_id = format!("secret-replacement-{index}");
+    let field = create_element(document, "div", Some("secret-field"))?;
+    let input_id = format!("secret-value-{index}");
     let input = create_element(document, "input", None)?;
-    input
-        .set_attribute("id", &input_id)
-        .map_err(|_| browser_error())?;
-    input
-        .set_attribute("type", "password")
-        .map_err(|_| browser_error())?;
-    input
-        .set_attribute("autocomplete", "new-password")
-        .map_err(|_| browser_error())?;
-    input
-        .set_attribute("aria-label", &format!("Replacement secret for {name}"))
-        .map_err(|_| browser_error())?;
-    append(&value_cell, &input)?;
+    for (attribute, attribute_value) in [
+        ("id", input_id.as_str()),
+        ("type", "password"),
+        ("autocomplete", "new-password"),
+        ("spellcheck", "false"),
+        ("placeholder", value.value.display_text()),
+        ("data-secret-state", "locked"),
+        // Empty rather than absent: an untouched locked box is not an edit, and
+        // the same comparison covers the revealed box once it holds the secret.
+        ("data-loaded", ""),
+        ("aria-label", &format!("Secret value for {name}")),
+    ] {
+        input
+            .set_attribute(attribute, attribute_value)
+            .map_err(|_| browser_error())?;
+    }
+    append(&field, &input)?;
 
-    let toggle_id = format!("toggle-secret-input-{index}");
-    let toggle = create_button(document, &toggle_id, "Show input", Some("secondary"))?;
-    toggle
-        .set_attribute("aria-controls", &input_id)
-        .map_err(|_| browser_error())?;
-    toggle
-        .set_attribute("aria-pressed", "false")
-        .map_err(|_| browser_error())?;
-    append(&value_cell, &toggle)?;
-
-    let revealed_id = format!("revealed-secret-{index}");
-    let revealed = create_element(document, "textarea", Some("revealed-secret"))?;
-    revealed
-        .set_attribute("id", &revealed_id)
-        .map_err(|_| browser_error())?;
-    revealed
-        .set_attribute("readonly", "")
-        .map_err(|_| browser_error())?;
-    revealed
-        .set_attribute("hidden", "")
-        .map_err(|_| browser_error())?;
-    revealed
-        .set_attribute("aria-label", &format!("Revealed secret for {name}"))
-        .map_err(|_| browser_error())?;
-    append(&value_cell, &revealed)?;
+    let toggle_id = format!("toggle-secret-{index}");
+    let locked_label = format!("Reveal secret for {name}");
+    let revealed_label = format!("Hide secret for {name}");
+    let toggle = create_icon_button(
+        document,
+        &toggle_id,
+        &locked_label,
+        Icon::LockClosed,
+        Some("secret"),
+    )?;
+    for (attribute, attribute_value) in [
+        ("aria-controls", input_id.as_str()),
+        ("aria-pressed", "false"),
+        ("data-label-locked", locked_label.as_str()),
+        ("data-label-revealed", revealed_label.as_str()),
+    ] {
+        toggle
+            .set_attribute(attribute, attribute_value)
+            .map_err(|_| browser_error())?;
+    }
+    append(&field, &toggle)?;
+    append(&value_cell, &field)?;
 
     let updated = create_element(document, "td", Some("updated-time"))?;
     updated.set_text_content(Some(&format_timestamp(value.updated_at)));
     let actions_cell = create_element(document, "td", None)?;
     let actions = create_element(document, "div", Some("row-actions"))?;
     let save_id = format!("save-secret-{index}");
-    let save = create_button(document, &save_id, "Replace", None)?;
-    let reveal_id = format!("reveal-secret-{index}");
-    let reveal = create_button(document, &reveal_id, "Reveal", Some("secondary"))?;
-    reveal
-        .set_attribute("aria-controls", &revealed_id)
-        .map_err(|_| browser_error())?;
-    reveal
-        .set_attribute("aria-expanded", "false")
-        .map_err(|_| browser_error())?;
+    let save = create_icon_button(
+        document,
+        &save_id,
+        &format!("Save {name}"),
+        Icon::Save,
+        Some("primary"),
+    )?;
     let add_path_id = format!("add-path-listed-value-{index}");
-    let add_path = create_button(document, &add_path_id, "Add path", Some("secondary"))?;
-    add_path
-        .set_attribute("aria-label", &format!("Add a path to {name}"))
-        .map_err(|_| browser_error())?;
+    let add_path = create_icon_button(
+        document,
+        &add_path_id,
+        &format!("Add a path to {name}"),
+        Icon::AddPath,
+        None,
+    )?;
     let remove_id = format!("delete-listed-value-{index}");
-    let remove = create_button(document, &remove_id, "Delete", Some("danger"))?;
+    let remove = create_icon_button(
+        document,
+        &remove_id,
+        &format!("Delete {name}"),
+        Icon::Delete,
+        Some("danger"),
+    )?;
     append(&actions, &save)?;
-    append(&actions, &reveal)?;
     append(&actions, &add_path)?;
     append(&actions, &remove)?;
     append(&actions_cell, &actions)?;
@@ -3852,31 +4242,21 @@ fn render_secret_value_row(
         .map_err(|_| browser_error())?;
     callback.forget();
 
+    let toggle_path = value.path.clone();
     let toggle_input = input_id;
     let toggle_button = toggle_id;
     let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
-        toggle_secret_input(&toggle_input, &toggle_button);
-    });
-    toggle
-        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
-    callback.forget();
-
-    let reveal_path = value.path.clone();
-    let reveal_output = revealed_id;
-    let reveal_button = reveal_id;
-    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
-        if element_is_hidden(&reveal_output) {
-            spawn_local(reveal_existing_secret(
-                reveal_path.clone(),
-                reveal_output.clone(),
-                reveal_button.clone(),
-            ));
+        if secret_field_revealed(&toggle_input) {
+            lock_secret_field(&toggle_input, &toggle_button);
         } else {
-            hide_revealed_secret(&reveal_output, &reveal_button);
+            spawn_local(reveal_existing_secret(
+                toggle_path.clone(),
+                toggle_input.clone(),
+                toggle_button.clone(),
+            ));
         }
     });
-    reveal
+    toggle
         .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
         .map_err(|_| browser_error())?;
     callback.forget();
@@ -3922,10 +4302,13 @@ fn append_alias_paths(
         append(&item, &path_text)?;
 
         let remove_id = format!("remove-alias-path-{index}-{alias_index}");
-        let remove = create_button(document, &remove_id, "Remove", Some("danger"))?;
-        remove
-            .set_attribute("aria-label", &format!("Remove path {absolute}"))
-            .map_err(|_| browser_error())?;
+        let remove = create_icon_button(
+            document,
+            &remove_id,
+            &format!("Remove path {absolute}"),
+            Icon::RemovePath,
+            Some("danger small"),
+        )?;
         let remove_path = alias_path.clone();
         let remove_focus = remove_id;
         let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
@@ -3955,23 +4338,6 @@ fn create_element(
     Ok(element)
 }
 
-fn create_button(
-    document: &Document,
-    id: &str,
-    label: &str,
-    class_name: Option<&str>,
-) -> Result<Element, ClientError> {
-    let button = create_element(document, "button", class_name)?;
-    button
-        .set_attribute("id", id)
-        .map_err(|_| browser_error())?;
-    button
-        .set_attribute("type", "button")
-        .map_err(|_| browser_error())?;
-    button.set_text_content(Some(label));
-    Ok(button)
-}
-
 fn append(parent: &Element, child: &Element) -> Result<(), ClientError> {
     parent
         .append_child(child)
@@ -3996,24 +4362,9 @@ fn clear_value_rows() {
     set_hidden("empty-values", false);
 }
 
-fn clear_revealed_secrets() {
-    let Some(document) = window().and_then(|window| window.document()) else {
-        return;
-    };
-    let outputs = document.get_elements_by_class_name("revealed-secret");
-    for index in 0..outputs.length() {
-        let Some(output) = outputs.item(index) else {
-            continue;
-        };
-        let output_id = output.id();
-        let Some(suffix) = output_id.strip_prefix("revealed-secret-") else {
-            continue;
-        };
-        hide_revealed_secret(&output_id, &format!("reveal-secret-{suffix}"));
-    }
-}
-
-fn clear_write_only_secret_inputs() {
+/// Shuts every padlock on the page. Called whenever an error is raised, so a
+/// failed request never leaves a revealed or half-typed secret on screen.
+fn lock_all_secret_fields() {
     let Some(document) = window().and_then(|window| window.document()) else {
         return;
     };
@@ -4023,20 +4374,10 @@ fn clear_write_only_secret_inputs() {
             continue;
         };
         let input_id = element.id();
-        if input_id != "new-secret-content" && !input_id.starts_with("secret-replacement-") {
-            continue;
-        }
-        if let Ok(input) = element.dyn_into::<HtmlInputElement>() {
-            input.set_value("");
-            input.set_type("password");
-        }
-        let button_id = input_id.strip_prefix("secret-replacement-").map_or_else(
-            || "toggle-new-secret".to_owned(),
-            |suffix| format!("toggle-secret-input-{suffix}"),
-        );
-        set_text(&button_id, "Show input");
-        if let Some(button) = document.get_element_by_id(&button_id) {
-            let _ = button.set_attribute("aria-pressed", "false");
+        if input_id == "new-secret-content" {
+            lock_secret_field(&input_id, "toggle-new-secret");
+        } else if let Some(suffix) = input_id.strip_prefix("secret-value-") {
+            lock_secret_field(&input_id, &format!("toggle-secret-{suffix}"));
         }
     }
 }
@@ -4046,11 +4387,7 @@ fn show_new_value_row() {
     if let Some(secret) = element::<HtmlInputElement>("new-value-secret") {
         secret.set_checked(false);
     }
-    if let Some(input) = element::<HtmlInputElement>("new-secret-content") {
-        input.set_value("");
-        input.set_type("password");
-    }
-    set_text("toggle-new-secret", "Show input");
+    lock_secret_field("new-secret-content", "toggle-new-secret");
     update_new_value_classification();
     if let Some(name) = element::<HtmlInputElement>("new-value-name") {
         name.set_value("");
@@ -4065,11 +4402,7 @@ fn show_new_value_row() {
 fn hide_new_value_row() {
     set_hidden("new-value-row", true);
     set_textarea("new-value-content", "");
-    if let Some(input) = element::<HtmlInputElement>("new-secret-content") {
-        input.set_value("");
-        input.set_type("password");
-    }
-    set_text("toggle-new-secret", "Show input");
+    lock_secret_field("new-secret-content", "toggle-new-secret");
     set_validation("new-value-name", "new-name-error", None);
     set_validation("new-value-content", "new-value-error", None);
 }
@@ -4078,26 +4411,22 @@ fn update_new_value_classification() {
     let secret =
         element::<HtmlInputElement>("new-value-secret").is_some_and(|input| input.checked());
     set_hidden("new-value-content", secret);
-    set_hidden("new-secret-content", !secret);
-    set_hidden("toggle-new-secret", !secret);
+    set_hidden("new-secret-field", !secret);
     set_validation("new-value-content", "new-value-error", None);
     set_validation("new-secret-content", "new-value-error", None);
     update_new_save_state();
 }
 
+/// Unmasks or re-masks a secret being typed. Nothing is fetched and nothing is
+/// discarded — there is no stored value behind this field yet, so the padlock
+/// only governs whether the operator can read back what they just entered.
 fn toggle_secret_input(input_id: &str, button_id: &str) {
     let Some(input) = element::<HtmlInputElement>(input_id) else {
         return;
     };
-    let visible = input.type_() == "text";
-    input.set_type(if visible { "password" } else { "text" });
-    set_text(button_id, if visible { "Show input" } else { "Hide input" });
-    if let Some(button) = window()
-        .and_then(|window| window.document())
-        .and_then(|document| document.get_element_by_id(button_id))
-    {
-        let _ = button.set_attribute("aria-pressed", if visible { "false" } else { "true" });
-    }
+    let revealed = input.type_() != "text";
+    input.set_type(if revealed { "text" } else { "password" });
+    set_secret_toggle(button_id, revealed);
 }
 
 fn validate_path_field() -> bool {
@@ -4198,40 +4527,64 @@ async fn refresh_status(config: &AppConfig) -> bool {
     );
     match client.service_status().await {
         Ok(status) => {
-            set_text("service-value", "Available");
+            // A working service needs no badge saying so; the version it
+            // reports is the standing evidence that it answered. The protocol
+            // version it also returns is a client-compatibility concern, not
+            // an operator's, so it stays out of the header.
+            set_text("service-value", "");
+            set_hidden("service-value", true);
             set_text("version-value", &status.application_version);
-            set_text("protocol-value", &status.protocol_version);
         }
         Err(error) => {
-            set_text("service-value", "Unavailable");
+            // Unhide before setting the text: a live region only announces a
+            // mutation to content already exposed in the accessibility tree,
+            // so setting the text first — while still `hidden` — makes the
+            // change silently, and un-hiding is not itself a text mutation
+            // that would announce it after the fact.
+            set_hidden("service-value", false);
+            set_text("service-value", "Service unavailable");
             show_error(error.message());
         }
     }
     match client.authentication_status().await {
         Ok(status) if status.authenticated => {
-            set_text("auth-value", "Logged in");
             set_hidden("login", true);
             set_hidden("logout", false);
+            render_identity(true);
             true
         }
         Ok(_) => {
-            set_text("auth-value", "Logged out");
             set_hidden("login", false);
             set_hidden("logout", true);
+            render_identity(false);
             false
         }
         Err(error) if error.kind == ErrorKind::Unauthenticated => {
             clear_browser_session();
-            set_text("auth-value", "Logged out");
             set_hidden("login", false);
             set_hidden("logout", true);
+            render_identity(false);
             show_error(error.message());
             false
         }
         Err(error) => {
-            set_text("auth-value", "Unavailable");
+            // The session may well still be good — the service is what failed —
+            // so keep Log out reachable rather than offering a second login.
+            //
+            // The name is a different question, deliberately answered the other
+            // way: `render_identity`'s own contract is that `signed_in` is what
+            // the service most recently confirmed, and here it confirmed
+            // nothing. Blanking the name until the next successful check is the
+            // conservative reading of "could not ask" — the header shows a name
+            // it can currently stand behind, not one carried over on the
+            // optimistic assumption that an outage is transient. `Log out`
+            // stays offered because discarding a session that turns out to
+            // still be valid is the worse failure of the two; showing a name
+            // that turns out to be stale is not offered the same benefit of
+            // the doubt.
             set_hidden("login", true);
             set_hidden("logout", false);
+            render_identity(false);
             show_error(error.message());
             false
         }
@@ -4260,7 +4613,18 @@ async fn begin_login(config: &AppConfig) -> Result<(), ClientError> {
         ("response_type", "code"),
         ("client_id", config.client_id.as_str()),
         ("redirect_uri", redirect_uri.as_str()),
-        ("scope", "openid sovereign-config offline_access"),
+        // `profile` and `email` are what make the header legible: without
+        // them the ID token carries no claim but `sub`, which the provider
+        // hashes into an opaque identifier. `identity_display_name`'s fallback
+        // chain is `name` → `preferred_username` → `email`, and the first two
+        // arrive under `profile` — `email` is a separate scope in standard
+        // OIDC (and in Authentik's default mappings), so it has to be listed
+        // too or that last fallback can never fire. Together they buy the
+        // display name and nothing the service trusts.
+        (
+            "scope",
+            "openid profile email sovereign-config offline_access",
+        ),
         ("state", state.as_str()),
         ("code_challenge", challenge.as_str()),
         ("code_challenge_method", "S256"),
@@ -4336,6 +4700,7 @@ async fn finish_login(config: &AppConfig) -> Result<(), ClientError> {
         .map_err(|_| oidc_error())?;
     let access_token = string_property(&json, "access_token")?;
     let refresh_token = string_property(&json, "refresh_token")?;
+    store_identity_name(identity_name_from_token_response(&json));
     let expires_in = expires_in(&json);
     let now = Date::now();
     persist_refresh_token_from_parts(
@@ -4411,6 +4776,7 @@ fn clear_persisted_refresh_token() {
         let _ = storage.remove_item(REFRESH_TOKEN_KEY);
         let _ = storage.remove_item(REFRESH_ENDPOINT_KEY);
         let _ = storage.remove_item(REFRESH_EXPIRES_KEY);
+        let _ = storage.remove_item(IDENTITY_NAME_KEY);
     }
 }
 
@@ -4446,6 +4812,11 @@ async fn refresh_tokens(
         .map_err(|_| oidc_error())?;
     let access_token = string_property(&json, "access_token")?;
     let refresh_token = string_property(&json, "refresh_token")?;
+    // A refresh that carries a fresh ID token is the only chance to notice the
+    // operator renamed themselves; one that does not leaves the stored name be.
+    if let Some(name) = identity_name_from_token_response(&json) {
+        store_identity_name(Some(name));
+    }
     Ok(MemoryTokens {
         access_token: Secret::new(access_token),
         refresh_token: Secret::new(refresh_token),
@@ -4781,8 +5152,7 @@ fn focus(id: &str) {
 }
 
 fn show_error(message: &str) {
-    clear_revealed_secrets();
-    clear_write_only_secret_inputs();
+    lock_all_secret_fields();
     set_text("error", message);
     set_hidden("error", false);
 }
@@ -4810,9 +5180,13 @@ mod tests {
 
     use sovereign_config_core::ConfigPath;
 
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    use super::TreeGuide::{Blank, Branch, Corner, Trunk};
     use super::{
-        Route, build_tree, classify_refresh_error, decode_grpc_web, decode_grpc_web_response,
-        namespace_labels, parse_absolute_path, route_from_path, route_url, value_parents_of,
+        Route, TreeNode, build_tree, classify_refresh_error, decode_grpc_web,
+        decode_grpc_web_response, identity_display_name, namespace_labels, parse_absolute_path,
+        route_from_path, route_url, tree_guides, value_parents_of,
     };
 
     fn paths(values: &[&str]) -> Vec<ConfigPath> {
@@ -4939,7 +5313,10 @@ mod tests {
         // field: this is card #294's whole point, not lossy canonicalization.
         let route = route_from_path("/configuration/Apps/API");
         assert_eq!(route_url(&route), "/configuration/Apps/API");
-        assert!(matches!(route_from_path("/unknown"), Route::System));
+        // With the System view gone, anything unrecognized lands on the
+        // configuration root rather than a page of its own.
+        assert_eq!(route_url(&route_from_path("/unknown")), "/configuration/");
+        assert_eq!(route_url(&route_from_path("/")), "/configuration/");
     }
 
     #[test]
@@ -4953,10 +5330,141 @@ mod tests {
             Route::Connections
         ));
         assert_eq!(route_url(&Route::Connections), "/connections/");
-        assert!(matches!(
-            route_from_path("/connections/extra"),
-            Route::System
-        ));
+        assert_eq!(
+            route_url(&route_from_path("/connections/extra")),
+            "/configuration/"
+        );
+    }
+
+    fn node(path: &str, depth: usize) -> TreeNode {
+        TreeNode {
+            path: ConfigPath::parse(path).unwrap(),
+            display: path.rsplit('/').next().unwrap_or("/").to_owned(),
+            depth,
+            has_values: false,
+            has_connection: false,
+        }
+    }
+
+    fn id_token(claims: &str) -> String {
+        format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(claims.as_bytes())
+        )
+    }
+
+    #[test]
+    fn tree_guides_close_the_last_branch_at_every_level() {
+        // /
+        // ├─ apps
+        // │  ├─ api
+        // │  │  └─ db
+        // │  └─ worker
+        // └─ infra
+        let nodes = [
+            node("/", 0),
+            node("/apps", 1),
+            node("/apps/api", 2),
+            node("/apps/api/db", 3),
+            node("/apps/worker", 2),
+            node("/infra", 1),
+        ];
+
+        assert_eq!(
+            tree_guides(&nodes),
+            [
+                vec![],
+                vec![Branch],
+                vec![Trunk, Branch],
+                vec![Trunk, Trunk, Corner],
+                vec![Trunk, Corner],
+                vec![Corner],
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_guides_blank_the_trunk_below_a_closed_branch() {
+        // A deeper node under the *last* child must not keep drawing its
+        // parent's trunk — that is the one case a naive depth-only indent gets
+        // wrong.
+        let nodes = [
+            node("/", 0),
+            node("/apps", 1),
+            node("/apps/api", 2),
+            node("/apps/api/db", 3),
+        ];
+
+        assert_eq!(
+            tree_guides(&nodes),
+            [
+                vec![],
+                vec![Corner],
+                vec![Blank, Corner],
+                vec![Blank, Blank, Corner],
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_guides_handle_the_empty_and_root_only_cases() {
+        assert!(tree_guides(&[]).is_empty());
+        assert_eq!(tree_guides(&[node("/", 0)]), [Vec::new()]);
+    }
+
+    #[test]
+    fn identity_prefers_the_most_human_claim_available() {
+        assert_eq!(
+            identity_display_name(&id_token(
+                r#"{"sub":"abc","email":"a@b.test","preferred_username":"avc","name":"A Vincent"}"#
+            ))
+            .as_deref(),
+            Some("A Vincent")
+        );
+        assert_eq!(
+            identity_display_name(&id_token(
+                r#"{"sub":"abc","email":"a@b.test","preferred_username":"avc"}"#
+            ))
+            .as_deref(),
+            Some("avc")
+        );
+        assert_eq!(
+            identity_display_name(&id_token(r#"{"sub":"abc","email":"a@b.test"}"#)).as_deref(),
+            Some("a@b.test")
+        );
+        // `sub` is the provider's hashed identifier, never a name: a token
+        // carrying nothing else leaves the header unlabelled rather than
+        // pinning a digest to the session.
+        assert_eq!(identity_display_name(&id_token(r#"{"sub":"abc"}"#)), None);
+    }
+
+    #[test]
+    fn identity_skips_blank_and_non_string_claims() {
+        assert_eq!(
+            identity_display_name(&id_token(r#"{"name":"   ","preferred_username":"avc"}"#))
+                .as_deref(),
+            Some("avc")
+        );
+        assert_eq!(
+            identity_display_name(&id_token(r#"{"name":42,"email":"a@b.test"}"#)).as_deref(),
+            Some("a@b.test")
+        );
+        assert_eq!(identity_display_name(&id_token("{}")), None);
+    }
+
+    #[test]
+    fn identity_rejects_tokens_it_cannot_read() {
+        // A malformed token labels nothing rather than labelling it wrongly;
+        // the header is the only thing this name ever drives.
+        for malformed in [
+            "",
+            "header",
+            "header.signature",
+            "header.!!!not-base64!!!.signature",
+            &id_token("not json"),
+        ] {
+            assert_eq!(identity_display_name(malformed), None, "read {malformed:?}");
+        }
     }
 
     #[test]
