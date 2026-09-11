@@ -786,6 +786,12 @@ fn install_actions() {
     install_route_link(&document, "downloads-link", Route::Downloads);
     if let Some(browser_window) = window() {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            // Every other route change closes the menu before anything else —
+            // `guarded_navigate` does it first, even ahead of its own unsaved-edits
+            // check — and a history pop is a route change too. Without this the
+            // panel outlives the page it was opened on, floating over whatever
+            // Back or Forward lands on next.
+            close_brand_menu();
             if has_unsaved_edits() {
                 // A history pop cannot be cancelled, so put the address bar
                 // back and ask the same question an in-app link would ask.
@@ -1907,6 +1913,12 @@ fn render_tree(nodes: &[TreeNode]) -> Result<(), ClientError> {
     // Exactly one node is ever in the tab order; without a selection that is the
     // root, which is also the node the Configuration view opens on.
     let focus_index = selected_index.or_else(|| (!nodes.is_empty()).then_some(0));
+    // `tree_guides` returns exactly one row per node (pinned by
+    // `tree_guides_handle_the_empty_and_root_only_cases` and its neighbours
+    // below), so `guides[index]` never runs past the end here — kept as a
+    // direct index rather than a defensive `.get` because that invariant is
+    // structural, not incidental: every push onto `guides` happens in the same
+    // loop, over the same `nodes`, with no branch that skips one.
     let guides = tree_guides(nodes);
     for (index, node) in nodes.iter().enumerate() {
         // Preorder ordering means a node has children exactly when the next one
@@ -2762,6 +2774,16 @@ async fn save_existing_secret(path: ConfigPath, input_id: String) {
         let config = app_config()?;
         let input = element::<HtmlInputElement>(&input_id).ok_or_else(browser_error)?;
         let value = input.value();
+        // A locked box reads as filled — its placeholder is `********` — but it
+        // holds nothing until the padlock is opened or a replacement is typed.
+        // The server accepts an empty secret without complaint, so a stray
+        // click on Save must not turn that emptiness into the stored value.
+        if value.is_empty() {
+            return Err(ClientError::new(
+                ErrorKind::InvalidRequest,
+                "type a replacement secret before saving",
+            ));
+        }
         input.set_value("");
         value_client(&config)
             .put_secret(&path, &SecretInput::new(value))
@@ -2815,6 +2837,16 @@ async fn reveal_existing_secret(path: ConfigPath, input_id: String, button_id: S
             let _ = input.set_attribute("data-secret-state", "revealed");
             // What the field now holds is exactly what the service holds, so an
             // untouched revealed box is not an unsaved edit.
+            //
+            // Accepted tradeoff: unlike `.value`, an attribute serializes into
+            // `outerHTML`, so a revealed secret is briefly readable through
+            // DOM-inspection tooling (devtools, a snapshot, `page.content()`) in
+            // a way the old textarea-based control never was. Not remotely
+            // reachable — CSP is `script-src 'self' 'wasm-unsafe-eval'`, and the
+            // plaintext is already on screen at this point regardless — and
+            // `lock_secret_field` scrubs it back to `""` on close, error,
+            // logout, reload and navigation, same as the field itself. Judged
+            // not worth a Rust-side baseline map to close a window this narrow.
             let _ = input.set_attribute("data-loaded", value.expose());
             set_secret_toggle(&button_id, true);
             focus(&input_id);
@@ -4504,8 +4536,13 @@ async fn refresh_status(config: &AppConfig) -> bool {
             set_text("version-value", &status.application_version);
         }
         Err(error) => {
-            set_text("service-value", "Service unavailable");
+            // Unhide before setting the text: a live region only announces a
+            // mutation to content already exposed in the accessibility tree,
+            // so setting the text first — while still `hidden` — makes the
+            // change silently, and un-hiding is not itself a text mutation
+            // that would announce it after the fact.
             set_hidden("service-value", false);
+            set_text("service-value", "Service unavailable");
             show_error(error.message());
         }
     }
@@ -4533,6 +4570,18 @@ async fn refresh_status(config: &AppConfig) -> bool {
         Err(error) => {
             // The session may well still be good — the service is what failed —
             // so keep Log out reachable rather than offering a second login.
+            //
+            // The name is a different question, deliberately answered the other
+            // way: `render_identity`'s own contract is that `signed_in` is what
+            // the service most recently confirmed, and here it confirmed
+            // nothing. Blanking the name until the next successful check is the
+            // conservative reading of "could not ask" — the header shows a name
+            // it can currently stand behind, not one carried over on the
+            // optimistic assumption that an outage is transient. `Log out`
+            // stays offered because discarding a session that turns out to
+            // still be valid is the worse failure of the two; showing a name
+            // that turns out to be stale is not offered the same benefit of
+            // the doubt.
             set_hidden("login", true);
             set_hidden("logout", false);
             render_identity(false);
@@ -4564,10 +4613,18 @@ async fn begin_login(config: &AppConfig) -> Result<(), ClientError> {
         ("response_type", "code"),
         ("client_id", config.client_id.as_str()),
         ("redirect_uri", redirect_uri.as_str()),
-        // `profile` is what makes the header legible: without it the ID token
-        // carries no claim but `sub`, which the provider hashes into an opaque
-        // identifier. It buys the display name and nothing the service trusts.
-        ("scope", "openid profile sovereign-config offline_access"),
+        // `profile` and `email` are what make the header legible: without
+        // them the ID token carries no claim but `sub`, which the provider
+        // hashes into an opaque identifier. `identity_display_name`'s fallback
+        // chain is `name` → `preferred_username` → `email`, and the first two
+        // arrive under `profile` — `email` is a separate scope in standard
+        // OIDC (and in Authentik's default mappings), so it has to be listed
+        // too or that last fallback can never fire. Together they buy the
+        // display name and nothing the service trusts.
+        (
+            "scope",
+            "openid profile email sovereign-config offline_access",
+        ),
         ("state", state.as_str()),
         ("code_challenge", challenge.as_str()),
         ("code_challenge_method", "S256"),

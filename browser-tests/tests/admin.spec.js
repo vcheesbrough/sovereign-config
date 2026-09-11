@@ -29,15 +29,18 @@ async function openView(page, name) {
 // The mutation sequence a view issued, with the listings that precede the
 // first mutation dropped. The app lands on the configuration root as soon as
 // the session is established and lists it, so how many listings come before a
-// deep link is opened is a matter of timing, not of behaviour worth asserting.
-// GetSubTree is excluded throughout: that is the sidebar tree's own
-// whole-estate read, not part of any grid sequence.
+// deep link is opened is a matter of timing, not of behaviour worth asserting
+// — but that there is at least one, before anything else, is: it is the grid
+// reading its path before it ever mutates it. GetSubTree is excluded
+// throughout: that is the sidebar tree's own whole-estate read, not part of
+// any grid sequence.
 function mutationSequence(requests) {
   const methods = requests
     .map(request => request.method)
     .filter(method => method !== 'GetSubTree');
+  expect(methods[0], 'expected the view to list its path before mutating it').toBe('ListValues');
   const first = methods.findIndex(method => method !== 'ListValues');
-  expect(first).toBeGreaterThan(-1);
+  expect(first, 'expected the flow to issue at least one mutation').toBeGreaterThan(-1);
   return methods.slice(first);
 }
 
@@ -715,10 +718,12 @@ test('keyboard login creates an S256 offline request without exposing a verifier
   expect(url.searchParams.get('code_challenge_method')).toBe('S256');
   expect(url.searchParams.get('code_challenge')).toBeTruthy();
   expect(url.searchParams.get('state')).toBeTruthy();
-  // `profile` is requested so the ID token carries a claim a person recognises;
-  // without it the provider releases only its hashed `sub`.
+  // `profile` and `email` are requested so the ID token carries a claim a
+  // person recognises; without them the provider releases only its hashed
+  // `sub`. `email` is a separate scope from `profile`, so both are needed for
+  // the header's full name → preferred_username → email fallback to work.
   expect(url.searchParams.get('scope'))
-    .toBe('openid profile sovereign-config offline_access');
+    .toBe('openid profile email sovereign-config offline_access');
   expect(url.searchParams.has('code_verifier')).toBe(false);
 });
 
@@ -2063,6 +2068,27 @@ test('secret values stay masked, rotate explicitly, and survive JSON edits', asy
   expect(accessibility.violations).toEqual([]);
 });
 
+test('a stray Save on a locked, untouched secret does not blank the stored value', async ({ page }) => {
+  const storedSecret = 'guarded-browser-secret-sentinel';
+  await openCallback(page);
+  await expect(signedIn(page)).toBeVisible();
+  const values = await mockValues(page, {
+    '/apps/api/api-token': { value: storedSecret, secret: true }
+  });
+  await page.goto('/configuration/apps/api');
+
+  // The locked box reads as filled behind its placeholder but holds nothing;
+  // the row's Save is otherwise indistinguishable from a plain row's.
+  const row = page.getByRole('row', { name: /api-token/ });
+  const secret = page.getByLabel('Secret value for api-token');
+  await expect(secret).toHaveValue('');
+  await row.getByRole('button', { name: 'Save api-token' }).click();
+
+  await expect(page.getByText('type a replacement secret before saving')).toBeVisible();
+  expect(values.requests.map(request => request.method)).not.toContain('PutValue');
+  expect(values.getValue('/apps/api/api-token')).toEqual({ value: storedSecret, secret: true });
+});
+
 test('delayed secret reveals are discarded after configuration navigation', async ({ page }) => {
   const oldSecret = 'old-path-secret-sentinel';
   const newSecret = 'new-path-secret-sentinel';
@@ -2408,6 +2434,31 @@ test('the access URLs view is renamed and lists granted permissions', async ({ p
   await expect(link).toBeVisible();
   await expect(link).toHaveClass('active');
   await expect(page.getByRole('cell', { name: 'Read, Write, Manage', exact: true })).toBeVisible();
+});
+
+test('a browser Back closes an open brand menu', async ({ page }) => {
+  await mockConnections(page, { connections: [] });
+  await openCallback(page);
+  await expect(signedIn(page)).toBeVisible();
+  await mockValues(page, {});
+  await openConfiguration(page);
+  await openView(page, 'Access URLs');
+  await expect(page).toHaveURL(/\/connections\/$/);
+
+  // Left open rather than dismissed by the navigation that got here — the
+  // in-app link path already closes the menu, so a Back press is the only way
+  // to reach this state.
+  const menuButton = page.getByRole('button', { name: 'Sovereign Config' });
+  await menuButton.click();
+  await expect(page.locator('#brand-menu')).toBeVisible();
+
+  // Regression: `render_route` swaps the page on a history pop without going
+  // through `guarded_navigate`, so the popstate handler must close the menu
+  // itself or the panel outlives the page it was opened on.
+  await page.goBack();
+  await expect(page).toHaveURL(/\/configuration\/$/);
+  await expect(page.locator('#brand-menu')).toBeHidden();
+  await expect(menuButton).toHaveAttribute('aria-expanded', 'false');
 });
 
 test('logout discards a revealed connection URL and clears the view', async ({ page }) => {
