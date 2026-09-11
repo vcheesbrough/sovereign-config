@@ -4138,7 +4138,13 @@ fn render_secret_value_row(
     let toggle_id = format!("toggle-secret-{index}");
     let locked_label = format!("Reveal secret for {name}");
     let revealed_label = format!("Hide secret for {name}");
-    let toggle = create_icon_button(document, &toggle_id, &locked_label, Icon::LockClosed, None)?;
+    let toggle = create_icon_button(
+        document,
+        &toggle_id,
+        &locked_label,
+        Icon::LockClosed,
+        Some("secret"),
+    )?;
     for (attribute, attribute_value) in [
         ("aria-controls", input_id.as_str()),
         ("aria-pressed", "false"),
