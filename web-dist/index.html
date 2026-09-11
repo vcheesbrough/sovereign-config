@@ -3,15 +3,15 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#002145">
+    <meta name="theme-color" content="#04211a">
     <title>Sovereign Config</title>
-    <link rel="icon" href="/favicon-55900db913ff664c.svg" integrity="sha384-HU3RFTHDLWSwv7HC1TcDL+JpANlmlbPCihfODUdHMqlMJ4boArck2nIxJ7bE40ag"/>
-    <link rel="stylesheet" href="/style-d68d86024c195842.css" integrity="sha384-3bepSR+t1Ou0V2Pv18iUeqTu5Q5brTuHOpo2Qn9onMMZvqVPGAz0INrIHo47idTA"/>
+    <link rel="icon" href="/favicon-a673546ed5b7769a.svg" integrity="sha384-hnGhyHb6lUXczUEHRuvzvR67saqSOAOVqdrOiO2swymWtIEAIRtpUQUv841qZnkk"/>
+    <link rel="stylesheet" href="/style-3fcdab15a5949181.css" integrity="sha384-h+O7rX1IcURwUM3/KAkyb1lTm4R6yCGv7RGU1zgvINOGHM0qnzlltn95Ux4wr3Y7"/>
     <script src="/app-config.js"></script>
     
 <script type="module">
-import init, * as bindings from '/sovereign-config-web-3f6048bc09b1b601.js';
-const wasm = await init({ module_or_path: '/sovereign-config-web-3f6048bc09b1b601_bg.wasm' });
+import init, * as bindings from '/sovereign-config-web-9ae2eb2986a2040d.js';
+const wasm = await init({ module_or_path: '/sovereign-config-web-9ae2eb2986a2040d_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -20,7 +20,7 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-  <link rel="modulepreload" href="/sovereign-config-web-3f6048bc09b1b601.js" crossorigin="anonymous" integrity="sha384-lnxMv/C5g20e8qEDOPJEw+6kwcFr4WjHs5uB3uMV4R1Zm0McqcPZn7/jq3gM7qNR"><link rel="preload" href="/sovereign-config-web-3f6048bc09b1b601_bg.wasm" crossorigin="anonymous" integrity="sha384-J8OeQpjAraLWnCOzZd0g57lJRJZJrPG5vO3oOzuRzmr/pGGL+3iiRa2dVXrXRs+P" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/sovereign-config-web-9ae2eb2986a2040d.js" crossorigin="anonymous" integrity="sha384-UHyWz7rpQLm3XwEGKYLdSI8r1Jq0ri0TpelgwHxXUi7oFH2WCXEivH07sdgEo9we"><link rel="preload" href="/sovereign-config-web-9ae2eb2986a2040d_bg.wasm" crossorigin="anonymous" integrity="sha384-a051mLYpDWVrY5xYXut3Hk+YWR/XIBsRHGnuG99yLScXUxdLt1GM3bYVY/zHTJ9j" as="fetch" type="application/wasm"></head>
   <body>
     <header>
       <!-- The brand mark is the app's only top-level navigation: the views that
@@ -45,11 +45,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
              service does not need a badge saying so. -->
         <span id="service-value" class="service-state" role="status" hidden></span>
         <span id="identity-name" class="identity-name" hidden></span>
-        <span class="watermark">
-          <span id="version-value" title="Application version">-</span>
-          <span class="watermark-separator" aria-hidden="true">·</span>
-          <span id="protocol-value" title="Protocol version">-</span>
-        </span>
+        <span id="version-value" class="watermark" title="Application version">-</span>
         <button id="login" type="button">Log in</button>
         <button id="logout" class="inverse" type="button" hidden>Log out</button>
       </div>

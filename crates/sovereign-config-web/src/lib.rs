@@ -1000,9 +1000,11 @@ fn identity_display_name(id_token: &str) -> Option<String> {
     let payload = id_token.split('.').nth(1)?;
     let claims: serde_json::Value =
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
-    // `sub` is the fallback of last resort: an opaque identifier reads badly in
-    // a header, but it is still better than an unlabelled session.
-    ["name", "preferred_username", "email", "sub"]
+    // Only claims a person would recognise. `sub` is deliberately not among
+    // them: the provider issues it hashed, so falling back to it labels the
+    // session with a hex digest that names nobody. An unlabelled header — the
+    // Log out button alone — says strictly more than that.
+    ["name", "preferred_username", "email"]
         .into_iter()
         .find_map(|claim| {
             let value = claims.get(claim)?.as_str()?.trim();
@@ -1905,7 +1907,7 @@ fn render_tree(nodes: &[TreeNode]) -> Result<(), ClientError> {
     // Exactly one node is ever in the tab order; without a selection that is the
     // root, which is also the node the Configuration view opens on.
     let focus_index = selected_index.or_else(|| (!nodes.is_empty()).then_some(0));
-    let prefixes = tree_prefixes(nodes);
+    let guides = tree_guides(nodes);
     for (index, node) in nodes.iter().enumerate() {
         // Preorder ordering means a node has children exactly when the next one
         // is deeper. The tree never collapses, so parents are always expanded.
@@ -1918,7 +1920,7 @@ fn render_tree(nodes: &[TreeNode]) -> Result<(), ClientError> {
             index,
             Some(index) == selected_index,
             has_children,
-            &prefixes[index],
+            &guides[index],
         )?;
         item.set_attribute(
             "tabindex",
@@ -1937,40 +1939,71 @@ fn render_tree(nodes: &[TreeNode]) -> Result<(), ClientError> {
     Ok(())
 }
 
-/// Draws each node's ancestry with box-drawing characters, the way a terminal
-/// tree listing does. Nodes arrive in preorder carrying their depth, which is
-/// all this needs: a node is the last of its siblings when the next node at or
-/// above its depth is shallower, and every level in between contributes either
-/// a continuing trunk or the blank that follows a closed one.
-fn tree_prefixes(nodes: &[TreeNode]) -> Vec<String> {
+/// One cell of a node's ancestry column, one per level of depth.
+///
+/// These were box-drawing characters until the joins gave them away: a glyph
+/// only paints inside its own line box, so a trunk assembled from `\u{2502}`
+/// breaks at every row boundary by however much the row exceeds the font's em
+/// box — and by how much depended on whichever monospace font the browser had
+/// resolved. Each cell is now an empty span, and CSS rules it with a line
+/// stretched across the whole row, so consecutive trunks meet exactly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TreeGuide {
+    /// An ancestor whose last child has already been drawn: nothing here.
+    Blank,
+    /// An ancestor with siblings still to come: a trunk through the whole row.
+    Trunk,
+    /// This node, with siblings after it: trunk through, elbow out.
+    Branch,
+    /// This node, the last of its siblings: the trunk ends at the elbow.
+    Corner,
+}
+
+impl TreeGuide {
+    fn class(self) -> &'static str {
+        match self {
+            Self::Blank => "tree-guide",
+            Self::Trunk => "tree-guide trunk",
+            Self::Branch => "tree-guide branch",
+            Self::Corner => "tree-guide corner",
+        }
+    }
+}
+
+/// Lays out each node's ancestry the way a terminal tree listing does. Nodes
+/// arrive in preorder carrying their depth, which is all this needs: a node is
+/// the last of its siblings when the next node at or above its depth is
+/// shallower, and every level in between contributes either a continuing trunk
+/// or the blank that follows a closed one.
+fn tree_guides(nodes: &[TreeNode]) -> Vec<Vec<TreeGuide>> {
     let last: Vec<bool> = (0..nodes.len())
         .map(|index| is_last_sibling(nodes, index))
         .collect();
-    let mut prefixes = Vec::with_capacity(nodes.len());
+    let mut guides = Vec::with_capacity(nodes.len());
     // Indexed by depth: whether the node currently open at that depth was the
     // last of its siblings, and so whether its trunk is still being drawn.
     let mut ancestors: Vec<bool> = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
         ancestors.truncate(node.depth);
-        let mut prefix = String::new();
+        let mut row = Vec::with_capacity(node.depth);
         for level in 1..node.depth {
-            prefix.push_str(if ancestors.get(level).copied().unwrap_or(true) {
-                "   "
+            row.push(if ancestors.get(level).copied().unwrap_or(true) {
+                TreeGuide::Blank
             } else {
-                "\u{2502}  "
+                TreeGuide::Trunk
             });
         }
         if node.depth > 0 {
-            prefix.push_str(if last[index] {
-                "\u{2514}\u{2500} "
+            row.push(if last[index] {
+                TreeGuide::Corner
             } else {
-                "\u{251c}\u{2500} "
+                TreeGuide::Branch
             });
         }
         ancestors.push(last[index]);
-        prefixes.push(prefix);
+        guides.push(row);
     }
-    prefixes
+    guides
 }
 
 fn is_last_sibling(nodes: &[TreeNode], index: usize) -> bool {
@@ -1987,7 +2020,7 @@ fn build_tree_node(
     index: usize,
     selected: bool,
     has_children: bool,
-    prefix: &str,
+    guides: &[TreeGuide],
 ) -> Result<Element, ClientError> {
     let mut class = String::from("tree-node");
     if node.has_values {
@@ -2013,15 +2046,20 @@ fn build_tree_node(
         item.set_attribute("aria-expanded", "true")
             .map_err(|_| browser_error())?;
     }
-    if !prefix.is_empty() {
+    if !guides.is_empty() {
         // The shape these guides draw is already in `aria-level`; repeating it
         // as punctuation would only make every node announce its own scaffold.
-        let guides = create_element(document, "span", Some("tree-prefix"))?;
-        guides
+        let column = create_element(document, "span", Some("tree-guides"))?;
+        column
             .set_attribute("aria-hidden", "true")
             .map_err(|_| browser_error())?;
-        guides.set_text_content(Some(prefix));
-        append(&item, &guides)?;
+        for guide in guides {
+            append(
+                &column,
+                &create_element(document, "span", Some(guide.class()))?,
+            )?;
+        }
+        append(&item, &column)?;
     }
     if node.has_connection {
         append(&item, &icon_svg(document, Icon::Key, "tree-key")?)?;
@@ -4451,15 +4489,13 @@ async fn refresh_status(config: &AppConfig) -> bool {
     );
     match client.service_status().await {
         Ok(status) => {
-            // A working service needs no badge saying so; the versions it
-            // reports are the standing evidence that it answered.
+            // A working service needs no badge saying so; the version it
+            // reports is the standing evidence that it answered. The protocol
+            // version it also returns is a client-compatibility concern, not
+            // an operator's, so it stays out of the header.
             set_text("service-value", "");
             set_hidden("service-value", true);
             set_text("version-value", &status.application_version);
-            set_text(
-                "protocol-value",
-                &format!("protocol {}", status.protocol_version),
-            );
         }
         Err(error) => {
             set_text("service-value", "Service unavailable");
@@ -4522,7 +4558,10 @@ async fn begin_login(config: &AppConfig) -> Result<(), ClientError> {
         ("response_type", "code"),
         ("client_id", config.client_id.as_str()),
         ("redirect_uri", redirect_uri.as_str()),
-        ("scope", "openid sovereign-config offline_access"),
+        // `profile` is what makes the header legible: without it the ID token
+        // carries no claim but `sub`, which the provider hashes into an opaque
+        // identifier. It buys the display name and nothing the service trusts.
+        ("scope", "openid profile sovereign-config offline_access"),
         ("state", state.as_str()),
         ("code_challenge", challenge.as_str()),
         ("code_challenge_method", "S256"),
@@ -5080,10 +5119,11 @@ mod tests {
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
+    use super::TreeGuide::{Blank, Branch, Corner, Trunk};
     use super::{
         Route, TreeNode, build_tree, classify_refresh_error, decode_grpc_web,
         decode_grpc_web_response, identity_display_name, namespace_labels, parse_absolute_path,
-        route_from_path, route_url, tree_prefixes, value_parents_of,
+        route_from_path, route_url, tree_guides, value_parents_of,
     };
 
     fn paths(values: &[&str]) -> Vec<ConfigPath> {
@@ -5268,14 +5308,14 @@ mod tests {
         ];
 
         assert_eq!(
-            tree_prefixes(&nodes),
+            tree_guides(&nodes),
             [
-                "",
-                "\u{251c}\u{2500} ",
-                "\u{2502}  \u{251c}\u{2500} ",
-                "\u{2502}  \u{2502}  \u{2514}\u{2500} ",
-                "\u{2502}  \u{2514}\u{2500} ",
-                "\u{2514}\u{2500} ",
+                vec![],
+                vec![Branch],
+                vec![Trunk, Branch],
+                vec![Trunk, Trunk, Corner],
+                vec![Trunk, Corner],
+                vec![Corner],
             ]
         );
     }
@@ -5293,20 +5333,20 @@ mod tests {
         ];
 
         assert_eq!(
-            tree_prefixes(&nodes),
+            tree_guides(&nodes),
             [
-                "",
-                "\u{2514}\u{2500} ",
-                "   \u{2514}\u{2500} ",
-                "      \u{2514}\u{2500} ",
+                vec![],
+                vec![Corner],
+                vec![Blank, Corner],
+                vec![Blank, Blank, Corner],
             ]
         );
     }
 
     #[test]
     fn tree_guides_handle_the_empty_and_root_only_cases() {
-        assert!(tree_prefixes(&[]).is_empty());
-        assert_eq!(tree_prefixes(&[node("/", 0)]), [""]);
+        assert!(tree_guides(&[]).is_empty());
+        assert_eq!(tree_guides(&[node("/", 0)]), [Vec::new()]);
     }
 
     #[test]
@@ -5329,10 +5369,10 @@ mod tests {
             identity_display_name(&id_token(r#"{"sub":"abc","email":"a@b.test"}"#)).as_deref(),
             Some("a@b.test")
         );
-        assert_eq!(
-            identity_display_name(&id_token(r#"{"sub":"abc"}"#)).as_deref(),
-            Some("abc")
-        );
+        // `sub` is the provider's hashed identifier, never a name: a token
+        // carrying nothing else leaves the header unlabelled rather than
+        // pinning a digest to the session.
+        assert_eq!(identity_display_name(&id_token(r#"{"sub":"abc"}"#)), None);
     }
 
     #[test]
@@ -5343,8 +5383,8 @@ mod tests {
             Some("avc")
         );
         assert_eq!(
-            identity_display_name(&id_token(r#"{"name":42,"sub":"abc"}"#)).as_deref(),
-            Some("abc")
+            identity_display_name(&id_token(r#"{"name":42,"email":"a@b.test"}"#)).as_deref(),
+            Some("a@b.test")
         );
         assert_eq!(identity_display_name(&id_token("{}")), None);
     }
