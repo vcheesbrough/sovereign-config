@@ -1,25 +1,27 @@
-/* Design system — dark-green surfaces, teal accent, amber highlights. The
-   greens step from near-black at the page background to a lit surface for
-   selection, so depth reads without any surface needing a border to be legible.
-   Teal is the analogous accent — the one interactive hue that stays distinct
-   from the green scaffolding — and amber, opposite green on the wheel, is the
-   single warm highlight reserved for headings, selection and focus. Every pair
-   the UI actually renders clears WCAG AA: body and muted text at 4.5:1 on every
-   surface they sit on, and borders and filled controls at 3:1 against the
-   surface behind them. */
+/* Design system — a monochrome CRT green, the way an old green-screen
+   terminal rendered everything in one phosphor hue and let intensity alone
+   carry the hierarchy. Surfaces, borders, muted text and the accent are all
+   the same ~128° green, stepped from near-black at the page background to a
+   lit surface for selection; nothing here needs a second hue to read as
+   structure. Amber is the one deliberate exception — the single warm
+   highlight reserved for headings, selection, focus and the padlock, the way
+   a real green terminal still had one alternate colour for what mattered
+   most. Every pair the UI actually renders clears WCAG AA: body and muted
+   text at 4.5:1 on every surface they sit on, and borders and filled
+   controls at 3:1 against the surface behind them. */
 :root {
   color-scheme: dark;
-  --bg:          #04211a;
-  --surface:     #0a2e24;
-  --surface-2:   #0f3b2d;
-  --surface-3:   #175a45;
-  --border:      #23906d;
-  --border-soft: #14503d;
-  --text:        #e8f5ef;
-  --text-muted:  #8fd0b4;
-  --accent:      #0a8476;
-  --accent-hover:#0b6f63;
-  --accent-text: #5eead4;
+  --bg:          #042108;
+  --surface:     #0a2e0f;
+  --surface-2:   #0f3b15;
+  --surface-3:   #175a20;
+  --border:      #239032;
+  --border-soft: #14501c;
+  --text:        #eaf5ec;
+  --text-muted:  #8fd098;
+  --accent:      #0a841a;
+  --accent-hover:#0b6f18;
+  --accent-text: #5eea71;
   --yellow:      #fbbf24;
   --danger:      #b91c1c;
   --danger-hover:#991b1b;
@@ -256,9 +258,15 @@ button.danger:disabled:hover { background: var(--danger); }
 .icon-button.primary:hover { color: #fff; background: var(--accent); }
 .icon-button.danger { color: var(--danger-text); background: transparent; border-color: var(--danger-text); }
 .icon-button.danger:hover { color: #fff; background: var(--danger); border-color: var(--danger); }
+/* The padlock: amber like every other lock-adjacent affordance (the revealed
+   field's border, the tree's key). Yellow is light, so its fill hovers to a
+   dark glyph rather than the white the other filled variants use. */
+.icon-button.secret { color: var(--yellow); border-color: var(--yellow); }
+.icon-button.secret:hover { color: var(--bg); background: var(--yellow); }
 .icon-button:disabled:hover { color: var(--text-muted); background: transparent; }
 .icon-button.primary:disabled:hover { color: var(--accent-text); background: transparent; }
 .icon-button.danger:disabled:hover { color: var(--danger-text); background: transparent; }
+.icon-button.secret:disabled:hover { color: var(--yellow); background: transparent; }
 .icon { width: 16px; height: 16px; flex: 0 0 auto; }
 .icon-button.small { width: 24px; min-height: 24px; }
 .icon-button.small .icon { width: 13px; height: 13px; }
