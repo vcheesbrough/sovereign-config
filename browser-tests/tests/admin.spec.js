@@ -9,6 +9,38 @@ const staticDir = process.env.PLAYWRIGHT_STATIC_DIR
   : path.resolve(__dirname, '../../web-dist');
 const tokenEndpoint = 'https://auth.example.test/application/o/token/';
 
+// The header no longer narrates the session in words: the button on offer is
+// the statement. Log out on show means signed in, Log in means signed out.
+function signedIn(page) {
+  return page.getByRole('button', { name: 'Log out' });
+}
+
+function signedOut(page) {
+  return page.getByRole('button', { name: 'Log in' });
+}
+
+// Access URLs, Downloads and Configuration values are reached through the
+// brand-mark menu rather than a sidebar nav strip.
+async function openView(page, name) {
+  await page.getByRole('button', { name: 'Sovereign Config' }).click();
+  await page.getByRole('link', { name, exact: true }).click();
+}
+
+// The mutation sequence a view issued, with the listings that precede the
+// first mutation dropped. The app lands on the configuration root as soon as
+// the session is established and lists it, so how many listings come before a
+// deep link is opened is a matter of timing, not of behaviour worth asserting.
+// GetSubTree is excluded throughout: that is the sidebar tree's own
+// whole-estate read, not part of any grid sequence.
+function mutationSequence(requests) {
+  const methods = requests
+    .map(request => request.method)
+    .filter(method => method !== 'GetSubTree');
+  const first = methods.findIndex(method => method !== 'ListValues');
+  expect(first).toBeGreaterThan(-1);
+  return methods.slice(first);
+}
+
 async function storedRefreshState(page) {
   return page.evaluate(() => ({
     token: sessionStorage.getItem('sovereign-config.refresh-token'),
@@ -542,12 +574,25 @@ async function mockDiscovery(page) {
   }));
 }
 
+// An unsigned ID token in the shape Authentik returns. The app decodes it for
+// a display name only and never treats it as proof of anything, so a real
+// signature would assert nothing the tests could check.
+function idToken(claims) {
+  const payload = Buffer.from(JSON.stringify(claims))
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  return `header.${payload}.signature`;
+}
+
 async function openCallback(
   page,
   refreshResult = 'success',
   state = 'expected-state',
   identityStatus = 0,
-  expireRefresh = false
+  expireRefresh = false,
+  claims = { sub: 'operator-subject', preferred_username: 'avc', name: 'A Vincent' }
 ) {
   await page.addInitScript(({ expireRefresh }) => {
     sessionStorage.setItem('sovereign-config.pkce-state', 'expected-state');
@@ -579,6 +624,7 @@ async function openCallback(
         body: JSON.stringify({
           access_token: 'access-token-one',
           refresh_token: 'refresh-token-one',
+          id_token: claims ? idToken(claims) : undefined,
           expires_in: 0.000001
         })
       });
@@ -631,9 +677,15 @@ test.beforeEach(async ({ page }) => {
 
 test('reports service and logged-out state accessibly', async ({ page }, testInfo) => {
   await page.goto('/');
-  await expect(page.getByText('Available')).toBeVisible();
+  // A reachable service says so by reporting its versions, not by wearing a
+  // badge; the badge is reserved for the failure the operator must act on.
   await expect(page.getByText('1.5.0')).toBeVisible();
-  await expect(page.getByText('Logged out')).toBeVisible();
+  await expect(page.getByText('protocol v3')).toBeVisible();
+  await expect(page.locator('#service-value')).toBeHidden();
+  await expect(signedOut(page)).toBeVisible();
+  // `/` is the configuration root now that the System view is gone.
+  await expect(page).toHaveURL(/\/configuration\/$/);
+  await expect(page.getByRole('heading', { name: 'Configuration values' })).toBeVisible();
 
   const accessibility = await new AxeBuilder({ page }).analyze();
   expect(accessibility.violations).toEqual([]);
@@ -667,7 +719,7 @@ test('keyboard login creates an S256 offline request without exposing a verifier
 
 test('callback refreshes an expired access token and rotates the refresh token', async ({ page }) => {
   const requests = await openCallback(page);
-  await expect(page.getByText('Logged in')).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   expect(requests).toHaveLength(2);
   expect(requests[0]).toMatchObject({
     grant_type: 'authorization_code',
@@ -683,18 +735,18 @@ test('callback refreshes an expired access token and rotates the refresh token',
 test('same-page navigation does not discard the in-memory login session', async ({ page }) => {
   await openCallback(page);
   await mockValues(page);
-  await expect(page.getByText('Logged in')).toBeVisible();
-  await page.getByRole('link', { name: 'Configuration values' }).click();
+  await expect(signedIn(page)).toBeVisible();
+  await openView(page, 'Configuration values');
   await expect(page).toHaveURL(/\/configuration\/$/);
   await expect(page.getByRole('heading', { name: 'Configuration values' })).toBeVisible();
-  await page.getByRole('link', { name: 'System status' }).click();
-  await expect(page).toHaveURL(/\/$/);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await openView(page, 'Downloads');
+  await expect(page).toHaveURL(/\/downloads$/);
+  await expect(signedIn(page)).toBeVisible();
 });
 
 test('refresh rejection clears the browser session', async ({ page }) => {
   await openCallback(page, 'rejected');
-  await expect(page.getByText('Logged out')).toBeVisible();
+  await expect(signedOut(page)).toBeVisible();
   await expect(page.getByText('login has expired')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Log in' })).toBeVisible();
   await expect.poll(() => storedRefreshState(page))
@@ -703,14 +755,12 @@ test('refresh rejection clears the browser session', async ({ page }) => {
 
 test('refresh outage does not reuse an expired access token', async ({ page }) => {
   await openCallback(page, 'unavailable');
-  await expect(page.getByText('Unavailable', { exact: true })).toBeVisible();
   await expect(page.getByText('service is unavailable')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Log out' })).toBeVisible();
 });
 
 test('transient refresh HTTP failure preserves the browser session', async ({ page }) => {
   await openCallback(page, 'transient');
-  await expect(page.getByText('Unavailable', { exact: true })).toBeVisible();
   await expect(page.getByText('identity provider is unavailable')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Log out' })).toBeVisible();
   await expect.poll(() => storedRefreshState(page)).toMatchObject({
@@ -721,7 +771,7 @@ test('transient refresh HTTP failure preserves the browser session', async ({ pa
 
 test('absolute refresh expiry clears the browser session without a token request', async ({ page }) => {
   const requests = await openCallback(page, 'success', 'expected-state', 0, true);
-  await expect(page.getByText('Logged out')).toBeVisible();
+  await expect(signedOut(page)).toBeVisible();
   await expect(page.getByText('authentication required')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Log in' })).toBeVisible();
   await expect.poll(() => storedRefreshState(page))
@@ -736,22 +786,52 @@ test('keyboard logout clears the in-memory session and restores focus', async ({
   await expect(logout).toBeVisible();
   await logout.focus();
   await page.keyboard.press('Enter');
-  await expect(page.getByText('Logged out')).toBeVisible();
+  await expect(signedOut(page)).toBeVisible();
   await expect(page.getByRole('button', { name: 'Log in' })).toBeFocused();
 });
 
 test('callback rejects a mismatched state without exchanging the code', async ({ page }) => {
   const requests = await openCallback(page, 'success', 'wrong-state');
-  await expect(page.getByText('Logged out')).toBeVisible();
+  await expect(signedOut(page)).toBeVisible();
   await expect(page.getByText('login response did not match this browser')).toBeVisible();
   expect(requests).toHaveLength(0);
 });
 
+test('the header names the signed-in operator and forgets them on logout', async ({ page }) => {
+  await openCallback(page);
+  const identity = page.locator('#identity-name');
+  await expect(identity).toHaveText('A Vincent');
+  // The name outlives a reload: the refresh token is restored from session
+  // storage, and so is the label that goes with it.
+  await page.reload();
+  await expect(identity).toHaveText('A Vincent');
+
+  await page.getByRole('button', { name: 'Log out' }).click();
+  await expect(signedOut(page)).toBeVisible();
+  await expect(identity).toBeHidden();
+  expect(await page.evaluate(() => sessionStorage.getItem('sovereign-config.identity-name')))
+    .toBeNull();
+});
+
+test('the header falls back through the ID token claims it is given', async ({ page }) => {
+  await openCallback(page, 'success', 'expected-state', 0, false, {
+    sub: 'operator-subject',
+    email: 'operator@example.test'
+  });
+  await expect(page.locator('#identity-name')).toHaveText('operator@example.test');
+});
+
+test('a session without an ID token is labelled by its buttons alone', async ({ page }) => {
+  await openCallback(page, 'success', 'expected-state', 0, false, null);
+  await expect(signedIn(page)).toBeVisible();
+  await expect(page.locator('#identity-name')).toBeHidden();
+});
+
 test('reload restores the session with a rotated refresh token', async ({ page }) => {
   const requests = await openCallback(page);
-  await expect(page.getByText('Logged in')).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await page.reload();
-  await expect(page.getByText('Logged in')).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   expect(requests).toHaveLength(3);
   expect(requests[2]).toMatchObject({
     grant_type: 'refresh_token',
@@ -761,7 +841,7 @@ test('reload restores the session with a rotated refresh token', async ({ page }
 
 test('configuration path is deep-linked, selectable, and restored by browser history', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, {
     '/apps/api/feature-flag': 'enabled',
     '/apps/worker/concurrency': '4'
@@ -789,7 +869,7 @@ test('configuration path is deep-linked, selectable, and restored by browser his
 
 test('path selector refreshes external paths and Enter opens the selected path', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   const values = await mockValues(page, {
     '/apps/api/feature-flag': 'enabled'
   });
@@ -811,7 +891,7 @@ test('path selector refreshes external paths and Enter opens the selected path',
 
 test('path selector autocomplete finds and does not duplicate a mixed-case namespace', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, {
     '/Apps/API/serverIP': '10.0.0.1'
   });
@@ -833,7 +913,7 @@ test('path selector autocomplete finds and does not duplicate a mixed-case names
 test('path selector popup uses the available viewport height', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 900 });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   const initial = Object.fromEntries(
     Array.from({ length: 40 }, (_, index) => [`/services/service-${index + 1}/enabled`, 'true'])
   );
@@ -860,7 +940,7 @@ test('path selector popup uses the available viewport height', async ({ page }) 
 
 test('configuration grid is accessible and contained on desktop and mobile', async ({ page }, testInfo) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, {
     '/apps/api/feature-flag': 'enabled',
     '/apps/api/retry-limit': '5'
@@ -907,7 +987,7 @@ function treeNode(page, path) {
 }
 
 async function openConfiguration(page) {
-  await page.getByRole('link', { name: 'Configuration values' }).click();
+  await openView(page, 'Configuration values');
   await expect(page).toHaveURL(/\/configuration\/$/);
 }
 
@@ -916,7 +996,7 @@ test('the sidebar tree lists every namespace and selects one on a single click',
     connections: [{ name: 'Pipeline reader', root: '/apps/api', permissions: [1] }]
   });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, TREE_VALUES);
   await openConfiguration(page);
 
@@ -984,7 +1064,7 @@ test('the sidebar tree lists every namespace and selects one on a single click',
 
 test('the tree renders a namespace label in the case of its fold-smallest contributing path', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   // "/Zone/alpha/one" and "/zone/beta/two" disagree on "/zone"'s case.
   // "alpha" sorts before "beta" as a fold key, so "/Zone/alpha/one" is the
   // fold-smallest path sharing that ancestor and its case wins the label —
@@ -1007,7 +1087,7 @@ test('the tree renders a namespace label in the case of its fold-smallest contri
 
 test('the grid shows a value under the case it was written with', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, { '/apps/api/serverIP': '10.0.0.1' });
   await page.goto('/configuration/apps/api');
   await expect(page.getByRole('row', { name: /serverIP/ })).toBeVisible();
@@ -1017,7 +1097,7 @@ test('the grid shows a value under the case it was written with', async ({ page 
 
 test('the tree gains a node for a new namespace and loses an emptied one', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, { '/apps/api/enabled': 'true' });
   await openConfiguration(page);
   await expect(treeNode(page, '/apps/worker')).toHaveCount(0);
@@ -1027,10 +1107,10 @@ test('the tree gains a node for a new namespace and loses an emptied one', async
   await page.getByRole('button', { name: 'Add value' }).click();
   await page.getByPlaceholder('value-name').fill('concurrency');
   await page.getByLabel('Value', { exact: true }).fill('4');
-  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await page.locator('#new-value-row').getByRole('button', { name: 'Save new value' }).click();
   await expect(treeNode(page, '/apps/worker')).toHaveCount(1);
 
-  await page.getByRole('button', { name: 'Delete' }).click();
+  await page.getByRole('button', { name: 'Delete concurrency' }).click();
   await page.locator('#confirm-delete').click();
   await expect(treeNode(page, '/apps/worker')).toHaveCount(0);
   await expect(treeNode(page, '/apps/api')).toHaveCount(1);
@@ -1038,7 +1118,7 @@ test('the tree gains a node for a new namespace and loses an emptied one', async
 
 test('leaving a path with an unsaved value is guarded by a confirmation', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, TREE_VALUES);
   await openConfiguration(page);
   await treeNode(page, '/apps/api').click();
@@ -1080,11 +1160,11 @@ test('leaving a path with an unsaved value is guarded by a confirmation', async 
   await treeNode(page, '/apps/api').click();
   await page.getByLabel('Value for enabled').fill('edited-but-unsaved');
 
-  // A nav link out of the view is guarded on the same terms.
-  await page.getByRole('link', { name: 'System status' }).click();
+  // A menu link out of the view is guarded on the same terms.
+  await openView(page, 'Downloads');
   await expect(dialog).toBeVisible();
   await page.locator('#discard-changes').click();
-  await expect(page).toHaveURL(/\/$/);
+  await expect(page).toHaveURL(/\/downloads$/);
 
   // The discarded edit is gone; the stored value is what comes back.
   await openConfiguration(page);
@@ -1096,7 +1176,7 @@ test('leaving a path with an unsaved value is guarded by a confirmation', async 
 
 test('a value with CRLF line endings is not mistaken for an unsaved edit', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, {
     '/apps/api/script': 'line-one\r\nline-two',
     '/apps/worker/concurrency': '4'
@@ -1118,7 +1198,7 @@ test('a value with CRLF line endings is not mistaken for an unsaved edit', async
 
 test('escaping the guard keeps the edit and abandons the route it was holding', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, TREE_VALUES);
   await openConfiguration(page);
   await treeNode(page, '/apps/api').click();
@@ -1144,7 +1224,7 @@ test('escaping the guard keeps the edit and abandons the route it was holding', 
 
 test('a full-page exit is guarded only while an edit is unsaved', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, TREE_VALUES);
   await openConfiguration(page);
   await treeNode(page, '/apps/api').click();
@@ -1167,12 +1247,12 @@ test('a full-page exit is guarded only while an edit is unsaved', async ({ page 
 
 test('a saved edit leaves nothing to guard', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, TREE_VALUES);
   await openConfiguration(page);
   await treeNode(page, '/apps/api').click();
   await page.getByLabel('Value for enabled').fill('false');
-  await page.getByRole('button', { name: 'Save', exact: true }).first().click();
+  await page.getByRole('button', { name: 'Save enabled' }).click();
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
 
   await treeNode(page, '/apps/worker').click();
@@ -1182,7 +1262,7 @@ test('a saved edit leaves nothing to guard', async ({ page }) => {
 
 test('the sidebar is drag resizable and keeps its width across a reload', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, TREE_VALUES);
   await openConfiguration(page);
 
@@ -1211,7 +1291,7 @@ test('the sidebar is drag resizable and keeps its width across a reload', async 
 
 test('a tall sidebar scrolls as a whole rather than lengthening the page', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, Object.fromEntries(
     Array.from({ length: 60 }, (_, index) => [`/services/service-${index + 1}/enabled`, 'true'])
   ));
@@ -1222,21 +1302,21 @@ test('a tall sidebar scrolls as a whole rather than lengthening the page', async
   const sidebar = await page.locator('#sidebar').boundingBox();
   // The sidebar claims the viewport below the header and no more, however many
   // nodes the tree holds.
-  expect(sidebar.y).toBeCloseTo(64, 0);
+  expect(sidebar.y).toBeCloseTo(48, 0);
   expect(sidebar.y + sidebar.height).toBeLessThanOrEqual(viewport + 1);
 
-  // The sidebar scrolls as a whole, so the nav links travel with the tree
-  // rather than staying pinned above it.
+  // The sidebar scrolls as a whole, so the tree's status line travels with the
+  // nodes rather than staying pinned above them.
   const scroller = page.locator('#sidebar-scroll');
   expect(await scroller.evaluate(box => box.scrollHeight > box.clientHeight)).toBe(true);
   expect(await page.locator('#config-tree').evaluate(list => list.scrollHeight <= list.clientHeight))
     .toBe(true);
 
-  const linkBefore = (await page.getByRole('link', { name: 'System status' }).boundingBox()).y;
+  const stateBefore = (await page.locator('#config-tree-state').boundingBox()).y;
   await scroller.evaluate(box => { box.scrollTop = 300; });
   expect(await scroller.evaluate(box => box.scrollTop)).toBeGreaterThan(0);
-  const linkAfter = (await page.getByRole('link', { name: 'System status' }).boundingBox()).y;
-  expect(linkBefore - linkAfter).toBeGreaterThan(200);
+  const stateAfter = (await page.locator('#config-tree-state').boundingBox()).y;
+  expect(stateBefore - stateAfter).toBeGreaterThan(200);
 
   // Scrolling the sidebar moves the sidebar, not the document.
   expect(await page.evaluate(() => window.scrollY)).toBe(0);
@@ -1262,7 +1342,7 @@ test('access URLs are listed and created at the selected tree node', async ({ pa
     connections: [{ id: CONNECTION_ID, name: 'Pipeline reader', root: '/apps/api' }]
   });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, TREE_VALUES);
   await openConfiguration(page);
   await treeNode(page, '/apps/api').click();
@@ -1325,7 +1405,7 @@ test('access URLs are listed and created at the selected tree node', async ({ pa
 test('a path-scoped access URL requires a name and a permission', async ({ page }) => {
   const connections = await mockConnections(page, { connections: [] });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, TREE_VALUES);
   await openConfiguration(page);
   await treeNode(page, '/apps/worker').click();
@@ -1349,7 +1429,7 @@ test('a failed access-URL listing is reported rather than shown as none', async 
     connections: [{ id: CONNECTION_ID, name: 'Pipeline reader', root: '/apps/api' }]
   });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, TREE_VALUES);
   await openConfiguration(page);
   await treeNode(page, '/apps/api').click();
@@ -1376,7 +1456,7 @@ test('a failed access-URL listing is reported rather than shown as none', async 
 
 test('the tree still renders when the estate cannot be read whole', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, TREE_VALUES);
   // A principal scoped to a prefix is refused the root subtree; the namespace
   // list ListValues returns still carries the shape of the tree.
@@ -1395,7 +1475,7 @@ test('the tree still renders when the estate cannot be read whole', async ({ pag
 
 test('logging out empties the sidebar tree', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, TREE_VALUES);
   await openConfiguration(page);
   await expect(page.getByRole('tree').getByRole('treeitem')).toHaveCount(5);
@@ -1407,7 +1487,7 @@ test('logging out empties the sidebar tree', async ({ page }) => {
 
 test('JSON mode reads and replaces subtrees without exposing row deletion', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   const { requests } = await mockValues(page, {
     '/apps/api/enabled': 'true',
     '/apps/api/nested/message': 'hello\nworld',
@@ -1421,7 +1501,7 @@ test('JSON mode reads and replaces subtrees without exposing row deletion', asyn
   await expect(mode).not.toBeChecked();
   await mode.check();
   await expect(page.getByRole('button', { name: 'Add value' })).toBeHidden();
-  await expect(page.getByRole('button', { name: 'Delete' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /^Delete / })).toHaveCount(0);
   const editor = page.getByLabel('JSON subtree');
   await expect(editor).toHaveValue(
     '{\n  "enabled": "true",\n  "nested": {\n    "message": "hello\\nworld"\n  }\n}\n'
@@ -1502,7 +1582,7 @@ test('JSON mode reads and replaces subtrees without exposing row deletion', asyn
 
 test('JSON mode retains rejected edits and reports non-representable stored trees', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   const values = await mockValues(page, {
     '/collision': 'parent',
     '/collision/child': 'child',
@@ -1541,7 +1621,7 @@ test('JSON mode retains rejected edits and reports non-representable stored tree
 test('path and new-value fields validate on every keystroke', async ({ page }) => {
   await openCallback(page);
   await mockValues(page);
-  await page.getByRole('link', { name: 'Configuration values' }).click();
+  await openView(page, 'Configuration values');
   const pathInput = page.getByLabel('Selected path');
 
   await pathInput.fill('apps/unrooted-path');
@@ -1583,7 +1663,7 @@ test('path and new-value fields validate on every keystroke', async ({ page }) =
 
 test('grid adds, edits, and permanently deletes individual values', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   const { requests } = await mockValues(page);
   await page.goto('/configuration/apps/api');
   await expect(page.getByText('No values at this path.')).toBeVisible();
@@ -1594,7 +1674,7 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
   await page.getByRole('button', { name: 'Add value' }).click();
   await page.getByLabel('Name', { exact: true }).fill('Feature-Flag');
   await page.getByLabel('Value', { exact: true }).fill('plain-value-sentinel');
-  await page.locator('#new-value-row').getByRole('button', { name: 'Save' }).click();
+  await page.locator('#new-value-row').getByRole('button', { name: 'Save new value' }).click();
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
   const editor = page.getByLabel('Value for Feature-Flag');
   await expect(editor).toHaveValue('plain-value-sentinel');
@@ -1603,7 +1683,8 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
   expect(put.fields.get(2)).toBe('plain-value-sentinel');
 
   await editor.fill('updated-value-sentinel');
-  await page.getByRole('row', { name: /feature-flag/i }).getByRole('button', { name: 'Save' }).click();
+  await page.getByRole('row', { name: /feature-flag/i })
+    .getByRole('button', { name: 'Save Feature-Flag' }).click();
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
   await expect(page.getByLabel('Value for Feature-Flag')).toHaveValue('updated-value-sentinel');
 
@@ -1621,17 +1702,13 @@ test('grid adds, edits, and permanently deletes individual values', async ({ pag
   await page.getByRole('dialog').getByRole('button', { name: 'Delete' }).click();
   await expect(page.getByText('Deleted', { exact: true })).toBeVisible();
   await expect(page.getByText('No values at this path.')).toBeVisible();
-  // GetSubTree is filtered out: it is the sidebar tree's own whole-estate read,
-  // not part of the grid's mutation sequence.
-  expect(requests.map(request => request.method).filter(method => method !== 'GetSubTree'))
-    .toEqual([
-      'ListValues', 'PutValue', 'ListValues', 'PutValue', 'ListValues', 'DeleteValues', 'ListValues'
-    ]);
+  expect(mutationSequence(requests))
+    .toEqual(['PutValue', 'ListValues', 'PutValue', 'ListValues', 'DeleteValues', 'ListValues']);
 });
 
 test('grid lists every alias path and removes one without deleting the value', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   const { requests } = await mockValues(page, {
     '/apps/api/feature-flag': {
       value: 'aliased-value-sentinel',
@@ -1668,13 +1745,12 @@ test('grid lists every alias path and removes one without deleting the value', a
   await expect(refreshedRow.getByText('/shared/feature-flag', { exact: true })).toBeVisible();
   await expect(refreshedRow.getByText('/apps/api/legacy-flag', { exact: true })).toHaveCount(0);
   await expect(page.getByLabel('Value for feature-flag')).toHaveValue('aliased-value-sentinel');
-  expect(requests.map(request => request.method).filter(method => method !== 'GetSubTree'))
-    .toEqual(['ListValues', 'DeleteValues', 'ListValues']);
+  expect(mutationSequence(requests)).toEqual(['DeleteValues', 'ListValues']);
 });
 
 test('grid adds another path to an existing value', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   const { requests } = await mockValues(page, {
     '/apps/api/feature-flag': { value: 'aliased-value-sentinel' }
   });
@@ -1717,13 +1793,12 @@ test('grid adds another path to an existing value', async ({ page }) => {
   await expect(page.getByLabel('Value for feature-flag')).toHaveValue('aliased-value-sentinel');
   // The sidebar tree's own whole-estate read is a separate concern; what
   // matters here is that the flow performed exactly one aliasing mutation.
-  expect(requests.map(request => request.method).filter(method => method !== 'GetSubTree'))
-    .toEqual(['ListValues', 'AddValuePath', 'ListValues']);
+  expect(mutationSequence(requests)).toEqual(['AddValuePath', 'ListValues']);
 });
 
 test('a second add-path activation while the request is in flight is ignored', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   const values = await mockValues(page, {
     '/apps/api/feature-flag': { value: 'aliased-value-sentinel' }
   });
@@ -1757,7 +1832,7 @@ test('a second add-path activation while the request is in flight is ignored', a
 // leave which one survives decided by sort order.
 test('sibling paths of one value each keep their own grid row', async ({ page }) => {
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await mockValues(page, {
     '/apps/api/feature-flag': {
       value: 'shared-value-sentinel',
@@ -1800,39 +1875,40 @@ test('secret values stay masked, rotate explicitly, and survive JSON edits', asy
   page.on('pageerror', error => pageErrors.push(error.message));
 
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   const values = await mockValues(page, {
     '/apps/api/api-token': { value: originalSecret, secret: true },
     '/apps/api/enabled': 'true'
   });
   await page.goto('/configuration/apps/api');
 
+  // A secret is one padlocked box: redacted and empty until the lock is
+  // opened, and the same box a replacement is typed into.
   const row = page.getByRole('row', { name: /api-token/ });
-  await expect(row.getByText('Secret', { exact: true })).toBeVisible();
-  await expect(row.getByLabel('Secret value for api-token is hidden')).toHaveText('********');
+  const secret = page.getByLabel('Secret value for api-token');
+  await expect(secret).toHaveAttribute('type', 'password');
+  await expect(secret).toHaveAttribute('placeholder', '********');
+  await expect(secret).toHaveValue('');
   await expect(page.locator('body')).not.toContainText(originalSecret);
 
-  const reveal = row.locator('button[aria-controls^="revealed-secret-"]');
-  await reveal.focus();
+  const padlock = row.getByRole('button', { name: 'Reveal secret for api-token' });
+  await padlock.focus();
   await page.keyboard.press('Enter');
-  const revealed = page.getByLabel('Revealed secret for api-token');
-  await expect(revealed).toHaveValue(originalSecret);
-  await expect(revealed).toHaveAttribute('readonly', '');
-  await expect(reveal).toHaveAttribute('aria-expanded', 'true');
-  await reveal.focus();
-  await page.keyboard.press('Enter');
-  await expect(revealed).toBeHidden();
-  await expect(revealed).toHaveValue('');
+  await expect(secret).toHaveValue(originalSecret);
+  await expect(secret).toHaveAttribute('type', 'text');
+  const opened = row.getByRole('button', { name: 'Hide secret for api-token' });
+  await expect(opened).toHaveAttribute('aria-pressed', 'true');
 
-  const replacement = page.getByLabel('Replacement secret for api-token');
-  const showReplacement = row.getByRole('button', { name: 'Show input' });
-  await showReplacement.focus();
+  // Shutting the lock discards the plaintext rather than merely re-masking it.
+  await opened.focus();
   await page.keyboard.press('Enter');
-  await expect(replacement).toHaveAttribute('type', 'text');
-  await page.keyboard.press('Enter');
-  await expect(replacement).toHaveAttribute('type', 'password');
-  await replacement.fill(rotatedSecret);
-  await row.getByRole('button', { name: 'Replace' }).click();
+  await expect(secret).toHaveValue('');
+  await expect(secret).toHaveAttribute('type', 'password');
+  await expect(page.locator('body')).not.toContainText(originalSecret);
+
+  // Writing a replacement needs no reveal: the locked box takes it directly.
+  await secret.fill(rotatedSecret);
+  await row.getByRole('button', { name: 'Save api-token' }).click();
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
   expect(values.getValue('/apps/api/api-token')).toEqual({ value: rotatedSecret, secret: true });
   await expect(page.locator('body')).not.toContainText(rotatedSecret);
@@ -1845,8 +1921,15 @@ test('secret values stay masked, rotate explicitly, and survive JSON edits', asy
   await page.getByLabel('Store as secret').check();
   const newSecret = page.getByLabel('Secret value', { exact: true });
   await expect(newSecret).toHaveAttribute('type', 'password');
+  // The new-value row's padlock only unmasks what is being typed — there is no
+  // stored secret behind it to fetch.
+  const newPadlock = page.getByRole('button', { name: 'Show the secret being typed' });
+  await newPadlock.click();
+  await expect(newSecret).toHaveAttribute('type', 'text');
+  await page.getByRole('button', { name: 'Hide the secret being typed' }).click();
+  await expect(newSecret).toHaveAttribute('type', 'password');
   await newSecret.fill(addedSecret);
-  await page.locator('#new-value-row').getByRole('button', { name: 'Save' }).click();
+  await page.locator('#new-value-row').getByRole('button', { name: 'Save new value' }).click();
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
   expect(values.getValue('/apps/api/Signing-Key')).toEqual({ value: addedSecret, secret: true });
   await expect(page.locator('body')).not.toContainText(addedSecret);
@@ -1869,8 +1952,8 @@ test('secret values stay masked, rotate explicitly, and survive JSON edits', asy
 
   await mode.uncheck();
   const refreshedRow = page.getByRole('row', { name: /api-token/ });
-  await refreshedRow.getByRole('button', { name: 'Reveal' }).click();
-  await expect(page.getByLabel('Revealed secret for api-token')).toHaveValue(rotatedSecret);
+  await refreshedRow.getByRole('button', { name: 'Reveal secret for api-token' }).click();
+  await expect(page.getByLabel('Secret value for api-token')).toHaveValue(rotatedSecret);
 
   const failedPut = '**/sovereign.config.v3.Configuration/PutValue';
   await page.route(failedPut, route => route.fulfill({
@@ -1881,26 +1964,26 @@ test('secret values stay masked, rotate explicitly, and survive JSON edits', asy
   await page.getByRole('button', { name: 'Add value' }).click();
   await page.getByLabel('Name', { exact: true }).fill('failed-value');
   await page.getByLabel('Value', { exact: true }).fill('never-stored');
-  await page.locator('#new-value-row').getByRole('button', { name: 'Save' }).click();
+  await page.locator('#new-value-row').getByRole('button', { name: 'Save new value' }).click();
   await expect(page.getByText('permission denied', { exact: true })).toBeVisible();
-  await expect(page.getByLabel('Revealed secret for api-token')).toBeHidden();
-  await expect(page.getByLabel('Revealed secret for api-token')).toHaveValue('');
+  // Any error shuts every padlock on the page.
+  await expect(page.getByLabel('Secret value for api-token')).toHaveValue('');
+  await expect(page.getByLabel('Secret value for api-token')).toHaveAttribute('type', 'password');
   await page.unroute(failedPut);
-  await page.locator('#new-value-row').getByRole('button', { name: 'Cancel' }).click();
+  await page.locator('#new-value-row').getByRole('button', { name: 'Cancel new value' }).click();
 
-  await refreshedRow.getByRole('button', { name: 'Reveal' }).click();
-  await expect(page.getByLabel('Revealed secret for api-token')).toHaveValue(rotatedSecret);
+  await refreshedRow.getByRole('button', { name: 'Reveal secret for api-token' }).click();
+  await expect(page.getByLabel('Secret value for api-token')).toHaveValue(rotatedSecret);
   await page.reload();
   await expect(page.getByRole('row', { name: /api-token/ })).toBeVisible();
-  await expect(page.getByLabel('Revealed secret for api-token')).toBeHidden();
-  await expect(page.getByLabel('Revealed secret for api-token')).toHaveValue('');
+  await expect(page.getByLabel('Secret value for api-token')).toHaveValue('');
   await expect(page.locator('body')).not.toContainText(rotatedSecret);
 
   await page.getByRole('button', { name: 'Add value' }).click();
   await page.getByLabel('Name', { exact: true }).fill('unsubmitted-secret');
   await page.getByLabel('Store as secret').check();
   await page.getByLabel('Secret value', { exact: true }).fill(unsubmittedSecret);
-  await page.getByRole('link', { name: 'System status' }).click();
+  await openView(page, 'Downloads');
   // An unsubmitted secret is an unsaved value, so leaving now asks first.
   await page.locator('#discard-changes').click();
   await expect(page.locator('body')).not.toContainText(unsubmittedSecret);
@@ -1909,10 +1992,11 @@ test('secret values stay masked, rotate explicitly, and survive JSON edits', asy
   await page.getByRole('button', { name: 'Add value' }).click();
   await page.getByLabel('Store as secret').check();
   await expect(page.getByLabel('Secret value', { exact: true })).toHaveValue('');
-  await page.locator('#new-value-row').getByRole('button', { name: 'Cancel' }).click();
+  await page.locator('#new-value-row').getByRole('button', { name: 'Cancel new value' }).click();
 
-  await page.getByRole('row', { name: /api-token/ }).getByRole('button', { name: 'Reveal' }).click();
-  await expect(page.getByLabel('Revealed secret for api-token')).toHaveValue(rotatedSecret);
+  await page.getByRole('row', { name: /api-token/ })
+    .getByRole('button', { name: 'Reveal secret for api-token' }).click();
+  await expect(page.getByLabel('Secret value for api-token')).toHaveValue(rotatedSecret);
   await page.getByRole('button', { name: 'Log out' }).click();
   await expect(page.getByRole('button', { name: 'Log in' })).toBeVisible();
   await expect(page.locator('body')).not.toContainText(rotatedSecret);
@@ -1933,7 +2017,7 @@ test('delayed secret reveals are discarded after configuration navigation', asyn
   const oldSecret = 'old-path-secret-sentinel';
   const newSecret = 'new-path-secret-sentinel';
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   const values = await mockValues(page, {
     '/apps/api/api-token': { value: oldSecret, secret: true },
     '/apps/worker/worker-token': { value: newSecret, secret: true }
@@ -1944,7 +2028,8 @@ test('delayed secret reveals are discarded after configuration navigation', asyn
   const revealResponse = page.waitForResponse(
     '**/sovereign.config.v3.Configuration/RevealSecret'
   );
-  await page.getByRole('row', { name: /api-token/ }).getByRole('button', { name: 'Reveal' }).click();
+  await page.getByRole('row', { name: /api-token/ })
+    .getByRole('button', { name: 'Reveal secret for api-token' }).click();
 
   const pathInput = page.getByLabel('Selected path');
   await pathInput.fill('/apps/worker');
@@ -1954,8 +2039,10 @@ test('delayed secret reveals are discarded after configuration navigation', asyn
 
   releaseReveal();
   await revealResponse;
-  await expect(page.getByLabel('Revealed secret for worker-token')).toBeHidden();
-  await expect(page.getByLabel('Revealed secret for worker-token')).toHaveValue('');
+  // The reply belongs to a path the operator has already left, so it is
+  // dropped rather than poured into whichever field now sits in that row.
+  await expect(page.getByLabel('Secret value for worker-token')).toHaveValue('');
+  await expect(page.getByLabel('Secret value for worker-token')).toHaveAttribute('type', 'password');
   await expect(page.locator('body')).not.toContainText(oldSecret);
 });
 
@@ -1971,11 +2058,11 @@ test('trailers-only save errors retain their bounded gRPC status', async ({ page
     body: Buffer.alloc(0)
   }));
 
-  await page.getByRole('link', { name: 'Configuration values' }).click();
+  await openView(page, 'Configuration values');
   await page.getByRole('button', { name: 'Add value' }).click();
   await page.getByLabel('Name', { exact: true }).fill('foo');
   await page.getByLabel('Value', { exact: true }).fill('bar');
-  await page.getByRole('button', { name: 'Save' }).click();
+  await page.locator('#new-value-row').getByRole('button', { name: 'Save new value' }).click();
   await expect(page.getByText('permission denied', { exact: true })).toBeVisible();
 });
 
@@ -1983,17 +2070,19 @@ for (const contract of transportContract) {
   test(`browser transport maps gRPC status ${contract.grpc_status}`, async ({ page }) => {
     const requests = await openCallback(page, 'success', 'expected-state', contract.grpc_status);
     if (contract.grpc_status === 0) {
-      await expect(page.getByText('Logged in')).toBeVisible();
+      await expect(signedIn(page)).toBeVisible();
       return;
     }
     await expect(page.getByText(contract.message, { exact: true })).toBeVisible();
-    const authentication = contract.grpc_status === 16 ? 'Logged out' : 'Unavailable';
-    await expect(page.getByText(authentication, { exact: true })).toBeVisible();
+    // Only an Unauthenticated answer ends the session; every other failure is
+    // the service's, so Log out stays on offer.
+    const session = contract.grpc_status === 16 ? signedOut(page) : signedIn(page);
+    await expect(session).toBeVisible();
     if (contract.grpc_status === 16) {
       await expect.poll(() => storedRefreshState(page))
         .toEqual({ token: null, endpoint: null, expiry: null });
       await page.reload();
-      await expect(page.getByText('Logged out')).toBeVisible();
+      await expect(signedOut(page)).toBeVisible();
       expect(requests).toHaveLength(2);
     }
   });
@@ -2007,7 +2096,7 @@ test('managed connections list only manageable roots and are accessible', async 
     ]
   });
   await openCallback(page);
-  await page.getByRole('link', { name: 'Access URLs' }).click();
+  await openView(page, 'Access URLs');
 
   await expect(page.locator('#connection-count')).toHaveText('2 connections');
   await expect(page.getByRole('rowheader', { name: 'Pipeline reader' })).toBeVisible();
@@ -2025,7 +2114,7 @@ test('managed connections list only manageable roots and are accessible', async 
 test('creating a connection confirms the exact root and reveals the URL once', async ({ page }) => {
   const connections = await mockConnections(page, { connections: [] });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await page.goto('/connections/');
 
   await page.getByLabel('Display name').fill('Pipeline reader');
@@ -2075,7 +2164,7 @@ test('creating a connection confirms the exact root and reveals the URL once', a
 test('the one-time connection URL is discarded and never persisted', async ({ page }) => {
   await mockConnections(page, { connections: [] });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await page.goto('/connections/');
   await page.getByLabel('Display name').fill('Pipeline reader');
   await page.getByLabel('Root').fill('/apps/api');
@@ -2124,7 +2213,7 @@ test('the one-time connection URL is discarded and never persisted', async ({ pa
 test('rotation and revocation confirm destructively and discard secrets', async ({ page }) => {
   const connections = await mockConnections(page);
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await page.goto('/connections/');
 
   await page.getByRole('button', { name: 'Rotate credential for Pipeline reader' }).click();
@@ -2159,7 +2248,7 @@ test('rotation and revocation confirm destructively and discard secrets', async 
 test('cancelling a confirmation restores focus and performs no operation', async ({ page }) => {
   const connections = await mockConnections(page);
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await page.goto('/connections/');
 
   await page.getByRole('button', { name: 'Rotate credential for Pipeline reader' }).click();
@@ -2174,7 +2263,7 @@ test('cancelling a confirmation restores focus and performs no operation', async
 test('ambiguous rotation reports a bounded error and returns no URL', async ({ page }) => {
   await mockConnections(page, { script: { RotateManagedConnection: 14 } });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await page.goto('/connections/');
 
   await page.getByRole('button', { name: 'Rotate credential for Pipeline reader' }).click();
@@ -2191,7 +2280,7 @@ test('ambiguous rotation reports a bounded error and returns no URL', async ({ p
 test('a conflicting rotation reports the bounded in-progress error', async ({ page }) => {
   await mockConnections(page, { script: { RotateManagedConnection: 10 } });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await page.goto('/connections/');
 
   await page.getByRole('button', { name: 'Rotate credential for Pipeline reader' }).click();
@@ -2204,7 +2293,7 @@ test('a conflicting rotation reports the bounded in-progress error', async ({ pa
 test('connection inputs validate before any confirmation opens', async ({ page }) => {
   const connections = await mockConnections(page, { connections: [] });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await page.goto('/connections/');
 
   await page.getByLabel('Display name').fill('');
@@ -2227,7 +2316,7 @@ test('connection inputs validate before any confirmation opens', async ({ page }
 test('creating an access URL requires at least one permission', async ({ page }) => {
   const connections = await mockConnections(page, { connections: [] });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await page.goto('/connections/');
 
   await page.getByLabel('Display name').fill('Pipeline reader');
@@ -2259,18 +2348,22 @@ test('the access URLs view is renamed and lists granted permissions', async ({ p
     connections: [{ name: 'Pipeline reader', root: '/apps/api', permissions: [1, 2, 3] }]
   });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await page.goto('/connections/');
 
-  await expect(page.getByRole('link', { name: 'Access URLs' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Access URLs' })).toBeVisible();
+  // The menu marks the view the operator is already on.
+  await page.getByRole('button', { name: 'Sovereign Config' }).click();
+  const link = page.getByRole('link', { name: 'Access URLs', exact: true });
+  await expect(link).toBeVisible();
+  await expect(link).toHaveClass('active');
   await expect(page.getByRole('cell', { name: 'Read, Write, Manage', exact: true })).toBeVisible();
 });
 
 test('logout discards a revealed connection URL and clears the view', async ({ page }) => {
   await mockConnections(page, { connections: [] });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await page.goto('/connections/');
   await page.getByLabel('Display name').fill('Pipeline reader');
   await page.getByLabel('Root').fill('/apps/api');
@@ -2295,7 +2388,7 @@ test('logout discards a revealed connection URL and clears the view', async ({ p
 test('a logout while create is still reloading connections suppresses the URL dialog', async ({ page }) => {
   const connections = await mockConnections(page, { connections: [] });
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await page.goto('/connections/');
   await expect(page.locator('#connection-count')).toHaveText('0 connections');
 
@@ -2322,7 +2415,7 @@ test('the Authentik administration endpoint is absent from browser assets', asyn
   page.on('response', response => responses.push(response));
   await mockConnections(page);
   await openCallback(page);
-  await expect(page.getByText('Logged in', { exact: true })).toBeVisible();
+  await expect(signedIn(page)).toBeVisible();
   await page.goto('/connections/');
   await expect(page.locator('#connection-count')).toHaveText('1 connection');
 
@@ -2355,7 +2448,7 @@ test('downloads page lists the published installer with a run command', async ({
     { file: INSTALLER, checksum: `${INSTALLER}.sha256`, size: 2921310 }
   ]);
   await page.goto('/');
-  await page.getByRole('link', { name: 'Downloads' }).click();
+  await openView(page, 'Downloads');
   await expect(page).toHaveURL(/\/downloads$/);
   await expect(page.getByRole('heading', { name: 'Downloads', level: 1 })).toBeVisible();
 
@@ -2378,6 +2471,6 @@ test('downloads page shows an empty state when no installers are published', asy
   await mockApplication(page);
   await mockManifest(page, []);
   await page.goto('/');
-  await page.getByRole('link', { name: 'Downloads' }).click();
+  await openView(page, 'Downloads');
   await expect(page.getByText('No installers are published by this server.')).toBeVisible();
 });
