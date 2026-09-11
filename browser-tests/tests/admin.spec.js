@@ -677,10 +677,12 @@ test.beforeEach(async ({ page }) => {
 
 test('reports service and logged-out state accessibly', async ({ page }, testInfo) => {
   await page.goto('/');
-  // A reachable service says so by reporting its versions, not by wearing a
+  // A reachable service says so by reporting its version, not by wearing a
   // badge; the badge is reserved for the failure the operator must act on.
-  await expect(page.getByText('1.5.0')).toBeVisible();
-  await expect(page.getByText('protocol v3')).toBeVisible();
+  await expect(page.locator('#version-value')).toHaveText('1.5.0');
+  // The protocol version is a client-compatibility concern, not an operator's:
+  // the service still reports it, and the header deliberately does not.
+  await expect(page.locator('header').getByText(/protocol/i)).toHaveCount(0);
   await expect(page.locator('#service-value')).toBeHidden();
   await expect(signedOut(page)).toBeVisible();
   // `/` is the configuration root now that the System view is gone.
@@ -713,7 +715,10 @@ test('keyboard login creates an S256 offline request without exposing a verifier
   expect(url.searchParams.get('code_challenge_method')).toBe('S256');
   expect(url.searchParams.get('code_challenge')).toBeTruthy();
   expect(url.searchParams.get('state')).toBeTruthy();
-  expect(url.searchParams.get('scope')).toBe('openid sovereign-config offline_access');
+  // `profile` is requested so the ID token carries a claim a person recognises;
+  // without it the provider releases only its hashed `sub`.
+  expect(url.searchParams.get('scope'))
+    .toBe('openid profile sovereign-config offline_access');
   expect(url.searchParams.has('code_verifier')).toBe(false);
 });
 
@@ -819,6 +824,14 @@ test('the header falls back through the ID token claims it is given', async ({ p
     email: 'operator@example.test'
   });
   await expect(page.locator('#identity-name')).toHaveText('operator@example.test');
+});
+
+test('the header stays unlabelled rather than showing an opaque subject', async ({ page }) => {
+  // `sub` is hashed by the provider, so it names nobody. An unlabelled header
+  // says more about the session than 64 characters of hex would.
+  await openCallback(page, 'success', 'expected-state', 0, false, { sub: 'operator-subject' });
+  await expect(signedIn(page)).toBeVisible();
+  await expect(page.locator('#identity-name')).toBeHidden();
 });
 
 test('a session without an ID token is labelled by its buttons alone', async ({ page }) => {
@@ -990,6 +1003,43 @@ async function openConfiguration(page) {
   await openView(page, 'Configuration values');
   await expect(page).toHaveURL(/\/configuration\/$/);
 }
+
+test('the sidebar tree draws unbroken ancestry guides', async ({ page }) => {
+  await openCallback(page);
+  await expect(signedIn(page)).toBeVisible();
+  await mockValues(page, TREE_VALUES);
+  await openConfiguration(page);
+  await expect(treeNode(page, '/apps/api/nested')).toHaveCount(1);
+
+  // One guide cell per level of depth, each classed by the rule it draws.
+  const classes = await page.evaluate(() => Object.fromEntries(
+    ['/', '/apps', '/apps/api', '/apps/api/nested', '/apps/worker'].map(path => [
+      path,
+      [...document.querySelectorAll(`#config-tree [data-path="${path}"] .tree-guide`)]
+        .map(guide => guide.className)
+    ])
+  ));
+  expect(classes).toEqual({
+    '/': [],
+    '/apps': ['tree-guide corner'],
+    '/apps/api': ['tree-guide', 'tree-guide branch'],
+    '/apps/api/nested': ['tree-guide', 'tree-guide trunk', 'tree-guide corner'],
+    '/apps/worker': ['tree-guide', 'tree-guide corner']
+  });
+
+  // The regression this guards: box-drawing glyphs only paint inside their own
+  // line box, so a trunk assembled from them broke at every row boundary. The
+  // rules are pinned to the full height of their cell, so a trunk continuing
+  // from one row into the next must leave no gap at all between the two.
+  const [above, below] = await page.evaluate(() => ['/apps/api', '/apps/api/nested']
+    .map(path => document
+      .querySelectorAll(`#config-tree [data-path="${path}"] .tree-guide`)[1]
+      .getBoundingClientRect())
+    .map(({ top, bottom, left, height }) => ({ top, bottom, left, height })));
+  expect(below.top).toBeCloseTo(above.bottom, 1);
+  expect(below.left).toBeCloseTo(above.left, 1);
+  expect(above.height).toBeGreaterThan(0);
+});
 
 test('the sidebar tree lists every namespace and selects one on a single click', async ({ page }) => {
   await mockConnections(page, {

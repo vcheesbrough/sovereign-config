@@ -1,22 +1,25 @@
-/* Design system — navy surfaces, indigo accent, amber highlights, shared with
-   the bored board UI. Two tokens depart from bored's, both to clear WCAG AA:
-   the indigo accent is darkened either side of bored's #6366f1, which carries
-   white text at only 4.46:1, and the muted text is lightened from #6fa8db,
-   which reaches only 4.48:1 on --surface-2, the input fill. Everything else is
-   bored's palette unchanged. */
+/* Design system — dark-green surfaces, teal accent, amber highlights. The
+   greens step from near-black at the page background to a lit surface for
+   selection, so depth reads without any surface needing a border to be legible.
+   Teal is the analogous accent — the one interactive hue that stays distinct
+   from the green scaffolding — and amber, opposite green on the wheel, is the
+   single warm highlight reserved for headings, selection and focus. Every pair
+   the UI actually renders clears WCAG AA: body and muted text at 4.5:1 on every
+   surface they sit on, and borders and filled controls at 3:1 against the
+   surface behind them. */
 :root {
   color-scheme: dark;
-  --bg:          #002145;
-  --surface:     #002d5e;
-  --surface-2:   #003878;
-  --surface-3:   #004590;
-  --border:      #1a5299;
-  --border-soft: #0d3a76;
-  --text:        #e8f3ff;
-  --text-muted:  #8fbfe8;
-  --accent:      #4f46e5;
-  --accent-hover:#4338ca;
-  --accent-text: #a5b4fc;
+  --bg:          #04211a;
+  --surface:     #0a2e24;
+  --surface-2:   #0f3b2d;
+  --surface-3:   #175a45;
+  --border:      #23906d;
+  --border-soft: #14503d;
+  --text:        #e8f5ef;
+  --text-muted:  #8fd0b4;
+  --accent:      #0a8476;
+  --accent-hover:#0b6f63;
+  --accent-text: #5eead4;
   --yellow:      #fbbf24;
   --danger:      #b91c1c;
   --danger-hover:#991b1b;
@@ -88,7 +91,7 @@ header {
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 10px 24px rgb(0 10 24 / 55%);
+  box-shadow: 0 10px 24px rgb(1 12 8 / 55%);
 }
 .brand-menu-panel a {
   display: block;
@@ -103,9 +106,8 @@ header {
 
 .session-actions { display: flex; align-items: center; gap: 12px; min-width: 0; font-size: 12px; }
 .identity-name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 22ch; }
-/* Version watermark, as in bored's navbar: present but deliberately quiet. */
+/* Application-version watermark: present but deliberately quiet. */
 .watermark { color: var(--text-muted); font-size: 11px; white-space: nowrap; user-select: none; }
-.watermark-separator { padding: 0 4px; opacity: .5; }
 .service-state { padding: 3px 8px; color: var(--danger-text); background: rgb(185 28 28 / 25%); border-radius: 999px; font-size: 11px; white-space: nowrap; }
 
 /* ── Layout ─────────────────────────────────────── */
@@ -137,8 +139,10 @@ header {
 .tree-panel .status-text { margin: 0 0 10px; padding: 0 4px; font-family: var(--mono); font-size: 11px; color: var(--text-muted); }
 
 /* ── Configuration tree ─────────────────────────── */
-/* Nodes draw their own ancestry with box-drawing characters, so the list needs
-   no indent of its own and every row starts at the same left edge. */
+/* Nodes draw their own ancestry, so the list needs no indent of its own and
+   every row starts at the same left edge. Rows carry no vertical padding: a
+   guide can only stretch to its row's content box, so any padding here would
+   part every trunk by twice its height at each row boundary. */
 .config-tree { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 12px; }
 .tree-node {
   display: flex;
@@ -146,7 +150,7 @@ header {
   gap: 5px;
   width: 100%;
   min-height: 24px;
-  padding: 2px 6px;
+  padding: 0 6px;
   color: var(--text-muted);
   background: none;
   border: 0;
@@ -160,9 +164,41 @@ header {
 .tree-node.has-values { color: var(--text); font-weight: 700; }
 .tree-node.selected { color: var(--yellow); background: var(--surface-3); }
 /* The guides are decoration: the tree's shape is already exposed through
-   `aria-level`, so they stay out of the accessibility tree. */
-.tree-prefix { flex: 0 0 auto; color: var(--border); letter-spacing: 0; user-select: none; white-space: pre; }
-.tree-node.selected .tree-prefix { color: var(--text-muted); }
+   `aria-level`, so they stay out of the accessibility tree.
+
+   They are ruled by CSS rather than written as box-drawing characters. A glyph
+   paints only within its own line box, so a `│` column leaves a gap at every
+   row boundary equal to the row's leading — the clunky, font-dependent seam
+   these replace. An absolutely positioned rule pinned `top: 0; bottom: 0`
+   spans the whole row instead, so consecutive trunks meet exactly. */
+.tree-guides { flex: 0 0 auto; align-self: stretch; display: flex; }
+.tree-guide { position: relative; flex: 0 0 auto; width: 14px; }
+.tree-guide.trunk::before,
+.tree-guide.branch::before,
+.tree-guide.corner::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 6px;
+  width: 1px;
+  background: var(--border);
+}
+/* A trunk and a branch both carry on past this row; a corner is the last child,
+   and its trunk stops dead at the elbow. */
+.tree-guide.trunk::before, .tree-guide.branch::before { bottom: 0; }
+.tree-guide.corner::before { height: 50%; }
+/* The elbow out towards the label, meeting the vertical rule at mid-row. */
+.tree-guide.branch::after,
+.tree-guide.corner::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: 0;
+  left: 6px;
+  height: 1px;
+  background: var(--border);
+}
+.tree-node.selected .tree-guide::before, .tree-node.selected .tree-guide::after { background: var(--text-muted); }
 .tree-key { flex: 0 0 auto; width: 12px; height: 12px; color: var(--yellow); }
 .tree-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
@@ -255,7 +291,7 @@ label { display: block; margin-bottom: 6px; font-size: 13px; font-weight: 600; }
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 10px 24px rgb(0 10 24 / 55%);
+  box-shadow: 0 10px 24px rgb(1 12 8 / 55%);
 }
 .path-options.above { top: auto; bottom: calc(100% + 4px); }
 .path-option { min-height: 34px; padding: 8px 10px; font-family: var(--mono); font-size: 12px; cursor: pointer; overflow-wrap: anywhere; }
@@ -339,7 +375,7 @@ dialog {
   border-radius: var(--radius);
 }
 #connection-url-dialog { width: min(720px, calc(100% - 32px)); }
-dialog::backdrop { background: rgb(0 10 24 / 70%); }
+dialog::backdrop { background: rgb(1 12 8 / 70%); }
 dialog h2 { color: var(--yellow); font-family: var(--mono); }
 dialog p { margin: 12px 0 20px; line-height: 1.5; }
 dialog code { font-family: var(--mono); overflow-wrap: anywhere; }
