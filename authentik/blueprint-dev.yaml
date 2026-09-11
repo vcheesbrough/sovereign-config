@@ -79,10 +79,14 @@ entries:
       property_mappings:
         - !Find [authentik_providers_oauth2.scopemapping, [scope_name, openid]]
         # The browser UI names the signed-in operator in its header. `sub` is
-        # issued hashed here (see sub_mode below), so `profile` is the only
-        # source of a claim a person recognises. It labels the header and
-        # nothing else: authorization runs on the grants mapping alone.
+        # issued hashed here (see sub_mode below), so `profile` (name,
+        # preferred_username) and `email` are the only sources of a claim a
+        # person recognises — `email` is a separate scope from `profile` in
+        # Authentik's default mappings, so both are attached. Neither labels
+        # anything but the header: authorization runs on the grants mapping
+        # alone.
         - !Find [authentik_providers_oauth2.scopemapping, [scope_name, profile]]
+        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, email]]
         - !Find [authentik_providers_oauth2.scopemapping, [scope_name, offline_access]]
         - !Find [authentik_providers_oauth2.scopemapping, [name, sovereign-config development grants]]
       jwt_federation_providers:
