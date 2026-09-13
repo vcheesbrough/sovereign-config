@@ -89,6 +89,44 @@ else
   pass "cache one MiB over the ceiling is wiped"
 fi
 
+# --- an unmeasurable cache is kept, not a build failure ----------------------
+# Stubbing du is the only portable way to force this: CI runs as root, so no
+# permission trick makes a real du fail. The branch matters because du exits
+# non-zero for any path it cannot stat, including a file a concurrent pipeline
+# deleted under its walk.
+stub_bin="$work/stub-bin"
+mkdir -p "$stub_bin"
+
+target="$work/unmeasurable"
+mkdir -p "$target"
+make_filler "$target/filler"
+
+printf '#!/bin/sh\nexit 1\n' > "$stub_bin/du"
+chmod +x "$stub_bin/du"
+
+if PATH="$stub_bin:$PATH" CI_CARGO_TARGET_MAX_MIB=1 "$prune" "$target" >/dev/null 2>&1; then
+  if [ -f "$target/filler" ]; then
+    pass "a failing du keeps the cache and exits 0"
+  else
+    fail "a failing du wiped the cache"
+  fi
+else
+  fail "a failing du should not fail the build"
+fi
+
+printf '#!/bin/sh\necho "du: cannot read"\n' > "$stub_bin/du"
+chmod +x "$stub_bin/du"
+
+if PATH="$stub_bin:$PATH" CI_CARGO_TARGET_MAX_MIB=1 "$prune" "$target" >/dev/null 2>&1; then
+  if [ -f "$target/filler" ]; then
+    pass "an unparseable du measurement keeps the cache and exits 0"
+  else
+    fail "an unparseable du measurement wiped the cache"
+  fi
+else
+  fail "an unparseable du measurement should not fail the build"
+fi
+
 # --- missing target directory: a no-op, not an error -------------------------
 if CI_CARGO_TARGET_MAX_MIB=1 "$prune" "$work/never-created" >/dev/null; then
   pass "a missing target directory is a no-op"
