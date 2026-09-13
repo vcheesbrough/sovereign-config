@@ -18,13 +18,29 @@ pass() {
   echo "ok: $1"
 }
 
-# 1 MiB of incompressible-enough filler; two of these exceed a 1 MiB ceiling.
+# 1 MiB of filler; two of these exceed a 1 MiB ceiling.
+#
+# Random rather than zeroes: a zero-filled file costs almost nothing on a
+# filesystem with transparent compression (ZFS with lz4, btrfs with compress=),
+# so `du` would report a few KiB and every size assertion below would collapse
+# on a developer machine or a CI agent whose Docker storage is on one of those.
+#
+# Backdated because the script defers a wipe when the cache has been written to
+# in the last CI_CARGO_TARGET_IDLE_MIN minutes; freshly created filler would
+# look like a concurrent build to every wipe-path test. Tests that want that
+# behaviour make a fresh file on purpose.
 make_filler() {
-  dd if=/dev/zero of="$1" bs=1024 count=1024 status=none
+  head -c 1048576 /dev/urandom > "$1"
+  touch -t 202001010000 "$1"
 }
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+
+# Stubs shadow a real command on PATH for one invocation, to force failures no
+# permission trick can produce as root.
+stub_bin="$work/stub-bin"
+mkdir -p "$stub_bin"
 
 # --- under the ceiling: the cache survives -----------------------------------
 target="$work/under"
@@ -48,6 +64,7 @@ make_filler "$target/debug/deps/libbaz.rlib"
 # Cargo writes dotfiles at the top level (.rustc_info.json); they must go too,
 # or the "wiped" cache still pins stale toolchain state.
 printf 'stale\n' > "$target/.rustc_info.json"
+touch -t 202001010000 "$target/.rustc_info.json"
 
 CI_CARGO_TARGET_MAX_MIB=1 "$prune" "$target" >/dev/null
 
@@ -89,14 +106,75 @@ else
   pass "cache one MiB over the ceiling is wiped"
 fi
 
+# --- a cache another pipeline is still writing to is not wiped ---------------
+# The wipe does not coordinate with cargo's build locks, so emptying the
+# directory under a concurrent pipeline would fail that pipeline. A recent write
+# is the signal, since the prune runs before this step builds anything.
+target="$work/busy"
+mkdir -p "$target/debug/deps"
+make_filler "$target/debug/deps/libfoo.rlib"
+make_filler "$target/debug/deps/libbar.rlib"
+make_filler "$target/debug/deps/libbaz.rlib"
+printf 'in flight\n' > "$target/debug/deps/libqux.rlib"
+
+# 3 MiB against a 2 MiB ceiling: over it, but under the multiple at which the
+# deferral gives way.
+CI_CARGO_TARGET_MAX_MIB=2 "$prune" "$target" >/dev/null
+
+if [ -f "$target/debug/deps/libfoo.rlib" ]; then
+  pass "a cache written to recently is left alone"
+else
+  fail "a cache written to recently was wiped under a concurrent build"
+fi
+
+# --- but deferring stops once the cache is far over the ceiling --------------
+# Deferring forever would give back the unbounded growth this script exists to
+# stop, so past the multiple the wipe goes ahead despite the recent write.
+CI_CARGO_TARGET_MAX_MIB=1 "$prune" "$target" >/dev/null
+
+if [ -f "$target/debug/deps/libfoo.rlib" ]; then
+  fail "a cache far over the ceiling was deferred indefinitely"
+else
+  pass "a cache far over the ceiling is wiped despite recent writes"
+fi
+
+# --- a wipe that cannot finish is not a build failure either -----------------
+# Another pipeline creating a file inside a directory rm has just emptied makes
+# rm report "Directory not empty"; find passes that on. Stubbing rm is the
+# deterministic way to reach it.
+target="$work/unwipeable"
+mkdir -p "$target"
+make_filler "$target/filler"
+
+printf '#!/bin/sh\nexit 1\n' > "$stub_bin/rm"
+chmod +x "$stub_bin/rm"
+
+if PATH="$stub_bin:$PATH" CI_CARGO_TARGET_MAX_MIB=0 "$prune" "$target" >/dev/null 2>&1; then
+  pass "a wipe that cannot finish still exits 0"
+else
+  fail "a wipe that cannot finish should not fail the build"
+fi
+
+rm -f "$stub_bin/rm"
+
+# --- a non-numeric idle window is a usage error ------------------------------
+target="$work/badidle"
+mkdir -p "$target"
+make_filler "$target/filler"
+
+if CI_CARGO_TARGET_IDLE_MIN=soon CI_CARGO_TARGET_MAX_MIB=0 "$prune" "$target" >/dev/null 2>&1; then
+  fail "a non-numeric idle window should be a usage error"
+elif [ -f "$target/filler" ]; then
+  pass "a non-numeric idle window is rejected without touching the cache"
+else
+  fail "a non-numeric idle window wiped the cache"
+fi
+
 # --- an unmeasurable cache is kept, not a build failure ----------------------
 # Stubbing du is the only portable way to force this: CI runs as root, so no
 # permission trick makes a real du fail. The branch matters because du exits
 # non-zero for any path it cannot stat, including a file a concurrent pipeline
 # deleted under its walk.
-stub_bin="$work/stub-bin"
-mkdir -p "$stub_bin"
-
 target="$work/unmeasurable"
 mkdir -p "$target"
 make_filler "$target/filler"

@@ -15,10 +15,12 @@
 #
 # The directory itself is never removed — it is a volume mount point.
 #
-# Caveat: a wipe does not coordinate with cargo's own build locks, so a wipe
-# racing a concurrent pipeline's build would fail that step. A wipe happens on
-# the order of once every two months, so the expected collision rate is
-# negligible and the failure is a re-runnable one.
+# A wipe does not coordinate with cargo's build locks, so emptying the directory
+# under a concurrently-running pipeline's cargo would fail that pipeline — and
+# pipelines do overlap in practice (a PR-branch push followed by its merge to
+# main). The ceiling is reached roughly every ten pipelines, often enough that
+# this is not a coincidence worth waving away, so the wipe is deferred while the
+# cache looks busy (see CI_CARGO_TARGET_IDLE_MIN below).
 #
 # Usage: ci-prune-cargo-target.sh [target-dir]
 #        (defaults to $CARGO_TARGET_DIR)
@@ -32,8 +34,18 @@ set -eu
 # cache is worth far less than its old 92.6 GB suggested.
 DEFAULT_MAX_MIB=20480
 
+# Writes this recent mean another pipeline is probably still building. Nothing
+# in this step has written to the cache yet — the prune runs before the build —
+# so any fresh file belongs to someone else.
+DEFAULT_IDLE_MIN=2
+
+# Deferring is safe, but only while the cache stays bounded. Past this multiple
+# of the ceiling, growth is the bigger problem and the wipe goes ahead anyway.
+DEFER_CEILING_MULTIPLE=2
+
 target_dir="${1:-${CARGO_TARGET_DIR:-}}"
 max_mib="${CI_CARGO_TARGET_MAX_MIB:-$DEFAULT_MAX_MIB}"
+idle_min="${CI_CARGO_TARGET_IDLE_MIN:-$DEFAULT_IDLE_MIN}"
 
 if [ -z "$target_dir" ]; then
   echo "ci-prune-cargo-target: no target directory given and CARGO_TARGET_DIR is unset" >&2
@@ -43,6 +55,13 @@ fi
 case "$max_mib" in
   '' | *[!0-9]*)
     echo "ci-prune-cargo-target: CI_CARGO_TARGET_MAX_MIB must be a whole number of MiB, got '$max_mib'" >&2
+    exit 2
+    ;;
+esac
+
+case "$idle_min" in
+  '' | *[!0-9]*)
+    echo "ci-prune-cargo-target: CI_CARGO_TARGET_IDLE_MIN must be a whole number of minutes, got '$idle_min'" >&2
     exit 2
     ;;
 esac
@@ -75,6 +94,23 @@ if [ "$used_kib" -le "$max_kib" ]; then
   exit 0
 fi
 
+# -mmin is portable across GNU find and busybox find. Only files are considered:
+# emptying a directory bumps its own mtime, which would otherwise look like
+# activity long after the writer finished.
+if [ "$used_kib" -le $((max_kib * DEFER_CEILING_MULTIPLE)) ] &&
+  [ -n "$(find "$target_dir" -mmin -"$idle_min" -type f 2>/dev/null | head -n 1)" ]; then
+  echo "ci-prune-cargo-target: $target_dir is $((used_kib / 1024)) MiB and was written to within the last $idle_min min — another pipeline may be building, deferring the wipe"
+  exit 0
+fi
+
 echo "ci-prune-cargo-target: $target_dir is $((used_kib / 1024)) MiB, over the $max_mib MiB ceiling — wiping"
-find "$target_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-echo "ci-prune-cargo-target: $target_dir emptied, next build will be cold"
+
+# A wipe that cannot finish must not fail the step either, for the same reason
+# the measurement above does not: another pipeline creating a file inside a
+# directory rm has just emptied makes rm report "Directory not empty". A
+# partially emptied cache is safe — cargo rebuilds whatever is missing.
+if find "$target_dir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +; then
+  echo "ci-prune-cargo-target: $target_dir emptied, next build will be cold"
+else
+  echo "ci-prune-cargo-target: partial wipe of $target_dir — cargo will rebuild what is missing"
+fi
