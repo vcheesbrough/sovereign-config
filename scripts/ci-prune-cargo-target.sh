@@ -50,7 +50,20 @@ fi
 
 # -sk is the portable spelling: both GNU coreutils (in the rust image) and
 # busybox (in the alpine image that runs the tests) support it.
-used_kib=$(du -sk "$target_dir" | cut -f1)
+#
+# A failed or unparseable measurement must never fail the build. The cache is an
+# optimisation, and du exits non-zero for any path it cannot stat — including a
+# file another pipeline's cargo deleted underneath the walk, which is normal for
+# a shared volume.
+used_kib=$(du -sk "$target_dir" 2>/dev/null | tail -1 | cut -f1) || true
+
+case "$used_kib" in
+  '' | *[!0-9]*)
+    echo "ci-prune-cargo-target: could not measure $target_dir — keeping cache"
+    exit 0
+    ;;
+esac
+
 max_kib=$((max_mib * 1024))
 
 if [ "$used_kib" -le "$max_kib" ]; then
