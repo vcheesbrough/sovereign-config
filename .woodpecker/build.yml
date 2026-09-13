@@ -37,13 +37,14 @@ steps:
       github_token:
         from_secret: github_token
 
-  shellcheck:
+  script-validation:
     depends_on: []
     when:
       - event: push
     image: docker.io/koalaman/shellcheck-alpine@sha256:e19ed93c22423970d56568e171b4512c9244fc75dd9114045016b4a0073ac4b7
     commands:
-      - shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh scripts/migrate-openbao-woodpecker-secrets.sh
+      - shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh scripts/migrate-openbao-woodpecker-secrets.sh scripts/ci-prune-cargo-target.sh scripts/ci-prune-cargo-target-test.sh
+      - sh scripts/ci-prune-cargo-target-test.sh
 
   workspace-validation:
     depends_on: []
@@ -52,12 +53,19 @@ steps:
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
     environment:
       CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
+      # Every CI run is a fresh checkout, so incremental state is written and
+      # never usefully read — it was 43 GB of the shared target volume
+      # (bored card #326). Off, it is also marginally faster for clean builds.
+      CARGO_INCREMENTAL: "0"
       SOVEREIGN_CONFIG_TEST_DATABASE_URL: postgresql://sovereign_config_test:sovereign_config_test@postgres-test:5432/sovereign_config_test
     volumes:
       - sovereign-config-cargo-registry:/usr/local/cargo/registry
       - sovereign-config-cargo-git:/usr/local/cargo/git
       - sovereign-config-contract-target:/woodpecker/cache/sovereign-config-target
     commands:
+      # Cargo never reaps artifacts from commits it no longer builds; this
+      # enforces the 20 GiB ceiling on the shared volume (bored card #326).
+      - scripts/ci-prune-cargo-target.sh
       - rustup component add clippy rustfmt
       - cargo fmt --check
       - cargo clippy --workspace --all-targets -- -D warnings
@@ -130,7 +138,7 @@ steps:
       - build-broker
       - workspace-validation
       - browser-validation
-      - shellcheck
+      - script-validation
     when:
       - event: push
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
@@ -213,6 +221,10 @@ steps:
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
     environment:
       CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
+      # Every CI run is a fresh checkout, so incremental state is written and
+      # never usefully read — it was 43 GB of the shared target volume
+      # (bored card #326). Off, it is also marginally faster for clean builds.
+      CARGO_INCREMENTAL: "0"
       SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL: https://auth.desync.link/
       SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP: sovereign-config-dev-connections
       SOVEREIGN_CONFIG_LIVE_AUTHENTIK_TOKEN:
@@ -227,6 +239,9 @@ steps:
       - sovereign-config-cargo-git:/usr/local/cargo/git
       - sovereign-config-contract-target:/woodpecker/cache/sovereign-config-target
     commands:
+      # Cargo never reaps artifacts from commits it no longer builds; this
+      # enforces the 20 GiB ceiling on the shared volume (bored card #326).
+      - scripts/ci-prune-cargo-target.sh
       - cargo test --package sovereign-config-server live_ -- --ignored --test-threads=1
 
   auto-deploy-dev:
@@ -389,6 +404,10 @@ steps:
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
     environment:
       CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
+      # Every CI run is a fresh checkout, so incremental state is written and
+      # never usefully read — it was 43 GB of the shared target volume
+      # (bored card #326). Off, it is also marginally faster for clean builds.
+      CARGO_INCREMENTAL: "0"
       SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL: https://auth.desync.link/
       SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP: sovereign-config-connections
       SOVEREIGN_CONFIG_LIVE_AUTHENTIK_TOKEN:
@@ -403,6 +422,9 @@ steps:
       - sovereign-config-cargo-git:/usr/local/cargo/git
       - sovereign-config-contract-target:/woodpecker/cache/sovereign-config-target
     commands:
+      # Cargo never reaps artifacts from commits it no longer builds; this
+      # enforces the 20 GiB ceiling on the shared volume (bored card #326).
+      - scripts/ci-prune-cargo-target.sh
       - cargo test --package sovereign-config-server live_ -- --ignored --test-threads=1
 
   deploy-prod:
