@@ -30,7 +30,7 @@ steps:
       - event: push
     depends_on: []
     pull: true
-    image: &version-plugin ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.1.0@sha256:81a29c3a5785c146b5b3dfd7e0d8e7edb353b72e4e53bdbef4f7e13a88488c59
+    image: &version-plugin ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.1.1@sha256:cf74d9706cb42b6d27c8d185789cd814ed061c8c88e06452d33ce3aed0bf9a22
     settings:
       mode: compute
       major_minor_source: cargo
