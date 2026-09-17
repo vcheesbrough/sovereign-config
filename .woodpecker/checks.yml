@@ -7,7 +7,7 @@
 #   deployment:  deploy-prod   (prod target, from main only)
 #
 #   checks       script-validation, unit-test, client-playwright   (+ postgres-test)
-#   build        compute-version → build-server ∥ build-broker
+#   build        compute-version ∥ prune-build-cache → build-server ∥ build-broker
 #   deploy-dev   compute-version ∥ validate-authentik-version → publish-dev-image
 #                → apply-authentik-blueprint-auto-dev → validate-authentik-manager-live
 #                → auto-deploy-dev → tag-release-auto-dev
@@ -40,8 +40,9 @@ steps:
       - event: [push, manual]
     image: docker.io/koalaman/shellcheck-alpine@sha256:e19ed93c22423970d56568e171b4512c9244fc75dd9114045016b4a0073ac4b7
     commands:
-      - shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh scripts/migrate-openbao-woodpecker-secrets.sh scripts/ci-prune-cargo-target.sh scripts/ci-prune-cargo-target-test.sh
+      - shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh scripts/migrate-openbao-woodpecker-secrets.sh scripts/ci-prune-cargo-target.sh scripts/ci-prune-cargo-target-test.sh scripts/ci-prune-buildkit-cache.sh scripts/ci-prune-buildkit-cache-test.sh
       - sh scripts/ci-prune-cargo-target-test.sh
+      - sh scripts/ci-prune-buildkit-cache-test.sh
 
   unit-test:
     depends_on: []
@@ -65,13 +66,15 @@ steps:
       - scripts/ci-prune-cargo-target.sh
       - rustup component add clippy rustfmt
       - cargo fmt --check
-      - cargo clippy --workspace --all-targets -- -D warnings
-      - cargo clippy --package sovereign-config-provider --all-targets --features config -- -D warnings
-      - cargo test --workspace
-      - cargo test --package sovereign-config-provider --features config
-      - cargo test --package sovereign-config-server -- --ignored --test-threads=1
+      # --locked on every command that resolves dependencies, as the image build
+      # does: a Cargo.lock that is out of date fails here, not later in build.
+      - cargo clippy --locked --workspace --all-targets -- -D warnings
+      - cargo clippy --locked --package sovereign-config-provider --all-targets --features config -- -D warnings
+      - cargo test --locked --workspace
+      - cargo test --locked --package sovereign-config-provider --features config
+      - cargo test --locked --package sovereign-config-server -- --ignored --test-threads=1
       - rustup target add wasm32-unknown-unknown
-      - cargo check --target wasm32-unknown-unknown --package sovereign-config-core --package sovereign-config-client --package sovereign-config-web
+      - cargo check --locked --target wasm32-unknown-unknown --package sovereign-config-core --package sovereign-config-client --package sovereign-config-web
 
   # Builds the release WebAssembly bundle and runs the Playwright suite against it
   # in Chromium and Firefox. The backend is mocked at the network layer

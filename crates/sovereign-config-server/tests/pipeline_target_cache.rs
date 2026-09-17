@@ -135,3 +135,66 @@ fn the_prune_script_is_linted_and_tested() {
         "script-validation must run the prune script's test suite"
     );
 }
+
+/// The `BuildKit` cache mount the image builds compile into is bounded too, before
+/// either build writes to it.
+#[test]
+fn the_buildkit_cache_is_pruned_before_the_image_builds() {
+    let pipeline = pipeline();
+    let prune = pipeline.step_in("build", "prune-build-cache");
+    assert_eq!(
+        commands(prune),
+        ["sh scripts/ci-prune-buildkit-cache.sh"],
+        "prune-build-cache must run the BuildKit cache prune script"
+    );
+    for build in ["build-server", "build-broker"] {
+        let dependencies: Vec<&str> = pipeline
+            .step_in("build", build)
+            .get("depends_on")
+            .and_then(Value::as_sequence)
+            .expect("image build should list its dependencies")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            dependencies.contains(&"prune-build-cache"),
+            "{build} must wait for prune-build-cache"
+        );
+    }
+
+    let validation = commands(pipeline.step("script-validation")).join("\n");
+    assert!(
+        validation.contains("scripts/ci-prune-buildkit-cache.sh")
+            && validation.contains("scripts/ci-prune-buildkit-cache-test.sh"),
+        "script-validation must shellcheck the BuildKit prune script and its tests"
+    );
+    assert!(
+        validation.contains("sh scripts/ci-prune-buildkit-cache-test.sh"),
+        "script-validation must run the BuildKit prune script's test suite"
+    );
+}
+
+/// The image build resolves dependencies with --locked, so unit-test must too:
+/// otherwise an out-of-date Cargo.lock passes every check and fails only in build.
+#[test]
+fn unit_test_resolves_dependencies_with_the_lockfile() {
+    let pipeline = pipeline();
+    let cargo: Vec<&str> = commands(pipeline.step("unit-test"))
+        .into_iter()
+        .filter(|command| {
+            ["cargo clippy", "cargo test", "cargo check", "cargo build"]
+                .iter()
+                .any(|prefix| command.starts_with(prefix))
+        })
+        .collect();
+    assert!(
+        cargo.len() >= 5,
+        "expected unit-test's cargo commands, found {cargo:?}"
+    );
+    for command in cargo {
+        assert!(
+            command.split_whitespace().any(|word| word == "--locked"),
+            "unit-test must pass --locked: {command}"
+        );
+    }
+}
