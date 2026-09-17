@@ -3,12 +3,12 @@
 #
 # The pipeline is split into workflows, one file each, in the style of v-note:
 #
-#   push:        checks → deploy-dev
+#   push:        checks ∥ build → deploy-dev
 #   deployment:  deploy-prod   (prod target, from main only)
 #
 #   checks       script-validation, unit-test, client-playwright   (+ postgres-test)
-#   deploy-dev   compute-version ∥ validate-authentik-version
-#                → build-server ∥ build-broker → publish-dev-image
+#   build        compute-version → build-server ∥ build-broker
+#   deploy-dev   compute-version ∥ validate-authentik-version → publish-dev-image
 #                → apply-authentik-blueprint-auto-dev → validate-authentik-manager-live
 #                → auto-deploy-dev → tag-release-auto-dev
 #   deploy-prod  resolve-release-tag ∥ validate-authentik-version
@@ -19,8 +19,8 @@
 # dependencies as whole stages, so a step starts only when every step of the
 # previous dependency level has finished, not just the ones it names. Workflows
 # share nothing — no workspace, no `.release-tag` — so each value a step reads is
-# produced inside its own workflow. deploy-dev depends on checks, so an image is
-# never published before every check passes.
+# produced inside its own workflow. deploy-dev depends on checks and build, so an
+# image is never published before every check passes.
 #
 # validate-authentik-version appears in both deploy workflows: it guards the
 # blueprint apply in each, and workflows cannot share a step.

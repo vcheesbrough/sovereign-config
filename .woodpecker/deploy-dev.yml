@@ -1,19 +1,21 @@
-# Deploy-dev workflow: allocate the semver, build and publish both images, apply
-# the dev Authentik blueprint, prove the connection manager against live
-# Authentik, deploy dev, then push the git tag.
+# Deploy-dev workflow: publish the two images the build workflow made, apply the
+# dev Authentik blueprint, prove the connection manager against live Authentik,
+# deploy dev, then push the git tag.
 #
-# Two images, one semver — every docker build MUST pass --target, see the
-# Dockerfile. compute-version is the single place a version is minted, and only
-# on push.
+# Workflows share nothing, so this workflow computes the release tag again.
+# compute-version reuses the tag already on this commit or allocates highest
+# remote patch + 1, so it normally matches the tag build used; publish-dev-image
+# refuses to publish if it does not.
 # See checks.yml for how the workflows fit together.
 
 when:
   - event: push
 
-# Nothing here starts until every check has passed. checks runs on push, so the
-# dependency is never optional.
+# Nothing here starts until every check has passed and both images are built.
+# Both run on push, so neither dependency is optional.
 depends_on:
   - checks
+  - build
 
 steps:
   # Allocates ONE semver per commit — ONLY on the push pipeline, the single
@@ -59,46 +61,11 @@ steps:
         grep -q 'initial_permissions' /tmp/authentik-schema.json
         echo "Validated compatible Authentik $$VERSION"
 
-  build-server:
-    depends_on:
-      - compute-version
-    when:
-      - event: push
-    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    commands:
-      - |
-        RELEASE_TAG=$$(cat .release-tag)
-        IMAGE=sovereign-config-ci:$$CI_COMMIT_SHA
-        docker build --platform linux/amd64 --target server-runtime --build-arg RELEASE_VERSION="$$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
-        docker image inspect "$$IMAGE" >/dev/null
-
-  # The Woodpecker CI secrets extension, published as a second image under the
-  # same semver. `--target` is mandatory on both image builds: broker-runtime is
-  # the last stage in the Dockerfile, so an untargeted build would tag the
-  # broker as the server.
-  build-broker:
-    depends_on:
-      - compute-version
-    when:
-      - event: push
-    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    commands:
-      - |
-        RELEASE_TAG=$$(cat .release-tag)
-        IMAGE=sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA
-        docker build --platform linux/amd64 --target broker-runtime --build-arg RELEASE_VERSION="$$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config-woodpecker-broker --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/crates/sovereign-config-woodpecker-broker/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
-        docker image inspect "$$IMAGE" >/dev/null
-
   publish-dev-image:
-    # unit-test, client-playwright and script-validation gate this through the
-    # workflow-level depends_on: nothing is published until checks has passed.
+    # The checks and build workflows gate this through the workflow-level
+    # depends_on: nothing is published until every check has passed.
     depends_on:
-      - build-server
-      - build-broker
+      - compute-version
     when:
       - event: push
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
@@ -114,6 +81,20 @@ steps:
         RELEASE_TAG=$$(cat .release-tag)
         IMAGE=registry.desync.link/sovereign-config:$$RELEASE_TAG
         BROKER_IMAGE=registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG
+        # The build workflow made both images on this Docker host and computed its
+        # own release tag. Publish only images built from this commit for exactly
+        # this tag: if another pipeline tagged a release in between, the two tags
+        # differ and a binary would ship under another version's name.
+        for LOCAL in sovereign-config-ci:$$CI_COMMIT_SHA sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA; do
+          LABELS=$$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }} {{ index .Config.Labels "org.opencontainers.image.revision" }}' "$$LOCAL") || {
+            echo "ERROR: $$LOCAL was not built on this host" >&2
+            exit 1
+          }
+          if [ "$$LABELS" != "$$RELEASE_TAG $$CI_COMMIT_SHA" ]; then
+            echo "ERROR: $$LOCAL is labelled '$$LABELS', expected '$$RELEASE_TAG $$CI_COMMIT_SHA'" >&2
+            exit 1
+          fi
+        done
         echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
         docker tag sovereign-config-ci:$$CI_COMMIT_SHA "$$IMAGE"
         docker push "$$IMAGE"

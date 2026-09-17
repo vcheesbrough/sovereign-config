@@ -123,14 +123,17 @@ fn build_and_dev_deploy_steps_run_on_push_only() {
         "auto-deploy-dev",
         "tag-release-auto-dev",
     ] {
-        let conditions = when_conditions(step(&pipeline(), name));
-        assert!(
-            !conditions.is_empty()
-                && conditions
-                    .iter()
-                    .all(|c| c.events == BTreeSet::from(["push".to_owned()])),
-            "{name} must be push-only so a production promotion never touches it"
-        );
+        let pipeline = pipeline();
+        for workflow in pipeline.workflows_of(name) {
+            let conditions = when_conditions(pipeline.step_in(workflow, name));
+            assert!(
+                !conditions.is_empty()
+                    && conditions
+                        .iter()
+                        .all(|c| c.events == BTreeSet::from(["push".to_owned()])),
+                "{name} in {workflow} must be push-only so a production promotion never touches it"
+            );
+        }
     }
 }
 
@@ -173,13 +176,20 @@ fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
     // push-only. On a deployment it would mint the *next* patch — an unbuilt tag
     // — and deploy-prod would pull an image that was never published.
     assert_eq!(
-        step(&pipeline, "compute-version")
-            .get("settings")
-            .and_then(|settings| settings.get("mode"))
-            .and_then(Value::as_str),
-        Some("compute"),
-        "compute-version allocates, so it must stay push-only (asserted above)"
+        pipeline.workflows_of("compute-version"),
+        ["build", "deploy-dev"]
     );
+    for workflow in ["build", "deploy-dev"] {
+        assert_eq!(
+            pipeline
+                .step_in(workflow, "compute-version")
+                .get("settings")
+                .and_then(|settings| settings.get("mode"))
+                .and_then(Value::as_str),
+            Some("compute"),
+            "compute-version allocates, so it must stay push-only (asserted above)"
+        );
+    }
     // The deployment resolves the commit's already-built tag instead of
     // allocating, and verify-image proves the artifact exists rather than
     // rebuilding — so deploy-prod deploys the exact image the push already
@@ -281,18 +291,20 @@ fn workflow_events(pipeline: &Pipeline, workflow: &str) -> BTreeSet<String> {
 #[test]
 fn every_step_sits_in_its_workflow() {
     let pipeline = pipeline();
-    let expected: [(&str, &[&str]); 3] = [
+    let expected: [(&str, &[&str]); 4] = [
         (
             "checks",
             &["script-validation", "unit-test", "client-playwright"],
+        ),
+        (
+            "build",
+            &["compute-version", "build-server", "build-broker"],
         ),
         (
             "deploy-dev",
             &[
                 "compute-version",
                 "validate-authentik-version",
-                "build-server",
-                "build-broker",
                 "publish-dev-image",
                 "apply-authentik-blueprint-auto-dev",
                 "validate-authentik-manager-live",
@@ -327,16 +339,16 @@ fn every_step_sits_in_its_workflow() {
     );
 }
 
-/// Nothing is published or deployed to dev unless every check passed: the
-/// tests, the browser suite, and the script checks.
+/// Nothing is published or deployed to dev unless every check passed — the
+/// tests, the browser suite, and the script checks — and both images are built.
 #[test]
-fn dev_deploy_waits_for_every_check() {
+fn dev_deploy_waits_for_checks_and_build() {
     let pipeline = pipeline();
     let dependencies: Vec<&str> = pipeline
         .workflow("deploy-dev")
         .get("depends_on")
         .and_then(Value::as_sequence)
-        .expect("deploy-dev should depend on checks")
+        .expect("deploy-dev should depend on checks and build")
         .iter()
         .map(|dependency| {
             dependency
@@ -344,12 +356,12 @@ fn dev_deploy_waits_for_every_check() {
                 .expect("deploy-dev's dependencies must be required, not optional")
         })
         .collect();
-    assert_eq!(dependencies, ["checks"]);
-    for workflow in ["checks", "deploy-dev"] {
+    assert_eq!(dependencies, ["checks", "build"]);
+    for workflow in ["checks", "build", "deploy-dev"] {
         assert_eq!(
             workflow_events(&pipeline, workflow),
             BTreeSet::from(["push".to_owned()]),
-            "{workflow} must be push-only, so deploy-dev's required dependency always runs with it"
+            "{workflow} must be push-only, so deploy-dev's required dependencies always run with it"
         );
     }
 }
@@ -448,6 +460,56 @@ fn prod_authentik_check_is_gated_like_every_prod_step() {
         assert_eq!(
             condition.evaluate.as_deref(),
             Some("CI_PIPELINE_DEPLOY_TARGET == \"prod\"")
+        );
+    }
+}
+
+/// build and deploy-dev each compute the release tag, because workflows share
+/// nothing. publish-dev-image must therefore refuse images that were not built
+/// from this commit for exactly its own tag, and build must label them so the
+/// check can see both.
+#[test]
+fn publish_only_ships_images_built_for_this_commit_and_tag() {
+    let pipeline = pipeline();
+    for (build, local) in [
+        ("build-server", "sovereign-config-ci:$$CI_COMMIT_SHA"),
+        (
+            "build-broker",
+            "sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA",
+        ),
+    ] {
+        let commands = commands_text(pipeline.step_in("build", build));
+        assert!(
+            commands.contains("org.opencontainers.image.version=\"$$RELEASE_TAG\"")
+                && commands.contains("org.opencontainers.image.revision=\"$$CI_COMMIT_SHA\""),
+            "{build} must label its image with the release tag and commit"
+        );
+        assert!(
+            commands.contains(&format!("IMAGE={local}")),
+            "{build} must tag the local image {local}"
+        );
+    }
+    let publish = commands_text(pipeline.step_in("deploy-dev", "publish-dev-image"));
+    let guard = publish
+        .find("docker image inspect")
+        .expect("publish-dev-image must inspect the local images");
+    let first_push = publish
+        .find("docker push")
+        .expect("publish-dev-image must push");
+    assert!(
+        guard < first_push,
+        "the label check must run before any push"
+    );
+    for expected in [
+        "sovereign-config-ci:$$CI_COMMIT_SHA",
+        "sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA",
+        "org.opencontainers.image.version",
+        "org.opencontainers.image.revision",
+        "\"$$RELEASE_TAG $$CI_COMMIT_SHA\"",
+    ] {
+        assert!(
+            publish.contains(expected),
+            "publish-dev-image's label check must cover {expected}"
         );
     }
 }
