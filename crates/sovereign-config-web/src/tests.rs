@@ -8,12 +8,12 @@ use sovereign_config_core::ConfigPath;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
-use super::TreeGuide::{Blank, Branch, Corner, Trunk};
-use super::{
-    Route, TreeNode, build_tree, classify_refresh_error, decode_grpc_web, decode_grpc_web_response,
-    identity_display_name, namespace_labels, parse_absolute_path, route_from_path, route_url,
-    tree_guides, value_parents_of,
-};
+use crate::configuration::parse_absolute_path;
+use crate::route::{Route, route_from_path, route_url};
+use crate::session::{classify_refresh_error, identity_display_name};
+use crate::transport::{decode_grpc_web, decode_grpc_web_response};
+use crate::tree::TreeGuide::{Blank, Branch, Corner, Trunk};
+use crate::tree::{TreeNode, build_tree, namespace_labels, tree_guides, value_parents_of};
 
 fn paths(values: &[&str]) -> Vec<ConfigPath> {
     values
