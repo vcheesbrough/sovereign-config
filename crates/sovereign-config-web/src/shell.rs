@@ -13,18 +13,18 @@ use crate::route::{
 };
 
 thread_local! {
-    pub(crate) static SIDEBAR_DRAG_POINTER: Cell<Option<i32>> = const { Cell::new(None) };
+    static SIDEBAR_DRAG_POINTER: Cell<Option<i32>> = const { Cell::new(None) };
 }
 
-pub(crate) const SIDEBAR_WIDTH_KEY: &str = "sovereign-config.sidebar-width";
+const SIDEBAR_WIDTH_KEY: &str = "sovereign-config.sidebar-width";
 
-pub(crate) const SIDEBAR_MIN_WIDTH: f64 = 200.0;
+const SIDEBAR_MIN_WIDTH: f64 = 200.0;
 
-pub(crate) const SIDEBAR_MAX_WIDTH: f64 = 560.0;
+const SIDEBAR_MAX_WIDTH: f64 = 560.0;
 
-pub(crate) const SIDEBAR_DEFAULT_WIDTH: f64 = 288.0;
+const SIDEBAR_DEFAULT_WIDTH: f64 = 288.0;
 
-pub(crate) const SIDEBAR_KEY_STEP: f64 = 16.0;
+const SIDEBAR_KEY_STEP: f64 = 16.0;
 
 pub(crate) fn install_unsaved_guard(document: &Document) {
     // In-app links, tree clicks, and Back are guarded by the modal below, but a
@@ -107,11 +107,11 @@ pub(crate) fn install_sidebar_resizer(document: &Document) {
     callback.forget();
 }
 
-pub(crate) fn layout_left() -> f64 {
+fn layout_left() -> f64 {
     element::<HtmlElement>("layout").map_or(0.0, |layout| layout.get_bounding_client_rect().left())
 }
 
-pub(crate) fn sidebar_width() -> f64 {
+fn sidebar_width() -> f64 {
     window()
         .and_then(|window| window.document())
         .and_then(|document| document.get_element_by_id("sidebar-resizer"))
@@ -120,7 +120,7 @@ pub(crate) fn sidebar_width() -> f64 {
         .unwrap_or(SIDEBAR_DEFAULT_WIDTH)
 }
 
-pub(crate) fn set_sidebar_width(width: f64) {
+fn set_sidebar_width(width: f64) {
     let width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH).round();
     if let Some(layout) = element::<HtmlElement>("layout") {
         let _ = layout
@@ -199,11 +199,11 @@ pub(crate) fn install_brand_menu(document: &Document) {
     callback.forget();
 }
 
-pub(crate) fn brand_menu_open() -> bool {
+fn brand_menu_open() -> bool {
     !element_is_hidden("brand-menu")
 }
 
-pub(crate) fn set_brand_menu_open(open: bool) {
+fn set_brand_menu_open(open: bool) {
     set_hidden("brand-menu", !open);
     if let Some(button) = window()
         .and_then(|window| window.document())

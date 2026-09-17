@@ -24,28 +24,28 @@ thread_local! {
     pub(crate) static TOKENS: RefCell<Option<MemoryTokens>> = const { RefCell::new(None) };
 }
 
-pub(crate) const STATE_KEY: &str = "sovereign-config.pkce-state";
+const STATE_KEY: &str = "sovereign-config.pkce-state";
 
-pub(crate) const VERIFIER_KEY: &str = "sovereign-config.pkce-verifier";
+const VERIFIER_KEY: &str = "sovereign-config.pkce-verifier";
 
-pub(crate) const REFRESH_TOKEN_KEY: &str = "sovereign-config.refresh-token";
+const REFRESH_TOKEN_KEY: &str = "sovereign-config.refresh-token";
 
-pub(crate) const REFRESH_ENDPOINT_KEY: &str = "sovereign-config.refresh-endpoint";
+const REFRESH_ENDPOINT_KEY: &str = "sovereign-config.refresh-endpoint";
 
-pub(crate) const REFRESH_EXPIRES_KEY: &str = "sovereign-config.refresh-expires-at";
+const REFRESH_EXPIRES_KEY: &str = "sovereign-config.refresh-expires-at";
 
-pub(crate) const RETURN_PATH_KEY: &str = "sovereign-config.return-path";
+const RETURN_PATH_KEY: &str = "sovereign-config.return-path";
 
-pub(crate) const IDENTITY_NAME_KEY: &str = "sovereign-config.identity-name";
+const IDENTITY_NAME_KEY: &str = "sovereign-config.identity-name";
 
-pub(crate) const REFRESH_LIFETIME_MS: f64 = 8.0 * 60.0 * 60.0 * 1000.0;
+const REFRESH_LIFETIME_MS: f64 = 8.0 * 60.0 * 60.0 * 1000.0;
 
 pub(crate) struct MemoryTokens {
     pub(crate) access_token: Secret,
-    pub(crate) refresh_token: Secret,
+    refresh_token: Secret,
     pub(crate) access_expires_at_ms: f64,
     pub(crate) refresh_expires_at_ms: f64,
-    pub(crate) token_endpoint: String,
+    token_endpoint: String,
 }
 
 /// The operator's display name as advertised by the OIDC ID token issued
@@ -70,11 +70,11 @@ pub(crate) fn identity_display_name(id_token: &str) -> Option<String> {
         })
 }
 
-pub(crate) fn identity_name_from_token_response(json: &JsValue) -> Option<String> {
+fn identity_name_from_token_response(json: &JsValue) -> Option<String> {
     identity_display_name(&optional_string_property(json, "id_token")?)
 }
 
-pub(crate) fn store_identity_name(name: Option<String>) {
+fn store_identity_name(name: Option<String>) {
     let Ok(storage) = session_storage() else {
         return;
     };
@@ -354,7 +354,7 @@ pub(crate) fn persist_refresh_token(tokens: &MemoryTokens) {
     );
 }
 
-pub(crate) fn persist_refresh_token_from_parts(token: &str, endpoint: &str, expires_at: f64) {
+fn persist_refresh_token_from_parts(token: &str, endpoint: &str, expires_at: f64) {
     if let Ok(storage) = session_storage() {
         let _ = storage.set_item(REFRESH_TOKEN_KEY, token);
         let _ = storage.set_item(REFRESH_ENDPOINT_KEY, endpoint);
@@ -417,7 +417,7 @@ pub(crate) async fn refresh_tokens(
     })
 }
 
-pub(crate) async fn refresh_error(response: &Response) -> ClientError {
+async fn refresh_error(response: &Response) -> ClientError {
     let oauth_error = match response.json() {
         Ok(json) => JsFuture::from(json)
             .await
@@ -436,7 +436,7 @@ pub(crate) fn classify_refresh_error(status: u16, oauth_error: Option<&str>) -> 
     }
 }
 
-pub(crate) fn expires_in(json: &JsValue) -> f64 {
+fn expires_in(json: &JsValue) -> f64 {
     Reflect::get(json, &JsValue::from_str("expires_in"))
         .ok()
         .and_then(|value| value.as_f64())
@@ -445,12 +445,12 @@ pub(crate) fn expires_in(json: &JsValue) -> f64 {
         .min(300.0)
 }
 
-pub(crate) struct Discovery {
-    pub(crate) authorization_endpoint: String,
-    pub(crate) token_endpoint: String,
+struct Discovery {
+    authorization_endpoint: String,
+    token_endpoint: String,
 }
 
-pub(crate) async fn discover(issuer: &str) -> Result<Discovery, ClientError> {
+async fn discover(issuer: &str) -> Result<Discovery, ClientError> {
     let url = format!("{issuer}.well-known/openid-configuration");
     let response = fetch(&url, "GET", None, &[]).await?;
     if !response.ok() {
@@ -469,7 +469,7 @@ pub(crate) async fn discover(issuer: &str) -> Result<Discovery, ClientError> {
     })
 }
 
-pub(crate) fn require_issuer_origin(issuer: &str, endpoint: &str) -> Result<(), ClientError> {
+fn require_issuer_origin(issuer: &str, endpoint: &str) -> Result<(), ClientError> {
     let issuer = Url::new(issuer).map_err(|_| oidc_error())?;
     let endpoint = Url::new(endpoint).map_err(|_| oidc_error())?;
     if issuer.origin() != endpoint.origin() {

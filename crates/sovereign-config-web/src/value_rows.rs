@@ -17,7 +17,7 @@ use crate::dom::{
 use crate::icons::{Icon, create_icon_button, set_icon_button_icon};
 use crate::path_selector::render_path_options;
 
-pub(crate) fn secret_field_revealed(input_id: &str) -> bool {
+fn secret_field_revealed(input_id: &str) -> bool {
     element::<HtmlInputElement>(input_id).is_some_and(|input| {
         input.get_attribute("data-secret-state").as_deref() == Some("revealed")
     })
@@ -89,7 +89,7 @@ pub(crate) fn render_listing(listing: &ValueListing) -> Result<(), ClientError> 
     Ok(())
 }
 
-pub(crate) fn render_value_row(
+fn render_value_row(
     document: &Document,
     value: &ListedValue,
     index: usize,
@@ -172,7 +172,7 @@ pub(crate) fn render_value_row(
     Ok(row)
 }
 
-pub(crate) fn render_secret_value_row(
+fn render_secret_value_row(
     document: &Document,
     value: &ListedValue,
     index: usize,
@@ -371,7 +371,7 @@ fn finish_value_row(
 /// primary path in the name cell. Each entry carries a danger "Remove" button
 /// that deletes only that path via the shared delete-confirm flow; the value
 /// survives through its remaining paths.
-pub(crate) fn append_alias_paths(
+fn append_alias_paths(
     document: &Document,
     name_cell: &Element,
     value: &ListedValue,

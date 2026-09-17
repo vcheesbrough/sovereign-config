@@ -16,8 +16,8 @@ use crate::route::{Route, guarded_navigate, route_from_location};
 use crate::transport::value_client;
 
 thread_local! {
-    pub(crate) static PATH_OPTIONS_REFRESHING: Cell<bool> = const { Cell::new(false) };
-    pub(crate) static ACTIVE_PATH_OPTION: Cell<Option<usize>> = const { Cell::new(None) };
+    static PATH_OPTIONS_REFRESHING: Cell<bool> = const { Cell::new(false) };
+    static ACTIVE_PATH_OPTION: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 pub(crate) fn install_path_selector_actions(document: &Document) {
@@ -115,7 +115,7 @@ pub(crate) fn open_selected_path() {
     }
 }
 
-pub(crate) fn open_path_options() {
+fn open_path_options() {
     let Some(input) = element::<HtmlInputElement>("selected-path") else {
         return;
     };
@@ -134,12 +134,12 @@ pub(crate) fn open_path_options() {
     set_active_path_option(None);
 }
 
-pub(crate) fn path_options_expanded() -> bool {
+fn path_options_expanded() -> bool {
     element::<HtmlInputElement>("selected-path")
         .is_some_and(|input| input.get_attribute("aria-expanded").as_deref() == Some("true"))
 }
 
-pub(crate) fn close_path_options() {
+fn close_path_options() {
     if let Some(input) = element::<HtmlInputElement>("selected-path") {
         let _ = input.set_attribute("aria-expanded", "false");
         let _ = input.remove_attribute("aria-activedescendant");
@@ -148,7 +148,7 @@ pub(crate) fn close_path_options() {
     set_active_path_option(None);
 }
 
-pub(crate) fn size_path_options(input: &HtmlInputElement, options: &Element) {
+fn size_path_options(input: &HtmlInputElement, options: &Element) {
     let Some(window) = window() else {
         return;
     };
@@ -176,7 +176,7 @@ pub(crate) fn size_path_options(input: &HtmlInputElement, options: &Element) {
     }
 }
 
-pub(crate) fn filter_path_options() {
+fn filter_path_options() {
     let Some(input) = element::<HtmlInputElement>("selected-path") else {
         return;
     };
@@ -197,7 +197,7 @@ pub(crate) fn filter_path_options() {
     set_active_path_option(None);
 }
 
-pub(crate) fn path_option_elements() -> Vec<Element> {
+fn path_option_elements() -> Vec<Element> {
     let Some(options) = window()
         .and_then(|window| window.document())
         .and_then(|document| document.get_element_by_id("existing-paths"))
@@ -210,7 +210,7 @@ pub(crate) fn path_option_elements() -> Vec<Element> {
         .collect()
 }
 
-pub(crate) fn move_active_path_option(direction: i32) {
+fn move_active_path_option(direction: i32) {
     let visible = path_option_elements()
         .into_iter()
         .enumerate()
@@ -231,7 +231,7 @@ pub(crate) fn move_active_path_option(direction: i32) {
     set_active_path_option(Some(next));
 }
 
-pub(crate) fn set_active_path_option(active_index: Option<usize>) {
+fn set_active_path_option(active_index: Option<usize>) {
     ACTIVE_PATH_OPTION.set(active_index);
     let options = path_option_elements();
     for (index, option) in options.iter().enumerate() {
@@ -254,7 +254,7 @@ pub(crate) fn set_active_path_option(active_index: Option<usize>) {
     }
 }
 
-pub(crate) fn select_active_path_option() {
+fn select_active_path_option() {
     let Some(index) = ACTIVE_PATH_OPTION.get() else {
         return;
     };
@@ -271,7 +271,7 @@ pub(crate) fn select_active_path_option() {
     close_path_options();
 }
 
-pub(crate) async fn refresh_path_options() {
+async fn refresh_path_options() {
     if PATH_OPTIONS_REFRESHING.replace(true) {
         return;
     }

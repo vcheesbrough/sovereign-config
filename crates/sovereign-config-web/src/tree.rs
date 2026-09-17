@@ -38,7 +38,7 @@ pub(crate) struct TreeNode {
     pub(crate) has_connection: bool,
 }
 
-pub(crate) fn path_segments(path: &str) -> Vec<&str> {
+fn path_segments(path: &str) -> Vec<&str> {
     path.split('/')
         .filter(|segment| !segment.is_empty())
         .collect()
@@ -49,7 +49,7 @@ pub(crate) fn path_segments(path: &str) -> Vec<&str> {
 /// Splits on the fold, never `as_str()` (display): `ConfigPath::parse` only
 /// accepts lowercase text, so splitting on display case would fail (and
 /// silently collapse to root via `.ok()`) for any mixed-case path.
-pub(crate) fn parent_of(path: &ConfigPath) -> ConfigPath {
+fn parent_of(path: &ConfigPath) -> ConfigPath {
     let fold = path.fold();
     fold.rsplit_once('/')
         .filter(|(parent, _)| !parent.is_empty())
@@ -61,7 +61,7 @@ pub(crate) fn parent_of(path: &ConfigPath) -> ConfigPath {
 /// key and the display form because letter case never changes a segment's
 /// length — `path.fold()` and `path.as_str()` always split at the same
 /// boundary.
-pub(crate) fn parent_forms(path: &ConfigPath) -> (String, String) {
+fn parent_forms(path: &ConfigPath) -> (String, String) {
     let fold = path.fold();
     match fold.rsplit_once('/') {
         Some((parent, _)) if !parent.is_empty() => {
@@ -346,7 +346,7 @@ pub(crate) enum TreeGuide {
 }
 
 impl TreeGuide {
-    pub(crate) fn class(self) -> &'static str {
+    fn class(self) -> &'static str {
         match self {
             Self::Blank => "tree-guide",
             Self::Trunk => "tree-guide trunk",
@@ -392,7 +392,7 @@ pub(crate) fn tree_guides(nodes: &[TreeNode]) -> Vec<Vec<TreeGuide>> {
     guides
 }
 
-pub(crate) fn is_last_sibling(nodes: &[TreeNode], index: usize) -> bool {
+fn is_last_sibling(nodes: &[TreeNode], index: usize) -> bool {
     let depth = nodes[index].depth;
     !nodes[index + 1..]
         .iter()
@@ -400,7 +400,7 @@ pub(crate) fn is_last_sibling(nodes: &[TreeNode], index: usize) -> bool {
         .any(|node| node.depth == depth)
 }
 
-pub(crate) fn build_tree_node(
+fn build_tree_node(
     document: &Document,
     node: &TreeNode,
     index: usize,
@@ -466,7 +466,7 @@ pub(crate) fn build_tree_node(
 /// rather than on each node, so a render allocates nothing: the tree is rebuilt
 /// twice per navigation over the whole estate, and per-node closures would have
 /// to be leaked every time to stay callable from JavaScript.
-pub(crate) fn event_tree_node(event: &Event) -> Option<(usize, ConfigPath)> {
+fn event_tree_node(event: &Event) -> Option<(usize, ConfigPath)> {
     let item = event
         .target()
         .and_then(|target| target.dyn_into::<Element>().ok())
@@ -529,7 +529,7 @@ pub(crate) fn install_tree_actions(document: &Document) {
 }
 
 /// Moves the roving tab stop to `index`, clamped to the rendered nodes.
-pub(crate) fn focus_tree_node(index: usize) {
+fn focus_tree_node(index: usize) {
     let count = TREE_NODES.with_borrow(Vec::len);
     if count == 0 {
         return;

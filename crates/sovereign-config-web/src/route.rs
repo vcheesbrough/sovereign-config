@@ -21,8 +21,8 @@ use crate::tree::{TREE_NODES, load_tree, render_tree};
 
 thread_local! {
     pub(crate) static PENDING_NAVIGATION: RefCell<Option<Route>> = const { RefCell::new(None) };
-    pub(crate) static PENDING_FROM_HISTORY: Cell<bool> = const { Cell::new(false) };
-    pub(crate) static CURRENT_URL: RefCell<String> = const { RefCell::new(String::new()) };
+    static PENDING_FROM_HISTORY: Cell<bool> = const { Cell::new(false) };
+    static CURRENT_URL: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 #[derive(Clone)]
@@ -108,17 +108,17 @@ pub(crate) fn has_unsaved_edits() -> bool {
 
 /// A textarea holds an edit when its text differs from what was loaded into it.
 /// One without a loaded marker — a revealed secret, say — is never an edit.
-pub(crate) fn edited_textarea(editor: &HtmlTextAreaElement) -> bool {
+fn edited_textarea(editor: &HtmlTextAreaElement) -> bool {
     editor
         .get_attribute("data-loaded")
         .is_some_and(|loaded| editor.value() != loaded)
 }
 
-pub(crate) fn navigate(route: &Route) {
+fn navigate(route: &Route) {
     navigate_with(route, false);
 }
 
-pub(crate) fn navigate_with(route: &Route, replace: bool) {
+fn navigate_with(route: &Route, replace: bool) {
     discard_connection_url();
     let url = route_url(route);
     if let Some(window) = window()
