@@ -10,6 +10,24 @@ const {
   openConfiguration
 } = require('./helpers');
 
+// The popup's size and placement are recalculated by the app's `resize` event
+// listener, which Playwright's `setViewportSize()` does not wait for (card
+// #282). Poll the smallest edge margin until the popup has settled inside the
+// viewport, then read the bounds the assertions run against.
+const settledPopupBounds = async (page, popup) => {
+  const viewportHeight = page.viewportSize().height;
+  await expect
+    .poll(async () => {
+      const box = await popup.boundingBox();
+      if (!box) {
+        return null;
+      }
+      return Math.min(box.y, viewportHeight - (box.y + box.height));
+    })
+    .toBeGreaterThanOrEqual(8);
+  return popup.boundingBox();
+};
+
 test.describe('navigation', () => {
   test.beforeEach(async ({ page }) => {
     await mockApplication(page);
@@ -101,7 +119,7 @@ test.describe('navigation', () => {
     await expect(popup).toBeVisible();
     await expect(page.locator('#existing-paths [role="option"]')).toHaveCount(42);
 
-    const bounds = await popup.boundingBox();
+    const bounds = await settledPopupBounds(page, popup);
     expect(bounds.height).toBeGreaterThan(400);
     expect(bounds.y + bounds.height).toBeLessThanOrEqual(page.viewportSize().height - 8);
 
@@ -109,7 +127,7 @@ test.describe('navigation', () => {
     expect(accessibility.violations).toEqual([]);
 
     await page.setViewportSize({ width: 390, height: 420 });
-    const mobileBounds = await popup.boundingBox();
+    const mobileBounds = await settledPopupBounds(page, popup);
     expect(mobileBounds.y).toBeGreaterThanOrEqual(8);
     expect(mobileBounds.y + mobileBounds.height).toBeLessThanOrEqual(page.viewportSize().height - 8);
   });
