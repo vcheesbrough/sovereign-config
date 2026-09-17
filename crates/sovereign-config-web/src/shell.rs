@@ -1,0 +1,252 @@
+//! The page chrome: the resizable sidebar, the brand menu, route links, and the full-page unsaved-edit guard.
+
+use crate::browser::local_storage;
+use crate::dom::element;
+use crate::dom::element_is_hidden;
+use crate::dom::focus;
+use crate::dom::set_hidden;
+use crate::route::PENDING_NAVIGATION;
+use crate::route::Route;
+use crate::route::discard_changes;
+use crate::route::guarded_navigate;
+use crate::route::has_unsaved_edits;
+use crate::route::keep_editing;
+use std::cell::Cell;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
+use web_sys::Document;
+use web_sys::Element;
+use web_sys::Event;
+use web_sys::HtmlElement;
+use web_sys::KeyboardEvent;
+use web_sys::PointerEvent;
+use web_sys::window;
+
+thread_local! {
+    pub(crate) static SIDEBAR_DRAG_POINTER: Cell<Option<i32>> = const { Cell::new(None) };
+}
+
+pub(crate) const SIDEBAR_WIDTH_KEY: &str = "sovereign-config.sidebar-width";
+
+pub(crate) const SIDEBAR_MIN_WIDTH: f64 = 200.0;
+
+pub(crate) const SIDEBAR_MAX_WIDTH: f64 = 560.0;
+
+pub(crate) const SIDEBAR_DEFAULT_WIDTH: f64 = 288.0;
+
+pub(crate) const SIDEBAR_KEY_STEP: f64 = 16.0;
+
+pub(crate) fn install_unsaved_guard(document: &Document) {
+    // In-app links, tree clicks, and Back are guarded by the modal below, but a
+    // reload, a tab close, or a typed URL never reaches any of them. Only the
+    // browser's own prompt can interpose there; its wording is not ours to set.
+    if let Some(browser_window) = window() {
+        let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
+            if has_unsaved_edits() {
+                event.prevent_default();
+            }
+        });
+        let _ = browser_window
+            .add_event_listener_with_callback("beforeunload", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(keep) = document.get_element_by_id("keep-editing") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| keep_editing());
+        let _ = keep.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(discard) = document.get_element_by_id("discard-changes") {
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| discard_changes());
+        let _ =
+            discard.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+    if let Some(dialog) = document.get_element_by_id("unsaved-dialog") {
+        // Escape closes a native dialog without either button; that is a
+        // decision to stay, so drop the pending route.
+        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+            PENDING_NAVIGATION.with_borrow_mut(Option::take);
+        });
+        let _ = dialog.add_event_listener_with_callback("close", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+}
+
+/// Drag and keyboard control for the sidebar separator. The width is a CSS
+/// custom property on the layout grid, so nothing else needs to know about it.
+pub(crate) fn install_sidebar_resizer(document: &Document) {
+    let Some(resizer) = document.get_element_by_id("sidebar-resizer") else {
+        return;
+    };
+    let handle = resizer.clone();
+    let callback = Closure::<dyn FnMut(_)>::new(move |event: PointerEvent| {
+        event.prevent_default();
+        let _ = handle.set_pointer_capture(event.pointer_id());
+        SIDEBAR_DRAG_POINTER.set(Some(event.pointer_id()));
+    });
+    let _ =
+        resizer.add_event_listener_with_callback("pointerdown", callback.as_ref().unchecked_ref());
+    callback.forget();
+
+    let callback = Closure::<dyn FnMut(_)>::new(move |event: PointerEvent| {
+        if SIDEBAR_DRAG_POINTER.get() != Some(event.pointer_id()) {
+            return;
+        }
+        event.prevent_default();
+        // Measure from the grid's own left edge rather than the viewport's, so
+        // any future gutter or centred shell does not silently offset the
+        // handle from the pointer by exactly that width.
+        set_sidebar_width(f64::from(event.client_x()) - layout_left());
+    });
+    let _ =
+        resizer.add_event_listener_with_callback("pointermove", callback.as_ref().unchecked_ref());
+    callback.forget();
+
+    for event_name in ["pointerup", "pointercancel"] {
+        let handle = resizer.clone();
+        let callback = Closure::<dyn FnMut(_)>::new(move |event: PointerEvent| {
+            if SIDEBAR_DRAG_POINTER.get() == Some(event.pointer_id()) {
+                let _ = handle.release_pointer_capture(event.pointer_id());
+                SIDEBAR_DRAG_POINTER.set(None);
+            }
+        });
+        let _ =
+            resizer.add_event_listener_with_callback(event_name, callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    let callback = Closure::<dyn FnMut(_)>::new(move |event: KeyboardEvent| {
+        let step = match event.key().as_str() {
+            "ArrowLeft" => -SIDEBAR_KEY_STEP,
+            "ArrowRight" => SIDEBAR_KEY_STEP,
+            _ => return,
+        };
+        event.prevent_default();
+        set_sidebar_width(sidebar_width() + step);
+    });
+    let _ = resizer.add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref());
+    callback.forget();
+}
+
+pub(crate) fn layout_left() -> f64 {
+    element::<HtmlElement>("layout").map_or(0.0, |layout| layout.get_bounding_client_rect().left())
+}
+
+pub(crate) fn sidebar_width() -> f64 {
+    window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("sidebar-resizer"))
+        .and_then(|resizer| resizer.get_attribute("aria-valuenow"))
+        .and_then(|width| width.parse::<f64>().ok())
+        .unwrap_or(SIDEBAR_DEFAULT_WIDTH)
+}
+
+pub(crate) fn set_sidebar_width(width: f64) {
+    let width = width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH).round();
+    if let Some(layout) = element::<HtmlElement>("layout") {
+        let _ = layout
+            .style()
+            .set_property("--sidebar-width", &format!("{width}px"));
+    }
+    if let Some(resizer) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("sidebar-resizer"))
+    {
+        let _ = resizer.set_attribute("aria-valuenow", &width.to_string());
+    }
+    if let Ok(storage) = local_storage() {
+        let _ = storage.set_item(SIDEBAR_WIDTH_KEY, &width.to_string());
+    }
+}
+
+pub(crate) fn restore_sidebar_width() {
+    let stored = local_storage()
+        .ok()
+        .and_then(|storage| storage.get_item(SIDEBAR_WIDTH_KEY).ok().flatten())
+        .and_then(|width| width.parse::<f64>().ok())
+        .filter(|width| width.is_finite());
+    if let Some(width) = stored {
+        set_sidebar_width(width);
+    }
+}
+
+/// The brand mark is a disclosure button for the views that are not the
+/// configuration tree. Opening is a pointer or keyboard action on the button;
+/// closing is anything that leaves it — Escape, a click elsewhere, or a
+/// navigation.
+pub(crate) fn install_brand_menu(document: &Document) {
+    let Some(button) = document.get_element_by_id("brand-menu-button") else {
+        return;
+    };
+    let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+        set_brand_menu_open(!brand_menu_open());
+    });
+    let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+    callback.forget();
+
+    // A pointerdown anywhere outside the button or the panel dismisses the
+    // menu. `pointerdown` rather than `click` so the menu is already gone by
+    // the time whatever was underneath it takes the press.
+    let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
+        if !brand_menu_open() {
+            return;
+        }
+        let inside = event
+            .target()
+            .and_then(|target| target.dyn_into::<Element>().ok())
+            .is_some_and(|target| {
+                target
+                    .closest("#brand-menu, #brand-menu-button")
+                    .ok()
+                    .flatten()
+                    .is_some()
+            });
+        if !inside {
+            close_brand_menu();
+        }
+    });
+    let _ =
+        document.add_event_listener_with_callback("pointerdown", callback.as_ref().unchecked_ref());
+    callback.forget();
+
+    let callback = Closure::<dyn FnMut(_)>::new(|event: KeyboardEvent| {
+        if event.key() == "Escape" && brand_menu_open() {
+            event.prevent_default();
+            close_brand_menu();
+            focus("brand-menu-button");
+        }
+    });
+    let _ = document.add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref());
+    callback.forget();
+}
+
+pub(crate) fn brand_menu_open() -> bool {
+    !element_is_hidden("brand-menu")
+}
+
+pub(crate) fn set_brand_menu_open(open: bool) {
+    set_hidden("brand-menu", !open);
+    if let Some(button) = window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.get_element_by_id("brand-menu-button"))
+    {
+        let _ = button.set_attribute("aria-expanded", if open { "true" } else { "false" });
+    }
+}
+
+pub(crate) fn close_brand_menu() {
+    if brand_menu_open() {
+        set_brand_menu_open(false);
+    }
+}
+
+pub(crate) fn install_route_link(document: &Document, id: &str, route: Route) {
+    if let Some(link) = document.get_element_by_id(id) {
+        let callback = Closure::<dyn FnMut(_)>::new(move |event: Event| {
+            event.prevent_default();
+            guarded_navigate(route.clone());
+        });
+        let _ = link.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+}
