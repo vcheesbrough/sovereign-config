@@ -21,11 +21,15 @@ use sovereign_config_core::{ConnectionUrl, ManagedPermission};
 use sqlx::postgres::PgPoolOptions;
 use tokio::{net::TcpListener, task::JoinHandle, time::sleep};
 
-use super::{
-    ConnectionRow, ManagedConnectionsService, ManagedSettings, Request, Secret, Status,
+use sovereign_config_core::Secret;
+use tonic::{Request, Status};
+
+use super::identity::{
     USERNAME_PREFIX, USERNAME_SLUG_MAX_CHARS, generate_app_password, generate_connection_id,
     managed_username, username_slug,
 };
+use super::store::ConnectionRow;
+use super::{ManagedConnectionsService, ManagedSettings};
 use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
 use crate::authentik::AuthentikAdminClient;
 use crate::metrics::ManagedConnectionMetrics;
