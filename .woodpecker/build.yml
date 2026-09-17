@@ -28,9 +28,24 @@ steps:
       github_token:
         from_secret: github_token
 
+  # Bounds this repository's BuildKit cargo target cache mount, which the image
+  # builds compile into and nothing else on the host prunes. Only the
+  # sovereign-config-cargo-target mount is measured or removed, never another
+  # repository's cache. It never fails the build. Runs before both image builds.
+  prune-build-cache:
+    depends_on: []
+    when:
+      - event: [push, manual]
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - sh scripts/ci-prune-buildkit-cache.sh
+
   build-server:
     depends_on:
       - compute-version
+      - prune-build-cache
     when:
       - event: [push, manual]
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
@@ -50,6 +65,7 @@ steps:
   build-broker:
     depends_on:
       - compute-version
+      - prune-build-cache
     when:
       - event: [push, manual]
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c

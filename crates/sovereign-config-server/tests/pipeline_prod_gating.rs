@@ -121,6 +121,7 @@ fn build_and_dev_deploy_steps_never_run_on_a_deployment() {
         "script-validation",
         "unit-test",
         "client-playwright",
+        "prune-build-cache",
         "build-server",
         "build-broker",
         "publish-dev-image",
@@ -301,7 +302,12 @@ fn every_step_sits_in_its_workflow() {
         ),
         (
             "build",
-            &["compute-version", "build-server", "build-broker"],
+            &[
+                "compute-version",
+                "prune-build-cache",
+                "build-server",
+                "build-broker",
+            ],
         ),
         (
             "deploy-dev",
