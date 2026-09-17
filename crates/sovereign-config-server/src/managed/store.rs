@@ -1,7 +1,9 @@
 //! Every `PostgreSQL` row type and query behind the `ManagedConnections`
 //! service.
 
-use sovereign_config_core::{ConfigPath, ConnectionId, ManagedConnectionState};
+use sovereign_config_core::{
+    ConfigPath, ConnectionId, DisplayName, ManagedConnectionState, ManagedPermissions,
+};
 use sqlx::{FromRow, Postgres, Transaction};
 use time::OffsetDateTime;
 use tonic::Status;
@@ -9,6 +11,7 @@ use tonic::Status;
 use super::ManagedConnectionsService;
 use super::wire::{internal_error, not_found};
 use crate::auth::{AuthenticatedPrincipal, Permission};
+use crate::authentik::CreatedServiceAccount;
 use crate::rpc::storage_unavailable;
 
 #[derive(FromRow)]
@@ -91,10 +94,151 @@ impl ManagedConnectionsService {
     }
 
     pub(super) async fn delete_row(&self, connection_id: &ConnectionId) -> bool {
+        self.delete_connection(connection_id).await.is_ok()
+    }
+
+    pub(super) async fn delete_connection(
+        &self,
+        connection_id: &ConnectionId,
+    ) -> Result<(), Status> {
         sqlx::query("DELETE FROM managed_connections WHERE connection_id = $1")
             .bind(connection_id.as_str())
             .execute(&self.database)
             .await
-            .is_ok()
+            .map_err(|_| storage_unavailable())?;
+        Ok(())
     }
+
+    /// Every connection row, oldest first.
+    pub(super) async fn list_rows(&self) -> Result<Vec<ConnectionRow>, Status> {
+        sqlx::query_as::<_, ConnectionRow>(
+            r"
+            SELECT connection_id, display_name, root, provider_user_id,
+                   credential_identifier, state, permissions, created_at, updated_at
+            FROM managed_connections
+            ORDER BY created_at, connection_id
+            ",
+        )
+        .fetch_all(&self.database)
+        .await
+        .map_err(|_| storage_unavailable())
+    }
+
+    /// Inserts a new connection in `provisioning`, before any external call.
+    pub(super) async fn insert_provisioning(
+        &self,
+        connection_id: &ConnectionId,
+        display_name: &DisplayName,
+        root: &ConfigPath,
+        permissions: &ManagedPermissions,
+    ) -> Result<(), Status> {
+        let now = OffsetDateTime::now_utc();
+        sqlx::query(
+            r"
+            INSERT INTO managed_connections
+                (connection_id, display_name, root, state, permissions, created_at, updated_at)
+            VALUES ($1, $2, $3, 'provisioning', $4, $5, $5)
+            ",
+        )
+        .bind(connection_id.as_str())
+        .bind(display_name.as_str())
+        .bind(root.as_str())
+        .bind(permissions.as_storage())
+        .bind(now)
+        .execute(&self.database)
+        .await
+        .map_err(|_| storage_unavailable())?;
+        Ok(())
+    }
+
+    pub(super) async fn record_provider_user(
+        &self,
+        connection_id: &ConnectionId,
+        account: &CreatedServiceAccount,
+    ) -> Result<(), Status> {
+        sqlx::query(
+            r"
+            UPDATE managed_connections
+            SET provider_user_id = $2, provider_user_uid = $3, updated_at = $4
+            WHERE connection_id = $1
+            ",
+        )
+        .bind(connection_id.as_str())
+        .bind(account.user_id)
+        .bind(&account.user_uid)
+        .bind(OffsetDateTime::now_utc())
+        .execute(&self.database)
+        .await
+        .map_err(|_| storage_unavailable())?;
+        Ok(())
+    }
+
+    pub(super) async fn record_credential_identifier(
+        &self,
+        connection_id: &ConnectionId,
+        credential_identifier: &str,
+    ) -> Result<(), Status> {
+        sqlx::query(
+            r"
+            UPDATE managed_connections
+            SET credential_identifier = $2, updated_at = $3
+            WHERE connection_id = $1
+            ",
+        )
+        .bind(connection_id.as_str())
+        .bind(credential_identifier)
+        .bind(OffsetDateTime::now_utc())
+        .execute(&self.database)
+        .await
+        .map_err(|_| storage_unavailable())?;
+        Ok(())
+    }
+}
+
+pub(super) async fn commit(transaction: Transaction<'_, Postgres>) -> Result<(), Status> {
+    transaction
+        .commit()
+        .await
+        .map_err(|_| storage_unavailable())
+}
+
+/// Marks a locked row `rotation_unknown` before the external call, so an
+/// interruption is always represented as an ambiguous rotation.
+pub(super) async fn mark_rotation_unknown(
+    transaction: &mut Transaction<'_, Postgres>,
+    connection_id: &ConnectionId,
+) -> Result<(), Status> {
+    sqlx::query(
+        r"
+            UPDATE managed_connections
+            SET state = 'rotation_unknown', updated_at = $2
+            WHERE connection_id = $1
+            ",
+    )
+    .bind(connection_id.as_str())
+    .bind(OffsetDateTime::now_utc())
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| storage_unavailable())?;
+    Ok(())
+}
+
+/// Marks a locked row `revoking`.
+pub(super) async fn mark_revoking(
+    transaction: &mut Transaction<'_, Postgres>,
+    connection_id: &ConnectionId,
+) -> Result<(), Status> {
+    sqlx::query(
+        r"
+                UPDATE managed_connections
+                SET state = 'revoking', updated_at = $2
+                WHERE connection_id = $1
+                ",
+    )
+    .bind(connection_id.as_str())
+    .bind(OffsetDateTime::now_utc())
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| storage_unavailable())?;
+    Ok(())
 }

@@ -19,7 +19,7 @@ use tonic::{Request, Response, Status};
 
 use super::identity::{generate_app_password, generate_connection_id, managed_username};
 use super::provisioning::{CLEANUP_MESSAGE, dependency_outcome};
-use super::store::ConnectionRow;
+use super::store::{ConnectionRow, commit, mark_revoking, mark_rotation_unknown};
 use super::wire::{
     conflict_error, dependency_error, internal_error, invalid_request, proto_metadata,
 };
@@ -29,7 +29,7 @@ use crate::metrics::{
     ManagedConnectionMetrics, ManagedDependencyCall, ManagedDependencyOutcome, ManagedOperation,
     ManagedOperationResult,
 };
-use crate::rpc::{STORAGE_UNAVAILABLE_MESSAGE, principal, storage_unavailable};
+use crate::rpc::{STORAGE_UNAVAILABLE_MESSAGE, principal};
 
 /// Non-secret settings used to build canonical connection URLs and grants.
 pub(crate) struct ManagedSettings {
@@ -143,17 +143,7 @@ impl ManagedConnectionsService {
         request: &Request<ListManagedConnectionsRequest>,
     ) -> Result<ListManagedConnectionsResponse, Status> {
         let principal = principal(request)?;
-        let rows = sqlx::query_as::<_, ConnectionRow>(
-            r"
-            SELECT connection_id, display_name, root, provider_user_id,
-                   credential_identifier, state, permissions, created_at, updated_at
-            FROM managed_connections
-            ORDER BY created_at, connection_id
-            ",
-        )
-        .fetch_all(&self.database)
-        .await
-        .map_err(|_| storage_unavailable())?;
+        let rows = self.list_rows().await?;
         let mut connections = Vec::new();
         for row in rows {
             let root = ConfigPath::parse(&row.root).map_err(|_| internal_error())?;
@@ -199,22 +189,8 @@ impl ManagedConnectionsService {
 
         let connection_id = generate_connection_id()?;
         let username = managed_username(&connection_id, display_name.as_str());
-        let now = OffsetDateTime::now_utc();
-        sqlx::query(
-            r"
-            INSERT INTO managed_connections
-                (connection_id, display_name, root, state, permissions, created_at, updated_at)
-            VALUES ($1, $2, $3, 'provisioning', $4, $5, $5)
-            ",
-        )
-        .bind(connection_id.as_str())
-        .bind(display_name.as_str())
-        .bind(root.as_str())
-        .bind(permissions.as_storage())
-        .bind(now)
-        .execute(&self.database)
-        .await
-        .map_err(|_| storage_unavailable())?;
+        self.insert_provisioning(&connection_id, &display_name, &root, &permissions)
+            .await?;
 
         self.provision_inserted(&connection_id, &username, &root, &permissions)
             .await
@@ -259,22 +235,8 @@ impl ManagedConnectionsService {
         if row.credential_identifier.is_none() {
             return Err(conflict_error());
         }
-        sqlx::query(
-            r"
-            UPDATE managed_connections
-            SET state = 'rotation_unknown', updated_at = $2
-            WHERE connection_id = $1
-            ",
-        )
-        .bind(connection_id.as_str())
-        .bind(OffsetDateTime::now_utc())
-        .execute(&mut *transaction)
-        .await
-        .map_err(|_| storage_unavailable())?;
-        transaction
-            .commit()
-            .await
-            .map_err(|_| storage_unavailable())?;
+        mark_rotation_unknown(&mut transaction, connection_id).await?;
+        commit(transaction).await?;
         Ok((row, root))
     }
 
@@ -307,31 +269,7 @@ impl ManagedConnectionsService {
                     ManagedDependencyCall::SetCredential,
                     dependency_outcome(error),
                 );
-                match error {
-                    // Definitive rejection before mutation: the previous
-                    // credential is still current.
-                    AdminError::Rejected | AdminError::Unavailable => {
-                        let _ = self
-                            .transition_state(
-                                &connection_id,
-                                ManagedConnectionState::RotationUnknown,
-                                ManagedConnectionState::Active,
-                            )
-                            .await;
-                    }
-                    // The token is gone; only revocation can clean this up.
-                    AdminError::NotFound => {
-                        let _ = self
-                            .transition_state(
-                                &connection_id,
-                                ManagedConnectionState::RotationUnknown,
-                                ManagedConnectionState::CleanupRequired,
-                            )
-                            .await;
-                    }
-                    // Ambiguous: Authentik may have applied the new key.
-                    AdminError::Ambiguous | AdminError::Invalid => {}
-                }
+                self.settle_failed_rotation(&connection_id, error).await;
                 return Err(dependency_error());
             }
         }
@@ -373,101 +311,130 @@ impl ManagedConnectionsService {
     ) -> Result<RevokeManagedConnectionResponse, Status> {
         let connection_id = ConnectionId::parse(request.get_ref().connection_id.clone())
             .map_err(|_| invalid_request())?;
-        let row = {
-            let principal = principal(request)?;
-            let mut transaction = self.begin().await?;
-            let row = self
-                .lock_manageable(&mut transaction, &connection_id, principal)
-                .await?;
-            sqlx::query(
-                r"
-                UPDATE managed_connections
-                SET state = 'revoking', updated_at = $2
-                WHERE connection_id = $1
-                ",
-            )
-            .bind(connection_id.as_str())
-            .bind(OffsetDateTime::now_utc())
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| storage_unavailable())?;
-            transaction
-                .commit()
-                .await
-                .map_err(|_| storage_unavailable())?;
-            row
-        };
+        let row = self.claim_for_revocation(request, &connection_id).await?;
+        let username = managed_username(&connection_id, &row.display_name);
+        if let Some(user_id) = self.revocation_target(&row, &username).await? {
+            self.delete_account_confirmed(user_id, &username).await?;
+        }
+        self.delete_connection(&connection_id).await?;
+        Ok(RevokeManagedConnectionResponse {})
+    }
 
-        let user_id = if let Some(user_id) = row.provider_user_id {
-            Some(user_id)
-        } else {
-            // The account may never have been created; probe only the
-            // exact generated username before declaring it absent.
-            let username = managed_username(&connection_id, &row.display_name);
-            match self.admin.find_user_by_username(&username).await {
-                Ok(found) => {
-                    self.metrics.record_dependency(
-                        ManagedDependencyCall::FindUser,
-                        ManagedDependencyOutcome::Ok,
-                    );
-                    found.map(|user| user.user_id)
-                }
-                Err(error) => {
-                    self.metrics.record_dependency(
-                        ManagedDependencyCall::FindUser,
-                        dependency_outcome(error),
-                    );
-                    // The lookup may be refused for an account the manager
-                    // can no longer see rather than reporting it missing.
-                    // Settle it via the app password, which is authoritative
-                    // because the token view is global and cascades with
-                    // the account.
-                    if !self.credential_is_gone(&username).await {
-                        return Err(dependency_error());
-                    }
-                    None
-                }
+    /// Locks a manageable row and marks it `revoking`, so a concurrent
+    /// rotation cannot report its URL as current.
+    async fn claim_for_revocation(
+        &self,
+        request: &Request<RevokeManagedConnectionRequest>,
+        connection_id: &ConnectionId,
+    ) -> Result<ConnectionRow, Status> {
+        let principal = principal(request)?;
+        let mut transaction = self.begin().await?;
+        let row = self
+            .lock_manageable(&mut transaction, connection_id, principal)
+            .await?;
+        mark_revoking(&mut transaction, connection_id).await?;
+        commit(transaction).await?;
+        Ok(row)
+    }
+
+    /// The Authentik account to delete for a revocation, if one exists.
+    async fn revocation_target(
+        &self,
+        row: &ConnectionRow,
+        username: &str,
+    ) -> Result<Option<i64>, Status> {
+        if let Some(user_id) = row.provider_user_id {
+            return Ok(Some(user_id));
+        }
+        // The account may never have been created; probe only the
+        // exact generated username before declaring it absent.
+        match self.admin.find_user_by_username(username).await {
+            Ok(found) => {
+                self.metrics.record_dependency(
+                    ManagedDependencyCall::FindUser,
+                    ManagedDependencyOutcome::Ok,
+                );
+                Ok(found.map(|user| user.user_id))
             }
-        };
-
-        if let Some(user_id) = user_id {
-            match self.admin.delete_user(user_id).await {
-                Ok(()) => {
-                    self.metrics.record_dependency(
-                        ManagedDependencyCall::DeleteUser,
-                        ManagedDependencyOutcome::Ok,
-                    );
+            Err(error) => {
+                self.metrics
+                    .record_dependency(ManagedDependencyCall::FindUser, dependency_outcome(error));
+                // The lookup may be refused for an account the manager
+                // can no longer see rather than reporting it missing.
+                // Settle it via the app password, which is authoritative
+                // because the token view is global and cascades with
+                // the account.
+                if !self.credential_is_gone(username).await {
+                    return Err(dependency_error());
                 }
-                Err(error) => {
-                    self.metrics.record_dependency(
-                        ManagedDependencyCall::DeleteUser,
-                        dependency_outcome(error),
-                    );
-                    // Deletion may already have happened: Authentik refuses,
-                    // or reports "not found", rather than reporting "not
-                    // found" consistently for an account the manager can no
-                    // longer see (the live RBAC test exercises both), and a
-                    // timeout is ambiguous by definition. Settle it by
-                    // looking for the account's app password, which is
-                    // authoritative because the token view is global and
-                    // Authentik cascades the token with the user. Trusting
-                    // `NotFound` on its own would let a lost delete
-                    // permission orphan a still-live credential.
-                    let username = managed_username(&connection_id, &row.display_name);
-                    if !self.credential_is_gone(&username).await {
-                        // The row stays `revoking`; revocation can be retried
-                        // until absence is confirmed.
-                        return Err(dependency_error());
-                    }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Deletes the account, or confirms it is already gone. The row stays
+    /// `revoking` on failure, so revocation can be retried until absence is
+    /// confirmed.
+    async fn delete_account_confirmed(&self, user_id: i64, username: &str) -> Result<(), Status> {
+        match self.admin.delete_user(user_id).await {
+            Ok(()) => {
+                self.metrics.record_dependency(
+                    ManagedDependencyCall::DeleteUser,
+                    ManagedDependencyOutcome::Ok,
+                );
+            }
+            Err(error) => {
+                self.metrics.record_dependency(
+                    ManagedDependencyCall::DeleteUser,
+                    dependency_outcome(error),
+                );
+                // Deletion may already have happened: Authentik refuses,
+                // or reports "not found", rather than reporting "not
+                // found" consistently for an account the manager can no
+                // longer see (the live RBAC test exercises both), and a
+                // timeout is ambiguous by definition. Settle it by
+                // looking for the account's app password, which is
+                // authoritative because the token view is global and
+                // Authentik cascades the token with the user. Trusting
+                // `NotFound` on its own would let a lost delete
+                // permission orphan a still-live credential.
+                if !self.credential_is_gone(username).await {
+                    // The row stays `revoking`; revocation can be retried
+                    // until absence is confirmed.
+                    return Err(dependency_error());
                 }
             }
         }
+        Ok(())
+    }
 
-        sqlx::query("DELETE FROM managed_connections WHERE connection_id = $1")
-            .bind(connection_id.as_str())
-            .execute(&self.database)
-            .await
-            .map_err(|_| storage_unavailable())?;
-        Ok(RevokeManagedConnectionResponse {})
+    /// Settles a rotation whose credential write failed, according to whether
+    /// the failure proves the previous credential is still current.
+    async fn settle_failed_rotation(&self, connection_id: &ConnectionId, error: AdminError) {
+        match error {
+            // Definitive rejection before mutation: the previous
+            // credential is still current.
+            AdminError::Rejected | AdminError::Unavailable => {
+                let _ = self
+                    .transition_state(
+                        connection_id,
+                        ManagedConnectionState::RotationUnknown,
+                        ManagedConnectionState::Active,
+                    )
+                    .await;
+            }
+            // The token is gone; only revocation can clean this up.
+            AdminError::NotFound => {
+                let _ = self
+                    .transition_state(
+                        connection_id,
+                        ManagedConnectionState::RotationUnknown,
+                        ManagedConnectionState::CleanupRequired,
+                    )
+                    .await;
+            }
+            // Ambiguous: Authentik may have applied the new key.
+            AdminError::Ambiguous | AdminError::Invalid => {}
+        }
     }
 }
