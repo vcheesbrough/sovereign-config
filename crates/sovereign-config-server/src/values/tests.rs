@@ -10,11 +10,14 @@ use sqlx::postgres::PgPoolOptions;
 use tokio::time::{sleep, timeout};
 use tonic::{Code, Request};
 
-use super::{
-    AddValuePathRequest, ConfigurationService, DeleteValuesRequest, GetSubTreeRequest,
-    ListValuePathsRequest, ListValuesRequest, MASKED_SECRET_TEXT, PutValueRequest,
-    ReplaceSubTreeRequest, encrypt_stored_secrets, wrong_key,
+use sovereign_config_core::MASKED_SECRET_TEXT;
+use sovereign_config_proto::sovereign::config::v3::{
+    AddValuePathRequest, DeleteValuesRequest, GetSubTreeRequest, ListValuePathsRequest,
+    ListValuesRequest, PutValueRequest, ReplaceSubTreeRequest,
 };
+
+use super::startup::wrong_key;
+use super::{ConfigurationService, encrypt_stored_secrets};
 use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
 
 fn request_with_grants<T>(message: T, grants: &[(&str, &[Permission])]) -> Request<T> {
