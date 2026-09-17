@@ -23,6 +23,7 @@ use crate::metrics::{
     ManagedConnectionMetrics, ManagedDependencyCall, ManagedDependencyOutcome, ManagedOperation,
     ManagedOperationResult,
 };
+use crate::rpc::{STORAGE_UNAVAILABLE_MESSAGE, principal, storage_unavailable, to_proto_timestamp};
 use sovereign_config_core::ConfigPath;
 use sovereign_config_proto::sovereign::config::v3::{
     CreateManagedConnectionRequest, CreateManagedConnectionResponse, ListManagedConnectionsRequest,
@@ -190,7 +191,7 @@ impl ManagedConnectionsService {
                 tonic::Code::NotFound => ManagedOperationResult::NotFound,
                 tonic::Code::Aborted => ManagedOperationResult::Conflict,
                 tonic::Code::Unavailable => match status.message() {
-                    STORAGE_MESSAGE => ManagedOperationResult::Storage,
+                    STORAGE_UNAVAILABLE_MESSAGE => ManagedOperationResult::Storage,
                     CLEANUP_MESSAGE => ManagedOperationResult::CleanupRequired,
                     _ => ManagedOperationResult::Dependency,
                 },
@@ -955,15 +956,10 @@ async fn cleanup_required(
     Status::unavailable(CLEANUP_MESSAGE)
 }
 
-#[allow(clippy::result_large_err)]
-fn principal<T>(request: &Request<T>) -> Result<&AuthenticatedPrincipal, Status> {
-    request
-        .extensions()
-        .get::<AuthenticatedPrincipal>()
-        .ok_or_else(|| Status::unauthenticated("authentication required"))
-}
-
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "tonic::Status is the crate's RPC error type and is returned by value"
+)]
 fn proto_metadata(row: &ConnectionRow) -> Result<ProtoManagedConnectionMetadata, Status> {
     let state = ManagedConnectionState::parse(&row.state).map_err(|_| internal_error())?;
     let permissions = ManagedPermissions::parse(&row.permissions).map_err(|_| internal_error())?;
@@ -988,16 +984,11 @@ const fn proto_state(state: ManagedConnectionState) -> ProtoManagedConnectionSta
     }
 }
 
-#[allow(clippy::result_large_err)]
-fn to_proto_timestamp(value: OffsetDateTime) -> Result<prost_types::Timestamp, Status> {
-    Ok(prost_types::Timestamp {
-        seconds: value.unix_timestamp(),
-        nanos: i32::try_from(value.nanosecond()).map_err(|_| internal_error())?,
-    })
-}
-
 /// Generates an opaque random connection identifier from the OS CSPRNG.
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "tonic::Status is the crate's RPC error type and is returned by value"
+)]
 fn generate_connection_id() -> Result<ConnectionId, Status> {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let value = random_string(ALPHABET, CONNECTION_ID_CHARS)?;
@@ -1005,14 +996,20 @@ fn generate_connection_id() -> Result<ConnectionId, Status> {
 }
 
 /// Generates a high-entropy replacement app password from the OS CSPRNG.
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "tonic::Status is the crate's RPC error type and is returned by value"
+)]
 fn generate_app_password() -> Result<Secret, Status> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     Ok(Secret::new(random_string(ALPHABET, APP_PASSWORD_CHARS)?))
 }
 
 /// Draws unbiased characters from the OS CSPRNG with rejection sampling.
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "tonic::Status is the crate's RPC error type and is returned by value"
+)]
 fn random_string(alphabet: &[u8], length: usize) -> Result<String, Status> {
     debug_assert!(alphabet.len() <= 64);
     let limit = u8::MAX - (u8::MAX % u8::try_from(alphabet.len()).map_err(|_| internal_error())?);
@@ -1029,7 +1026,6 @@ fn random_string(alphabet: &[u8], length: usize) -> Result<String, Status> {
     Ok(value)
 }
 
-const STORAGE_MESSAGE: &str = "configuration storage is unavailable";
 const CLEANUP_MESSAGE: &str = "managed connection requires cleanup";
 
 const fn dependency_outcome(error: AdminError) -> ManagedDependencyOutcome {
@@ -1056,10 +1052,6 @@ fn conflict_error() -> Status {
 
 fn dependency_error() -> Status {
     Status::unavailable("managed connection dependency is unavailable")
-}
-
-fn storage_unavailable() -> Status {
-    Status::unavailable(STORAGE_MESSAGE)
 }
 
 fn internal_error() -> Status {

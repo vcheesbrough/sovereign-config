@@ -17,8 +17,9 @@ use time::OffsetDateTime;
 use tonic::{Request, Response, Status};
 use tracing::{error, info};
 
-use crate::auth::{AuthenticatedPrincipal, Permission};
+use crate::auth::Permission;
 use crate::encryption::{DecryptError, ValueCipher, is_envelope};
+use crate::rpc::{principal, storage_unavailable, to_proto_timestamp};
 
 /// Classification of a value the caller may read back in the clear.
 const PLAIN: &str = "plain";
@@ -119,7 +120,10 @@ impl ConfigurationService {
     /// Secrets become an AEAD envelope bound to the content row that will hold
     /// them; plain values are stored verbatim, because masking them would only
     /// obstruct the operators and tooling that are meant to read them.
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "tonic::Status is the crate's RPC error type and is returned by value"
+    )]
     fn stored_representation(
         &self,
         content_id: i64,
@@ -136,7 +140,6 @@ impl ConfigurationService {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 #[tonic::async_trait]
 impl Configuration for ConfigurationService {
     async fn list_values(
@@ -145,10 +148,7 @@ impl Configuration for ConfigurationService {
     ) -> Result<Response<ListValuesResponse>, Status> {
         let selected = ConfigPath::parse_selection(&request.get_ref().path)
             .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
-        let principal = request
-            .extensions()
-            .get::<AuthenticatedPrincipal>()
-            .ok_or_else(|| Status::unauthenticated("authentication required"))?;
+        let principal = principal(&request)?;
         let candidates = sqlx::query_as::<_, PathContentRow>(
             "SELECT path, lowercase_path, content_id, created_at FROM configuration_paths ORDER BY lowercase_path",
         )
@@ -680,10 +680,7 @@ impl Configuration for ConfigurationService {
         &self,
         request: Request<AddValuePathRequest>,
     ) -> Result<Response<AddValuePathResponse>, Status> {
-        let principal = request
-            .extensions()
-            .get::<AuthenticatedPrincipal>()
-            .ok_or_else(|| Status::unauthenticated("authentication required"))?;
+        let principal = principal(&request)?;
         let source = ConfigPath::parse_operation(&request.get_ref().source_path)
             .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
         let new_path = ConfigPath::parse_operation(&request.get_ref().new_path)
@@ -763,10 +760,7 @@ impl Configuration for ConfigurationService {
         request: Request<ListValuePathsRequest>,
     ) -> Result<Response<ListValuePathsResponse>, Status> {
         let path = authorize(&request, &[Permission::Read], false)?;
-        let principal = request
-            .extensions()
-            .get::<AuthenticatedPrincipal>()
-            .ok_or_else(|| Status::unauthenticated("authentication required"))?;
+        let principal = principal(&request)?;
         let content_id = sqlx::query_scalar::<_, i64>(
             "SELECT content_id FROM configuration_paths WHERE lowercase_path = $1",
         )
@@ -989,7 +983,10 @@ async fn lock_path(
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "tonic::Status is the crate's RPC error type and is returned by value"
+)]
 fn authorize<T>(
     request: &Request<T>,
     permissions: &[Permission],
@@ -1004,10 +1001,7 @@ where
         ConfigPath::parse_operation(request.get_ref().path())
     }
     .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
-    let principal = request
-        .extensions()
-        .get::<AuthenticatedPrincipal>()
-        .ok_or_else(|| Status::unauthenticated("authentication required"))?;
+    let principal = principal(request)?;
     if permissions
         .iter()
         .any(|permission| !principal.allows(&path, *permission))
@@ -1163,23 +1157,6 @@ fn upsert_ancestor(
             }
         }
     }
-}
-
-#[allow(clippy::result_large_err)]
-fn to_proto_timestamp(value: OffsetDateTime) -> Result<prost_types::Timestamp, Status> {
-    let nanos = value.nanosecond();
-    Ok(prost_types::Timestamp {
-        seconds: value.unix_timestamp(),
-        nanos: i32::try_from(nanos).map_err(|_| invalid_timestamp())?,
-    })
-}
-
-fn storage_unavailable() -> Status {
-    Status::unavailable("configuration storage is unavailable")
-}
-
-fn invalid_timestamp() -> Status {
-    Status::internal("configuration timestamp is invalid")
 }
 
 fn encryption_failed() -> Status {

@@ -1133,7 +1133,6 @@ fn install_route_link(document: &Document, id: &str, route: Route) {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn install_configuration_actions(document: &Document) {
     if let Some(form) = document.get_element_by_id("path-form") {
         let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
@@ -3049,7 +3048,6 @@ fn close_add_path_dialog() {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn install_connections_actions(document: &Document) {
     for form in [&ESTATE_CONNECTION_FORM, &PATH_CONNECTION_FORM] {
         if let Some(element) = document.get_element_by_id(form.form_id) {
@@ -3965,7 +3963,6 @@ fn render_path_options(listing: &ValueListing) -> Result<(), ClientError> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 fn render_value_row(
     document: &Document,
     value: &ListedValue,
@@ -4118,7 +4115,6 @@ fn render_value_row(
     Ok(row)
 }
 
-#[allow(clippy::too_many_lines)]
 fn render_secret_value_row(
     document: &Document,
     value: &ListedValue,
