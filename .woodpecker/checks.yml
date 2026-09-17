@@ -1,27 +1,29 @@
-# Checks workflow: the Rust and shell gates. Neither step depends on the other,
-# so both start together.
+# Checks workflow: every gate that needs no deployment. No step depends on
+# another, so all of them start together.
 #
 # The pipeline is split into workflows, one file each, in the style of v-note:
 #
-#   push:        checks ∥ client ∥ authentik → deploy-dev
-#   deployment:  authentik → deploy-prod   (prod target, from main only)
+#   push:        checks → deploy-dev
+#   deployment:  deploy-prod   (prod target, from main only)
 #
-#   checks       unit-test, script-validation          (+ postgres-test service)
-#   client       client-playwright
-#   authentik    validate-authentik-version            (push and deployment)
-#   deploy-dev   compute-version → build-server ∥ build-broker → publish-dev-image
+#   checks       script-validation, unit-test, client-playwright   (+ postgres-test)
+#   deploy-dev   compute-version ∥ validate-authentik-version
+#                → build-server ∥ build-broker → publish-dev-image
 #                → apply-authentik-blueprint-auto-dev → validate-authentik-manager-live
 #                → auto-deploy-dev → tag-release-auto-dev
-#   deploy-prod  resolve-release-tag → verify-image ∥ apply-authentik-blueprint-prod
+#   deploy-prod  resolve-release-tag ∥ validate-authentik-version
+#                → verify-image ∥ apply-authentik-blueprint-prod
 #                → validate-authentik-manager-live-prod → deploy-prod
 #
 # Why workflows and not one file of `depends_on` steps: Woodpecker runs step
 # dependencies as whole stages, so a step starts only when every step of the
 # previous dependency level has finished, not just the ones it names. Workflows
-# run in parallel and share nothing — no workspace, no `.release-tag` — so each
-# value a step reads is produced inside its own workflow. Gating across workflows
-# is the workflow-level `depends_on`: deploy-dev runs only if checks, client and
-# authentik all succeed, so an image is never published before the tests pass.
+# share nothing — no workspace, no `.release-tag` — so each value a step reads is
+# produced inside its own workflow. deploy-dev depends on checks, so an image is
+# never published before every check passes.
+#
+# validate-authentik-version appears in both deploy workflows: it guards the
+# blueprint apply in each, and workflows cannot share a step.
 #
 # Every build, publish, version-allocation and dev-deploy step is push-only, and
 # every production step is deployment-only; each step also carries its own
@@ -69,6 +71,31 @@ steps:
       - cargo test --package sovereign-config-server -- --ignored --test-threads=1
       - rustup target add wasm32-unknown-unknown
       - cargo check --target wasm32-unknown-unknown --package sovereign-config-core --package sovereign-config-client --package sovereign-config-web
+
+  # Builds the release WebAssembly bundle and runs the Playwright suite against it
+  # in Chromium and Firefox. The backend is mocked at the network layer
+  # (browser-tests/tests/helpers.js), so this is a client test, not end-to-end.
+  client-playwright:
+    depends_on: []
+    when:
+      - event: push
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - |
+        rm -rf .browser-dist
+        docker build --target web-dist-artifact --output type=local,dest=.browser-dist .
+        CONTAINER=$$(docker create --workdir /tests \
+          --env PLAYWRIGHT_STATIC=1 \
+          --env PLAYWRIGHT_STATIC_DIR=/web-dist \
+          mcr.microsoft.com/playwright:v1.61.1-noble@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48 \
+          sh -lc 'npm ci --ignore-scripts && npm test')
+        trap 'docker rm --force "$$CONTAINER" >/dev/null 2>&1 || true; rm -rf .browser-dist' EXIT
+        docker cp browser-tests/. "$$CONTAINER:/tests"
+        docker cp test-contracts/. "$$CONTAINER:/test-contracts"
+        docker cp .browser-dist/. "$$CONTAINER:/web-dist"
+        docker start --attach "$$CONTAINER"
 
 services:
   # Only the push pipeline's unit-test uses a database; the

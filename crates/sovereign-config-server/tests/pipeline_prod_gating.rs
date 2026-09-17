@@ -217,21 +217,6 @@ fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
         verify_cmd.contains("registry.desync.link/sovereign-config-woodpecker-broker:"),
         "verify-image must also prove the broker image was published for this tag"
     );
-    // validate-authentik-version lives in the authentik workflow, which runs on
-    // both events, so it still gates both the dev and prod blueprint applies.
-    assert_eq!(
-        pipeline.workflow_of("validate-authentik-version"),
-        "authentik"
-    );
-    let events: BTreeSet<String> = when_conditions(pipeline.workflow("authentik"))
-        .into_iter()
-        .flat_map(|condition| condition.events)
-        .collect();
-    assert_eq!(
-        events,
-        BTreeSet::from(["push".to_owned(), "deployment".to_owned()]),
-        "the authentik workflow must run on both push and deployment"
-    );
 }
 
 #[test]
@@ -284,19 +269,10 @@ fn prod_live_manager_check_validates_the_production_group() {
     );
 }
 
-fn workflow_dependencies(pipeline: &Pipeline, workflow: &str) -> BTreeSet<String> {
-    pipeline
-        .workflow(workflow)
-        .get("depends_on")
-        .and_then(Value::as_sequence)
-        .unwrap_or_else(|| panic!("workflow {workflow} should depend on other workflows"))
-        .iter()
-        .map(|dependency| {
-            dependency
-                .as_str()
-                .unwrap_or_else(|| panic!("{workflow} dependencies must be required, not optional"))
-                .to_owned()
-        })
+fn workflow_events(pipeline: &Pipeline, workflow: &str) -> BTreeSet<String> {
+    when_conditions(pipeline.workflow(workflow))
+        .into_iter()
+        .flat_map(|condition| condition.events)
         .collect()
 }
 
@@ -305,14 +281,16 @@ fn workflow_dependencies(pipeline: &Pipeline, workflow: &str) -> BTreeSet<String
 #[test]
 fn every_step_sits_in_its_workflow() {
     let pipeline = pipeline();
-    for (workflow, steps) in [
-        ("checks", &["script-validation", "unit-test"][..]),
-        ("client", &["client-playwright"][..]),
-        ("authentik", &["validate-authentik-version"][..]),
+    let expected: [(&str, &[&str]); 3] = [
+        (
+            "checks",
+            &["script-validation", "unit-test", "client-playwright"],
+        ),
         (
             "deploy-dev",
             &[
                 "compute-version",
+                "validate-authentik-version",
                 "build-server",
                 "build-broker",
                 "publish-dev-image",
@@ -320,66 +298,143 @@ fn every_step_sits_in_its_workflow() {
                 "validate-authentik-manager-live",
                 "auto-deploy-dev",
                 "tag-release-auto-dev",
-            ][..],
+            ],
         ),
         (
             "deploy-prod",
             &[
+                "validate-authentik-version",
                 "resolve-release-tag",
                 "verify-image",
                 "apply-authentik-blueprint-prod",
                 "validate-authentik-manager-live-prod",
                 "deploy-prod",
-            ][..],
+            ],
         ),
-    ] {
-        for name in steps {
-            assert_eq!(
-                pipeline.workflow_of(name),
-                workflow,
-                "{name} moved workflow"
-            );
-        }
-    }
-    assert_eq!(pipeline.steps().len(), 17, "a step was added or removed");
+    ];
+    let actual: Vec<(&str, String)> = pipeline
+        .steps()
+        .into_iter()
+        .map(|(workflow, name, _)| (workflow, name))
+        .collect();
+    let expected: Vec<(&str, String)> = expected
+        .iter()
+        .flat_map(|(workflow, steps)| steps.iter().map(|step| (*workflow, (*step).to_owned())))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "a step was added, removed, or moved workflow"
+    );
 }
 
-/// Nothing is published or deployed to dev unless every gate passed: the tests,
-/// the browser suite, the script checks, and the Authentik compatibility check.
+/// Nothing is published or deployed to dev unless every check passed: the
+/// tests, the browser suite, and the script checks.
 #[test]
-fn dev_deploy_waits_for_every_gate() {
+fn dev_deploy_waits_for_every_check() {
     let pipeline = pipeline();
-    assert_eq!(
-        workflow_dependencies(&pipeline, "deploy-dev"),
-        BTreeSet::from([
-            "authentik".to_owned(),
-            "checks".to_owned(),
-            "client".to_owned()
-        ]),
-    );
-    for workflow in ["checks", "client", "deploy-dev"] {
-        let events: BTreeSet<String> = when_conditions(pipeline.workflow(workflow))
-            .into_iter()
-            .flat_map(|condition| condition.events)
-            .collect();
+    let dependencies: Vec<&str> = pipeline
+        .workflow("deploy-dev")
+        .get("depends_on")
+        .and_then(Value::as_sequence)
+        .expect("deploy-dev should depend on checks")
+        .iter()
+        .map(|dependency| {
+            dependency
+                .as_str()
+                .expect("deploy-dev's dependencies must be required, not optional")
+        })
+        .collect();
+    assert_eq!(dependencies, ["checks"]);
+    for workflow in ["checks", "deploy-dev"] {
         assert_eq!(
-            events,
+            workflow_events(&pipeline, workflow),
             BTreeSet::from(["push".to_owned()]),
-            "{workflow} must be push-only, so deploy-dev's required dependencies always run with it"
+            "{workflow} must be push-only, so deploy-dev's required dependency always runs with it"
         );
     }
 }
 
-/// The prod workflow is itself restricted to a prod deployment from main, and it
-/// cannot start before Authentik is proven compatible.
+/// The prod workflow is itself restricted to a prod deployment from main. It
+/// depends on no other workflow, because nothing else runs on a deployment.
 #[test]
 fn prod_workflow_is_gated_as_a_whole() {
     let pipeline = pipeline();
-    assert_eq!(
-        workflow_dependencies(&pipeline, "deploy-prod"),
-        BTreeSet::from(["authentik".to_owned()]),
+    assert!(
+        pipeline.workflow("deploy-prod").get("depends_on").is_none(),
+        "deploy-prod must not wait for a workflow that never runs on a deployment"
     );
     let conditions = when_conditions(pipeline.workflow("deploy-prod"));
+    assert!(!conditions.is_empty());
+    for condition in conditions {
+        assert_eq!(condition.events, BTreeSet::from(["deployment".to_owned()]));
+        assert_eq!(
+            condition.branches,
+            PROD_BRANCHES
+                .iter()
+                .map(|&branch| branch.to_owned())
+                .collect()
+        );
+        assert_eq!(
+            condition.evaluate.as_deref(),
+            Some("CI_PIPELINE_DEPLOY_TARGET == \"prod\"")
+        );
+    }
+}
+
+/// Each deploy workflow checks Authentik compatibility itself before applying
+/// its blueprint: workflows cannot share a step, so the check is defined in
+/// both, runs only with the deploy it guards, and is otherwise identical.
+#[test]
+fn each_blueprint_apply_waits_for_the_authentik_version_check() {
+    let pipeline = pipeline();
+    assert_eq!(
+        pipeline.workflows_of("validate-authentik-version"),
+        ["deploy-dev", "deploy-prod"]
+    );
+    let mut copies = Vec::new();
+    for (workflow, apply, event) in [
+        ("deploy-dev", "apply-authentik-blueprint-auto-dev", "push"),
+        (
+            "deploy-prod",
+            "apply-authentik-blueprint-prod",
+            "deployment",
+        ),
+    ] {
+        let dependencies: Vec<&str> = pipeline
+            .step_in(workflow, apply)
+            .get("depends_on")
+            .and_then(Value::as_sequence)
+            .expect("blueprint apply should list its dependencies")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            dependencies.contains(&"validate-authentik-version"),
+            "{apply} must wait for validate-authentik-version"
+        );
+        let check = pipeline.step_in(workflow, "validate-authentik-version");
+        assert!(
+            when_conditions(check)
+                .iter()
+                .all(|condition| condition.events == BTreeSet::from([event.to_owned()])),
+            "the {workflow} copy of validate-authentik-version must run only on {event}"
+        );
+        let mut copy = check.as_mapping().expect("step is a mapping").clone();
+        copy.remove("when");
+        copies.push(copy);
+    }
+    assert_eq!(
+        copies[0], copies[1],
+        "both copies of validate-authentik-version must check the same thing"
+    );
+}
+
+/// The prod copy of the Authentik check carries the same prod-only guard as
+/// every other production step.
+#[test]
+fn prod_authentik_check_is_gated_like_every_prod_step() {
+    let pipeline = pipeline();
+    let conditions = when_conditions(pipeline.step_in("deploy-prod", "validate-authentik-version"));
     assert!(!conditions.is_empty());
     for condition in conditions {
         assert_eq!(condition.events, BTreeSet::from(["deployment".to_owned()]));
