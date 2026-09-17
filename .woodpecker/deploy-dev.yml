@@ -10,12 +10,10 @@
 when:
   - event: push
 
-# Nothing here starts until every gate has passed. All three run on push, so
-# none of these dependencies is optional.
+# Nothing here starts until every check has passed. checks runs on push, so the
+# dependency is never optional.
 depends_on:
   - checks
-  - client
-  - authentik
 
 steps:
   # Allocates ONE semver per commit — ONLY on the push pipeline, the single
@@ -34,6 +32,32 @@ steps:
       major_minor_source: cargo
       github_token:
         from_secret: github_token
+
+  # A cheap, dependency-free curl gate: live Authentik must be new enough and
+  # expose every API surface managed connections need, before this workflow
+  # applies its blueprint. It needs no build artifact, so it depends on nothing.
+  validate-authentik-version:
+    depends_on: []
+    when:
+      - event: push
+    image: docker.io/curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
+    environment:
+      AUTHENTIK_API_TOKEN:
+        from_secret: authentik_api_token
+    commands:
+      - |
+        umask 077
+        printf 'header = "Authorization: Bearer %s"\n' "$$AUTHENTIK_API_TOKEN" > /tmp/authentik-curl.conf
+        VERSION=$$(curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/admin/version/ | sed -n 's/.*"version_current":"\([^"]*\)".*/\1/p')
+        test -n "$$VERSION"
+        awk -v version="$$VERSION" 'BEGIN { split(version, part, "."); if (part[1] > 2026 || (part[1] == 2026 && part[2] > 5) || (part[1] == 2026 && part[2] == 5 && part[3] >= 2)) exit 0; exit 1 }'
+        curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/schema/ > /tmp/authentik-schema.json
+        grep -q 'grant_types' /tmp/authentik-schema.json
+        # Surfaces required by managed application connections.
+        grep -q '/core/users/service_account/' /tmp/authentik-schema.json
+        grep -q '/core/tokens/{identifier}/set_key/' /tmp/authentik-schema.json
+        grep -q 'initial_permissions' /tmp/authentik-schema.json
+        echo "Validated compatible Authentik $$VERSION"
 
   build-server:
     depends_on:
@@ -71,8 +95,7 @@ steps:
 
   publish-dev-image:
     # unit-test, client-playwright and script-validation gate this through the
-    # workflow-level depends_on: nothing is published until the checks and
-    # client workflows have both passed.
+    # workflow-level depends_on: nothing is published until checks has passed.
     depends_on:
       - build-server
       - build-broker
@@ -100,8 +123,8 @@ steps:
         docker push "$$BROKER_IMAGE"
 
   apply-authentik-blueprint-auto-dev:
-    # validate-authentik-version gates this through the workflow-level depends_on.
     depends_on:
+      - validate-authentik-version
       - publish-dev-image
     when:
       - event: push

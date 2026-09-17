@@ -10,7 +10,7 @@ use std::path::Path;
 use serde_yaml::Value;
 
 /// Every workflow file, in the order the pipeline reads: gates, then deploys.
-pub const WORKFLOWS: [&str; 5] = ["checks", "client", "authentik", "deploy-dev", "deploy-prod"];
+pub const WORKFLOWS: [&str; 3] = ["checks", "deploy-dev", "deploy-prod"];
 
 pub struct Pipeline {
     workflows: Vec<(&'static str, Value)>,
@@ -62,27 +62,33 @@ impl Pipeline {
             .collect()
     }
 
-    /// The workflow holding the step `name`. Step names are unique across the
-    /// whole pipeline, so a name alone identifies a step.
-    pub fn workflow_of(&self, name: &str) -> &'static str {
-        let owners: Vec<&'static str> = self
-            .steps()
+    /// Every workflow defining a step called `name`, in [`WORKFLOWS`] order.
+    pub fn workflows_of(&self, name: &str) -> Vec<&'static str> {
+        self.steps()
             .into_iter()
             .filter(|(_, step, _)| step == name)
             .map(|(workflow, _, _)| workflow)
-            .collect();
-        match owners.as_slice() {
+            .collect()
+    }
+
+    /// The one workflow defining `name`. Panics if the name is missing or is
+    /// defined in several workflows; use [`Pipeline::step_in`] for those.
+    pub fn workflow_of(&self, name: &str) -> &'static str {
+        match self.workflows_of(name).as_slice() {
             [workflow] => workflow,
             [] => panic!("step {name} should exist"),
-            many => panic!("step {name} is defined in more than one workflow: {many:?}"),
+            many => panic!("step {name} is defined in several workflows: {many:?}"),
         }
     }
 
     pub fn step(&self, name: &str) -> &Value {
-        let workflow = self.workflow_of(name);
+        self.step_in(self.workflow_of(name), name)
+    }
+
+    pub fn step_in(&self, workflow: &str, name: &str) -> &Value {
         self.workflow(workflow)
             .get("steps")
             .and_then(|steps| steps.get(name))
-            .expect("step located by workflow_of")
+            .unwrap_or_else(|| panic!("step {name} should exist in {workflow}"))
     }
 }
