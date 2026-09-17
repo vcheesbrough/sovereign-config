@@ -18,13 +18,18 @@ use tonic::{
     Request, Response, Status,
     transport::{Endpoint, Server},
 };
-use tonic_health::pb::{HealthCheckRequest, health_check_response, health_client::HealthClient};
+use tonic_health::pb::{
+    HealthCheckRequest, health_check_response,
+    health_client::HealthClient,
+    health_server::{Health, HealthServer},
+};
+use tonic_health::server::HealthReporter;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use auth::{Authenticator, grpc_authentication_layer};
 use authentik::AuthentikAdminClient;
-use config::{Config, required_env};
+use config::{Config, ManagedConnectionConfig, required_env};
 use managed::{ManagedConnectionsService, ManagedSettings};
 use metrics::{AuthenticationMetrics, ManagedConnectionMetrics};
 use sovereign_config_core::{PROTOCOL_VERSION, Secret};
@@ -132,44 +137,15 @@ async fn main() -> Result<()> {
     if env::args().nth(1).as_deref() == Some("healthcheck") {
         return healthcheck().await;
     }
-
-    fmt()
-        .json()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    init_logging();
 
     let config = Config::from_env()?;
     let web_assets = WebAssetsLayer::new(&config.web);
     let authenticator = Authenticator::new(config.authentication)?;
     let authentication_metrics = Arc::new(AuthenticationMetrics::default());
     let managed_metrics = Arc::new(ManagedConnectionMetrics::default());
-    let managed_admin = AuthentikAdminClient::new(
-        config.managed.api_origin.clone(),
-        Secret::new(config.managed.api_token),
-        config.managed.timeout,
-    )?;
-    let managed_settings = ManagedSettings {
-        public_origin: config.managed.public_origin,
-        issuer: config.managed.issuer,
-        client_id: config.managed.client_id,
-        grants_attribute: config.managed.grants_attribute,
-        managed_group: config.managed.managed_group,
-        // Comfortably longer than the bounded Authentik call, so an expired
-        // lease proves the previous rotation attempt has ended.
-        rotation_lease: config.managed.timeout * 6,
-    };
-    let database = PgPoolOptions::new()
-        .acquire_timeout(Duration::from_secs(5))
-        .connect(&config.database_url)
-        .await
-        .map_err(|_| anyhow::anyhow!("unable to connect to required PostgreSQL dependency"))?;
-    sqlx::migrate!("./migrations")
-        .run(&database)
-        .await
-        .context("database migration failed")?;
-
+    let (managed_admin, managed_settings) = managed_dependencies(config.managed)?;
+    let database = connect_database(&config.database_url).await?;
     let value_cipher = Arc::new(config.value_cipher);
     encrypt_stored_secrets(&database, &value_cipher).await?;
 
@@ -178,29 +154,8 @@ async fn main() -> Result<()> {
         authentication_metrics: Arc::clone(&authentication_metrics),
         managed_metrics: Arc::clone(&managed_metrics),
     };
-    let metrics_app = Router::new()
-        .route("/metrics", get(metrics))
-        .route("/readyz", get(ready))
-        .with_state(state.clone());
-    let metrics_listener = TcpListener::bind(config.metrics_addr)
-        .await
-        .context("unable to bind metrics listener")?;
-    tokio::spawn(async move {
-        if let Err(error) = axum::serve(metrics_listener, metrics_app).await {
-            error!(error = %error, "metrics server terminated");
-        }
-    });
-
-    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_serving::<SystemServer<SystemService>>()
-        .await;
-    health_reporter
-        .set_serving::<ConfigurationServer<ConfigurationService>>()
-        .await;
-    health_reporter
-        .set_serving::<ManagedConnectionsServer<ManagedConnectionsService>>()
-        .await;
+    spawn_metrics_server(config.metrics_addr, state.clone()).await?;
+    let (_health_reporter, health_service) = serving_health_service().await;
 
     info!(grpc_addr = %config.grpc_addr, metrics_addr = %config.metrics_addr, protocol_version = PROTOCOL_VERSION, "sovereign-config started");
     Server::builder()
@@ -227,6 +182,90 @@ async fn main() -> Result<()> {
         .serve_with_shutdown(config.grpc_addr, shutdown_signal())
         .await
         .context("gRPC server terminated")
+}
+
+/// Structured JSON logs to stdout, filtered by `RUST_LOG`-style environment
+/// configuration and defaulting to `info`.
+fn init_logging() {
+    fmt()
+        .json()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+}
+
+/// The Authentik admin client and the non-secret settings the managed
+/// connection service builds URLs and grants from.
+fn managed_dependencies(
+    managed: ManagedConnectionConfig,
+) -> Result<(AuthentikAdminClient, ManagedSettings)> {
+    let admin = AuthentikAdminClient::new(
+        managed.api_origin.clone(),
+        Secret::new(managed.api_token),
+        managed.timeout,
+    )?;
+    let settings = ManagedSettings {
+        public_origin: managed.public_origin,
+        issuer: managed.issuer,
+        client_id: managed.client_id,
+        grants_attribute: managed.grants_attribute,
+        managed_group: managed.managed_group,
+        // Comfortably longer than the bounded Authentik call, so an expired
+        // lease proves the previous rotation attempt has ended.
+        rotation_lease: managed.timeout * 6,
+    };
+    Ok((admin, settings))
+}
+
+/// Connects to the required `PostgreSQL` dependency and applies the
+/// forward-only migrations before anything can serve.
+async fn connect_database(database_url: &str) -> Result<PgPool> {
+    let database = PgPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(database_url)
+        .await
+        .map_err(|_| anyhow::anyhow!("unable to connect to required PostgreSQL dependency"))?;
+    sqlx::migrate!("./migrations")
+        .run(&database)
+        .await
+        .context("database migration failed")?;
+    Ok(database)
+}
+
+/// Serves `/metrics` and `/readyz` on the internal metrics listener in the
+/// background. Binding happens before this returns, so a taken port fails
+/// startup.
+async fn spawn_metrics_server(address: SocketAddr, state: AppState) -> Result<()> {
+    let metrics_app = Router::new()
+        .route("/metrics", get(metrics))
+        .route("/readyz", get(ready))
+        .with_state(state);
+    let metrics_listener = TcpListener::bind(address)
+        .await
+        .context("unable to bind metrics listener")?;
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(metrics_listener, metrics_app).await {
+            error!(error = %error, "metrics server terminated");
+        }
+    });
+    Ok(())
+}
+
+/// The gRPC health service with every served service marked serving. The
+/// reporter is returned so the caller decides how long it lives.
+async fn serving_health_service() -> (HealthReporter, HealthServer<impl Health>) {
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<SystemServer<SystemService>>()
+        .await;
+    health_reporter
+        .set_serving::<ConfigurationServer<ConfigurationService>>()
+        .await;
+    health_reporter
+        .set_serving::<ManagedConnectionsServer<ManagedConnectionsService>>()
+        .await;
+    (health_reporter, health_service)
 }
 
 async fn healthcheck() -> Result<()> {
