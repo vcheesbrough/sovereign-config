@@ -1,3 +1,5 @@
-# Ratchet for clippy::too_many_lines (pedantic). 185 is the largest function
-# in the tree today; slice 8 of bored #340 lowers it to the clippy default.
-too-many-lines-threshold = 185
+# Ratchet for clippy::too_many_lines (pedantic, warned and promoted to an
+# error in CI). 100 is clippy's own default. Split a long function rather than
+# raising this or adding #[allow(clippy::too_many_lines)] to product code;
+# crates/sovereign-config-server/tests/lint_ratchet.rs enforces both.
+too-many-lines-threshold = 100
