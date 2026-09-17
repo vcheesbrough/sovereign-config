@@ -1,7 +1,7 @@
 #!/bin/sh
 # Bound the shared Woodpecker Rust target cache.
 #
-# Three CI steps (workspace-validation and both validate-authentik-manager-live*
+# Three CI steps (unit-test and both validate-authentik-manager-live*
 # steps) share one `sovereign-config-contract-target` volume as CARGO_TARGET_DIR.
 # Cargo never garbage-collects artifacts from commits it no longer builds, so
 # that volume grew to 92.6 GB over two months with nothing reaping it
@@ -26,10 +26,10 @@
 #        (defaults to $CARGO_TARGET_DIR)
 set -eu
 
-# 20 GiB. Measured on pipelines 216/217 (card #326): a cold workspace-validation
+# 20 GiB. Measured on pipelines 216/217 (card #326): a cold unit-test
 # leaves ~3.6 GiB behind and each subsequent pipeline adds ~1.9 GiB of
 # hash-suffixed workspace artifacts that cargo never reaps, so the ceiling is
-# reached roughly every ten pipelines. A cold workspace-validation took 121 s
+# reached roughly every ten pipelines. A cold unit-test took 121 s
 # against 101 s warm, so the wipe costs tens of seconds when it fires — the
 # cache is worth far less than its old 92.6 GB suggested.
 DEFAULT_MAX_MIB=20480
