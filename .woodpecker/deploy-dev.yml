@@ -9,23 +9,23 @@
 # See checks.yml for how the workflows fit together.
 
 when:
-  - event: push
+  - event: [push, manual]
 
 # Nothing here starts until every check has passed and both images are built.
-# Both run on push, so neither dependency is optional.
+# All three run on push and manual alike, so neither dependency is optional.
 depends_on:
   - checks
   - build
 
 steps:
-  # Allocates ONE semver per commit — ONLY on the push pipeline, the single
+  # Allocates ONE semver per commit — ONLY on a push or manual run, the single
   # place a version is minted. A deployment must NOT run this: it would allocate
   # the *next* patch (an unbuilt tag) and deploy-prod would pull an image that
   # was never published. Deployments resolve the commit's existing tag via
   # resolve-release-tag instead (mirrors bored card #254).
   compute-version:
     when:
-      - event: push
+      - event: [push, manual]
     depends_on: []
     pull: true
     image: &version-plugin ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.1.1@sha256:cf74d9706cb42b6d27c8d185789cd814ed061c8c88e06452d33ce3aed0bf9a22
@@ -41,7 +41,7 @@ steps:
   validate-authentik-version:
     depends_on: []
     when:
-      - event: push
+      - event: [push, manual]
     image: docker.io/curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
     environment:
       AUTHENTIK_API_TOKEN:
@@ -67,7 +67,7 @@ steps:
     depends_on:
       - compute-version
     when:
-      - event: push
+      - event: [push, manual]
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -108,7 +108,7 @@ steps:
       - validate-authentik-version
       - publish-dev-image
     when:
-      - event: push
+      - event: [push, manual]
     pull: true
     image: ghcr.io/vcheesbrough/woodpecker-plugin-authentik-blueprint:v0.2.0@sha256:9f262c4390205b5629e9af7560f4e492f0155395a429153703ba351206d9d975
     settings:
@@ -134,7 +134,7 @@ steps:
     depends_on:
       - apply-authentik-blueprint-auto-dev
     when:
-      - event: push
+      - event: [push, manual]
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
     environment:
       CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
@@ -165,7 +165,7 @@ steps:
     depends_on:
       - validate-authentik-manager-live
     when:
-      - event: push
+      - event: [push, manual]
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -190,7 +190,7 @@ steps:
 
   tag-release-auto-dev:
     when:
-      - event: push
+      - event: [push, manual]
     depends_on:
       - auto-deploy-dev
     pull: true

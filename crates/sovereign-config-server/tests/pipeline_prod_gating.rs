@@ -11,6 +11,12 @@ use std::collections::BTreeSet;
 use serde_yaml::Value;
 use support::{Pipeline, pipeline};
 
+/// The events that build, publish and deploy dev. A manual run from the
+/// Woodpecker UI does exactly what a push does.
+fn push_events() -> BTreeSet<String> {
+    BTreeSet::from(["push".to_owned(), "manual".to_owned()])
+}
+
 /// The only branch permitted to trigger a production promotion.
 const PROD_BRANCHES: &[&str] = &["main"];
 
@@ -105,9 +111,9 @@ fn production_steps_deploy_to_prod_from_permitted_branches() {
 }
 
 #[test]
-fn build_and_dev_deploy_steps_run_on_push_only() {
+fn build_and_dev_deploy_steps_never_run_on_a_deployment() {
     // Everything that allocates a version, builds, publishes, tags, or deploys
-    // dev is push-only, so a production promotion (a deployment event) never
+    // dev runs on push and manual only, so a production promotion (a deployment event) never
     // mints a new version, never rebuilds or republishes the image, and never
     // touches development.
     for name in [
@@ -127,11 +133,8 @@ fn build_and_dev_deploy_steps_run_on_push_only() {
         for workflow in pipeline.workflows_of(name) {
             let conditions = when_conditions(pipeline.step_in(workflow, name));
             assert!(
-                !conditions.is_empty()
-                    && conditions
-                        .iter()
-                        .all(|c| c.events == BTreeSet::from(["push".to_owned()])),
-                "{name} in {workflow} must be push-only so a production promotion never touches it"
+                !conditions.is_empty() && conditions.iter().all(|c| c.events == push_events()),
+                "{name} in {workflow} must run on push and manual only, so a production promotion never touches it"
             );
         }
     }
@@ -173,7 +176,7 @@ fn the_release_publishes_both_images_under_one_semver() {
 fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
     let pipeline = pipeline();
     // compute-version (mode compute) allocates the next semver; it must be
-    // push-only. On a deployment it would mint the *next* patch — an unbuilt tag
+    // push/manual-only. On a deployment it would mint the *next* patch — an unbuilt tag
     // — and deploy-prod would pull an image that was never published.
     assert_eq!(
         pipeline.workflows_of("compute-version"),
@@ -187,7 +190,7 @@ fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
                 .and_then(|settings| settings.get("mode"))
                 .and_then(Value::as_str),
             Some("compute"),
-            "compute-version allocates, so it must stay push-only (asserted above)"
+            "compute-version allocates, so it must stay off the deployment event (asserted above)"
         );
     }
     // The deployment resolves the commit's already-built tag instead of
@@ -360,8 +363,8 @@ fn dev_deploy_waits_for_checks_and_build() {
     for workflow in ["checks", "build", "deploy-dev"] {
         assert_eq!(
             workflow_events(&pipeline, workflow),
-            BTreeSet::from(["push".to_owned()]),
-            "{workflow} must be push-only, so deploy-dev's required dependencies always run with it"
+            push_events(),
+            "{workflow} must run on push and manual alike, so deploy-dev's required dependencies always run with it"
         );
     }
 }
@@ -404,12 +407,16 @@ fn each_blueprint_apply_waits_for_the_authentik_version_check() {
         ["deploy-dev", "deploy-prod"]
     );
     let mut copies = Vec::new();
-    for (workflow, apply, event) in [
-        ("deploy-dev", "apply-authentik-blueprint-auto-dev", "push"),
+    for (workflow, apply, events) in [
+        (
+            "deploy-dev",
+            "apply-authentik-blueprint-auto-dev",
+            push_events(),
+        ),
         (
             "deploy-prod",
             "apply-authentik-blueprint-prod",
-            "deployment",
+            BTreeSet::from(["deployment".to_owned()]),
         ),
     ] {
         let dependencies: Vec<&str> = pipeline
@@ -428,8 +435,8 @@ fn each_blueprint_apply_waits_for_the_authentik_version_check() {
         assert!(
             when_conditions(check)
                 .iter()
-                .all(|condition| condition.events == BTreeSet::from([event.to_owned()])),
-            "the {workflow} copy of validate-authentik-version must run only on {event}"
+                .all(|condition| condition.events == events),
+            "the {workflow} copy of validate-authentik-version must run only on {events:?}"
         );
         let mut copy = check.as_mapping().expect("step is a mapping").clone();
         copy.remove("when");
@@ -512,4 +519,32 @@ fn publish_only_ships_images_built_for_this_commit_and_tag() {
             "publish-dev-image's label check must cover {expected}"
         );
     }
+}
+
+/// Triggering a pipeline by hand does exactly what a push does: every workflow
+/// and step that runs on a push also runs on a manual trigger, and nothing runs
+/// on one without the other.
+#[test]
+fn a_manual_run_matches_a_push() {
+    let pipeline = pipeline();
+    let mut checked = 0;
+    for workflow in support::WORKFLOWS {
+        let mut conditions = when_conditions(pipeline.workflow(workflow));
+        for (owner, _, step) in pipeline.steps() {
+            if owner == workflow {
+                conditions.extend(when_conditions(step));
+            }
+        }
+        for condition in conditions {
+            let push = condition.events.contains("push");
+            let manual = condition.events.contains("manual");
+            assert_eq!(
+                push, manual,
+                "{workflow} has a condition on {:?}: push and manual must go together",
+                condition.events
+            );
+            checked += usize::from(push);
+        }
+    }
+    assert!(checked > 0, "no push condition was found to compare");
 }
