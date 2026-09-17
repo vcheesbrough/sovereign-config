@@ -1,0 +1,83 @@
+# Checks workflow: the Rust and shell gates. Neither step depends on the other,
+# so both start together.
+#
+# The pipeline is split into workflows, one file each, in the style of v-note:
+#
+#   push:        checks ∥ client ∥ authentik → deploy-dev
+#   deployment:  authentik → deploy-prod   (prod target, from main only)
+#
+#   checks       unit-test, script-validation          (+ postgres-test service)
+#   client       client-playwright
+#   authentik    validate-authentik-version            (push and deployment)
+#   deploy-dev   compute-version → build-server ∥ build-broker → publish-dev-image
+#                → apply-authentik-blueprint-auto-dev → validate-authentik-manager-live
+#                → auto-deploy-dev → tag-release-auto-dev
+#   deploy-prod  resolve-release-tag → verify-image ∥ apply-authentik-blueprint-prod
+#                → validate-authentik-manager-live-prod → deploy-prod
+#
+# Why workflows and not one file of `depends_on` steps: Woodpecker runs step
+# dependencies as whole stages, so a step starts only when every step of the
+# previous dependency level has finished, not just the ones it names. Workflows
+# run in parallel and share nothing — no workspace, no `.release-tag` — so each
+# value a step reads is produced inside its own workflow. Gating across workflows
+# is the workflow-level `depends_on`: deploy-dev runs only if checks, client and
+# authentik all succeed, so an image is never published before the tests pass.
+#
+# Every build, publish, version-allocation and dev-deploy step is push-only, and
+# every production step is deployment-only; each step also carries its own
+# `when`, which crates/sovereign-config-server/tests/pipeline_prod_gating.rs pins.
+
+when:
+  - event: push
+
+steps:
+  script-validation:
+    depends_on: []
+    when:
+      - event: push
+    image: docker.io/koalaman/shellcheck-alpine@sha256:e19ed93c22423970d56568e171b4512c9244fc75dd9114045016b4a0073ac4b7
+    commands:
+      - shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh scripts/migrate-openbao-woodpecker-secrets.sh scripts/ci-prune-cargo-target.sh scripts/ci-prune-cargo-target-test.sh
+      - sh scripts/ci-prune-cargo-target-test.sh
+
+  unit-test:
+    depends_on: []
+    when:
+      - event: push
+    image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
+    environment:
+      CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
+      # Every CI run is a fresh checkout, so incremental state is written and
+      # never usefully read — it was 43 GB of the shared target volume
+      # (bored card #326). Off, it is also marginally faster for clean builds.
+      CARGO_INCREMENTAL: "0"
+      SOVEREIGN_CONFIG_TEST_DATABASE_URL: postgresql://sovereign_config_test:sovereign_config_test@postgres-test:5432/sovereign_config_test
+    volumes:
+      - sovereign-config-cargo-registry:/usr/local/cargo/registry
+      - sovereign-config-cargo-git:/usr/local/cargo/git
+      - sovereign-config-contract-target:/woodpecker/cache/sovereign-config-target
+    commands:
+      # Cargo never reaps artifacts from commits it no longer builds; this
+      # enforces the 20 GiB ceiling on the shared volume (bored card #326).
+      - scripts/ci-prune-cargo-target.sh
+      - rustup component add clippy rustfmt
+      - cargo fmt --check
+      - cargo clippy --workspace --all-targets -- -D warnings
+      - cargo clippy --package sovereign-config-provider --all-targets --features config -- -D warnings
+      - cargo test --workspace
+      - cargo test --package sovereign-config-provider --features config
+      - cargo test --package sovereign-config-server -- --ignored --test-threads=1
+      - rustup target add wasm32-unknown-unknown
+      - cargo check --target wasm32-unknown-unknown --package sovereign-config-core --package sovereign-config-client --package sovereign-config-web
+
+services:
+  # Only the push pipeline's unit-test uses a database; the
+  # deployment (promotion) path touches no Postgres, so don't start this there.
+  postgres-test:
+    when:
+      - event: push
+    image: docker.io/library/postgres@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4
+    environment:
+      POSTGRES_DB: sovereign_config_test
+      POSTGRES_USER: sovereign_config_test
+      POSTGRES_PASSWORD: sovereign_config_test
