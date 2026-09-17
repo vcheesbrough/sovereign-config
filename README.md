@@ -229,6 +229,16 @@ Each crate has one consumer, target, or artifact. Dependencies only point down t
 
 The shared layer reader planned by bored card #293 sits above `native`, not inside it. The broker's reader already needs the native transport and a cached client-credentials token provider, and only the broker and the CLI need layer merging. That crate should depend on `core`, `client` and `native`, and be consumed by the broker and the CLI.
 
+### Where code goes
+
+A module holds one concern. When a file starts mixing concerns, add a sibling module rather than growing it. `clippy.toml` holds functions to clippy's default of 100 lines, and `crates/sovereign-config-server/tests/lint_ratchet.rs` fails if product code silences that lint.
+
+- **Server services** (`values/`, `managed/`): `service.rs` is the tonic impl and the RPC control flow, and holds no SQL. `store.rs` holds every row type and query. Authorization, pure validation such as `values/subtree.rs`, and wire mapping (`content.rs`, `wire.rs`) each get their own module. Authentik orchestration lives in `managed/provisioning.rs`. `rpc.rs` holds helpers every service shares.
+- **Server root**: `main.rs` is the startup sequence, one named step per concern. Authentication, Authentik, configuration, encryption, metrics and static assets each keep their own module.
+- **Core**: one module per concept (`path`, `value`, `listing`, `json`, `status`, `error`, `connection`, `managed`). Every public item is re-exported from the crate root, and dependants import it from there.
+- **Web**: one module per view (`configuration`, `value_rows`, `path_selector`, `tree`, `connections`, `downloads`) plus shared plumbing (`transport`, `session`, `route`, `shell`, `dom`, `browser`, `icons`). A thread-local static lives beside the code that owns it. Event handlers are registered through `dom::on_element_id` or `dom::listen`.
+- **Tests**: unit tests sit in a sibling `tests.rs` declared with `#[cfg(test)] mod tests;`, and Postgres-backed ones are `#[ignore]` and run in CI with `--ignored`. Browser tests use one `browser-tests/tests/<area>.spec.js` per view, with shared mocks in `helpers.js`.
+
 ## Upgrade
 
 1. Stop Sovereign Config traffic through Traefik, stop the old Sovereign Config container while leaving PostgreSQL running, and verify no v2 server process remains before migration or v3 writes.
