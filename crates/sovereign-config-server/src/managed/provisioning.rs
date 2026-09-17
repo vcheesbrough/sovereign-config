@@ -8,15 +8,14 @@ use sovereign_config_core::{
     ConfigPath, ConnectionId, ConnectionUrl, ManagedConnectionState, ManagedPermissions,
 };
 use sovereign_config_proto::sovereign::config::v3::CreateManagedConnectionResponse;
-use time::OffsetDateTime;
 use tokio::time::sleep;
 use tonic::Status;
 
 use super::ManagedConnectionsService;
+use super::store::ConnectionRow;
 use super::wire::{dependency_error, internal_error, proto_metadata};
-use crate::authentik::AdminError;
+use crate::authentik::{AdminError, CreatedServiceAccount};
 use crate::metrics::{ManagedDependencyCall, ManagedDependencyOutcome};
-use crate::rpc::storage_unavailable;
 
 /// How many times to re-probe for a possibly-delayed create before giving up
 /// on finding it. A single immediate probe cannot distinguish "never
@@ -59,72 +58,11 @@ impl ManagedConnectionsService {
             }
         };
 
-        // Record the external identity immediately so a crash from here on
-        // leaves a row that revocation can reconcile and clean up.
-        if sqlx::query(
-            r"
-            UPDATE managed_connections
-            SET provider_user_id = $2, provider_user_uid = $3, updated_at = $4
-            WHERE connection_id = $1
-            ",
-        )
-        .bind(connection_id.as_str())
-        .bind(account.user_id)
-        .bind(&account.user_uid)
-        .bind(OffsetDateTime::now_utc())
-        .execute(&self.database)
-        .await
-        .is_err()
-        {
-            return Err(self
-                .compensate_created_account(connection_id, account.user_id, storage_unavailable())
-                .await);
-        }
-
-        match self
-            .configure_account(connection_id, username, root, permissions, &account)
+        let (row, connection_url) = match self
+            .complete_provisioning(connection_id, username, root, permissions, &account)
             .await
         {
-            Ok(()) => {}
-            Err(status) => {
-                return Err(self
-                    .compensate_created_account(connection_id, account.user_id, status)
-                    .await);
-            }
-        }
-
-        let connection_url = ConnectionUrl::managed(
-            &self.settings.public_origin,
-            root,
-            &self.settings.issuer,
-            &self.settings.client_id,
-            username,
-            &account.app_password,
-        )
-        .map_err(|_| internal_error());
-        let connection_url = match connection_url {
-            Ok(url) => url,
-            Err(status) => {
-                return Err(self
-                    .compensate_created_account(connection_id, account.user_id, status)
-                    .await);
-            }
-        };
-
-        let row = match self
-            .transition_state(
-                connection_id,
-                ManagedConnectionState::Provisioning,
-                ManagedConnectionState::Active,
-            )
-            .await
-        {
-            Ok(Some(row)) => row,
-            Ok(None) => {
-                return Err(self
-                    .compensate_created_account(connection_id, account.user_id, internal_error())
-                    .await);
-            }
+            Ok(completed) => completed,
             Err(status) => {
                 return Err(self
                     .compensate_created_account(connection_id, account.user_id, status)
@@ -138,6 +76,41 @@ impl ManagedConnectionsService {
         })
     }
 
+    /// Every provisioning step after the account exists. Any error here is
+    /// compensated by the caller, which deletes the account it created.
+    async fn complete_provisioning(
+        &self,
+        connection_id: &ConnectionId,
+        username: &str,
+        root: &ConfigPath,
+        permissions: &ManagedPermissions,
+        account: &CreatedServiceAccount,
+    ) -> Result<(ConnectionRow, ConnectionUrl), Status> {
+        // Record the external identity immediately so a crash from here on
+        // leaves a row that revocation can reconcile and clean up.
+        self.record_provider_user(connection_id, account).await?;
+        self.configure_account(connection_id, username, root, permissions, account)
+            .await?;
+        let connection_url = ConnectionUrl::managed(
+            &self.settings.public_origin,
+            root,
+            &self.settings.issuer,
+            &self.settings.client_id,
+            username,
+            &account.app_password,
+        )
+        .map_err(|_| internal_error())?;
+        let row = self
+            .transition_state(
+                connection_id,
+                ManagedConnectionState::Provisioning,
+                ManagedConnectionState::Active,
+            )
+            .await?
+            .ok_or_else(internal_error)?;
+        Ok((row, connection_url))
+    }
+
     /// Discovers the single app-password credential, records its identifier,
     /// and patches the exact selected grant plus managed marker.
     pub(super) async fn configure_account(
@@ -146,7 +119,7 @@ impl ManagedConnectionsService {
         username: &str,
         root: &ConfigPath,
         permissions: &ManagedPermissions,
-        account: &crate::authentik::CreatedServiceAccount,
+        account: &CreatedServiceAccount,
     ) -> Result<(), Status> {
         let identifiers = match self.admin.find_app_password_identifiers(username).await {
             Ok(identifiers) => identifiers,
@@ -173,22 +146,8 @@ impl ManagedConnectionsService {
             ManagedDependencyOutcome::Ok,
         );
 
-        if sqlx::query(
-            r"
-            UPDATE managed_connections
-            SET credential_identifier = $2, updated_at = $3
-            WHERE connection_id = $1
-            ",
-        )
-        .bind(connection_id.as_str())
-        .bind(credential_identifier)
-        .bind(OffsetDateTime::now_utc())
-        .execute(&self.database)
-        .await
-        .is_err()
-        {
-            return Err(storage_unavailable());
-        }
+        self.record_credential_identifier(connection_id, credential_identifier)
+            .await?;
 
         match self
             .admin
