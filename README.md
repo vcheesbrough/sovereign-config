@@ -47,12 +47,12 @@ Cargo supplies the `major.minor` release line. After a successful development de
 
 The development deployment is verified by calling `System.GetVersion` through the public gRPC endpoint after Woodpecker completes. gRPC health and `System.GetVersion` are the only RPCs that do not require authentication.
 
-Production is deployed with Woodpecker's **Deploy feature — a `deployment` event targeting the `prod` environment, from `main`**. All build, publish, and version-allocation steps are gated to `push`, so a promotion never rebuilds, republishes, or mints a new version, and never redeploys development. Instead it **resolves the semver the push pipeline already tagged onto the commit** (`resolve-release-tag`; it never allocates — allocating on a deployment would mint an unbuilt tag), **verifies that exact image is present in the registry** (`verify-image`, no rebuild), applies the production Authentik blueprint (`authentik/blueprint.yaml`), validates the production connection manager against live Authentik, and deploys that image onto the production stack (`sovereign-config.desync.link`, container `sovereign-config-production`, compose project `sovereign-config-prod`). A commit can therefore only be promoted after its push pipeline has finished (build + dev deploy → git tag); a commit with no release tag fails closed.
+Production is deployed with Woodpecker's **Deploy feature — a `deployment` event targeting the `prod` environment, from `main`**. All build, publish, and version-allocation steps run only on a `push` or a manual run of the pipeline, never on a `deployment`, so a promotion never rebuilds, republishes, or mints a new version, and never redeploys development. Instead it **resolves the semver the push pipeline already tagged onto the commit** (`resolve-release-tag`; it never allocates — allocating on a deployment would mint an unbuilt tag), **verifies that exact image is present in the registry** (`verify-image`, no rebuild), applies the production Authentik blueprint (`authentik/blueprint.yaml`), validates the production connection manager against live Authentik, and deploys that image onto the production stack (`sovereign-config.desync.link`, container `sovereign-config-production`, compose project `sovereign-config-prod`). A commit can therefore only be promoted after its push pipeline has finished (build + dev deploy → git tag); a commit with no release tag fails closed.
 
 Before the first promotion the operator provides the production Woodpecker secrets `sovereign_config_prod_postgres_password`, `sovereign_config_prod_oidc_introspection_client_secret`, `sovereign_config_prod_manager_api_token`, and `sovereign_config_prod_value_encryption_key` (the server refuses to start without it), the pre-created encrypted `sovereign-config-production-db` volume, and DNS/Traefik for the production host. The shared secrets the deployment path reuses — `github_token` (tag resolution), `zot_ci_user` and `zot_ci_password` (registry pull), and `authentik_api_token` (blueprint) — must permit the `deployment` event in their Woodpecker event allowlists.
 
 Build release images only for linux/amd64 with `docker build --platform linux/amd64 --target server-runtime --tag sovereign-config:local .`. `--target` is mandatory: the Dockerfile has a second final stage, `broker-runtime`, for the Woodpecker secrets broker (`docker build --platform linux/amd64 --target broker-runtime --tag sovereign-config-woodpecker-broker:local .`), and an untargeted build tags whichever stage is last in the file.
-Woodpecker reuses Cargo dependency and compilation caches across validation and server-image builds.
+Woodpecker keeps two separate Cargo caches, and neither reuses the other. The `unit-test` step builds debug and test artifacts into the `sovereign-config-contract-target` volume. The image builds compile release artifacts into the `sovereign-config-cargo-target` BuildKit cache mount. Each cache is bounded at 20 GiB by its own prune script, `scripts/ci-prune-cargo-target.sh` and `scripts/ci-prune-buildkit-cache.sh`.
 
 The server embeds the fingerprinted Rust WASM administration application and serves it with gRPC-Web on the native gRPC listener. Browser assets, runtime OIDC configuration, and gRPC-Web use the service origin; the server sends no cross-origin API permission. Browser access tokens remain only in WASM memory, while rotating refresh tokens remain in tab-scoped session storage. Access expiry refreshes transparently and reload restores the tab's session; logout, absolute refresh expiry, or definitive refresh rejection require a new PKCE authorization.
 
@@ -209,6 +209,35 @@ The connection-manager identity is isolated from the introspection credential an
 ## Woodpecker CI secrets extension
 
 `sovereign-config-woodpecker-broker` is a Woodpecker CI external secrets extension backed by Sovereign Config, published as its own image (`registry.desync.link/sovereign-config-woodpecker-broker`) under the same semver as the server. Woodpecker POSTs signed repository and pipeline metadata to a single configured endpoint; the broker verifies the RFC 9421 Ed25519 signature — including recomputing the body digest — renders an ordered list of configuration layers from the repository in the request, reads them through a read-only managed connection, and returns the merged secrets in Woodpecker's format. Later layers override earlier ones, so a per-repository path can override a shared default, and the repository identity always comes from the signed request rather than from configuration. Woodpecker supports exactly one secret-extension endpoint, so adopting it is a replacement rather than an addition. Pipeline YAML is unchanged: secret names are stored verbatim as path segments, which is why the canonical path grammar permits `_`. Woodpecker matches `from_secret:` names by exact lowercase string, so the broker always resolves a layer's direct children by their fold key regardless of the case a value was written with — a value stored as `serverIP` is still found under `from_secret: serverip`. See `crates/sovereign-config-woodpecker-broker/README.md` for the environment surface, the layer syntax, the security notes, and the cutover runbook.
+
+## Workspace layout
+
+Each crate has one consumer, target, or artifact. Dependencies only point down this list.
+
+| Crate | Role | Depends on |
+| --- | --- | --- |
+| `sovereign-config-proto` | Generated `sovereign.config.v3` gRPC types. | — |
+| `sovereign-config-core` | The shared contract: paths, value and secret newtypes, listing shapes, the JSON subtree codec, connection URLs, and `ClientError`. No I/O and no async. | — |
+| `sovereign-config-server` | The service binary: gRPC, gRPC-Web, PostgreSQL, Authentik. | proto, core |
+| `sovereign-config-client` | The transport-agnostic client: the `Transport`, `ValueTransport` and `ManagedConnectionTransport` traits, `AccessTokenProvider`, and the `Client` facade. | core |
+| `sovereign-config-native` | The native tonic transport, OIDC device and refresh flows, and the profile store. | proto, core, client |
+| `sovereign-config-web` | The browser UI, compiled to WebAssembly, with its own gRPC-Web transport. | proto, core, client |
+| `sovereign-config-cli`, `sovereign-config-mcp`, `sovereign-config-provider` | The CLI, the MCP server, and the application provider facade. | core, client, native |
+| `sovereign-config-woodpecker-broker` | The Woodpecker CI secrets extension image. | core, client, native |
+
+`core`, `client` and `native` stay three crates. Folding `client` into `core` would put `async-trait` and the transport abstraction into the server, which needs only the data contract. Folding `native` into `client` would pull tokio, reqwest and rustix into the WebAssembly build, which implements the same traits over gRPC-Web instead.
+
+The shared layer reader planned by bored card #293 sits above `native`, not inside it. The broker's reader already needs the native transport and a cached client-credentials token provider, and only the broker and the CLI need layer merging. That crate should depend on `core`, `client` and `native`, and be consumed by the broker and the CLI.
+
+### Where code goes
+
+A module holds one concern. When a file starts mixing concerns, add a sibling module rather than growing it. `clippy.toml` holds functions to clippy's default of 100 lines, and `crates/sovereign-config-server/tests/lint_ratchet.rs` fails if product code silences that lint.
+
+- **Server services** (`values/`, `managed/`): `service.rs` is the tonic impl and the RPC control flow, and holds no SQL. `store.rs` holds every row type and query. Authorization, pure validation such as `values/subtree.rs`, and wire mapping (`content.rs`, `wire.rs`) each get their own module. Authentik orchestration lives in `managed/provisioning.rs`. `rpc.rs` holds helpers every service shares.
+- **Server root**: `main.rs` is the startup sequence, one named step per concern. Authentication, Authentik, configuration, encryption, metrics and static assets each keep their own module.
+- **Core**: one module per concept (`path`, `value`, `listing`, `json`, `status`, `error`, `connection`, `managed`). Every public item is re-exported from the crate root, and dependants import it from there.
+- **Web**: one module per view (`configuration`, `value_rows`, `path_selector`, `tree`, `connections`, `downloads`) plus shared plumbing (`transport`, `session`, `route`, `shell`, `dom`, `browser`, `icons`). A thread-local static lives beside the code that owns it. Event handlers are registered through `dom::on_element_id` or `dom::listen`.
+- **Tests**: unit tests sit in a sibling `tests.rs` declared with `#[cfg(test)] mod tests;`, and Postgres-backed ones are `#[ignore]` and run in CI with `--ignored`. Browser tests use one `browser-tests/tests/<area>.spec.js` per view, with shared mocks in `helpers.js`.
 
 ## Upgrade
 

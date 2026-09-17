@@ -69,7 +69,7 @@ fn readme_documents_the_value_encryption_boundary() {
 #[test]
 fn readme_lists_every_production_secret_the_deployment_consumes() {
     let readme = include_str!("../../../README.md");
-    let pipeline = include_str!("../../../.woodpecker/build.yml");
+    let pipeline = include_str!("../../../.woodpecker/deploy-prod.yml");
 
     // A missing entry here is not cosmetic: the deploy step recreates the
     // running container before the server validates its configuration, so an

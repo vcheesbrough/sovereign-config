@@ -1,28 +1,27 @@
-//! Guards the deployment-trigger policy encoded in `.woodpecker/build.yml`:
+//! Guards the deployment-trigger policy encoded in the `.woodpecker/` workflows:
 //! production runs only on a `deployment` event (Woodpecker's Deploy/promote to
 //! prod), never on push; development deploys only on push, so a production
 //! promotion never also redeploys it. This is the lowest-layer check for card
 //! #262 — the pipeline file is not otherwise exercised by any test.
 
+mod support;
+
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use serde_yaml::Value;
+use support::{Pipeline, pipeline};
+
+/// The events that build, publish and deploy dev. A manual run from the
+/// Woodpecker UI does exactly what a push does.
+fn push_events() -> BTreeSet<String> {
+    BTreeSet::from(["push".to_owned(), "manual".to_owned()])
+}
 
 /// The only branch permitted to trigger a production promotion.
 const PROD_BRANCHES: &[&str] = &["main"];
 
-fn pipeline() -> Value {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.woodpecker/build.yml");
-    let contents = std::fs::read_to_string(path).expect("pipeline should be readable");
-    serde_yaml::from_str(&contents).expect("pipeline should be valid YAML")
-}
-
-fn step<'a>(pipeline: &'a Value, name: &str) -> &'a Value {
-    pipeline
-        .get("steps")
-        .and_then(|steps| steps.get(name))
-        .unwrap_or_else(|| panic!("step {name} should exist"))
+fn step<'a>(pipeline: &'a Pipeline, name: &str) -> &'a Value {
+    pipeline.step(name)
 }
 
 /// All of a step's `commands` joined into one string for substring assertions.
@@ -56,11 +55,12 @@ fn strings(value: &Value) -> BTreeSet<String> {
     }
 }
 
+/// The `when` conditions of a step or of a whole workflow file.
 fn when_conditions(step: &Value) -> Vec<Condition> {
     let conditions = step
         .get("when")
         .and_then(Value::as_sequence)
-        .unwrap_or_else(|| panic!("step should carry a `when` list"));
+        .unwrap_or_else(|| panic!("step or workflow should carry a `when` list"));
     conditions
         .iter()
         .map(|condition| Condition {
@@ -111,16 +111,17 @@ fn production_steps_deploy_to_prod_from_permitted_branches() {
 }
 
 #[test]
-fn build_and_dev_deploy_steps_run_on_push_only() {
+fn build_and_dev_deploy_steps_never_run_on_a_deployment() {
     // Everything that allocates a version, builds, publishes, tags, or deploys
-    // dev is push-only, so a production promotion (a deployment event) never
+    // dev runs on push and manual only, so a production promotion (a deployment event) never
     // mints a new version, never rebuilds or republishes the image, and never
     // touches development.
     for name in [
         "compute-version",
         "script-validation",
-        "workspace-validation",
-        "browser-validation",
+        "unit-test",
+        "client-playwright",
+        "prune-build-cache",
         "build-server",
         "build-broker",
         "publish-dev-image",
@@ -129,14 +130,14 @@ fn build_and_dev_deploy_steps_run_on_push_only() {
         "auto-deploy-dev",
         "tag-release-auto-dev",
     ] {
-        let conditions = when_conditions(step(&pipeline(), name));
-        assert!(
-            !conditions.is_empty()
-                && conditions
-                    .iter()
-                    .all(|c| c.events == BTreeSet::from(["push".to_owned()])),
-            "{name} must be push-only so a production promotion never touches it"
-        );
+        let pipeline = pipeline();
+        for workflow in pipeline.workflows_of(name) {
+            let conditions = when_conditions(pipeline.step_in(workflow, name));
+            assert!(
+                !conditions.is_empty() && conditions.iter().all(|c| c.events == push_events()),
+                "{name} in {workflow} must run on push and manual only, so a production promotion never touches it"
+            );
+        }
     }
 }
 
@@ -176,16 +177,23 @@ fn the_release_publishes_both_images_under_one_semver() {
 fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
     let pipeline = pipeline();
     // compute-version (mode compute) allocates the next semver; it must be
-    // push-only. On a deployment it would mint the *next* patch — an unbuilt tag
+    // push/manual-only. On a deployment it would mint the *next* patch — an unbuilt tag
     // — and deploy-prod would pull an image that was never published.
     assert_eq!(
-        step(&pipeline, "compute-version")
-            .get("settings")
-            .and_then(|settings| settings.get("mode"))
-            .and_then(Value::as_str),
-        Some("compute"),
-        "compute-version allocates, so it must stay push-only (asserted above)"
+        pipeline.workflows_of("compute-version"),
+        ["build", "deploy-dev"]
     );
+    for workflow in ["build", "deploy-dev"] {
+        assert_eq!(
+            pipeline
+                .step_in(workflow, "compute-version")
+                .get("settings")
+                .and_then(|settings| settings.get("mode"))
+                .and_then(Value::as_str),
+            Some("compute"),
+            "compute-version allocates, so it must stay off the deployment event (asserted above)"
+        );
+    }
     // The deployment resolves the commit's already-built tag instead of
     // allocating, and verify-image proves the artifact exists rather than
     // rebuilding — so deploy-prod deploys the exact image the push already
@@ -222,14 +230,6 @@ fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
     assert!(
         verify_cmd.contains("registry.desync.link/sovereign-config-woodpecker-broker:"),
         "verify-image must also prove the broker image was published for this tag"
-    );
-    // validate-authentik-version has no `when`, so it still gates both the dev
-    // and prod blueprint applies.
-    assert!(
-        step(&pipeline, "validate-authentik-version")
-            .get("when")
-            .is_none(),
-        "validate-authentik-version must run on both push and deployment"
     );
 }
 
@@ -281,4 +281,276 @@ fn prod_live_manager_check_validates_the_production_group() {
         Some("sovereign-config-connections"),
         "the prod live-manager gate must validate the production browsing group"
     );
+}
+
+fn workflow_events(pipeline: &Pipeline, workflow: &str) -> BTreeSet<String> {
+    when_conditions(pipeline.workflow(workflow))
+        .into_iter()
+        .flat_map(|condition| condition.events)
+        .collect()
+}
+
+/// Workflows share nothing, so the order of the pipeline rests on each step
+/// sitting in the right workflow and on the workflow-level `depends_on`.
+#[test]
+fn every_step_sits_in_its_workflow() {
+    let pipeline = pipeline();
+    let expected: [(&str, &[&str]); 4] = [
+        (
+            "checks",
+            &["script-validation", "unit-test", "client-playwright"],
+        ),
+        (
+            "build",
+            &[
+                "compute-version",
+                "prune-build-cache",
+                "build-server",
+                "build-broker",
+            ],
+        ),
+        (
+            "deploy-dev",
+            &[
+                "compute-version",
+                "validate-authentik-version",
+                "publish-dev-image",
+                "apply-authentik-blueprint-auto-dev",
+                "validate-authentik-manager-live",
+                "auto-deploy-dev",
+                "tag-release-auto-dev",
+            ],
+        ),
+        (
+            "deploy-prod",
+            &[
+                "validate-authentik-version",
+                "resolve-release-tag",
+                "verify-image",
+                "apply-authentik-blueprint-prod",
+                "validate-authentik-manager-live-prod",
+                "deploy-prod",
+            ],
+        ),
+    ];
+    let actual: Vec<(&str, String)> = pipeline
+        .steps()
+        .into_iter()
+        .map(|(workflow, name, _)| (workflow, name))
+        .collect();
+    let expected: Vec<(&str, String)> = expected
+        .iter()
+        .flat_map(|(workflow, steps)| steps.iter().map(|step| (*workflow, (*step).to_owned())))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "a step was added, removed, or moved workflow"
+    );
+}
+
+/// Nothing is published or deployed to dev unless every check passed — the
+/// tests, the browser suite, and the script checks — and both images are built.
+#[test]
+fn dev_deploy_waits_for_checks_and_build() {
+    let pipeline = pipeline();
+    let dependencies: Vec<&str> = pipeline
+        .workflow("deploy-dev")
+        .get("depends_on")
+        .and_then(Value::as_sequence)
+        .expect("deploy-dev should depend on checks and build")
+        .iter()
+        .map(|dependency| {
+            dependency
+                .as_str()
+                .expect("deploy-dev's dependencies must be required, not optional")
+        })
+        .collect();
+    assert_eq!(dependencies, ["checks", "build"]);
+    for workflow in ["checks", "build", "deploy-dev"] {
+        assert_eq!(
+            workflow_events(&pipeline, workflow),
+            push_events(),
+            "{workflow} must run on push and manual alike, so deploy-dev's required dependencies always run with it"
+        );
+    }
+}
+
+/// The prod workflow is itself restricted to a prod deployment from main. It
+/// depends on no other workflow, because nothing else runs on a deployment.
+#[test]
+fn prod_workflow_is_gated_as_a_whole() {
+    let pipeline = pipeline();
+    assert!(
+        pipeline.workflow("deploy-prod").get("depends_on").is_none(),
+        "deploy-prod must not wait for a workflow that never runs on a deployment"
+    );
+    let conditions = when_conditions(pipeline.workflow("deploy-prod"));
+    assert!(!conditions.is_empty());
+    for condition in conditions {
+        assert_eq!(condition.events, BTreeSet::from(["deployment".to_owned()]));
+        assert_eq!(
+            condition.branches,
+            PROD_BRANCHES
+                .iter()
+                .map(|&branch| branch.to_owned())
+                .collect()
+        );
+        assert_eq!(
+            condition.evaluate.as_deref(),
+            Some("CI_PIPELINE_DEPLOY_TARGET == \"prod\"")
+        );
+    }
+}
+
+/// Each deploy workflow checks Authentik compatibility itself before applying
+/// its blueprint: workflows cannot share a step, so the check is defined in
+/// both, runs only with the deploy it guards, and is otherwise identical.
+#[test]
+fn each_blueprint_apply_waits_for_the_authentik_version_check() {
+    let pipeline = pipeline();
+    assert_eq!(
+        pipeline.workflows_of("validate-authentik-version"),
+        ["deploy-dev", "deploy-prod"]
+    );
+    let mut copies = Vec::new();
+    for (workflow, apply, events) in [
+        (
+            "deploy-dev",
+            "apply-authentik-blueprint-auto-dev",
+            push_events(),
+        ),
+        (
+            "deploy-prod",
+            "apply-authentik-blueprint-prod",
+            BTreeSet::from(["deployment".to_owned()]),
+        ),
+    ] {
+        let dependencies: Vec<&str> = pipeline
+            .step_in(workflow, apply)
+            .get("depends_on")
+            .and_then(Value::as_sequence)
+            .expect("blueprint apply should list its dependencies")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            dependencies.contains(&"validate-authentik-version"),
+            "{apply} must wait for validate-authentik-version"
+        );
+        let check = pipeline.step_in(workflow, "validate-authentik-version");
+        assert!(
+            when_conditions(check)
+                .iter()
+                .all(|condition| condition.events == events),
+            "the {workflow} copy of validate-authentik-version must run only on {events:?}"
+        );
+        let mut copy = check.as_mapping().expect("step is a mapping").clone();
+        copy.remove("when");
+        copies.push(copy);
+    }
+    assert_eq!(
+        copies[0], copies[1],
+        "both copies of validate-authentik-version must check the same thing"
+    );
+}
+
+/// The prod copy of the Authentik check carries the same prod-only guard as
+/// every other production step.
+#[test]
+fn prod_authentik_check_is_gated_like_every_prod_step() {
+    let pipeline = pipeline();
+    let conditions = when_conditions(pipeline.step_in("deploy-prod", "validate-authentik-version"));
+    assert!(!conditions.is_empty());
+    for condition in conditions {
+        assert_eq!(condition.events, BTreeSet::from(["deployment".to_owned()]));
+        assert_eq!(
+            condition.branches,
+            PROD_BRANCHES
+                .iter()
+                .map(|&branch| branch.to_owned())
+                .collect()
+        );
+        assert_eq!(
+            condition.evaluate.as_deref(),
+            Some("CI_PIPELINE_DEPLOY_TARGET == \"prod\"")
+        );
+    }
+}
+
+/// build and deploy-dev each compute the release tag, because workflows share
+/// nothing. publish-dev-image must therefore refuse images that were not built
+/// from this commit for exactly its own tag, and build must label them so the
+/// check can see both.
+#[test]
+fn publish_only_ships_images_built_for_this_commit_and_tag() {
+    let pipeline = pipeline();
+    for (build, local) in [
+        ("build-server", "sovereign-config-ci:$$CI_COMMIT_SHA"),
+        (
+            "build-broker",
+            "sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA",
+        ),
+    ] {
+        let commands = commands_text(pipeline.step_in("build", build));
+        assert!(
+            commands.contains("org.opencontainers.image.version=\"$$RELEASE_TAG\"")
+                && commands.contains("org.opencontainers.image.revision=\"$$CI_COMMIT_SHA\""),
+            "{build} must label its image with the release tag and commit"
+        );
+        assert!(
+            commands.contains(&format!("IMAGE={local}")),
+            "{build} must tag the local image {local}"
+        );
+    }
+    let publish = commands_text(pipeline.step_in("deploy-dev", "publish-dev-image"));
+    let guard = publish
+        .find("docker image inspect")
+        .expect("publish-dev-image must inspect the local images");
+    let first_push = publish
+        .find("docker push")
+        .expect("publish-dev-image must push");
+    assert!(
+        guard < first_push,
+        "the label check must run before any push"
+    );
+    for expected in [
+        "sovereign-config-ci:$$CI_COMMIT_SHA",
+        "sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA",
+        "org.opencontainers.image.version",
+        "org.opencontainers.image.revision",
+        "\"$$RELEASE_TAG $$CI_COMMIT_SHA\"",
+    ] {
+        assert!(
+            publish.contains(expected),
+            "publish-dev-image's label check must cover {expected}"
+        );
+    }
+}
+
+/// Triggering a pipeline by hand does exactly what a push does: every workflow
+/// and step that runs on a push also runs on a manual trigger, and nothing runs
+/// on one without the other.
+#[test]
+fn a_manual_run_matches_a_push() {
+    let pipeline = pipeline();
+    let mut checked = 0;
+    for workflow in support::WORKFLOWS {
+        let mut conditions = when_conditions(pipeline.workflow(workflow));
+        for (owner, _, step) in pipeline.steps() {
+            if owner == workflow {
+                conditions.extend(when_conditions(step));
+            }
+        }
+        for condition in conditions {
+            let push = condition.events.contains("push");
+            let manual = condition.events.contains("manual");
+            assert_eq!(
+                push, manual,
+                "{workflow} has a condition on {:?}: push and manual must go together",
+                condition.events
+            );
+            checked += usize::from(push);
+        }
+    }
+    assert!(checked > 0, "no push condition was found to compare");
 }
