@@ -1,0 +1,63 @@
+# Build workflow: compute the release tag and build both images, in parallel
+# with checks. Nothing here publishes: deploy-dev pushes these images only after
+# checks has passed.
+#
+# Two images, one semver — every docker build MUST pass --target, see the
+# Dockerfile. Both are tagged locally as <name>-ci:<commit> and labelled with the
+# release tag and commit, which deploy-dev checks before it publishes.
+# See checks.yml for how the workflows fit together.
+
+when:
+  - event: push
+
+steps:
+  # Allocates ONE semver per commit — ONLY on the push pipeline, the single
+  # place a version is minted. A deployment must NOT run this: it would allocate
+  # the *next* patch (an unbuilt tag) and deploy-prod would pull an image that
+  # was never published. Deployments resolve the commit's existing tag via
+  # resolve-release-tag instead (mirrors bored card #254).
+  compute-version:
+    when:
+      - event: push
+    depends_on: []
+    pull: true
+    image: &version-plugin ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.1.1@sha256:cf74d9706cb42b6d27c8d185789cd814ed061c8c88e06452d33ce3aed0bf9a22
+    settings:
+      mode: compute
+      major_minor_source: cargo
+      github_token:
+        from_secret: github_token
+
+  build-server:
+    depends_on:
+      - compute-version
+    when:
+      - event: push
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - |
+        RELEASE_TAG=$$(cat .release-tag)
+        IMAGE=sovereign-config-ci:$$CI_COMMIT_SHA
+        docker build --platform linux/amd64 --target server-runtime --build-arg RELEASE_VERSION="$$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
+        docker image inspect "$$IMAGE" >/dev/null
+
+  # The Woodpecker CI secrets extension, published as a second image under the
+  # same semver. `--target` is mandatory on both image builds: broker-runtime is
+  # the last stage in the Dockerfile, so an untargeted build would tag the
+  # broker as the server.
+  build-broker:
+    depends_on:
+      - compute-version
+    when:
+      - event: push
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - |
+        RELEASE_TAG=$$(cat .release-tag)
+        IMAGE=sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA
+        docker build --platform linux/amd64 --target broker-runtime --build-arg RELEASE_VERSION="$$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config-woodpecker-broker --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/crates/sovereign-config-woodpecker-broker/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
+        docker image inspect "$$IMAGE" >/dev/null
