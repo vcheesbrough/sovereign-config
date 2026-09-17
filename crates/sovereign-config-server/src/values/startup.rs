@@ -1,15 +1,10 @@
 use anyhow::Context as _;
-use sqlx::{FromRow, PgPool};
+use sqlx::PgPool;
 use tracing::{error, info};
 
 use super::SECRET;
+use super::store::{lock_encryption_pass, reseal_secret, stored_secrets};
 use crate::encryption::{ValueCipher, is_envelope};
-
-#[derive(FromRow)]
-struct StoredSecretRow {
-    id: i64,
-    value: String,
-}
 
 /// Brings every stored secret up to the current encrypted representation.
 ///
@@ -48,24 +43,13 @@ pub(crate) async fn encrypt_stored_secrets(
     // a rolling deploy must revisit this — a `put_value` landing between the
     // SELECT below and its UPDATE would be overwritten by the sealed older
     // value. Locking the rows (`FOR UPDATE`) is the fix at that point.
-    sqlx::query(
-        "SELECT pg_advisory_xact_lock(hashtextextended('sovereign-config:encrypt-stored-secrets', 0))",
-    )
-    .execute(&mut *transaction)
-    .await
-    .context("unable to lock configuration secrets for encryption")?;
+    lock_encryption_pass(&mut transaction)
+        .await
+        .context("unable to lock configuration secrets for encryption")?;
 
-    let stored = sqlx::query_as::<_, StoredSecretRow>(
-        r"
-        SELECT id, value
-        FROM configuration_value_contents
-        WHERE classification = 'secret'
-        ORDER BY id
-        ",
-    )
-    .fetch_all(&mut *transaction)
-    .await
-    .context("unable to read configuration secrets for encryption")?;
+    let stored = stored_secrets(&mut transaction)
+        .await
+        .context("unable to read configuration secrets for encryption")?;
 
     let mut encrypted = 0usize;
     let mut sealed_on_entry = 0usize;
@@ -89,10 +73,7 @@ pub(crate) async fn encrypt_stored_secrets(
         // `updated_at` deliberately stays put: how a value is stored changed,
         // the value itself did not, and moving the timestamp would misreport a
         // rotation to every client watching it.
-        sqlx::query("UPDATE configuration_value_contents SET value = $2 WHERE id = $1")
-            .bind(row.id)
-            .bind(&sealed)
-            .execute(&mut *transaction)
+        reseal_secret(&mut transaction, row.id, &sealed)
             .await
             .context("unable to encrypt a stored configuration secret")?;
         encrypted += 1;
