@@ -1,0 +1,202 @@
+# Deploy-dev workflow: publish the two images the build workflow made, apply the
+# dev Authentik blueprint, prove the connection manager against live Authentik,
+# deploy dev, then push the git tag.
+#
+# Workflows share nothing, so this workflow computes the release tag again.
+# compute-version reuses the tag already on this commit or allocates highest
+# remote patch + 1, so it normally matches the tag build used; publish-dev-image
+# refuses to publish if it does not.
+# See checks.yml for how the workflows fit together.
+
+when:
+  - event: [push, manual]
+
+# Nothing here starts until every check has passed and both images are built.
+# All three run on push and manual alike, so neither dependency is optional.
+depends_on:
+  - checks
+  - build
+
+steps:
+  # Allocates ONE semver per commit — ONLY on a push or manual run, the single
+  # place a version is minted. A deployment must NOT run this: it would allocate
+  # the *next* patch (an unbuilt tag) and deploy-prod would pull an image that
+  # was never published. Deployments resolve the commit's existing tag via
+  # resolve-release-tag instead (mirrors bored card #254).
+  compute-version:
+    when:
+      - event: [push, manual]
+    depends_on: []
+    pull: true
+    image: &version-plugin ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.1.1@sha256:cf74d9706cb42b6d27c8d185789cd814ed061c8c88e06452d33ce3aed0bf9a22
+    settings:
+      mode: compute
+      major_minor_source: cargo
+      github_token:
+        from_secret: github_token
+
+  # A cheap, dependency-free curl gate: live Authentik must be new enough and
+  # expose every API surface managed connections need, before this workflow
+  # applies its blueprint. It needs no build artifact, so it depends on nothing.
+  validate-authentik-version:
+    depends_on: []
+    when:
+      - event: [push, manual]
+    image: docker.io/curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
+    environment:
+      AUTHENTIK_API_TOKEN:
+        from_secret: authentik_api_token
+    commands:
+      - |
+        umask 077
+        printf 'header = "Authorization: Bearer %s"\n' "$$AUTHENTIK_API_TOKEN" > /tmp/authentik-curl.conf
+        VERSION=$$(curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/admin/version/ | sed -n 's/.*"version_current":"\([^"]*\)".*/\1/p')
+        test -n "$$VERSION"
+        awk -v version="$$VERSION" 'BEGIN { split(version, part, "."); if (part[1] > 2026 || (part[1] == 2026 && part[2] > 5) || (part[1] == 2026 && part[2] == 5 && part[3] >= 2)) exit 0; exit 1 }'
+        curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/schema/ > /tmp/authentik-schema.json
+        grep -q 'grant_types' /tmp/authentik-schema.json
+        # Surfaces required by managed application connections.
+        grep -q '/core/users/service_account/' /tmp/authentik-schema.json
+        grep -q '/core/tokens/{identifier}/set_key/' /tmp/authentik-schema.json
+        grep -q 'initial_permissions' /tmp/authentik-schema.json
+        echo "Validated compatible Authentik $$VERSION"
+
+  publish-dev-image:
+    # The checks and build workflows gate this through the workflow-level
+    # depends_on: nothing is published until every check has passed.
+    depends_on:
+      - compute-version
+    when:
+      - event: [push, manual]
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      REGISTRY_USER:
+        from_secret: zot_ci_user
+      REGISTRY_PASSWORD:
+        from_secret: zot_ci_password
+    commands:
+      - |
+        RELEASE_TAG=$$(cat .release-tag)
+        IMAGE=registry.desync.link/sovereign-config:$$RELEASE_TAG
+        BROKER_IMAGE=registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG
+        # The build workflow made both images on this Docker host and computed its
+        # own release tag. Publish only images built from this commit for exactly
+        # this tag: if another pipeline tagged a release in between, the two tags
+        # differ and a binary would ship under another version's name.
+        for LOCAL in sovereign-config-ci:$$CI_COMMIT_SHA sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA; do
+          LABELS=$$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }} {{ index .Config.Labels "org.opencontainers.image.revision" }}' "$$LOCAL") || {
+            echo "ERROR: $$LOCAL was not built on this host" >&2
+            exit 1
+          }
+          if [ "$$LABELS" != "$$RELEASE_TAG $$CI_COMMIT_SHA" ]; then
+            echo "ERROR: $$LOCAL is labelled '$$LABELS', expected '$$RELEASE_TAG $$CI_COMMIT_SHA'" >&2
+            exit 1
+          fi
+        done
+        echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
+        docker tag sovereign-config-ci:$$CI_COMMIT_SHA "$$IMAGE"
+        docker push "$$IMAGE"
+        # Both images carry the same semver, so server and broker are always
+        # protocol-matched by construction.
+        docker tag sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA "$$BROKER_IMAGE"
+        docker push "$$BROKER_IMAGE"
+
+  apply-authentik-blueprint-auto-dev:
+    depends_on:
+      - validate-authentik-version
+      - publish-dev-image
+    when:
+      - event: [push, manual]
+    pull: true
+    image: ghcr.io/vcheesbrough/woodpecker-plugin-authentik-blueprint:v0.2.0@sha256:9f262c4390205b5629e9af7560f4e492f0155395a429153703ba351206d9d975
+    settings:
+      api_url: https://auth.desync.link
+      api_token:
+        from_secret: authentik_api_token
+      file: authentik/blueprint-dev.yaml
+      instance_name: sovereign-config-dev
+      timeout_seconds: 900
+      vars:
+        AUTHENTIK_SOVEREIGN_CONFIG_DEV_INTROSPECTION_CLIENT_SECRET:
+          from_secret: sovereign_config_dev_oidc_introspection_client_secret
+        AUTHENTIK_SOVEREIGN_CONFIG_DEV_MANAGER_API_TOKEN:
+          from_secret: sovereign_config_dev_manager_api_token
+        SOVEREIGN_CONFIG_DEV_BROWSER_REDIRECT_URI: https://sovereign-config-dev.desync.link/auth/callback
+        AUTHENTIK_DEV_BRAND_DOMAIN: auth.desync.link
+
+  # Exercises the connection manager against the real Authentik RBAC surface,
+  # which no mock can reproduce. Runs after the blueprint so the manager
+  # identity exists, and gates the deployment so a broken permission model
+  # cannot reach the running service.
+  validate-authentik-manager-live:
+    depends_on:
+      - apply-authentik-blueprint-auto-dev
+    when:
+      - event: [push, manual]
+    image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
+    environment:
+      CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
+      # Every CI run is a fresh checkout, so incremental state is written and
+      # never usefully read — it was 43 GB of the shared target volume
+      # (bored card #326). Off, it is also marginally faster for clean builds.
+      CARGO_INCREMENTAL: "0"
+      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL: https://auth.desync.link/
+      SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP: sovereign-config-dev-connections
+      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_TOKEN:
+        from_secret: sovereign_config_dev_manager_api_token
+      # Elevated credential used only to create and clean up a disposable
+      # canary object for the "manager cannot touch objects it didn't create"
+      # test; never used to act as the manager under test.
+      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_ADMIN_TOKEN:
+        from_secret: authentik_api_token
+    volumes:
+      - sovereign-config-cargo-registry:/usr/local/cargo/registry
+      - sovereign-config-cargo-git:/usr/local/cargo/git
+      - sovereign-config-contract-target:/woodpecker/cache/sovereign-config-target
+    commands:
+      # Cargo never reaps artifacts from commits it no longer builds; this
+      # enforces the 20 GiB ceiling on the shared volume (bored card #326).
+      - scripts/ci-prune-cargo-target.sh
+      - cargo test --package sovereign-config-server live_ -- --ignored --test-threads=1
+
+  auto-deploy-dev:
+    depends_on:
+      - validate-authentik-manager-live
+    when:
+      - event: [push, manual]
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      POSTGRES_PASSWORD:
+        from_secret: sovereign_config_dev_postgres_password
+      OIDC_INTROSPECTION_URL: https://auth.desync.link/application/o/introspect/
+      OIDC_ISSUER: https://auth.desync.link/application/o/sovereign-config-dev/
+      OIDC_INTROSPECTION_CLIENT_SECRET:
+        from_secret: sovereign_config_dev_oidc_introspection_client_secret
+      MANAGER_API_TOKEN:
+        from_secret: sovereign_config_dev_manager_api_token
+      VALUE_ENCRYPTION_KEY:
+        from_secret: sovereign_config_dev_value_encryption_key
+    commands:
+      - |
+        ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
+        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL="$$OIDC_INTROSPECTION_URL" SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config-dev/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET_FILE= SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET="$$OIDC_INTROSPECTION_CLIENT_SECRET" SOVEREIGN_CONFIG_PUBLIC_ORIGIN=https://sovereign-config-dev.desync.link SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE=sovereign_config_dev_grants SOVEREIGN_CONFIG_MANAGER_GROUP=sovereign-config-dev-connections SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE= SOVEREIGN_CONFIG_MANAGER_API_TOKEN="$$MANAGER_API_TOKEN" SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE= SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY="$$VALUE_ENCRYPTION_KEY" docker compose -p sovereign-config-dev up -d --wait --wait-timeout 90 || {
+          docker compose -p sovereign-config-dev logs --tail 200
+          exit 1
+        }
+
+  tag-release-auto-dev:
+    when:
+      - event: [push, manual]
+    depends_on:
+      - auto-deploy-dev
+    pull: true
+    image: *version-plugin
+    settings:
+      mode: push-tag
+      major_minor_source: cargo
+      github_token:
+        from_secret: github_token

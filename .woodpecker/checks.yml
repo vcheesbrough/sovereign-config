@@ -1,0 +1,114 @@
+# Checks workflow: every gate that needs no deployment. No step depends on
+# another, so all of them start together.
+#
+# The pipeline is split into workflows, one file each, in the style of v-note:
+#
+#   push/manual: checks ∥ build → deploy-dev   (a manual run is identical to a push)
+#   deployment:  deploy-prod   (prod target, from main only)
+#
+#   checks       script-validation, unit-test, client-playwright   (+ postgres-test)
+#   build        compute-version ∥ prune-build-cache → build-server ∥ build-broker
+#   deploy-dev   compute-version ∥ validate-authentik-version → publish-dev-image
+#                → apply-authentik-blueprint-auto-dev → validate-authentik-manager-live
+#                → auto-deploy-dev → tag-release-auto-dev
+#   deploy-prod  resolve-release-tag ∥ validate-authentik-version
+#                → verify-image ∥ apply-authentik-blueprint-prod
+#                → validate-authentik-manager-live-prod → deploy-prod
+#
+# Why workflows and not one file of `depends_on` steps: Woodpecker runs step
+# dependencies as whole stages, so a step starts only when every step of the
+# previous dependency level has finished, not just the ones it names. Workflows
+# share nothing — no workspace, no `.release-tag` — so each value a step reads is
+# produced inside its own workflow. deploy-dev depends on checks and build, so an
+# image is never published before every check passes.
+#
+# validate-authentik-version appears in both deploy workflows: it guards the
+# blueprint apply in each, and workflows cannot share a step.
+#
+# Every build, publish, version-allocation and dev-deploy step runs on push and
+# manual only, and
+# every production step is deployment-only; each step also carries its own
+# `when`, which crates/sovereign-config-server/tests/pipeline_prod_gating.rs pins.
+
+when:
+  - event: [push, manual]
+
+steps:
+  script-validation:
+    depends_on: []
+    when:
+      - event: [push, manual]
+    image: docker.io/koalaman/shellcheck-alpine@sha256:e19ed93c22423970d56568e171b4512c9244fc75dd9114045016b4a0073ac4b7
+    commands:
+      - shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh scripts/migrate-openbao-woodpecker-secrets.sh scripts/ci-prune-cargo-target.sh scripts/ci-prune-cargo-target-test.sh scripts/ci-prune-buildkit-cache.sh scripts/ci-prune-buildkit-cache-test.sh
+      - sh scripts/ci-prune-cargo-target-test.sh
+      - sh scripts/ci-prune-buildkit-cache-test.sh
+
+  unit-test:
+    depends_on: []
+    when:
+      - event: [push, manual]
+    image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
+    environment:
+      CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
+      # Every CI run is a fresh checkout, so incremental state is written and
+      # never usefully read — it was 43 GB of the shared target volume
+      # (bored card #326). Off, it is also marginally faster for clean builds.
+      CARGO_INCREMENTAL: "0"
+      SOVEREIGN_CONFIG_TEST_DATABASE_URL: postgresql://sovereign_config_test:sovereign_config_test@postgres-test:5432/sovereign_config_test
+    volumes:
+      - sovereign-config-cargo-registry:/usr/local/cargo/registry
+      - sovereign-config-cargo-git:/usr/local/cargo/git
+      - sovereign-config-contract-target:/woodpecker/cache/sovereign-config-target
+    commands:
+      # Cargo never reaps artifacts from commits it no longer builds; this
+      # enforces the 20 GiB ceiling on the shared volume (bored card #326).
+      - scripts/ci-prune-cargo-target.sh
+      - rustup component add clippy rustfmt
+      - cargo fmt --check
+      # --locked on every command that resolves dependencies, as the image build
+      # does: a Cargo.lock that is out of date fails here, not later in build.
+      - cargo clippy --locked --workspace --all-targets -- -D warnings
+      - cargo clippy --locked --package sovereign-config-provider --all-targets --features config -- -D warnings
+      - cargo test --locked --workspace
+      - cargo test --locked --package sovereign-config-provider --features config
+      - cargo test --locked --package sovereign-config-server -- --ignored --test-threads=1
+      - rustup target add wasm32-unknown-unknown
+      - cargo check --locked --target wasm32-unknown-unknown --package sovereign-config-core --package sovereign-config-client --package sovereign-config-web
+
+  # Builds the release WebAssembly bundle and runs the Playwright suite against it
+  # in Chromium and Firefox. The backend is mocked at the network layer
+  # (browser-tests/tests/helpers.js), so this is a client test, not end-to-end.
+  client-playwright:
+    depends_on: []
+    when:
+      - event: [push, manual]
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - |
+        rm -rf .browser-dist
+        docker build --target web-dist-artifact --output type=local,dest=.browser-dist .
+        CONTAINER=$$(docker create --workdir /tests \
+          --env PLAYWRIGHT_STATIC=1 \
+          --env PLAYWRIGHT_STATIC_DIR=/web-dist \
+          mcr.microsoft.com/playwright:v1.61.1-noble@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48 \
+          sh -lc 'npm ci --ignore-scripts && npm test')
+        trap 'docker rm --force "$$CONTAINER" >/dev/null 2>&1 || true; rm -rf .browser-dist' EXIT
+        docker cp browser-tests/. "$$CONTAINER:/tests"
+        docker cp test-contracts/. "$$CONTAINER:/test-contracts"
+        docker cp .browser-dist/. "$$CONTAINER:/web-dist"
+        docker start --attach "$$CONTAINER"
+
+services:
+  # Only unit-test (push or manual) uses a database; the
+  # deployment (promotion) path touches no Postgres, so don't start this there.
+  postgres-test:
+    when:
+      - event: [push, manual]
+    image: docker.io/library/postgres@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4
+    environment:
+      POSTGRES_DB: sovereign_config_test
+      POSTGRES_USER: sovereign_config_test
+      POSTGRES_PASSWORD: sovereign_config_test

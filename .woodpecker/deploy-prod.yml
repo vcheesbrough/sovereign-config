@@ -1,0 +1,215 @@
+# Deploy-prod workflow: production is a promotion of the exact image the dev
+# push already built, published, and git-tagged for this commit — triggered by
+# Woodpecker's Deploy feature, a `deployment` event targeting prod, only from
+# main. Nothing here rebuilds, republishes, or mints a new version:
+# resolve-release-tag reads the semver the push already tagged onto this commit
+# (NEVER allocates — that would mint an unbuilt tag; bored card #254),
+# verify-image pulls that exact published artifact, and deploy-prod deploys it.
+# See checks.yml for how the workflows fit together.
+
+when:
+  - event: deployment
+    branch: main
+    evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
+
+steps:
+  # A cheap, dependency-free curl gate: live Authentik must be new enough and
+  # expose every API surface managed connections need, before this workflow
+  # applies its blueprint. It needs no build artifact, so it depends on nothing.
+  validate-authentik-version:
+    depends_on: []
+    when:
+      - event: deployment
+        branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
+    image: docker.io/curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
+    environment:
+      AUTHENTIK_API_TOKEN:
+        from_secret: authentik_api_token
+    commands:
+      - |
+        umask 077
+        printf 'header = "Authorization: Bearer %s"\n' "$$AUTHENTIK_API_TOKEN" > /tmp/authentik-curl.conf
+        VERSION=$$(curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/admin/version/ | sed -n 's/.*"version_current":"\([^"]*\)".*/\1/p')
+        test -n "$$VERSION"
+        awk -v version="$$VERSION" 'BEGIN { split(version, part, "."); if (part[1] > 2026 || (part[1] == 2026 && part[2] > 5) || (part[1] == 2026 && part[2] == 5 && part[3] >= 2)) exit 0; exit 1 }'
+        curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/schema/ > /tmp/authentik-schema.json
+        grep -q 'grant_types' /tmp/authentik-schema.json
+        # Surfaces required by managed application connections.
+        grep -q '/core/users/service_account/' /tmp/authentik-schema.json
+        grep -q '/core/tokens/{identifier}/set_key/' /tmp/authentik-schema.json
+        grep -q 'initial_permissions' /tmp/authentik-schema.json
+        echo "Validated compatible Authentik $$VERSION"
+
+  # Resolve the semver the dev push already allocated and tagged onto this
+  # commit — a deployment must NEVER allocate (that mints an unbuilt tag; see
+  # bored card #254). Fail closed if the commit was never built/dev-deployed on
+  # a push (no tag on the commit).
+  resolve-release-tag:
+    depends_on: []
+    when:
+      - event: deployment
+        branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
+    # Digest-pinned image that already ships git — no runtime package install on
+    # the deploy path (repo policy: pin by digest, no undeclared outbound fetch).
+    image: docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
+    environment:
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      - |
+        git config --global --add safe.directory '*'
+        # Fast path: a semver tag already on HEAD from the clone.
+        RELEASE_TAG=$$(git tag --points-at HEAD 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$$' | sort -V | tail -1)
+        # Fallback (private repo): query the remote without fetching objects;
+        # annotated tags carry the commit sha on the dereferenced (^{}) line.
+        if [ -z "$$RELEASE_TAG" ]; then
+          RELEASE_TAG=$$(git ls-remote --tags "https://x-access-token:$$GITHUB_TOKEN@github.com/$$CI_REPO" \
+            | awk -v sha="$$CI_COMMIT_SHA" '{ ref=$$2; sub("refs/tags/","",ref); sub(/\^\{\}$$/,"",ref) } $$1==sha && ref ~ /^[0-9]+\.[0-9]+\.[0-9]+$$/ { print ref }' \
+            | sort -V | tail -1)
+        fi
+        if [ -z "$$RELEASE_TAG" ]; then
+          echo "ERROR: commit $$CI_COMMIT_SHA has no release tag." >&2
+          echo "A commit must finish its push pipeline (build + dev deploy -> git tag) before it can be promoted to production." >&2
+          exit 1
+        fi
+        printf '%s' "$$RELEASE_TAG" > .release-tag
+        echo "Promoting release $$RELEASE_TAG (resolved from the push build/dev-deploy; no re-allocation)."
+
+  # Promote the artifact the push pipeline already built and published for this
+  # commit — do NOT rebuild. Pull the exact tag and fail closed if it is absent,
+  # which means this commit never completed its push build/publish.
+  verify-image:
+    depends_on:
+      - resolve-release-tag
+    when:
+      - event: deployment
+        branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      REGISTRY_USER:
+        from_secret: zot_ci_user
+      REGISTRY_PASSWORD:
+        from_secret: zot_ci_password
+    commands:
+      - |
+        RELEASE_TAG=$$(cat .release-tag)
+        echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
+        # Fail closed if either image is missing: a promotion that shipped the
+        # server without its matching broker would leave CI resolving secrets
+        # against a stale extension.
+        for IMAGE in \
+          registry.desync.link/sovereign-config:$$RELEASE_TAG \
+          registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG; do
+          if ! docker pull "$$IMAGE"; then
+            echo "ERROR: $$IMAGE not found in the registry." >&2
+            echo "The push pipeline (build + publish) must succeed for this commit before it can be promoted." >&2
+            exit 1
+          fi
+        done
+
+  apply-authentik-blueprint-prod:
+    depends_on:
+      - validate-authentik-version
+    # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
+    # the `prod` environment, only from main.
+    when:
+      - event: deployment
+        branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
+    pull: true
+    image: ghcr.io/vcheesbrough/woodpecker-plugin-authentik-blueprint:v0.2.0@sha256:9f262c4390205b5629e9af7560f4e492f0155395a429153703ba351206d9d975
+    settings:
+      api_url: https://auth.desync.link
+      api_token:
+        from_secret: authentik_api_token
+      file: authentik/blueprint.yaml
+      instance_name: sovereign-config
+      timeout_seconds: 900
+      vars:
+        AUTHENTIK_SOVEREIGN_CONFIG_INTROSPECTION_CLIENT_SECRET:
+          from_secret: sovereign_config_prod_oidc_introspection_client_secret
+        AUTHENTIK_SOVEREIGN_CONFIG_MANAGER_API_TOKEN:
+          from_secret: sovereign_config_prod_manager_api_token
+        SOVEREIGN_CONFIG_BROWSER_REDIRECT_URI: https://sovereign-config.desync.link/auth/callback
+        AUTHENTIK_BRAND_DOMAIN: auth.desync.link
+
+  # Mirrors validate-authentik-manager-live for production: exercises the
+  # connection manager against the real Authentik RBAC surface after the
+  # production blueprint applies, gating the deployment so a broken permission
+  # model cannot reach the running production service.
+  validate-authentik-manager-live-prod:
+    depends_on:
+      - apply-authentik-blueprint-prod
+    # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
+    # the `prod` environment, only from main.
+    when:
+      - event: deployment
+        branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
+    image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
+    environment:
+      CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
+      # Every CI run is a fresh checkout, so incremental state is written and
+      # never usefully read — it was 43 GB of the shared target volume
+      # (bored card #326). Off, it is also marginally faster for clean builds.
+      CARGO_INCREMENTAL: "0"
+      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL: https://auth.desync.link/
+      SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP: sovereign-config-connections
+      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_TOKEN:
+        from_secret: sovereign_config_prod_manager_api_token
+      # Elevated credential used only to create and clean up a disposable canary
+      # object for the "manager cannot touch objects it didn't create" test;
+      # never used to act as the manager under test.
+      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_ADMIN_TOKEN:
+        from_secret: authentik_api_token
+    volumes:
+      - sovereign-config-cargo-registry:/usr/local/cargo/registry
+      - sovereign-config-cargo-git:/usr/local/cargo/git
+      - sovereign-config-contract-target:/woodpecker/cache/sovereign-config-target
+    commands:
+      # Cargo never reaps artifacts from commits it no longer builds; this
+      # enforces the 20 GiB ceiling on the shared volume (bored card #326).
+      - scripts/ci-prune-cargo-target.sh
+      - cargo test --package sovereign-config-server live_ -- --ignored --test-threads=1
+
+  deploy-prod:
+    depends_on:
+      - validate-authentik-manager-live-prod
+      - verify-image
+    # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
+    # the `prod` environment, only from main.
+    when:
+      - event: deployment
+        branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      REGISTRY_USER:
+        from_secret: zot_ci_user
+      REGISTRY_PASSWORD:
+        from_secret: zot_ci_password
+      POSTGRES_PASSWORD:
+        from_secret: sovereign_config_prod_postgres_password
+      OIDC_INTROSPECTION_URL: https://auth.desync.link/application/o/introspect/
+      OIDC_ISSUER: https://auth.desync.link/application/o/sovereign-config/
+      OIDC_INTROSPECTION_CLIENT_SECRET:
+        from_secret: sovereign_config_prod_oidc_introspection_client_secret
+      MANAGER_API_TOKEN:
+        from_secret: sovereign_config_prod_manager_api_token
+      VALUE_ENCRYPTION_KEY:
+        from_secret: sovereign_config_prod_value_encryption_key
+    commands:
+      - echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
+      - |
+        ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
+        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=prod SOVEREIGN_CONFIG_HOST=sovereign-config.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-production POSTGRES_DATA_VOLUME=sovereign-config-production-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL="$$OIDC_INTROSPECTION_URL" SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET_FILE= SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET="$$OIDC_INTROSPECTION_CLIENT_SECRET" SOVEREIGN_CONFIG_PUBLIC_ORIGIN=https://sovereign-config.desync.link SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE=sovereign_config_prod_grants SOVEREIGN_CONFIG_MANAGER_GROUP=sovereign-config-connections SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE= SOVEREIGN_CONFIG_MANAGER_API_TOKEN="$$MANAGER_API_TOKEN" SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE= SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY="$$VALUE_ENCRYPTION_KEY" docker compose -p sovereign-config-prod up -d --pull always --wait --wait-timeout 90 || {
+          docker compose -p sovereign-config-prod logs --tail 200
+          exit 1
+        }
