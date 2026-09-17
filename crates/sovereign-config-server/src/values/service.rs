@@ -1,30 +1,31 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::SystemTime,
-};
+//! The tonic `Configuration` impl. Each RPC authorizes, then composes named
+//! validation (`authz`, `subtree`, `paths`), storage (`store`) and wire
+//! mapping (`content`) steps; no SQL is written here.
 
-use sovereign_config_core::{ConfigPath, MASKED_SECRET_TEXT};
+use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
+
+use sovereign_config_core::ConfigPath;
 use sovereign_config_proto::sovereign::config::v3::{
     AddValuePathRequest, AddValuePathResponse, DeleteValuesRequest, DeleteValuesResponse,
     GetSubTreeRequest, GetSubTreeResponse, ListValuePathsRequest, ListValuePathsResponse,
     ListValuesRequest, ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
     ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest, RevealSecretResponse,
-    SubTreeValue, configuration_server::Configuration, put_value_request, sub_tree_mutation_value,
+    SubTreeMutationValue, SubTreeValue, configuration_server::Configuration, put_value_request,
+    sub_tree_mutation_value,
 };
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use tonic::{Request, Response, Status};
 use tracing::error;
 
 use super::authz::authorize;
 use super::content::{listed_content, subtree_content};
-use super::paths::{add_parent_paths, parent_path, paths_collide};
+use super::paths::{add_parent_paths, parent_path};
 use super::store::{
-    DeletedPathRow, ListedValueRow, MutationRow, PathContentClassRow, PathContentRow, PathRow,
-    PathWithFoldRow, RevealedRow, SubTreeRow, content_ids, insert_content, insert_path,
-    lock_mutation_path, path_collides, prune_orphan_contents, reserve_content_id,
+    self, MutationRow, content_ids, insert_content, insert_path, lock_mutation_path, path_collides,
+    prune_orphan_contents, reserve_content_id,
 };
+use super::subtree::{self, NormalizedSubtree};
 use super::{PLAIN, SECRET};
 use crate::auth::Permission;
 use crate::encryption::{DecryptError, ValueCipher};
@@ -34,6 +35,21 @@ use crate::rpc::{principal, storage_unavailable, to_proto_timestamp};
 pub(crate) struct ConfigurationService {
     database: PgPool,
     cipher: Arc<ValueCipher>,
+}
+
+/// A subtree's plain writes resolved against what is stored: content ids that
+/// already exist mapped to their single new value, and paths with no stored
+/// value yet.
+///
+/// `shared` must stay ordered by content id: iterating it ascending is what
+/// gives concurrent replacements a common row-lock order. Values
+/// cross-aliased between disjoint subtrees (X at /a/1 and /b/2, Y at /a/2 and
+/// /b/1) would otherwise lock X-then-Y in one transaction and Y-then-X in the
+/// other and deadlock, since their path locks are disjoint. Do not swap this
+/// for a `HashMap`.
+struct ResolvedWrites<'a> {
+    shared: BTreeMap<i64, &'a String>,
+    fresh: Vec<(&'a String, &'a String)>,
 }
 
 impl ConfigurationService {
@@ -64,6 +80,64 @@ impl ConfigurationService {
             Ok(value.to_owned())
         }
     }
+
+    /// Writes `value` at an existing content row, refusing a reclassification
+    /// that would change how the value is exposed at its other paths.
+    async fn overwrite_existing(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        existing: store::PathContentClassRow,
+        value: &str,
+        classification: &str,
+        now: OffsetDateTime,
+    ) -> Result<MutationRow, Status> {
+        // Classification belongs to the stored value, so it cannot differ
+        // between aliases. Rather than let a write through one path silently
+        // change how the value is exposed at every other path — including
+        // paths the caller may not be able to see — refuse the change while
+        // more than one path resolves to it. Rotating a value in place, and
+        // changing classification while a single path remains, both still
+        // work.
+        if existing.path_count > 1 && existing.classification != classification {
+            return Err(Status::invalid_argument(
+                "configuration value has multiple paths and cannot change classification",
+            ));
+        }
+        let content_id = existing.content_id;
+        // Reclassification needs no conversion of what is already stored:
+        // every classification change arrives with a fresh value from the
+        // caller, so `plain -> secret` seals the new value and
+        // `secret -> plain` writes the new plaintext.
+        let stored = self.stored_representation(content_id, classification, value)?;
+        // Writing through any path updates the shared content, so every
+        // other path aliasing it observes the new value.
+        store::update_content(transaction, content_id, &stored, classification, now).await
+    }
+
+    /// Creates a new value at `path`, which must not nest with any stored path.
+    async fn create_value(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        path: &ConfigPath,
+        value: &str,
+        classification: &str,
+        now: OffsetDateTime,
+    ) -> Result<MutationRow, Status> {
+        if path_collides(transaction, &path.fold()).await? {
+            return Err(Status::invalid_argument(
+                "configuration value collides with an existing value",
+            ));
+        }
+        let content_id = reserve_content_id(transaction).await?;
+        let stored = self.stored_representation(content_id, classification, value)?;
+        let content = insert_content(transaction, content_id, &stored, classification, now).await?;
+        // The path exactly as written establishes its display case.
+        insert_path(transaction, path.as_str(), content.id, now).await?;
+        Ok(MutationRow {
+            created_at: content.created_at,
+            updated_at: content.updated_at,
+        })
+    }
 }
 
 #[tonic::async_trait]
@@ -75,12 +149,7 @@ impl Configuration for ConfigurationService {
         let selected = ConfigPath::parse_selection(&request.get_ref().path)
             .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
         let principal = principal(&request)?;
-        let candidates = sqlx::query_as::<_, PathContentRow>(
-            "SELECT path, lowercase_path, content_id, created_at FROM configuration_paths ORDER BY lowercase_path",
-        )
-        .fetch_all(&self.database)
-        .await
-        .map_err(|_| storage_unavailable())?;
+        let candidates = store::path_candidates(&self.database).await?;
 
         // Group every readable path by the content it resolves to so a listed
         // value can advertise its other authorized aliases, even ones outside
@@ -112,20 +181,7 @@ impl Configuration for ConfigurationService {
 
         let mut values = Vec::new();
         if !direct.is_empty() {
-            let rows = sqlx::query_as::<_, ListedValueRow>(
-                r"
-                SELECT p.path, p.lowercase_path, p.content_id, c.value, c.classification, c.created_at, c.updated_at
-                FROM configuration_paths p
-                JOIN configuration_value_contents c ON c.id = p.content_id
-                WHERE p.lowercase_path = ANY($1::TEXT[])
-                ORDER BY p.lowercase_path
-                ",
-            )
-            .bind(&direct)
-            .fetch_all(&self.database)
-            .await
-            .map_err(|_| storage_unavailable())?;
-            for row in rows {
+            for row in store::listed_values(&self.database, &direct).await? {
                 let (classification, content) = listed_content(row.value, &row.classification)
                     .ok_or_else(storage_unavailable)?;
                 let alias_paths = content_paths
@@ -160,26 +216,7 @@ impl Configuration for ConfigurationService {
         request: Request<GetSubTreeRequest>,
     ) -> Result<Response<GetSubTreeResponse>, Status> {
         let path = authorize(&request, &[Permission::Read], true)?;
-        // Subtree matching uses starts_with, never LIKE: `_` is a legal path
-        // segment character (since 2.15.0) and a single-character LIKE
-        // wildcard, so `LIKE '/a/b_c/%'` would also match the sibling subtree
-        // `/a/bXc/` that authorize() never checked. This applies to every
-        // prefix match in this file. Do not "optimize" it back to LIKE for the
-        // btree prefix scan.
-        let rows = sqlx::query_as::<_, SubTreeRow>(
-            r"
-            SELECT p.path, c.value, c.classification
-            FROM configuration_paths p
-            JOIN configuration_value_contents c ON c.id = p.content_id
-            WHERE $1 = '/' OR p.lowercase_path = $1 OR starts_with(p.lowercase_path, $1 || '/')
-            ORDER BY p.lowercase_path
-            ",
-        )
-        .bind(path.fold())
-        .fetch_all(&self.database)
-        .await
-        .map_err(|_| storage_unavailable())?;
-
+        let rows = store::sub_tree_rows(&self.database, &path.fold()).await?;
         let mut values = Vec::with_capacity(rows.len());
         for row in rows {
             let (classification, content) =
@@ -208,89 +245,20 @@ impl Configuration for ConfigurationService {
                 "configuration value contains an invalid character",
             ));
         }
-        let mut transaction = self
-            .database
-            .begin()
-            .await
-            .map_err(|_| storage_unavailable())?;
+        let mut transaction = store::begin(&self.database).await?;
         lock_mutation_path(&mut transaction, &path).await?;
         let now = OffsetDateTime::from(SystemTime::now());
-        let existing = sqlx::query_as::<_, PathContentClassRow>(
-            r"
-            SELECT
-                p.content_id,
-                c.classification,
-                (
-                    SELECT COUNT(*)
-                    FROM configuration_paths siblings
-                    WHERE siblings.content_id = p.content_id
-                ) AS path_count
-            FROM configuration_paths p
-            JOIN configuration_value_contents c ON c.id = p.content_id
-            WHERE p.lowercase_path = $1
-            ",
-        )
-        .bind(path.fold())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|_| storage_unavailable())?;
-        let row = if let Some(existing) = existing {
-            // Classification belongs to the stored value, so it cannot differ
-            // between aliases. Rather than let a write through one path silently
-            // change how the value is exposed at every other path — including
-            // paths the caller may not be able to see — refuse the change while
-            // more than one path resolves to it. Rotating a value in place, and
-            // changing classification while a single path remains, both still
-            // work.
-            if existing.path_count > 1 && existing.classification != classification {
-                return Err(Status::invalid_argument(
-                    "configuration value has multiple paths and cannot change classification",
-                ));
+        let row = match store::path_content_class(&mut transaction, &path.fold()).await? {
+            Some(existing) => {
+                self.overwrite_existing(&mut transaction, existing, value, classification, now)
+                    .await?
             }
-            let content_id = existing.content_id;
-            // Reclassification needs no conversion of what is already stored:
-            // every classification change arrives with a fresh value from the
-            // caller, so `plain -> secret` seals the new value and
-            // `secret -> plain` writes the new plaintext.
-            let stored = self.stored_representation(content_id, classification, value)?;
-            // Writing through any path updates the shared content, so every
-            // other path aliasing it observes the new value.
-            sqlx::query_as::<_, MutationRow>(
-                r"
-                UPDATE configuration_value_contents
-                SET value = $2, classification = $3, updated_at = $4
-                WHERE id = $1
-                RETURNING created_at, updated_at
-                ",
-            )
-            .bind(content_id)
-            .bind(&stored)
-            .bind(classification)
-            .bind(now)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|_| storage_unavailable())?
-        } else {
-            if path_collides(&mut transaction, &path.fold()).await? {
-                return Err(Status::invalid_argument(
-                    "configuration value collides with an existing value",
-                ));
-            }
-            let content_id = reserve_content_id(&mut transaction).await?;
-            let stored = self.stored_representation(content_id, classification, value)?;
-            let content =
-                insert_content(&mut transaction, content_id, &stored, classification, now).await?;
-            // The path exactly as written establishes its display case.
-            insert_path(&mut transaction, path.as_str(), content.id, now).await?;
-            MutationRow {
-                created_at: content.created_at,
-                updated_at: content.updated_at,
+            None => {
+                self.create_value(&mut transaction, &path, value, classification, now)
+                    .await?
             }
         };
-        transaction
-            .commit()
-            .await
-            .map_err(|_| storage_unavailable())?;
+        store::commit(transaction).await?;
 
         Ok(Response::new(PutValueResponse {
             created_at: Some(to_proto_timestamp(row.created_at)?),
@@ -303,218 +271,37 @@ impl Configuration for ConfigurationService {
         request: Request<ReplaceSubTreeRequest>,
     ) -> Result<Response<ReplaceSubTreeResponse>, Status> {
         let path = authorize(&request, &[Permission::Write, Permission::Manage], true)?;
-        let mut values = request.get_ref().values.clone();
-        // Parse and fold every path up front, before sorting or the
-        // ancestor-collision walk below: both depend on paths comparing and
-        // ordering by fold key, not by raw (possibly mixed-case) bytes. Each
-        // value's `path` field is normalized in place to its fold form here,
-        // so every line below this loop keeps the same fold-only invariant it
-        // always has; `displays` is consulted only where a path is written.
-        let mut displays: BTreeMap<String, String> = BTreeMap::new();
-        for value in &mut values {
-            let value_path = ConfigPath::parse_operation(&value.path)
-                .map_err(|_| Status::invalid_argument("configuration subtree is invalid"))?;
-            if !value_path.is_at_or_below(&path) {
-                return Err(Status::invalid_argument("configuration subtree is invalid"));
-            }
-            match value.content.as_ref() {
-                Some(sub_tree_mutation_value::Content::PlainValue(content))
-                    if !content.contains('\0') => {}
-                Some(sub_tree_mutation_value::Content::PreserveSecret(_)) => {}
-                _ => return Err(Status::invalid_argument("configuration subtree is invalid")),
-            }
-            let fold = value_path.fold();
-            if fold != value_path.as_str() {
-                displays.insert(fold.clone(), value_path.as_str().to_owned());
-            }
-            value.path = fold;
-        }
-        values.sort_by(|first, second| first.path.cmp(&second.path));
-        let mut accepted_paths = BTreeSet::new();
-        for value in &values {
-            let mut ancestor = value.path.as_str();
-            let mut has_stored_ancestor = false;
-            while let Some((parent, _)) = ancestor.rsplit_once('/') {
-                if parent.is_empty() {
-                    break;
-                }
-                if accepted_paths.contains(parent) {
-                    has_stored_ancestor = true;
-                    break;
-                }
-                ancestor = parent;
-            }
-            if has_stored_ancestor || !accepted_paths.insert(value.path.as_str()) {
-                return Err(Status::invalid_argument("configuration subtree is invalid"));
-            }
-        }
+        let NormalizedSubtree {
+            mut values,
+            displays,
+        } = subtree::normalize(&path, request.get_ref().values.clone())?;
 
-        let mut transaction = self
-            .database
-            .begin()
-            .await
-            .map_err(|_| storage_unavailable())?;
+        let mut transaction = store::begin(&self.database).await?;
         lock_mutation_path(&mut transaction, &path).await?;
-        let secret_rows = sqlx::query_as::<_, PathRow>(
-            r"
-            SELECT p.lowercase_path AS path
-            FROM configuration_paths p
-            JOIN configuration_value_contents c ON c.id = p.content_id
-            WHERE c.classification = 'secret'
-              AND (
-                    $1 = '/'
-                    OR p.lowercase_path = $1
-                    OR starts_with(p.lowercase_path, $1 || '/')
-                    OR starts_with($1, p.lowercase_path || '/')
-                  )
-            ORDER BY p.lowercase_path
-            ",
-        )
-        .bind(path.fold())
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(|_| storage_unavailable())?;
-        let secret_paths = secret_rows
-            .into_iter()
-            .map(|row| row.path)
-            .collect::<BTreeSet<_>>();
-        // The JSON representation uses the masked token for both a preserved
-        // secret and a legitimate plain value with the same text. Resolve
-        // that ambiguity against the stored classification while the
-        // mutation path is locked. Unknown markers are therefore stored as a
-        // plain masked token; markers colliding with an existing secret still
-        // fail the subtree validation below.
-        for value in &mut values {
-            let Some(sub_tree_mutation_value::Content::PreserveSecret(_)) = value.content.as_ref()
-            else {
-                continue;
-            };
-            if !secret_paths.contains(&value.path) {
-                value.content = Some(sub_tree_mutation_value::Content::PlainValue(
-                    MASKED_SECRET_TEXT.into(),
-                ));
-            }
-        }
-        let plain_paths: Vec<String> = values
-            .iter()
-            .filter_map(|value| match value.content.as_ref() {
-                Some(sub_tree_mutation_value::Content::PlainValue(_)) => Some(value.path.clone()),
-                _ => None,
-            })
-            .collect();
-        let preserve_paths = values
-            .iter()
-            .filter_map(|value| match value.content.as_ref() {
-                Some(sub_tree_mutation_value::Content::PreserveSecret(_)) => {
-                    Some(value.path.as_str())
-                }
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        if plain_paths.iter().any(|plain| {
-            secret_paths
-                .iter()
-                .any(|secret| paths_collide(plain, secret))
-        }) || !preserve_paths
-            .iter()
-            .all(|preserve| secret_paths.contains(*preserve))
-        {
-            return Err(Status::invalid_argument("configuration subtree is invalid"));
-        }
+        let secret_paths = store::secret_paths_touching(&mut transaction, &path.fold()).await?;
+        subtree::resolve_preserve_markers(&mut values, &secret_paths);
+        let plain_paths = subtree::plain_paths(&values, &secret_paths)?;
         let now = OffsetDateTime::from(SystemTime::now());
-        let cleared = sqlx::query_as::<_, DeletedPathRow>(
-            r"
-            DELETE FROM configuration_paths p
-            USING configuration_value_contents c
-            WHERE p.content_id = c.id
-              AND ($1 = '/' OR p.lowercase_path = $1 OR starts_with(p.lowercase_path, $1 || '/'))
-              AND c.classification = 'plain'
-              AND NOT (p.lowercase_path = ANY($2::TEXT[]))
-            RETURNING p.content_id
-            ",
-        )
-        .bind(path.fold())
-        .bind(&plain_paths)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(|_| storage_unavailable())?;
+        let cleared =
+            store::delete_plain_paths_except(&mut transaction, &path.fold(), &plain_paths).await?;
         prune_orphan_contents(&mut transaction, &content_ids(&cleared)).await?;
-        // Several paths in the subtree can alias one stored value, and the
-        // subtree representation exposes every one of them. Resolve each
-        // mutation to its content before writing so a shared value is written
-        // exactly once: applying one update per path would let the last path in
-        // sort order overwrite the others, silently discarding an edit while
-        // still reporting success. Ascending content id also gives concurrent
-        // replacements a common write order.
-        // The map must stay ordered by content id: iterating it ascending is
-        // what gives concurrent replacements a common row-lock order. Values
-        // cross-aliased between disjoint subtrees (X at /a/1 and /b/2, Y at /a/2
-        // and /b/1) would otherwise lock X-then-Y in one transaction and
-        // Y-then-X in the other and deadlock, since their path locks are
-        // disjoint. Do not swap this for a HashMap.
-        let mut shared: BTreeMap<i64, &String> = BTreeMap::new();
-        let mut fresh: Vec<(&String, &String)> = Vec::new();
-        for value in &values {
-            let Some(sub_tree_mutation_value::Content::PlainValue(content)) =
-                value.content.as_ref()
-            else {
-                continue;
-            };
-            let existing = sqlx::query_scalar::<_, i64>(
-                "SELECT content_id FROM configuration_paths WHERE lowercase_path = $1",
-            )
-            .bind(&value.path)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|_| storage_unavailable())?;
-            match existing {
-                Some(content_id) => match shared.get(&content_id) {
-                    // Aliases of one value must agree; a genuine conflict is
-                    // ambiguous, so reject it rather than pick a winner.
-                    Some(assigned) if *assigned != content => {
-                        return Err(Status::invalid_argument(
-                            "configuration subtree assigns conflicting values to one stored value",
-                        ));
-                    }
-                    Some(_) => {}
-                    None => {
-                        shared.insert(content_id, content);
-                    }
-                },
-                None => fresh.push((&value.path, content)),
-            }
-        }
+        let writes = resolve_plain_writes(&mut transaction, &values).await?;
         // Nothing below encrypts, because subtree replacement can neither read
         // nor create a secret: it only ever writes `plain`, only ever deletes
         // `plain`, and the validation above rejects a plain value colliding
         // with a secret path. Every content row reached here is therefore
         // already plaintext and stays that way.
-        for (content_id, content) in &shared {
-            sqlx::query(
-                r"
-                UPDATE configuration_value_contents
-                SET value = $2, classification = 'plain', updated_at = $3
-                WHERE id = $1
-                ",
-            )
-            .bind(content_id)
-            .bind(content)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| storage_unavailable())?;
+        for (content_id, content) in &writes.shared {
+            store::update_plain_content(&mut transaction, *content_id, content, now).await?;
         }
-        for (path, content) in fresh {
+        for (path, content) in writes.fresh {
             let content_id = reserve_content_id(&mut transaction).await?;
             let inserted =
                 insert_content(&mut transaction, content_id, content, PLAIN, now).await?;
             let display = displays.get(path).map_or(path.as_str(), String::as_str);
             insert_path(&mut transaction, display, inserted.id, now).await?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|_| storage_unavailable())?;
+        store::commit(transaction).await?;
         Ok(Response::new(ReplaceSubTreeResponse {
             updated_at: Some(to_proto_timestamp(now)?),
             value_count: u64::try_from(values.len()).map_err(|_| storage_unavailable())?,
@@ -527,29 +314,9 @@ impl Configuration for ConfigurationService {
     ) -> Result<Response<DeleteValuesResponse>, Status> {
         let recurse = request.get_ref().recurse;
         let path = authorize(&request, &[Permission::Write], recurse)?;
-        let mut transaction = self
-            .database
-            .begin()
-            .await
-            .map_err(|_| storage_unavailable())?;
+        let mut transaction = store::begin(&self.database).await?;
         lock_mutation_path(&mut transaction, &path).await?;
-        let deleted = if recurse {
-            sqlx::query_as::<_, DeletedPathRow>(
-                "DELETE FROM configuration_paths WHERE $1 = '/' OR lowercase_path = $1 OR starts_with(lowercase_path, $1 || '/') RETURNING content_id",
-            )
-            .bind(path.fold())
-            .fetch_all(&mut *transaction)
-            .await
-            .map_err(|_| storage_unavailable())?
-        } else {
-            sqlx::query_as::<_, DeletedPathRow>(
-                "DELETE FROM configuration_paths WHERE lowercase_path = $1 RETURNING content_id",
-            )
-            .bind(path.fold())
-            .fetch_all(&mut *transaction)
-            .await
-            .map_err(|_| storage_unavailable())?
-        };
+        let deleted = store::delete_paths(&mut transaction, &path.fold(), recurse).await?;
         if deleted.is_empty() {
             return Err(Status::not_found("configuration value not found"));
         }
@@ -557,10 +324,7 @@ impl Configuration for ConfigurationService {
         // left with no remaining paths so deleting the last path removes the
         // value for good, while shared values survive.
         prune_orphan_contents(&mut transaction, &content_ids(&deleted)).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|_| storage_unavailable())?;
+        store::commit(transaction).await?;
         let deleted_at = OffsetDateTime::from(SystemTime::now());
         Ok(Response::new(DeleteValuesResponse {
             deleted_at: Some(to_proto_timestamp(deleted_at)?),
@@ -573,19 +337,9 @@ impl Configuration for ConfigurationService {
         request: Request<RevealSecretRequest>,
     ) -> Result<Response<RevealSecretResponse>, Status> {
         let path = authorize(&request, &[Permission::Read], false)?;
-        let row = sqlx::query_as::<_, RevealedRow>(
-            r"
-            SELECT p.content_id, c.value, c.classification
-            FROM configuration_paths p
-            JOIN configuration_value_contents c ON c.id = p.content_id
-            WHERE p.lowercase_path = $1
-            ",
-        )
-        .bind(path.fold())
-        .fetch_optional(&self.database)
-        .await
-        .map_err(|_| storage_unavailable())?
-        .ok_or_else(|| Status::not_found("configuration value not found"))?;
+        let row = store::revealed_row(&self.database, &path.fold())
+            .await?
+            .ok_or_else(|| Status::not_found("configuration value not found"))?;
         if row.classification != SECRET {
             return Err(Status::invalid_argument(
                 "configuration value is not a secret",
@@ -630,11 +384,7 @@ impl Configuration for ConfigurationService {
             ));
         }
 
-        let mut transaction = self
-            .database
-            .begin()
-            .await
-            .map_err(|_| storage_unavailable())?;
+        let mut transaction = store::begin(&self.database).await?;
         // Lock both mutation hierarchies in a canonical order so concurrent
         // aliasing in either direction cannot deadlock.
         let (first, second) = if source <= new_path {
@@ -645,23 +395,10 @@ impl Configuration for ConfigurationService {
         lock_mutation_path(&mut transaction, first).await?;
         lock_mutation_path(&mut transaction, second).await?;
 
-        let content_id = sqlx::query_scalar::<_, i64>(
-            "SELECT content_id FROM configuration_paths WHERE lowercase_path = $1",
-        )
-        .bind(source.fold())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|_| storage_unavailable())?
-        .ok_or_else(|| Status::not_found("configuration value not found"))?;
-        let occupied = sqlx::query_scalar::<_, String>(
-            "SELECT path FROM configuration_paths WHERE lowercase_path = $1",
-        )
-        .bind(new_path.fold())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|_| storage_unavailable())?
-        .is_some();
-        if occupied {
+        let content_id = store::content_id_at(&mut *transaction, &source.fold())
+            .await?
+            .ok_or_else(|| Status::not_found("configuration value not found"))?;
+        if store::path_is_occupied(&mut transaction, &new_path.fold()).await? {
             return Err(Status::already_exists("configuration path already exists"));
         }
         if path_collides(&mut transaction, &new_path.fold()).await? {
@@ -672,10 +409,7 @@ impl Configuration for ConfigurationService {
         let now = OffsetDateTime::from(SystemTime::now());
         // The path exactly as written establishes this alias's display case.
         insert_path(&mut transaction, new_path.as_str(), content_id, now).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|_| storage_unavailable())?;
+        store::commit(transaction).await?;
         Ok(Response::new(AddValuePathResponse {
             created_at: Some(to_proto_timestamp(now)?),
         }))
@@ -687,25 +421,13 @@ impl Configuration for ConfigurationService {
     ) -> Result<Response<ListValuePathsResponse>, Status> {
         let path = authorize(&request, &[Permission::Read], false)?;
         let principal = principal(&request)?;
-        let content_id = sqlx::query_scalar::<_, i64>(
-            "SELECT content_id FROM configuration_paths WHERE lowercase_path = $1",
-        )
-        .bind(path.fold())
-        .fetch_optional(&self.database)
-        .await
-        .map_err(|_| storage_unavailable())?
-        .ok_or_else(|| Status::not_found("configuration value not found"))?;
-        let rows = sqlx::query_as::<_, PathWithFoldRow>(
-            "SELECT path, lowercase_path FROM configuration_paths WHERE content_id = $1 ORDER BY lowercase_path",
-        )
-        .bind(content_id)
-        .fetch_all(&self.database)
-        .await
-        .map_err(|_| storage_unavailable())?;
+        let content_id = store::content_id_at(&self.database, &path.fold())
+            .await?
+            .ok_or_else(|| Status::not_found("configuration value not found"))?;
         // Hide paths the caller cannot read: one value may be reachable through
         // paths outside the caller's grants.
         let mut paths = Vec::new();
-        for row in rows {
+        for row in store::paths_of_content(&self.database, content_id).await? {
             let candidate =
                 ConfigPath::parse(&row.lowercase_path).map_err(|_| storage_unavailable())?;
             if principal.allows(&candidate, Permission::Read) {
@@ -714,6 +436,43 @@ impl Configuration for ConfigurationService {
         }
         Ok(Response::new(ListValuePathsResponse { paths }))
     }
+}
+
+/// Resolves each plain write to the content it lands on, so a value shared by
+/// several paths in the subtree is written exactly once: applying one update
+/// per path would let the last path in sort order overwrite the others,
+/// silently discarding an edit while still reporting success.
+async fn resolve_plain_writes<'a>(
+    transaction: &mut Transaction<'_, Postgres>,
+    values: &'a [SubTreeMutationValue],
+) -> Result<ResolvedWrites<'a>, Status> {
+    let mut writes = ResolvedWrites {
+        shared: BTreeMap::new(),
+        fresh: Vec::new(),
+    };
+    for value in values {
+        let Some(sub_tree_mutation_value::Content::PlainValue(content)) = value.content.as_ref()
+        else {
+            continue;
+        };
+        match store::content_id_at(&mut **transaction, &value.path).await? {
+            Some(content_id) => match writes.shared.get(&content_id) {
+                // Aliases of one value must agree; a genuine conflict is
+                // ambiguous, so reject it rather than pick a winner.
+                Some(assigned) if *assigned != content => {
+                    return Err(Status::invalid_argument(
+                        "configuration subtree assigns conflicting values to one stored value",
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    writes.shared.insert(content_id, content);
+                }
+            },
+            None => writes.fresh.push((&value.path, content)),
+        }
+    }
+    Ok(writes)
 }
 
 fn encryption_failed() -> Status {

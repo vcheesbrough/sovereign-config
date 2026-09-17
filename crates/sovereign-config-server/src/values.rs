@@ -5,6 +5,7 @@
 //! - `authz` — per-request path parsing and permission checks.
 //! - `store` — every `PostgreSQL` row type and query.
 //! - `paths` — pure fold-path arithmetic (collision, parents, ancestors).
+//! - `subtree` — pure validation of a `ReplaceSubTree` mutation.
 //! - `content` — mapping a stored value onto its masked wire representation.
 //! - `startup` — the start-of-day secret encryption pass.
 
@@ -14,6 +15,7 @@ mod paths;
 mod service;
 mod startup;
 mod store;
+mod subtree;
 
 pub(crate) use service::ConfigurationService;
 pub(crate) use startup::encrypt_stored_secrets;
