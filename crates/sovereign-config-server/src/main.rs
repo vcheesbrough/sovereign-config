@@ -4,6 +4,7 @@ mod config;
 mod encryption;
 mod managed;
 mod metrics;
+mod rpc;
 mod values;
 mod web;
 
