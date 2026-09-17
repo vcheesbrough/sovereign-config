@@ -1,26 +1,16 @@
-//! The page chrome: the resizable sidebar, the brand menu, route links, and the full-page unsaved-edit guard.
+//! The page chrome: the resizable sidebar, the brand menu, route links, and the
+//! full-page unsaved-edit guard.
 
-use crate::browser::local_storage;
-use crate::dom::element;
-use crate::dom::element_is_hidden;
-use crate::dom::focus;
-use crate::dom::set_hidden;
-use crate::route::PENDING_NAVIGATION;
-use crate::route::Route;
-use crate::route::discard_changes;
-use crate::route::guarded_navigate;
-use crate::route::has_unsaved_edits;
-use crate::route::keep_editing;
 use std::cell::Cell;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
-use web_sys::Document;
-use web_sys::Element;
-use web_sys::Event;
-use web_sys::HtmlElement;
-use web_sys::KeyboardEvent;
-use web_sys::PointerEvent;
-use web_sys::window;
+use web_sys::{Document, Element, Event, HtmlElement, KeyboardEvent, PointerEvent, window};
+
+use crate::browser::local_storage;
+use crate::dom::{element, element_is_hidden, focus, on_element_id, set_hidden};
+use crate::route::{
+    PENDING_NAVIGATION, Route, discard_changes, guarded_navigate, has_unsaved_edits, keep_editing,
+};
 
 thread_local! {
     pub(crate) static SIDEBAR_DRAG_POINTER: Cell<Option<i32>> = const { Cell::new(None) };
@@ -50,26 +40,15 @@ pub(crate) fn install_unsaved_guard(document: &Document) {
             .add_event_listener_with_callback("beforeunload", callback.as_ref().unchecked_ref());
         callback.forget();
     }
-    if let Some(keep) = document.get_element_by_id("keep-editing") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| keep_editing());
-        let _ = keep.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(discard) = document.get_element_by_id("discard-changes") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| discard_changes());
-        let _ =
-            discard.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(dialog) = document.get_element_by_id("unsaved-dialog") {
-        // Escape closes a native dialog without either button; that is a
-        // decision to stay, so drop the pending route.
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            PENDING_NAVIGATION.with_borrow_mut(Option::take);
-        });
-        let _ = dialog.add_event_listener_with_callback("close", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
+    on_element_id(document, "keep-editing", "click", |_: Event| keep_editing());
+    on_element_id(document, "discard-changes", "click", |_: Event| {
+        discard_changes();
+    });
+    // Escape closes a native dialog without either button; that is a
+    // decision to stay, so drop the pending route.
+    on_element_id(document, "unsaved-dialog", "close", |_: Event| {
+        PENDING_NAVIGATION.with_borrow_mut(Option::take);
+    });
 }
 
 /// Drag and keyboard control for the sidebar separator. The width is a CSS
@@ -241,12 +220,8 @@ pub(crate) fn close_brand_menu() {
 }
 
 pub(crate) fn install_route_link(document: &Document, id: &str, route: Route) {
-    if let Some(link) = document.get_element_by_id(id) {
-        let callback = Closure::<dyn FnMut(_)>::new(move |event: Event| {
-            event.prevent_default();
-            guarded_navigate(route.clone());
-        });
-        let _ = link.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
+    on_element_id(document, id, "click", move |event: Event| {
+        event.prevent_default();
+        guarded_navigate(route.clone());
+    });
 }

@@ -19,58 +19,39 @@ mod transport;
 mod tree;
 mod value_rows;
 
-use crate::browser::app_config;
-use crate::browser::location_search;
-use crate::configuration::CONFIGURATION_LOAD_GENERATION;
-use crate::configuration::hide_new_value_row;
-use crate::configuration::install_configuration_actions;
-use crate::configuration::load_current_configuration;
-use crate::connections::CONNECTIONS;
-use crate::connections::CONNECTIONS_LOAD_GENERATION;
-use crate::connections::ESTATE_CONNECTION_TABLE;
-use crate::connections::PATH_CONNECTION_TABLE;
-use crate::connections::clear_connection_rows;
-use crate::connections::discard_connection_url;
-use crate::connections::install_connections_actions;
-use crate::connections::load_current_connections;
-use crate::dom::focus;
-use crate::dom::set_hidden;
-use crate::dom::set_loaded_textarea;
-use crate::dom::set_text;
-use crate::dom::show_error;
-use crate::downloads::load_downloads;
-use crate::route::Route;
-use crate::route::has_unsaved_edits;
-use crate::route::open_unsaved_dialog;
-use crate::route::refresh_views;
-use crate::route::render_route;
-use crate::route::restore_current_url;
-use crate::route::route_from_location;
-use crate::session::begin_login;
-use crate::session::clear_browser_session;
-use crate::session::finish_login;
-use crate::session::refresh_status;
-use crate::session::render_identity;
-use crate::session::restore_tokens;
-use crate::shell::close_brand_menu;
-use crate::shell::install_brand_menu;
-use crate::shell::install_route_link;
-use crate::shell::install_sidebar_resizer;
-use crate::shell::install_unsaved_guard;
-use crate::shell::restore_sidebar_width;
-use crate::tree::TREE_LOAD_GENERATION;
-use crate::tree::TREE_NODES;
-use crate::tree::install_tree_actions;
-use crate::tree::load_tree;
-use crate::tree::render_tree;
-use crate::value_rows::clear_value_rows;
 use sovereign_config_core::ConfigPath;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::Event;
-use web_sys::window;
+use web_sys::{Event, window};
+
+use crate::browser::{app_config, location_search};
+use crate::configuration::{
+    CONFIGURATION_LOAD_GENERATION, hide_new_value_row, install_configuration_actions,
+    load_current_configuration,
+};
+use crate::connections::{
+    CONNECTIONS, CONNECTIONS_LOAD_GENERATION, ESTATE_CONNECTION_TABLE, PATH_CONNECTION_TABLE,
+    clear_connection_rows, discard_connection_url, install_connections_actions,
+    load_current_connections,
+};
+use crate::dom::{focus, on_element_id, set_hidden, set_loaded_textarea, set_text, show_error};
+use crate::downloads::load_downloads;
+use crate::route::{
+    Route, has_unsaved_edits, open_unsaved_dialog, refresh_views, render_route,
+    restore_current_url, route_from_location,
+};
+use crate::session::{
+    begin_login, clear_browser_session, finish_login, refresh_status, render_identity,
+    restore_tokens,
+};
+use crate::shell::{
+    close_brand_menu, install_brand_menu, install_route_link, install_sidebar_resizer,
+    install_unsaved_guard, restore_sidebar_width,
+};
+use crate::tree::{TREE_LOAD_GENERATION, TREE_NODES, install_tree_actions, load_tree, render_tree};
+use crate::value_rows::clear_value_rows;
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -147,50 +128,42 @@ pub(crate) fn install_actions() {
             .add_event_listener_with_callback("popstate", callback.as_ref().unchecked_ref());
         callback.forget();
     }
-    if let Some(login) = document.get_element_by_id("login") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: web_sys::Event| {
-            spawn_local(async {
-                match app_config() {
-                    Ok(config) => {
-                        if let Err(error) = begin_login(&config).await {
-                            show_error(error.message());
-                        }
+    on_element_id(&document, "login", "click", |_: web_sys::Event| {
+        spawn_local(async {
+            match app_config() {
+                Ok(config) => {
+                    if let Err(error) = begin_login(&config).await {
+                        show_error(error.message());
                     }
-                    Err(error) => show_error(error.message()),
                 }
-            });
+                Err(error) => show_error(error.message()),
+            }
         });
-        let _ = login.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(logout) = document.get_element_by_id("logout") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: web_sys::Event| {
-            CONFIGURATION_LOAD_GENERATION.set(CONFIGURATION_LOAD_GENERATION.get().wrapping_add(1));
-            CONNECTIONS_LOAD_GENERATION.set(CONNECTIONS_LOAD_GENERATION.get().wrapping_add(1));
-            TREE_LOAD_GENERATION.set(TREE_LOAD_GENERATION.get().wrapping_add(1));
-            discard_connection_url();
-            clear_browser_session();
-            render_identity(false);
-            set_hidden("login", false);
-            set_hidden("logout", true);
-            set_text("value-state", "Log in to view values");
-            hide_new_value_row();
-            clear_value_rows();
-            set_loaded_textarea("json-content", "");
-            set_text("value-count", "0 values");
-            clear_connection_rows(&ESTATE_CONNECTION_TABLE);
-            clear_connection_rows(&PATH_CONNECTION_TABLE);
-            CONNECTIONS.with_borrow_mut(Vec::clear);
-            TREE_NODES.with_borrow_mut(Vec::clear);
-            let _ = render_tree(&[]);
-            set_text("config-tree-state", "Log in to browse");
-            set_text("connection-state", "Log in to view connections");
-            close_brand_menu();
-            focus("login");
-        });
-        let _ = logout.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
+    });
+    on_element_id(&document, "logout", "click", |_: web_sys::Event| {
+        CONFIGURATION_LOAD_GENERATION.set(CONFIGURATION_LOAD_GENERATION.get().wrapping_add(1));
+        CONNECTIONS_LOAD_GENERATION.set(CONNECTIONS_LOAD_GENERATION.get().wrapping_add(1));
+        TREE_LOAD_GENERATION.set(TREE_LOAD_GENERATION.get().wrapping_add(1));
+        discard_connection_url();
+        clear_browser_session();
+        render_identity(false);
+        set_hidden("login", false);
+        set_hidden("logout", true);
+        set_text("value-state", "Log in to view values");
+        hide_new_value_row();
+        clear_value_rows();
+        set_loaded_textarea("json-content", "");
+        set_text("value-count", "0 values");
+        clear_connection_rows(&ESTATE_CONNECTION_TABLE);
+        clear_connection_rows(&PATH_CONNECTION_TABLE);
+        CONNECTIONS.with_borrow_mut(Vec::clear);
+        TREE_NODES.with_borrow_mut(Vec::clear);
+        let _ = render_tree(&[]);
+        set_text("config-tree-state", "Log in to browse");
+        set_text("connection-state", "Log in to view connections");
+        close_brand_menu();
+        focus("login");
+    });
     install_configuration_actions(&document);
     install_connections_actions(&document);
     install_tree_actions(&document);

@@ -1,30 +1,19 @@
-//! The path selector combobox: options, filtering, keyboard selection, and refresh.
+//! The path selector combobox: options, filtering, keyboard selection, and
+//! refresh.
 
-use crate::browser::app_config;
-use crate::browser::browser_error;
-use crate::configuration::selected_namespace;
-use crate::configuration::validate_path_field;
-use crate::dom::element;
-use crate::dom::focus;
-use crate::dom::set_hidden;
-use crate::dom::show_error;
-use crate::route::Route;
-use crate::route::guarded_navigate;
-use crate::route::route_from_location;
-use crate::transport::value_client;
-use sovereign_config_core::ClientError;
-use sovereign_config_core::ValueListing;
+use sovereign_config_core::{ClientError, ValueListing};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::Document;
-use web_sys::Element;
-use web_sys::Event;
-use web_sys::HtmlInputElement;
-use web_sys::KeyboardEvent;
-use web_sys::window;
+use web_sys::{Document, Element, Event, HtmlInputElement, KeyboardEvent, window};
+
+use crate::browser::{app_config, browser_error};
+use crate::configuration::{selected_namespace, validate_path_field};
+use crate::dom::{element, focus, listen, set_hidden, show_error};
+use crate::route::{Route, guarded_navigate, route_from_location};
+use crate::transport::value_client;
 
 thread_local! {
     pub(crate) static PATH_OPTIONS_REFRESHING: Cell<bool> = const { Cell::new(false) };
@@ -350,7 +339,7 @@ pub(crate) fn render_path_options(listing: &ValueListing) -> Result<(), ClientEr
             .map_err(|_| browser_error())?;
         option.set_text_content(Some(&path));
         let selected_path = path;
-        let callback = Closure::<dyn FnMut(_)>::new(move |event: Event| {
+        listen(&option, "pointerdown", move |event: Event| {
             event.prevent_default();
             if let Some(input) = element::<HtmlInputElement>("selected-path") {
                 input.set_value(&selected_path);
@@ -358,11 +347,7 @@ pub(crate) fn render_path_options(listing: &ValueListing) -> Result<(), ClientEr
                 close_path_options();
                 focus("selected-path");
             }
-        });
-        option
-            .add_event_listener_with_callback("pointerdown", callback.as_ref().unchecked_ref())
-            .map_err(|_| browser_error())?;
-        callback.forget();
+        })?;
         options.append_child(&option).map_err(|_| browser_error())?;
     }
     if path_options_expanded() {

@@ -1,41 +1,24 @@
-//! The OIDC session: PKCE login, token refresh and persistence, identity display, and issuer discovery.
+//! The OIDC session: PKCE login, token refresh and persistence, identity
+//! display, and issuer discovery.
 
-use crate::browser::AppConfig;
-use crate::browser::browser_error;
-use crate::browser::location_search;
-use crate::browser::oidc_error;
-use crate::browser::optional_string_property;
-use crate::browser::random_urlsafe;
-use crate::browser::redirect_uri;
-use crate::browser::session_storage;
-use crate::browser::string_property;
-use crate::dom::clear_error;
-use crate::dom::set_hidden;
-use crate::dom::set_text;
-use crate::dom::show_error;
-use crate::route::route_from_location;
-use crate::route::route_from_path;
-use crate::route::route_url;
-use crate::transport::BrowserTransport;
-use crate::transport::MemoryAuthentication;
-use crate::transport::fetch;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use js_sys::Date;
-use js_sys::Reflect;
-use sha2::Digest;
-use sha2::Sha256;
+use js_sys::{Date, Reflect};
+use sha2::{Digest, Sha256};
 use sovereign_config_client::Client;
-use sovereign_config_core::ClientError;
-use sovereign_config_core::ErrorKind;
-use sovereign_config_core::Secret;
+use sovereign_config_core::{ClientError, ErrorKind, Secret};
 use std::cell::RefCell;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::Response;
-use web_sys::Url;
-use web_sys::UrlSearchParams;
-use web_sys::window;
+use web_sys::{Response, Url, UrlSearchParams, window};
+
+use crate::browser::{
+    AppConfig, browser_error, location_search, oidc_error, optional_string_property,
+    random_urlsafe, redirect_uri, session_storage, string_property,
+};
+use crate::dom::{clear_error, set_hidden, set_text, show_error};
+use crate::route::{route_from_location, route_from_path, route_url};
+use crate::transport::{BrowserTransport, MemoryAuthentication, fetch};
 
 thread_local! {
     pub(crate) static TOKENS: RefCell<Option<MemoryTokens>> = const { RefCell::new(None) };

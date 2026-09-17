@@ -1,100 +1,44 @@
-//! gRPC-Web transport: the `Transport`/`ValueTransport`/`ManagedConnectionTransport` impls for the browser, frame decoding, and proto-to-core mapping.
+//! gRPC-Web transport: the
+//! `Transport`/`ValueTransport`/`ManagedConnectionTransport` impls for the
+//! browser, frame decoding, and proto-to-core mapping.
 
-use crate::browser::AppConfig;
-use crate::browser::browser_error;
-use crate::session::TOKENS;
-use crate::session::clear_persisted_refresh_token;
-use crate::session::persist_refresh_token;
-use crate::session::refresh_tokens;
 use async_trait::async_trait;
-use js_sys::Date;
-use js_sys::Uint8Array;
+use js_sys::{Date, Uint8Array};
 use prost::Message;
-use sovereign_config_client::AccessTokenProvider;
-use sovereign_config_client::Client;
-use sovereign_config_client::ManagedConnectionTransport;
-use sovereign_config_client::RpcCode;
-use sovereign_config_client::Transport;
-use sovereign_config_client::ValueTransport;
-use sovereign_config_client::VersionReply;
-use sovereign_config_client::map_rpc_status;
-use sovereign_config_client::timestamp;
-use sovereign_config_core::AddPathMetadata;
-use sovereign_config_core::AuthenticationStatus;
-use sovereign_config_core::ClientError;
-use sovereign_config_core::ConfigPath;
-use sovereign_config_core::ConnectionId;
-use sovereign_config_core::ConnectionUrl;
-use sovereign_config_core::DeleteMetadata;
-use sovereign_config_core::DisplayName;
-use sovereign_config_core::ErrorKind;
-use sovereign_config_core::ListedValue;
-use sovereign_config_core::ManagedConnectionMetadata;
-use sovereign_config_core::ManagedConnectionState;
-use sovereign_config_core::ManagedPermissions;
-use sovereign_config_core::MaskedSecret;
-use sovereign_config_core::PlainValue;
-use sovereign_config_core::ProvisionedManagedConnection;
-use sovereign_config_core::PutMetadata;
-use sovereign_config_core::ReplaceMetadata;
-use sovereign_config_core::RevealedConnectionUrl;
-use sovereign_config_core::RevealedSecret;
-use sovereign_config_core::Secret;
-use sovereign_config_core::SecretInput;
-use sovereign_config_core::SubTreeMutationContent;
-use sovereign_config_core::SubTreeMutationValue;
-use sovereign_config_core::SubTreeValue;
-use sovereign_config_core::Timestamp;
-use sovereign_config_core::ValueContent;
-use sovereign_config_core::ValueListing;
-use sovereign_config_core::ValuePaths;
-use sovereign_config_core::ValueSubTree;
-use sovereign_config_proto::sovereign::config::v3::AddValuePathRequest;
-use sovereign_config_proto::sovereign::config::v3::AddValuePathResponse;
-use sovereign_config_proto::sovereign::config::v3::CreateManagedConnectionRequest;
-use sovereign_config_proto::sovereign::config::v3::CreateManagedConnectionResponse;
-use sovereign_config_proto::sovereign::config::v3::DeleteValuesRequest;
-use sovereign_config_proto::sovereign::config::v3::DeleteValuesResponse;
-use sovereign_config_proto::sovereign::config::v3::GetIdentityRequest;
-use sovereign_config_proto::sovereign::config::v3::GetIdentityResponse;
-use sovereign_config_proto::sovereign::config::v3::GetSubTreeRequest;
-use sovereign_config_proto::sovereign::config::v3::GetSubTreeResponse;
-use sovereign_config_proto::sovereign::config::v3::GetVersionRequest;
-use sovereign_config_proto::sovereign::config::v3::GetVersionResponse;
-use sovereign_config_proto::sovereign::config::v3::ListManagedConnectionsRequest;
-use sovereign_config_proto::sovereign::config::v3::ListManagedConnectionsResponse;
-use sovereign_config_proto::sovereign::config::v3::ListValuePathsRequest;
-use sovereign_config_proto::sovereign::config::v3::ListValuePathsResponse;
-use sovereign_config_proto::sovereign::config::v3::ListValuesRequest;
-use sovereign_config_proto::sovereign::config::v3::ListValuesResponse;
-use sovereign_config_proto::sovereign::config::v3::ManagedConnectionMetadata as ProtoManagedConnectionMetadata;
-use sovereign_config_proto::sovereign::config::v3::ManagedConnectionState as ProtoManagedConnectionState;
-use sovereign_config_proto::sovereign::config::v3::PreserveSecret;
-use sovereign_config_proto::sovereign::config::v3::PutValueRequest;
-use sovereign_config_proto::sovereign::config::v3::PutValueResponse;
-use sovereign_config_proto::sovereign::config::v3::ReplaceSubTreeRequest;
-use sovereign_config_proto::sovereign::config::v3::ReplaceSubTreeResponse;
-use sovereign_config_proto::sovereign::config::v3::RevealSecretRequest;
-use sovereign_config_proto::sovereign::config::v3::RevealSecretResponse;
-use sovereign_config_proto::sovereign::config::v3::RevokeManagedConnectionRequest;
-use sovereign_config_proto::sovereign::config::v3::RevokeManagedConnectionResponse;
-use sovereign_config_proto::sovereign::config::v3::RotateManagedConnectionRequest;
-use sovereign_config_proto::sovereign::config::v3::RotateManagedConnectionResponse;
-use sovereign_config_proto::sovereign::config::v3::SubTreeMutationValue as ProtoSubTreeMutationValue;
-use sovereign_config_proto::sovereign::config::v3::ValueClassification as ProtoClassification;
-use sovereign_config_proto::sovereign::config::v3::listed_value;
-use sovereign_config_proto::sovereign::config::v3::put_value_request;
-use sovereign_config_proto::sovereign::config::v3::sub_tree_mutation_value;
-use sovereign_config_proto::sovereign::config::v3::sub_tree_value;
-use wasm_bindgen::JsCast;
-use wasm_bindgen::JsValue;
+use sovereign_config_client::{
+    AccessTokenProvider, Client, ManagedConnectionTransport, RpcCode, Transport, ValueTransport,
+    VersionReply, map_rpc_status, timestamp,
+};
+use sovereign_config_core::{
+    AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl,
+    DeleteMetadata, DisplayName, ErrorKind, ListedValue, ManagedConnectionMetadata,
+    ManagedConnectionState, ManagedPermissions, MaskedSecret, PlainValue,
+    ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedConnectionUrl,
+    RevealedSecret, Secret, SecretInput, SubTreeMutationContent, SubTreeMutationValue,
+    SubTreeValue, Timestamp, ValueContent, ValueListing, ValuePaths, ValueSubTree,
+};
+use sovereign_config_proto::sovereign::config::v3::{
+    AddValuePathRequest, AddValuePathResponse, CreateManagedConnectionRequest,
+    CreateManagedConnectionResponse, DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest,
+    GetIdentityResponse, GetSubTreeRequest, GetSubTreeResponse, GetVersionRequest,
+    GetVersionResponse, ListManagedConnectionsRequest, ListManagedConnectionsResponse,
+    ListValuePathsRequest, ListValuePathsResponse, ListValuesRequest, ListValuesResponse,
+    ManagedConnectionMetadata as ProtoManagedConnectionMetadata,
+    ManagedConnectionState as ProtoManagedConnectionState, PreserveSecret, PutValueRequest,
+    PutValueResponse, ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest,
+    RevealSecretResponse, RevokeManagedConnectionRequest, RevokeManagedConnectionResponse,
+    RotateManagedConnectionRequest, RotateManagedConnectionResponse,
+    SubTreeMutationValue as ProtoSubTreeMutationValue, ValueClassification as ProtoClassification,
+    listed_value, put_value_request, sub_tree_mutation_value, sub_tree_value,
+};
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::Headers;
-use web_sys::Request;
-use web_sys::RequestCache;
-use web_sys::RequestInit;
-use web_sys::Response;
-use web_sys::window;
+use web_sys::{Headers, Request, RequestCache, RequestInit, Response, window};
+
+use crate::browser::{AppConfig, browser_error};
+use crate::session::{
+    TOKENS, clear_persisted_refresh_token, persist_refresh_token, refresh_tokens,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) struct BrowserTransport;

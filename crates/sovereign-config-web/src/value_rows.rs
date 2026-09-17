@@ -1,38 +1,21 @@
-//! The Configuration grid rows: rendering plain and secret values, alias paths, and the secret padlock.
+//! The Configuration grid rows: rendering plain and secret values, alias paths,
+//! and the secret padlock.
+
+use sovereign_config_core::{ClientError, ListedValue, ValueContent, ValueListing};
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::spawn_local;
+use web_sys::{Document, Element, Event, HtmlInputElement, HtmlTextAreaElement, window};
 
 use crate::browser::browser_error;
-use crate::configuration::absolute_path;
-use crate::configuration::format_timestamp;
-use crate::configuration::hide_new_value_row;
-use crate::configuration::open_add_path;
-use crate::configuration::open_delete;
-use crate::configuration::reveal_existing_secret;
-use crate::configuration::save_existing_secret;
-use crate::configuration::save_existing_value;
-use crate::configuration::validate_value_field;
-use crate::dom::append;
-use crate::dom::create_element;
-use crate::dom::element;
-use crate::dom::set_button_disabled;
-use crate::dom::set_hidden;
-use crate::dom::set_text;
-use crate::icons::Icon;
-use crate::icons::create_icon_button;
-use crate::icons::set_icon_button_icon;
+use crate::configuration::{
+    absolute_path, format_timestamp, hide_new_value_row, open_add_path, open_delete,
+    reveal_existing_secret, save_existing_secret, save_existing_value, validate_value_field,
+};
+use crate::dom::{
+    append, create_element, element, listen, set_button_disabled, set_hidden, set_text,
+};
+use crate::icons::{Icon, create_icon_button, set_icon_button_icon};
 use crate::path_selector::render_path_options;
-use sovereign_config_core::ClientError;
-use sovereign_config_core::ListedValue;
-use sovereign_config_core::ValueContent;
-use sovereign_config_core::ValueListing;
-use wasm_bindgen::JsCast;
-use wasm_bindgen::closure::Closure;
-use wasm_bindgen_futures::spawn_local;
-use web_sys::Document;
-use web_sys::Element;
-use web_sys::Event;
-use web_sys::HtmlInputElement;
-use web_sys::HtmlTextAreaElement;
-use web_sys::window;
 
 pub(crate) fn secret_field_revealed(input_id: &str) -> bool {
     element::<HtmlInputElement>(input_id).is_some_and(|input| {
@@ -114,22 +97,9 @@ pub(crate) fn render_value_row(
     if matches!(&value.value, ValueContent::Secret(_)) {
         return render_secret_value_row(document, value, index);
     }
-    let row = create_element(document, "tr", None)?;
-    row.set_attribute("data-value-row", "")
-        .map_err(|_| browser_error())?;
-
-    let name_cell = create_element(document, "th", None)?;
-    name_cell
-        .set_attribute("scope", "row")
-        .map_err(|_| browser_error())?;
+    let row = create_value_row(document)?;
     let name = value.path.name().unwrap_or_else(|| value.path.as_str());
-    let name_text = create_element(document, "span", Some("value-name"))?;
-    name_text.set_text_content(Some(name));
-    let full_path = create_element(document, "span", Some("full-path"))?;
-    full_path.set_text_content(Some(&absolute_path(&value.path)));
-    append(&name_cell, &name_text)?;
-    append(&name_cell, &full_path)?;
-    append_alias_paths(document, &name_cell, value, index)?;
+    let name_cell = render_name_cell(document, value, index, name)?;
 
     let value_cell = create_element(document, "td", None)?;
     let input_id = format!("listed-value-{index}");
@@ -174,87 +144,31 @@ pub(crate) fn render_value_row(
     append(&value_cell, &editor)?;
     append(&value_cell, &field_error)?;
 
-    let updated = create_element(document, "td", Some("updated-time"))?;
-    updated.set_text_content(Some(&format_timestamp(value.updated_at)));
-
-    let actions_cell = create_element(document, "td", None)?;
-    let actions = create_element(document, "div", Some("row-actions"))?;
-    let save_id = format!("save-listed-value-{index}");
-    let save = create_icon_button(
+    let actions = render_row_actions(
         document,
-        &save_id,
-        &format!("Save {name}"),
-        Icon::Save,
-        Some("primary"),
+        value,
+        index,
+        name,
+        format!("save-listed-value-{index}"),
     )?;
-    let add_path_id = format!("add-path-listed-value-{index}");
-    let add_path = create_icon_button(
-        document,
-        &add_path_id,
-        &format!("Add a path to {name}"),
-        Icon::AddPath,
-        None,
-    )?;
-    let remove_id = format!("delete-listed-value-{index}");
-    let remove = create_icon_button(
-        document,
-        &remove_id,
-        &format!("Delete {name}"),
-        Icon::Delete,
-        Some("danger"),
-    )?;
-    append(&actions, &save)?;
-    append(&actions, &add_path)?;
-    append(&actions, &remove)?;
-    append(&actions_cell, &actions)?;
-
-    let add_path_source = value.path.clone();
-    let add_path_focus = add_path_id;
-    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
-        open_add_path(add_path_source.clone(), add_path_focus.clone());
-    });
-    add_path
-        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
-    callback.forget();
 
     let save_path = value.path.clone();
     let save_input = input_id.clone();
-    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+    listen(&actions.save, "click", move |_: Event| {
         let path = save_path.clone();
         let input = save_input.clone();
         spawn_local(async move { save_existing_value(path, input).await });
-    });
-    save.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
-    callback.forget();
+    })?;
 
-    let validation_input = input_id.clone();
-    let validation_error = error_id.clone();
-    let validation_save = save_id.clone();
-    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+    let validation_input = input_id;
+    let validation_error = error_id;
+    let validation_save = actions.save_id.clone();
+    listen(&editor, "input", move |_: Event| {
         let valid = validate_value_field(&validation_input, &validation_error);
         set_button_disabled(&validation_save, !valid);
-    });
-    editor
-        .add_event_listener_with_callback("input", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
-    callback.forget();
+    })?;
 
-    let delete_path = value.path.clone();
-    let delete_focus = remove_id;
-    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
-        open_delete(delete_path.clone(), delete_focus.clone());
-    });
-    remove
-        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
-    callback.forget();
-
-    append(&row, &name_cell)?;
-    append(&row, &value_cell)?;
-    append(&row, &updated)?;
-    append(&row, &actions_cell)?;
+    finish_value_row(document, &row, value, &name_cell, &value_cell, &actions)?;
     Ok(row)
 }
 
@@ -263,22 +177,9 @@ pub(crate) fn render_secret_value_row(
     value: &ListedValue,
     index: usize,
 ) -> Result<Element, ClientError> {
-    let row = create_element(document, "tr", None)?;
-    row.set_attribute("data-value-row", "")
-        .map_err(|_| browser_error())?;
+    let row = create_value_row(document)?;
     let name = value.path.name().ok_or_else(browser_error)?;
-
-    let name_cell = create_element(document, "th", None)?;
-    name_cell
-        .set_attribute("scope", "row")
-        .map_err(|_| browser_error())?;
-    let name_text = create_element(document, "span", Some("value-name"))?;
-    name_text.set_text_content(Some(name));
-    let full_path = create_element(document, "span", Some("full-path"))?;
-    full_path.set_text_content(Some(&absolute_path(&value.path)));
-    append(&name_cell, &name_text)?;
-    append(&name_cell, &full_path)?;
-    append_alias_paths(document, &name_cell, value, index)?;
+    let name_cell = render_name_cell(document, value, index, name)?;
 
     // One box does both jobs: it shows the stored secret once the padlock is
     // opened, and it is where a replacement is typed. Left locked it stays
@@ -329,11 +230,78 @@ pub(crate) fn render_secret_value_row(
     append(&field, &toggle)?;
     append(&value_cell, &field)?;
 
-    let updated = create_element(document, "td", Some("updated-time"))?;
-    updated.set_text_content(Some(&format_timestamp(value.updated_at)));
+    let actions = render_row_actions(document, value, index, name, format!("save-secret-{index}"))?;
+
+    let save_path = value.path.clone();
+    let save_input = input_id.clone();
+    listen(&actions.save, "click", move |_: Event| {
+        spawn_local(save_existing_secret(save_path.clone(), save_input.clone()));
+    })?;
+
+    let toggle_path = value.path.clone();
+    let toggle_input = input_id;
+    let toggle_button = toggle_id;
+    listen(&toggle, "click", move |_: Event| {
+        if secret_field_revealed(&toggle_input) {
+            lock_secret_field(&toggle_input, &toggle_button);
+        } else {
+            spawn_local(reveal_existing_secret(
+                toggle_path.clone(),
+                toggle_input.clone(),
+                toggle_button.clone(),
+            ));
+        }
+    })?;
+
+    finish_value_row(document, &row, value, &name_cell, &value_cell, &actions)?;
+    Ok(row)
+}
+
+fn create_value_row(document: &Document) -> Result<Element, ClientError> {
+    let row = create_element(document, "tr", None)?;
+    row.set_attribute("data-value-row", "")
+        .map_err(|_| browser_error())?;
+    Ok(row)
+}
+
+/// The row header: the value's name, its full path, and its other paths.
+fn render_name_cell(
+    document: &Document,
+    value: &ListedValue,
+    index: usize,
+    name: &str,
+) -> Result<Element, ClientError> {
+    let name_cell = create_element(document, "th", None)?;
+    name_cell
+        .set_attribute("scope", "row")
+        .map_err(|_| browser_error())?;
+    let name_text = create_element(document, "span", Some("value-name"))?;
+    name_text.set_text_content(Some(name));
+    let full_path = create_element(document, "span", Some("full-path"))?;
+    full_path.set_text_content(Some(&absolute_path(&value.path)));
+    append(&name_cell, &name_text)?;
+    append(&name_cell, &full_path)?;
+    append_alias_paths(document, &name_cell, value, index)?;
+    Ok(name_cell)
+}
+
+/// A row's action cell. The add-path and delete buttons are fully wired; the
+/// save button is returned for the caller, whose save differs by value kind.
+struct RowActions {
+    cell: Element,
+    save: Element,
+    save_id: String,
+}
+
+fn render_row_actions(
+    document: &Document,
+    value: &ListedValue,
+    index: usize,
+    name: &str,
+    save_id: String,
+) -> Result<RowActions, ClientError> {
     let actions_cell = create_element(document, "td", None)?;
     let actions = create_element(document, "div", Some("row-actions"))?;
-    let save_id = format!("save-secret-{index}");
     let save = create_icon_button(
         document,
         &save_id,
@@ -364,57 +332,39 @@ pub(crate) fn render_secret_value_row(
 
     let add_path_source = value.path.clone();
     let add_path_focus = add_path_id;
-    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+    listen(&add_path, "click", move |_: Event| {
         open_add_path(add_path_source.clone(), add_path_focus.clone());
-    });
-    add_path
-        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
-    callback.forget();
-
-    let save_path = value.path.clone();
-    let save_input = input_id.clone();
-    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
-        spawn_local(save_existing_secret(save_path.clone(), save_input.clone()));
-    });
-    save.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
-    callback.forget();
-
-    let toggle_path = value.path.clone();
-    let toggle_input = input_id;
-    let toggle_button = toggle_id;
-    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
-        if secret_field_revealed(&toggle_input) {
-            lock_secret_field(&toggle_input, &toggle_button);
-        } else {
-            spawn_local(reveal_existing_secret(
-                toggle_path.clone(),
-                toggle_input.clone(),
-                toggle_button.clone(),
-            ));
-        }
-    });
-    toggle
-        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
-    callback.forget();
+    })?;
 
     let delete_path = value.path.clone();
     let delete_focus = remove_id;
-    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+    listen(&remove, "click", move |_: Event| {
         open_delete(delete_path.clone(), delete_focus.clone());
-    });
-    remove
-        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
-    callback.forget();
+    })?;
 
-    append(&row, &name_cell)?;
-    append(&row, &value_cell)?;
-    append(&row, &updated)?;
-    append(&row, &actions_cell)?;
-    Ok(row)
+    Ok(RowActions {
+        cell: actions_cell,
+        save,
+        save_id,
+    })
+}
+
+/// Appends the four cells of a value row in column order.
+fn finish_value_row(
+    document: &Document,
+    row: &Element,
+    value: &ListedValue,
+    name_cell: &Element,
+    value_cell: &Element,
+    actions: &RowActions,
+) -> Result<(), ClientError> {
+    let updated = create_element(document, "td", Some("updated-time"))?;
+    updated.set_text_content(Some(&format_timestamp(value.updated_at)));
+    append(row, name_cell)?;
+    append(row, value_cell)?;
+    append(row, &updated)?;
+    append(row, &actions.cell)?;
+    Ok(())
 }
 
 /// Renders the value's additional authorized paths (`alias_paths`) beneath the
@@ -450,13 +400,9 @@ pub(crate) fn append_alias_paths(
         )?;
         let remove_path = alias_path.clone();
         let remove_focus = remove_id;
-        let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+        listen(&remove, "click", move |_: Event| {
             open_delete(remove_path.clone(), remove_focus.clone());
-        });
-        remove
-            .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
-            .map_err(|_| browser_error())?;
-        callback.forget();
+        })?;
         append(&item, &remove)?;
 
         append(&list, &item)?;

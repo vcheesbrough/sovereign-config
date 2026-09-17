@@ -1,49 +1,27 @@
-//! The Configuration view: loading a path, JSON mode, saving, deleting and aliasing values, and field validation.
+//! The Configuration view: loading a path, JSON mode, saving, deleting and
+//! aliasing values, and field validation.
 
-use crate::browser::app_config;
-use crate::browser::browser_error;
-use crate::dom::clear_error;
-use crate::dom::element;
-use crate::dom::focus;
-use crate::dom::set_button_disabled;
-use crate::dom::set_hidden;
-use crate::dom::set_loaded_textarea;
-use crate::dom::set_text;
-use crate::dom::set_textarea;
-use crate::dom::show_error;
-use crate::path_selector::install_path_selector_actions;
-use crate::path_selector::open_selected_path;
-use crate::route::Route;
-use crate::route::reload_configuration;
-use crate::route::route_from_location;
-use crate::transport::value_client;
-use crate::value_rows::clear_value_rows;
-use crate::value_rows::lock_secret_field;
-use crate::value_rows::render_listing;
-use crate::value_rows::set_secret_toggle;
-use crate::value_rows::toggle_secret_input;
 use js_sys::Date;
-use sovereign_config_core::ClientError;
-use sovereign_config_core::ConfigPath;
-use sovereign_config_core::ErrorKind;
-use sovereign_config_core::PlainValue;
-use sovereign_config_core::SecretInput;
-use sovereign_config_core::Timestamp;
-use sovereign_config_core::ValueListing;
-use sovereign_config_core::ValueSubTree;
-use sovereign_config_core::parse_subtree_json;
-use sovereign_config_core::render_subtree_json;
-use std::cell::Cell;
-use std::cell::RefCell;
-use wasm_bindgen::JsCast;
+use sovereign_config_core::{
+    ClientError, ConfigPath, ErrorKind, PlainValue, SecretInput, Timestamp, ValueListing,
+    ValueSubTree, parse_subtree_json, render_subtree_json,
+};
+use std::cell::{Cell, RefCell};
 use wasm_bindgen::JsValue;
-use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::Document;
-use web_sys::Event;
-use web_sys::HtmlDialogElement;
-use web_sys::HtmlInputElement;
-use web_sys::HtmlTextAreaElement;
+use web_sys::{Document, Event, HtmlDialogElement, HtmlInputElement, HtmlTextAreaElement};
+
+use crate::browser::{app_config, browser_error};
+use crate::dom::{
+    clear_error, element, focus, on_element_id, set_button_disabled, set_hidden,
+    set_loaded_textarea, set_text, set_textarea, show_error,
+};
+use crate::path_selector::{install_path_selector_actions, open_selected_path};
+use crate::route::{Route, reload_configuration, route_from_location};
+use crate::transport::value_client;
+use crate::value_rows::{
+    clear_value_rows, lock_secret_field, render_listing, set_secret_toggle, toggle_secret_input,
+};
 
 thread_local! {
     pub(crate) static DELETE_TARGET: RefCell<Option<DeleteTarget>> = const { RefCell::new(None) };
@@ -66,129 +44,65 @@ pub(crate) struct AddPathTarget {
 }
 
 pub(crate) fn install_configuration_actions(document: &Document) {
-    if let Some(form) = document.get_element_by_id("path-form") {
-        let callback = Closure::<dyn FnMut(_)>::new(|event: Event| {
-            event.prevent_default();
-            open_selected_path();
-        });
-        let _ = form.add_event_listener_with_callback("submit", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
+    on_element_id(document, "path-form", "submit", |event: Event| {
+        event.prevent_default();
+        open_selected_path();
+    });
     install_path_selector_actions(document);
-    if let Some(mode) = document.get_element_by_id("json-mode") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            let enabled =
-                element::<HtmlInputElement>("json-mode").is_some_and(|input| input.checked());
-            JSON_MODE.set(enabled);
-            update_configuration_mode();
-            spawn_local(async { load_current_configuration().await });
-        });
-        let _ = mode.add_event_listener_with_callback("change", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(save) = document.get_element_by_id("save-json") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            spawn_local(async { save_json_subtree().await });
-        });
-        let _ = save.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(editor) = document.get_element_by_id("json-content") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            CONFIGURATION_LOAD_GENERATION.set(CONFIGURATION_LOAD_GENERATION.get().wrapping_add(1));
-            set_text("value-state", "Edited");
-            validate_json_editor();
-        });
-        let _ = editor.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(add) = document.get_element_by_id("add-value") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            show_new_value_row();
-        });
-        let _ = add.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(classification) = document.get_element_by_id("new-value-secret") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            update_new_value_classification();
-        });
-        let _ = classification
-            .add_event_listener_with_callback("change", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(cancel) = document.get_element_by_id("cancel-new-value") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            hide_new_value_row();
-            focus("add-value");
-        });
-        let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(save) = document.get_element_by_id("save-new-value") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            spawn_local(async { save_new_value().await });
-        });
-        let _ = save.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(name) = document.get_element_by_id("new-value-name") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            validate_name_field();
-            update_new_save_state();
-        });
-        let _ = name.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(value) = document.get_element_by_id("new-value-content") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            validate_value_field("new-value-content", "new-value-error");
-            update_new_save_state();
-        });
-        let _ = value.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(value) = document.get_element_by_id("new-secret-content") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            validate_secret_field("new-secret-content", "new-value-error");
-            update_new_save_state();
-        });
-        let _ = value.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(toggle) = document.get_element_by_id("toggle-new-secret") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            toggle_secret_input("new-secret-content", "toggle-new-secret");
-        });
-        let _ = toggle.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(cancel) = document.get_element_by_id("cancel-delete") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| cancel_delete());
-        let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(confirm) = document.get_element_by_id("confirm-delete") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            spawn_local(async { delete_selected_value().await });
-        });
-        let _ =
-            confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(cancel) = document.get_element_by_id("cancel-add-path") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| cancel_add_path());
-        let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(confirm) = document.get_element_by_id("confirm-add-path") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            spawn_local(async { add_selected_path().await });
-        });
-        let _ =
-            confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
+    on_element_id(document, "json-mode", "change", |_: Event| {
+        let enabled = element::<HtmlInputElement>("json-mode").is_some_and(|input| input.checked());
+        JSON_MODE.set(enabled);
+        update_configuration_mode();
+        spawn_local(async { load_current_configuration().await });
+    });
+    on_element_id(document, "save-json", "click", |_: Event| {
+        spawn_local(async { save_json_subtree().await });
+    });
+    on_element_id(document, "json-content", "input", |_: Event| {
+        CONFIGURATION_LOAD_GENERATION.set(CONFIGURATION_LOAD_GENERATION.get().wrapping_add(1));
+        set_text("value-state", "Edited");
+        validate_json_editor();
+    });
+    on_element_id(document, "add-value", "click", |_: Event| {
+        show_new_value_row();
+    });
+    on_element_id(document, "new-value-secret", "change", |_: Event| {
+        update_new_value_classification();
+    });
+    on_element_id(document, "cancel-new-value", "click", |_: Event| {
+        hide_new_value_row();
+        focus("add-value");
+    });
+    on_element_id(document, "save-new-value", "click", |_: Event| {
+        spawn_local(async { save_new_value().await });
+    });
+    on_element_id(document, "new-value-name", "input", |_: Event| {
+        validate_name_field();
+        update_new_save_state();
+    });
+    on_element_id(document, "new-value-content", "input", |_: Event| {
+        validate_value_field("new-value-content", "new-value-error");
+        update_new_save_state();
+    });
+    on_element_id(document, "new-secret-content", "input", |_: Event| {
+        validate_secret_field("new-secret-content", "new-value-error");
+        update_new_save_state();
+    });
+    on_element_id(document, "toggle-new-secret", "click", |_: Event| {
+        toggle_secret_input("new-secret-content", "toggle-new-secret");
+    });
+    on_element_id(document, "cancel-delete", "click", |_: Event| {
+        cancel_delete();
+    });
+    on_element_id(document, "confirm-delete", "click", |_: Event| {
+        spawn_local(async { delete_selected_value().await });
+    });
+    on_element_id(document, "cancel-add-path", "click", |_: Event| {
+        cancel_add_path();
+    });
+    on_element_id(document, "confirm-add-path", "click", |_: Event| {
+        spawn_local(async { add_selected_path().await });
+    });
 }
 
 pub(crate) fn absolute_path(path: &ConfigPath) -> String {
