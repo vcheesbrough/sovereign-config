@@ -1,50 +1,27 @@
-//! Access URLs: the estate-wide and per-path connection tables, create/rotate/revoke dialogs, and the one-time URL reveal.
+//! Access URLs: the estate-wide and per-path connection tables,
+//! create/rotate/revoke dialogs, and the one-time URL reveal.
 
-use crate::browser::app_config;
-use crate::browser::browser_error;
-use crate::configuration::parse_absolute_path;
-use crate::configuration::set_validation;
-use crate::dom::append;
-use crate::dom::clear_error;
-use crate::dom::close_dialog;
-use crate::dom::create_element;
-use crate::dom::element;
-use crate::dom::element_is_hidden;
-use crate::dom::focus;
-use crate::dom::set_button_disabled;
-use crate::dom::set_hidden;
-use crate::dom::set_text;
-use crate::dom::show_error;
-use crate::icons::Icon;
-use crate::icons::create_icon_button;
-use crate::route::Route;
-use crate::route::route_from_location;
+use sovereign_config_core::{
+    ClientError, ConfigPath, ConnectionId, DisplayName, ManagedConnectionMetadata,
+    ManagedConnectionState, ManagedPermission, ManagedPermissions, ProvisionedManagedConnection,
+    Secret,
+};
+use std::cell::{Cell, RefCell};
+use wasm_bindgen_futures::{JsFuture, spawn_local};
+use web_sys::{
+    Document, Element, Event, HtmlDialogElement, HtmlInputElement, HtmlTextAreaElement, window,
+};
+
+use crate::browser::{app_config, browser_error};
+use crate::configuration::{parse_absolute_path, set_validation};
+use crate::dom::{
+    append, clear_error, close_dialog, create_element, element, element_is_hidden, focus, listen,
+    on_element_id, set_button_disabled, set_hidden, set_text, show_error,
+};
+use crate::icons::{Icon, create_icon_button};
+use crate::route::{Route, route_from_location};
 use crate::transport::value_client;
-use crate::tree::load_tree;
-use crate::tree::selected_tree_path;
-use sovereign_config_core::ClientError;
-use sovereign_config_core::ConfigPath;
-use sovereign_config_core::ConnectionId;
-use sovereign_config_core::DisplayName;
-use sovereign_config_core::ManagedConnectionMetadata;
-use sovereign_config_core::ManagedConnectionState;
-use sovereign_config_core::ManagedPermission;
-use sovereign_config_core::ManagedPermissions;
-use sovereign_config_core::ProvisionedManagedConnection;
-use sovereign_config_core::Secret;
-use std::cell::Cell;
-use std::cell::RefCell;
-use wasm_bindgen::JsCast;
-use wasm_bindgen::closure::Closure;
-use wasm_bindgen_futures::JsFuture;
-use wasm_bindgen_futures::spawn_local;
-use web_sys::Document;
-use web_sys::Element;
-use web_sys::Event;
-use web_sys::HtmlDialogElement;
-use web_sys::HtmlInputElement;
-use web_sys::HtmlTextAreaElement;
-use web_sys::window;
+use crate::tree::{load_tree, selected_tree_path};
 
 thread_local! {
     pub(crate) static CONNECTIONS_LOAD_GENERATION: Cell<u64> = const { Cell::new(0) };
@@ -77,132 +54,86 @@ pub(crate) struct PendingConnection {
 
 pub(crate) fn install_connections_actions(document: &Document) {
     for form in [&ESTATE_CONNECTION_FORM, &PATH_CONNECTION_FORM] {
-        if let Some(element) = document.get_element_by_id(form.form_id) {
-            let callback = Closure::<dyn FnMut(_)>::new(move |event: Event| {
-                event.prevent_default();
-                open_create_connection(form);
-            });
-            let _ = element
-                .add_event_listener_with_callback("submit", callback.as_ref().unchecked_ref());
-            callback.forget();
-        }
-        if let Some(name) = document.get_element_by_id(form.name_id) {
-            let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
-                validate_connection_name_field(form);
-            });
-            let _ =
-                name.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
-            callback.forget();
-        }
-    }
-    if let Some(root) = document.get_element_by_id("connection-root") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            validate_connection_root_field();
+        on_element_id(document, form.form_id, "submit", move |event: Event| {
+            event.prevent_default();
+            open_create_connection(form);
         });
-        let _ = root.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(cancel) = document.get_element_by_id("cancel-create-connection") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            let return_focus = PENDING_CONNECTION
-                .with_borrow_mut(Option::take)
-                .map_or_else(
-                    || "create-connection".to_owned(),
-                    |pending| pending.return_focus,
-                );
-            close_dialog("create-connection-dialog");
-            focus(&return_focus);
+        on_element_id(document, form.name_id, "input", move |_: Event| {
+            validate_connection_name_field(form);
         });
-        let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
     }
-    if let Some(confirm) = document.get_element_by_id("confirm-create-connection") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+    on_element_id(document, "connection-root", "input", |_: Event| {
+        validate_connection_root_field();
+    });
+    on_element_id(document, "cancel-create-connection", "click", |_: Event| {
+        let return_focus = PENDING_CONNECTION
+            .with_borrow_mut(Option::take)
+            .map_or_else(
+                || "create-connection".to_owned(),
+                |pending| pending.return_focus,
+            );
+        close_dialog("create-connection-dialog");
+        focus(&return_focus);
+    });
+    on_element_id(
+        document,
+        "confirm-create-connection",
+        "click",
+        |_: Event| {
             spawn_local(async { create_connection().await });
-        });
-        let _ =
-            confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(cancel) = document.get_element_by_id("cancel-rotate-connection") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            cancel_connection_dialog("rotate-connection-dialog");
-        });
-        let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(confirm) = document.get_element_by_id("confirm-rotate-connection") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+        },
+    );
+    on_element_id(document, "cancel-rotate-connection", "click", |_: Event| {
+        cancel_connection_dialog("rotate-connection-dialog");
+    });
+    on_element_id(
+        document,
+        "confirm-rotate-connection",
+        "click",
+        |_: Event| {
             spawn_local(async { rotate_connection().await });
-        });
-        let _ =
-            confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(cancel) = document.get_element_by_id("cancel-revoke-connection") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            cancel_connection_dialog("revoke-connection-dialog");
-        });
-        let _ = cancel.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(confirm) = document.get_element_by_id("confirm-revoke-connection") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
+        },
+    );
+    on_element_id(document, "cancel-revoke-connection", "click", |_: Event| {
+        cancel_connection_dialog("revoke-connection-dialog");
+    });
+    on_element_id(
+        document,
+        "confirm-revoke-connection",
+        "click",
+        |_: Event| {
             spawn_local(async { revoke_connection().await });
-        });
-        let _ =
-            confirm.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(dialog) = document.get_element_by_id("create-connection-dialog") {
-        // Escape closes a native dialog without either button. Treat that as the
-        // cancel it is, so a credential draft — display name, root, and grants —
-        // does not outlive the decision not to create it.
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            if let Some(pending) = PENDING_CONNECTION.with_borrow_mut(Option::take) {
-                focus(&pending.return_focus);
-            }
-        });
-        let _ = dialog.add_event_listener_with_callback("close", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(reveal) = document.get_element_by_id("reveal-connection-url") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            toggle_connection_url_reveal();
-        });
-        let _ = reveal.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(copy) = document.get_element_by_id("copy-connection-url") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            spawn_local(async { copy_connection_url().await });
-        });
-        let _ = copy.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(close) = document.get_element_by_id("close-connection-url") {
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            let return_focus = CONNECTION_URL_RETURN_FOCUS.with_borrow_mut(Option::take);
-            discard_connection_url();
-            if let Some(return_focus) = return_focus {
-                focus(&return_focus);
-            }
-        });
-        let _ = close.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
-    if let Some(dialog) = document.get_element_by_id("connection-url-dialog") {
-        // The native dialog can also close through Escape; always discard.
-        let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
-            let return_focus = CONNECTION_URL_RETURN_FOCUS.with_borrow_mut(Option::take);
-            discard_connection_url();
-            if let Some(return_focus) = return_focus {
-                focus(&return_focus);
-            }
-        });
-        let _ = dialog.add_event_listener_with_callback("close", callback.as_ref().unchecked_ref());
-        callback.forget();
-    }
+        },
+    );
+    // Escape closes a native dialog without either button. Treat that as the
+    // cancel it is, so a credential draft — display name, root, and grants —
+    // does not outlive the decision not to create it.
+    on_element_id(document, "create-connection-dialog", "close", |_: Event| {
+        if let Some(pending) = PENDING_CONNECTION.with_borrow_mut(Option::take) {
+            focus(&pending.return_focus);
+        }
+    });
+    on_element_id(document, "reveal-connection-url", "click", |_: Event| {
+        toggle_connection_url_reveal();
+    });
+    on_element_id(document, "copy-connection-url", "click", |_: Event| {
+        spawn_local(async { copy_connection_url().await });
+    });
+    on_element_id(document, "close-connection-url", "click", |_: Event| {
+        let return_focus = CONNECTION_URL_RETURN_FOCUS.with_borrow_mut(Option::take);
+        discard_connection_url();
+        if let Some(return_focus) = return_focus {
+            focus(&return_focus);
+        }
+    });
+    // The native dialog can also close through Escape; always discard.
+    on_element_id(document, "connection-url-dialog", "close", |_: Event| {
+        let return_focus = CONNECTION_URL_RETURN_FOCUS.with_borrow_mut(Option::take);
+        discard_connection_url();
+        if let Some(return_focus) = return_focus {
+            focus(&return_focus);
+        }
+    });
 }
 
 /// The identifiers of one create-connection form. The Access URLs view types a
@@ -801,7 +732,7 @@ pub(crate) fn render_connection_row(
     let rotate_name = connection.display_name.as_str().to_owned();
     let rotate_root = connection.root.as_str().to_owned();
     let rotate_focus = rotate_id.clone();
-    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+    listen(&rotate, "click", move |_: Event| {
         open_connection_dialog(
             "rotate-connection-dialog",
             "rotate-connection-name",
@@ -812,11 +743,7 @@ pub(crate) fn render_connection_row(
             &rotate_root,
             &rotate_focus,
         );
-    });
-    rotate
-        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
-    callback.forget();
+    })?;
     append(&actions, &rotate)?;
 
     let revoke_id = format!("{prefix}revoke-connection-{index}");
@@ -831,7 +758,7 @@ pub(crate) fn render_connection_row(
     let revoke_name = connection.display_name.as_str().to_owned();
     let revoke_root = connection.root.as_str().to_owned();
     let revoke_focus = revoke_id.clone();
-    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+    listen(&revoke, "click", move |_: Event| {
         open_connection_dialog(
             "revoke-connection-dialog",
             "revoke-connection-name",
@@ -842,11 +769,7 @@ pub(crate) fn render_connection_row(
             &revoke_root,
             &revoke_focus,
         );
-    });
-    revoke
-        .add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
-    callback.forget();
+    })?;
     append(&actions, &revoke)?;
     append(&actions_cell, &actions)?;
     append(&row, &actions_cell)?;

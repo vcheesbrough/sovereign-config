@@ -1,35 +1,20 @@
-//! The sidebar configuration tree: building the fully expanded node list, drawing guides, and keyboard/mouse actions.
+//! The sidebar configuration tree: building the fully expanded node list,
+//! drawing guides, and keyboard/mouse actions.
 
-use crate::browser::app_config;
-use crate::browser::browser_error;
-use crate::connections::CONNECTIONS;
-use crate::connections::render_path_connections;
-use crate::dom::append;
-use crate::dom::create_element;
-use crate::dom::current_text;
-use crate::dom::focus;
-use crate::dom::set_text;
-use crate::dom::show_error;
-use crate::icons::Icon;
-use crate::icons::icon_svg;
-use crate::route::Route;
-use crate::route::guarded_navigate;
-use crate::route::route_from_location;
-use crate::session::logged_in;
-use crate::transport::value_client;
-use sovereign_config_core::ClientError;
-use sovereign_config_core::ConfigPath;
-use std::cell::Cell;
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use sovereign_config_core::{ClientError, ConfigPath};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
-use web_sys::Document;
-use web_sys::Element;
-use web_sys::Event;
-use web_sys::KeyboardEvent;
-use web_sys::window;
+use web_sys::{Document, Element, Event, KeyboardEvent, window};
+
+use crate::browser::{app_config, browser_error};
+use crate::connections::{CONNECTIONS, render_path_connections};
+use crate::dom::{append, create_element, current_text, focus, set_text, show_error};
+use crate::icons::{Icon, icon_svg};
+use crate::route::{Route, guarded_navigate, route_from_location};
+use crate::session::logged_in;
+use crate::transport::value_client;
 
 thread_local! {
     pub(crate) static TREE_LOAD_GENERATION: Cell<u64> = const { Cell::new(0) };

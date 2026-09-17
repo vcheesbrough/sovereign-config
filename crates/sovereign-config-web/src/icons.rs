@@ -1,12 +1,10 @@
 //! Inline SVG icons and icon buttons.
 
-use crate::browser::browser_error;
-use crate::dom::append;
-use crate::dom::create_element;
 use sovereign_config_core::ClientError;
-use web_sys::Document;
-use web_sys::Element;
-use web_sys::window;
+use web_sys::{Document, Element, window};
+
+use crate::browser::browser_error;
+use crate::dom::{append, create_element};
 
 /// The icon set, drawn rather than imported so the app needs no icon asset and
 /// no font beyond the two it already uses. Every glyph is a 16x16 stroke path

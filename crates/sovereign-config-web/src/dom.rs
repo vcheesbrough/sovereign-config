@@ -1,15 +1,16 @@
-//! Small typed helpers over the document: element lookup, text, visibility, focus, and the page error banner.
+//! Small typed helpers over the document: element lookup, text, visibility,
+//! focus, and the page error banner.
+
+use sovereign_config_core::ClientError;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
+use web_sys::{
+    Document, Element, Event, EventTarget, HtmlButtonElement, HtmlDialogElement,
+    HtmlTextAreaElement, window,
+};
 
 use crate::browser::browser_error;
 use crate::value_rows::lock_all_secret_fields;
-use sovereign_config_core::ClientError;
-use wasm_bindgen::JsCast;
-use web_sys::Document;
-use web_sys::Element;
-use web_sys::HtmlButtonElement;
-use web_sys::HtmlDialogElement;
-use web_sys::HtmlTextAreaElement;
-use web_sys::window;
 
 pub(crate) fn set_active(id: &str, active: bool) {
     if let Some(element) = window()
@@ -145,4 +146,35 @@ pub(crate) fn show_error(message: &str) {
 pub(crate) fn clear_error() {
     set_text("error", "");
     set_hidden("error", true);
+}
+
+/// Runs `handler` for every `event` on the element with `id`, for the life of
+/// the page. Nothing is installed when the element is absent, and a failed
+/// registration is ignored, exactly as each call site did before this helper.
+pub(crate) fn on_element_id(
+    document: &Document,
+    id: &str,
+    event: &str,
+    handler: impl FnMut(Event) + 'static,
+) {
+    if let Some(element) = document.get_element_by_id(id) {
+        let callback = Closure::<dyn FnMut(Event)>::new(handler);
+        let _ = element.add_event_listener_with_callback(event, callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+}
+
+/// Runs `handler` for every `event` on `target`, for the life of the page. A
+/// failed registration is reported and the handler dropped.
+pub(crate) fn listen(
+    target: &EventTarget,
+    event: &str,
+    handler: impl FnMut(Event) + 'static,
+) -> Result<(), ClientError> {
+    let callback = Closure::<dyn FnMut(Event)>::new(handler);
+    target
+        .add_event_listener_with_callback(event, callback.as_ref().unchecked_ref())
+        .map_err(|_| browser_error())?;
+    callback.forget();
+    Ok(())
 }

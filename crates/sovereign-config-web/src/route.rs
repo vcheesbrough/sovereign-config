@@ -1,36 +1,23 @@
-//! Routing: URL <-> `Route`, navigation with the unsaved-edit guard, and rendering the active view.
+//! Routing: URL <-> `Route`, navigation with the unsaved-edit guard, and
+//! rendering the active view.
 
-use crate::configuration::absolute_path;
-use crate::configuration::load_current_configuration;
-use crate::configuration::validate_path_field;
-use crate::connections::discard_connection_url;
-use crate::connections::load_current_connections;
-use crate::connections::render_path_connections;
-use crate::connections::reset_path_connection_form;
-use crate::dom::close_dialog;
-use crate::dom::element;
-use crate::dom::element_is_hidden;
-use crate::dom::focus;
-use crate::dom::set_active;
-use crate::dom::set_hidden;
-use crate::dom::set_text;
-use crate::dom::show_error;
+use sovereign_config_core::ConfigPath;
+use std::cell::{Cell, RefCell};
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::spawn_local;
+use web_sys::{HtmlDialogElement, HtmlElement, HtmlInputElement, HtmlTextAreaElement, window};
+
+use crate::configuration::{absolute_path, load_current_configuration, validate_path_field};
+use crate::connections::{
+    discard_connection_url, load_current_connections, render_path_connections,
+    reset_path_connection_form,
+};
+use crate::dom::{
+    close_dialog, element, element_is_hidden, focus, set_active, set_hidden, set_text, show_error,
+};
 use crate::downloads::load_downloads;
 use crate::shell::close_brand_menu;
-use crate::tree::TREE_NODES;
-use crate::tree::load_tree;
-use crate::tree::render_tree;
-use sovereign_config_core::ConfigPath;
-use std::cell::Cell;
-use std::cell::RefCell;
-use wasm_bindgen::JsCast;
-use wasm_bindgen::JsValue;
-use wasm_bindgen_futures::spawn_local;
-use web_sys::HtmlDialogElement;
-use web_sys::HtmlElement;
-use web_sys::HtmlInputElement;
-use web_sys::HtmlTextAreaElement;
-use web_sys::window;
+use crate::tree::{TREE_NODES, load_tree, render_tree};
 
 thread_local! {
     pub(crate) static PENDING_NAVIGATION: RefCell<Option<Route>> = const { RefCell::new(None) };

@@ -1,10 +1,10 @@
-//! Page-level browser access: the injected application config, web storage, the current location, and randomness.
+//! Page-level browser access: the injected application config, web storage, the
+//! current location, and randomness.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use js_sys::Reflect;
-use sovereign_config_core::ClientError;
-use sovereign_config_core::ErrorKind;
+use sovereign_config_core::{ClientError, ErrorKind};
 use wasm_bindgen::JsValue;
 use web_sys::window;
 

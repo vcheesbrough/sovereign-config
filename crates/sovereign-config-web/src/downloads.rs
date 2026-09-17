@@ -1,25 +1,15 @@
 //! The Downloads view: the published installer manifest and its cards.
 
-use crate::browser::browser_error;
-use crate::browser::string_property;
-use crate::dom::append;
-use crate::dom::create_element;
-use crate::dom::set_hidden;
-use crate::dom::set_text;
-use crate::route::Route;
-use crate::route::route_from_location;
-use crate::transport::fetch;
 use js_sys::Reflect;
 use sovereign_config_core::ClientError;
-use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
-use wasm_bindgen::closure::Closure;
-use wasm_bindgen_futures::JsFuture;
-use wasm_bindgen_futures::spawn_local;
-use web_sys::Document;
-use web_sys::Element;
-use web_sys::Event;
-use web_sys::window;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
+use web_sys::{Document, Element, Event, window};
+
+use crate::browser::{browser_error, string_property};
+use crate::dom::{append, create_element, listen, set_hidden, set_text};
+use crate::route::{Route, route_from_location};
+use crate::transport::fetch;
 
 /// One installer as described by `/dist/manifest.json`.
 pub(crate) struct InstallerEntry {
@@ -201,14 +191,11 @@ pub(crate) fn build_download_card(
         .map_err(|_| browser_error())?;
     let command_for_copy = command.clone();
     let status_for_copy = status.clone();
-    let callback = Closure::<dyn FnMut(_)>::new(move |_: Event| {
+    listen(&copy, "click", move |_: Event| {
         let command = command_for_copy.clone();
         let status = status_for_copy.clone();
         spawn_local(async move { copy_to_clipboard(&command, &status).await });
-    });
-    copy.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref())
-        .map_err(|_| browser_error())?;
-    callback.forget();
+    })?;
     append(&command_actions, &copy)?;
     append(&command_actions, &status)?;
     append(&card, &command_actions)?;
