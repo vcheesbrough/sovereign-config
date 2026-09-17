@@ -210,6 +210,25 @@ The connection-manager identity is isolated from the introspection credential an
 
 `sovereign-config-woodpecker-broker` is a Woodpecker CI external secrets extension backed by Sovereign Config, published as its own image (`registry.desync.link/sovereign-config-woodpecker-broker`) under the same semver as the server. Woodpecker POSTs signed repository and pipeline metadata to a single configured endpoint; the broker verifies the RFC 9421 Ed25519 signature — including recomputing the body digest — renders an ordered list of configuration layers from the repository in the request, reads them through a read-only managed connection, and returns the merged secrets in Woodpecker's format. Later layers override earlier ones, so a per-repository path can override a shared default, and the repository identity always comes from the signed request rather than from configuration. Woodpecker supports exactly one secret-extension endpoint, so adopting it is a replacement rather than an addition. Pipeline YAML is unchanged: secret names are stored verbatim as path segments, which is why the canonical path grammar permits `_`. Woodpecker matches `from_secret:` names by exact lowercase string, so the broker always resolves a layer's direct children by their fold key regardless of the case a value was written with — a value stored as `serverIP` is still found under `from_secret: serverip`. See `crates/sovereign-config-woodpecker-broker/README.md` for the environment surface, the layer syntax, the security notes, and the cutover runbook.
 
+## Workspace layout
+
+Each crate has one consumer, target, or artifact. Dependencies only point down this list.
+
+| Crate | Role | Depends on |
+| --- | --- | --- |
+| `sovereign-config-proto` | Generated `sovereign.config.v3` gRPC types. | — |
+| `sovereign-config-core` | The shared contract: paths, value and secret newtypes, listing shapes, the JSON subtree codec, connection URLs, and `ClientError`. No I/O and no async. | — |
+| `sovereign-config-server` | The service binary: gRPC, gRPC-Web, PostgreSQL, Authentik. | proto, core |
+| `sovereign-config-client` | The transport-agnostic client: the `Transport`, `ValueTransport` and `ManagedConnectionTransport` traits, `AccessTokenProvider`, and the `Client` facade. | core |
+| `sovereign-config-native` | The native tonic transport, OIDC device and refresh flows, and the profile store. | proto, core, client |
+| `sovereign-config-web` | The browser UI, compiled to WebAssembly, with its own gRPC-Web transport. | proto, core, client |
+| `sovereign-config-cli`, `sovereign-config-mcp`, `sovereign-config-provider` | The CLI, the MCP server, and the application provider facade. | core, client, native |
+| `sovereign-config-woodpecker-broker` | The Woodpecker CI secrets extension image. | core, client, native |
+
+`core`, `client` and `native` stay three crates. Folding `client` into `core` would put `async-trait` and the transport abstraction into the server, which needs only the data contract. Folding `native` into `client` would pull tokio, reqwest and rustix into the WebAssembly build, which implements the same traits over gRPC-Web instead.
+
+The shared layer reader planned by bored card #293 sits above `native`, not inside it. The broker's reader already needs the native transport and a cached client-credentials token provider, and only the broker and the CLI need layer merging. That crate should depend on `core`, `client` and `native`, and be consumed by the broker and the CLI.
+
 ## Upgrade
 
 1. Stop Sovereign Config traffic through Traefik, stop the old Sovereign Config container while leaving PostgreSQL running, and verify no v2 server process remains before migration or v3 writes.
