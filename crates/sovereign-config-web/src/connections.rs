@@ -25,31 +25,31 @@ use crate::tree::{load_tree, selected_tree_path};
 
 thread_local! {
     pub(crate) static CONNECTIONS_LOAD_GENERATION: Cell<u64> = const { Cell::new(0) };
-    pub(crate) static CONNECTION_TARGET: RefCell<Option<ConnectionTarget>> = const { RefCell::new(None) };
-    pub(crate) static CONNECTION_URL_SECRET: RefCell<Option<Secret>> = const { RefCell::new(None) };
-    pub(crate) static CONNECTION_URL_RETURN_FOCUS: RefCell<Option<String>> = const { RefCell::new(None) };
-    pub(crate) static CONNECTION_PENDING: Cell<bool> = const { Cell::new(false) };
-    pub(crate) static PENDING_CONNECTION: RefCell<Option<PendingConnection>> = const { RefCell::new(None) };
+    static CONNECTION_TARGET: RefCell<Option<ConnectionTarget>> = const { RefCell::new(None) };
+    static CONNECTION_URL_SECRET: RefCell<Option<Secret>> = const { RefCell::new(None) };
+    static CONNECTION_URL_RETURN_FOCUS: RefCell<Option<String>> = const { RefCell::new(None) };
+    static CONNECTION_PENDING: Cell<bool> = const { Cell::new(false) };
+    static PENDING_CONNECTION: RefCell<Option<PendingConnection>> = const { RefCell::new(None) };
     pub(crate) static CONNECTIONS: RefCell<Vec<ManagedConnectionMetadata>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The connection selected for a pending rotate or revoke confirmation.
-pub(crate) struct ConnectionTarget {
-    pub(crate) connection_id: ConnectionId,
-    pub(crate) return_focus: String,
+struct ConnectionTarget {
+    connection_id: ConnectionId,
+    return_focus: String,
 }
 
 /// A validated create-connection request awaiting its confirmation. Both the
 /// estate-wide form and the per-path form on the Configuration view fill this
 /// in, so the confirmation dialog and the mutation itself stay single-sourced.
-pub(crate) struct PendingConnection {
-    pub(crate) display_name: DisplayName,
-    pub(crate) root: ConfigPath,
-    pub(crate) permissions: ManagedPermissions,
+struct PendingConnection {
+    display_name: DisplayName,
+    root: ConfigPath,
+    permissions: ManagedPermissions,
     /// Cleared once the connection is created, so the operator does not
     /// accidentally create a second connection under the same name.
-    pub(crate) name_input_id: String,
-    pub(crate) return_focus: String,
+    name_input_id: String,
+    return_focus: String,
 }
 
 pub(crate) fn install_connections_actions(document: &Document) {
@@ -139,18 +139,18 @@ pub(crate) fn install_connections_actions(document: &Document) {
 /// The identifiers of one create-connection form. The Access URLs view types a
 /// root; the Configuration view takes the selected tree node instead, so its
 /// `root_id` is absent.
-pub(crate) struct ConnectionForm {
-    pub(crate) form_id: &'static str,
-    pub(crate) name_id: &'static str,
-    pub(crate) name_error_id: &'static str,
-    pub(crate) root_id: Option<&'static str>,
-    pub(crate) permission_prefix: &'static str,
-    pub(crate) permissions_field_id: &'static str,
-    pub(crate) permissions_error_id: &'static str,
-    pub(crate) submit_id: &'static str,
+struct ConnectionForm {
+    form_id: &'static str,
+    name_id: &'static str,
+    name_error_id: &'static str,
+    root_id: Option<&'static str>,
+    permission_prefix: &'static str,
+    permissions_field_id: &'static str,
+    permissions_error_id: &'static str,
+    submit_id: &'static str,
 }
 
-pub(crate) const ESTATE_CONNECTION_FORM: ConnectionForm = ConnectionForm {
+const ESTATE_CONNECTION_FORM: ConnectionForm = ConnectionForm {
     form_id: "connection-form",
     name_id: "connection-name",
     name_error_id: "connection-name-error",
@@ -161,7 +161,7 @@ pub(crate) const ESTATE_CONNECTION_FORM: ConnectionForm = ConnectionForm {
     submit_id: "create-connection",
 };
 
-pub(crate) const PATH_CONNECTION_FORM: ConnectionForm = ConnectionForm {
+const PATH_CONNECTION_FORM: ConnectionForm = ConnectionForm {
     form_id: "path-connection-form",
     name_id: "path-connection-name",
     name_error_id: "path-connection-name-error",
@@ -172,7 +172,7 @@ pub(crate) const PATH_CONNECTION_FORM: ConnectionForm = ConnectionForm {
     submit_id: "create-path-connection",
 };
 
-pub(crate) fn validate_connection_name_field(form: &ConnectionForm) -> bool {
+fn validate_connection_name_field(form: &ConnectionForm) -> bool {
     let value = element::<HtmlInputElement>(form.name_id).map(|input| input.value());
     let valid = value
         .as_deref()
@@ -191,7 +191,7 @@ pub(crate) fn validate_connection_name_field(form: &ConnectionForm) -> bool {
     valid
 }
 
-pub(crate) fn validate_connection_root_field() -> bool {
+fn validate_connection_root_field() -> bool {
     let value = element::<HtmlInputElement>("connection-root").map(|input| input.value());
     let valid = value
         .as_deref()
@@ -212,7 +212,7 @@ pub(crate) fn validate_connection_root_field() -> bool {
 
 /// Validates one create-connection form and, if it holds together, records the
 /// request for the shared confirmation dialog to act on.
-pub(crate) fn open_create_connection(form: &ConnectionForm) {
+fn open_create_connection(form: &ConnectionForm) {
     let name_valid = validate_connection_name_field(form);
     let root_valid = form.root_id.is_none() || validate_connection_root_field();
     let permissions_valid = validate_connection_permissions_field(form);
@@ -265,7 +265,7 @@ pub(crate) fn open_create_connection(form: &ConnectionForm) {
 
 /// Reads the three permission checkboxes into a core permission set, returning
 /// `None` when the operator has selected nothing.
-pub(crate) fn selected_connection_permissions(form: &ConnectionForm) -> Option<ManagedPermissions> {
+fn selected_connection_permissions(form: &ConnectionForm) -> Option<ManagedPermissions> {
     let mut selected = Vec::new();
     for (name, permission) in [
         ("read", ManagedPermission::Read),
@@ -280,7 +280,7 @@ pub(crate) fn selected_connection_permissions(form: &ConnectionForm) -> Option<M
     ManagedPermissions::new(selected).ok()
 }
 
-pub(crate) fn validate_connection_permissions_field(form: &ConnectionForm) -> bool {
+fn validate_connection_permissions_field(form: &ConnectionForm) -> bool {
     let valid = selected_connection_permissions(form).is_some();
     set_validation(
         form.permissions_field_id,
@@ -296,7 +296,7 @@ pub(crate) fn validate_connection_permissions_field(form: &ConnectionForm) -> bo
 
 /// A natural-language list of granted permissions for the confirmation copy,
 /// e.g. `read`, `read and write`, or `read, write and manage`.
-pub(crate) fn connection_permissions_phrase(permissions: &ManagedPermissions) -> String {
+fn connection_permissions_phrase(permissions: &ManagedPermissions) -> String {
     let words = permissions.grant_tokens();
     match words.as_slice() {
         [] => String::new(),
@@ -307,7 +307,7 @@ pub(crate) fn connection_permissions_phrase(permissions: &ManagedPermissions) ->
 
 /// A capitalized, canonically ordered label for a connection's granted
 /// permissions, e.g. `Read, Write`.
-pub(crate) fn connection_permissions_label(permissions: &ManagedPermissions) -> String {
+fn connection_permissions_label(permissions: &ManagedPermissions) -> String {
     permissions
         .iter()
         .map(|permission| match permission {
@@ -319,7 +319,7 @@ pub(crate) fn connection_permissions_label(permissions: &ManagedPermissions) -> 
         .join(", ")
 }
 
-pub(crate) fn cancel_connection_dialog(dialog_id: &str) {
+fn cancel_connection_dialog(dialog_id: &str) {
     let return_focus = CONNECTION_TARGET
         .with_borrow_mut(Option::take)
         .map(|target| target.return_focus);
@@ -329,7 +329,7 @@ pub(crate) fn cancel_connection_dialog(dialog_id: &str) {
     }
 }
 
-pub(crate) async fn create_connection() {
+async fn create_connection() {
     if CONNECTION_PENDING.get() {
         return;
     }
@@ -379,7 +379,7 @@ pub(crate) async fn create_connection() {
     }
 }
 
-pub(crate) async fn rotate_connection() {
+async fn rotate_connection() {
     if CONNECTION_PENDING.get() {
         return;
     }
@@ -424,7 +424,7 @@ pub(crate) async fn rotate_connection() {
     }
 }
 
-pub(crate) async fn revoke_connection() {
+async fn revoke_connection() {
     if CONNECTION_PENDING.get() {
         return;
     }
@@ -492,7 +492,7 @@ pub(crate) fn reset_path_connection_form() {
 
 /// The heading owning `return_focus`: the per-path table on the Configuration
 /// view, or the estate-wide one on the Access URLs view.
-pub(crate) fn connections_heading_for(return_focus: &str) -> &'static str {
+fn connections_heading_for(return_focus: &str) -> &'static str {
     if return_focus.starts_with(PATH_CONNECTION_TABLE.prefix) {
         "path-connections-heading"
     } else {
@@ -502,10 +502,7 @@ pub(crate) fn connections_heading_for(return_focus: &str) -> &'static str {
 
 /// Opens the one-time result surface with the URL masked; the secret lives
 /// only in application memory until the surface closes.
-pub(crate) fn open_connection_url_dialog(
-    provisioned: &ProvisionedManagedConnection,
-    return_focus: &str,
-) {
+fn open_connection_url_dialog(provisioned: &ProvisionedManagedConnection, return_focus: &str) {
     CONNECTION_URL_SECRET.with_borrow_mut(|slot| {
         *slot = Some(provisioned.connection_url.connection().canonical().clone());
     });
@@ -520,7 +517,7 @@ pub(crate) fn open_connection_url_dialog(
     }
 }
 
-pub(crate) fn toggle_connection_url_reveal() {
+fn toggle_connection_url_reveal() {
     if element_is_hidden("revealed-connection-url") {
         let Some(secret) = CONNECTION_URL_SECRET.with_borrow(std::clone::Clone::clone) else {
             return;
@@ -544,7 +541,7 @@ pub(crate) fn toggle_connection_url_reveal() {
     }
 }
 
-pub(crate) fn hide_connection_url_reveal() {
+fn hide_connection_url_reveal() {
     if let Some(output) = element::<HtmlTextAreaElement>("revealed-connection-url") {
         output.set_value("");
     }
@@ -559,7 +556,7 @@ pub(crate) fn hide_connection_url_reveal() {
     }
 }
 
-pub(crate) async fn copy_connection_url() {
+async fn copy_connection_url() {
     let Some(secret) = CONNECTION_URL_SECRET.with_borrow(std::clone::Clone::clone) else {
         return;
     };
@@ -618,10 +615,10 @@ pub(crate) async fn load_current_connections() {
 /// whole estate; the Configuration view lists only the selected path. Both share
 /// this renderer, so their row actions must not collide on element ids.
 pub(crate) struct ConnectionTable {
-    pub(crate) body_id: &'static str,
-    pub(crate) count_id: &'static str,
-    pub(crate) empty_id: &'static str,
-    pub(crate) prefix: &'static str,
+    body_id: &'static str,
+    count_id: &'static str,
+    empty_id: &'static str,
+    prefix: &'static str,
 }
 
 pub(crate) const ESTATE_CONNECTION_TABLE: ConnectionTable = ConnectionTable {
@@ -638,9 +635,7 @@ pub(crate) const PATH_CONNECTION_TABLE: ConnectionTable = ConnectionTable {
     prefix: "path-",
 };
 
-pub(crate) fn render_connections(
-    connections: &[ManagedConnectionMetadata],
-) -> Result<(), ClientError> {
+fn render_connections(connections: &[ManagedConnectionMetadata]) -> Result<(), ClientError> {
     render_connection_rows(connections, &ESTATE_CONNECTION_TABLE)
 }
 
@@ -662,7 +657,7 @@ pub(crate) fn render_path_connections() {
     }
 }
 
-pub(crate) fn render_connection_rows(
+fn render_connection_rows(
     connections: &[ManagedConnectionMetadata],
     table: &ConnectionTable,
 ) -> Result<(), ClientError> {
@@ -686,7 +681,7 @@ pub(crate) fn render_connection_rows(
     Ok(())
 }
 
-pub(crate) fn render_connection_row(
+fn render_connection_row(
     document: &Document,
     connection: &ManagedConnectionMetadata,
     index: usize,
@@ -777,7 +772,7 @@ pub(crate) fn render_connection_row(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn open_connection_dialog(
+fn open_connection_dialog(
     dialog_id: &str,
     name_id: &str,
     root_id: &str,
@@ -801,7 +796,7 @@ pub(crate) fn open_connection_dialog(
     }
 }
 
-pub(crate) const fn connection_state_label(state: ManagedConnectionState) -> &'static str {
+const fn connection_state_label(state: ManagedConnectionState) -> &'static str {
     match state {
         ManagedConnectionState::Provisioning => "Provisioning",
         ManagedConnectionState::Active => "Active",

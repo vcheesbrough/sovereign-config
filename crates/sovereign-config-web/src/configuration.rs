@@ -24,23 +24,23 @@ use crate::value_rows::{
 };
 
 thread_local! {
-    pub(crate) static DELETE_TARGET: RefCell<Option<DeleteTarget>> = const { RefCell::new(None) };
-    pub(crate) static ADD_PATH_TARGET: RefCell<Option<AddPathTarget>> = const { RefCell::new(None) };
-    pub(crate) static JSON_MODE: Cell<bool> = const { Cell::new(false) };
+    static DELETE_TARGET: RefCell<Option<DeleteTarget>> = const { RefCell::new(None) };
+    static ADD_PATH_TARGET: RefCell<Option<AddPathTarget>> = const { RefCell::new(None) };
+    static JSON_MODE: Cell<bool> = const { Cell::new(false) };
     pub(crate) static CONFIGURATION_LOAD_GENERATION: Cell<u64> = const { Cell::new(0) };
 }
 
-pub(crate) struct DeleteTarget {
-    pub(crate) path: ConfigPath,
-    pub(crate) return_focus: String,
+struct DeleteTarget {
+    path: ConfigPath,
+    return_focus: String,
 }
 
 /// The value selected for a pending "add path" confirmation. The source path
 /// identifies the stored value; the new path is read from the dialog input.
 #[derive(Clone)]
-pub(crate) struct AddPathTarget {
-    pub(crate) source: ConfigPath,
-    pub(crate) return_focus: String,
+struct AddPathTarget {
+    source: ConfigPath,
+    return_focus: String,
 }
 
 pub(crate) fn install_configuration_actions(document: &Document) {
@@ -123,7 +123,7 @@ pub(crate) fn parse_absolute_path(value: &str) -> Result<ConfigPath, ClientError
     ConfigPath::parse_operation(value).map_err(|_| invalid_path())
 }
 
-pub(crate) fn invalid_path() -> ClientError {
+fn invalid_path() -> ClientError {
     ClientError::new(
         ErrorKind::InvalidRequest,
         "path must begin with / and contain only letters, numbers, hyphens, and underscores",
@@ -193,12 +193,12 @@ pub(crate) async fn load_current_configuration() {
     }
 }
 
-pub(crate) enum ConfigurationData {
+enum ConfigurationData {
     Listing(ValueListing),
     SubTree(ValueSubTree),
 }
 
-pub(crate) fn update_configuration_mode() {
+fn update_configuration_mode() {
     let json = JSON_MODE.get();
     set_hidden("value-table", json);
     set_hidden("json-editor", !json);
@@ -209,7 +209,7 @@ pub(crate) fn update_configuration_mode() {
     }
 }
 
-pub(crate) fn validate_json_editor() -> bool {
+fn validate_json_editor() -> bool {
     let result = (|| {
         let Route::Configuration(path) = route_from_location() else {
             return Err(browser_error());
@@ -233,7 +233,7 @@ pub(crate) fn validate_json_editor() -> bool {
     }
 }
 
-pub(crate) async fn save_json_subtree() {
+async fn save_json_subtree() {
     if !validate_json_editor() {
         return;
     }
@@ -264,7 +264,7 @@ pub(crate) async fn save_json_subtree() {
     }
 }
 
-pub(crate) async fn save_new_value() {
+async fn save_new_value() {
     let secret =
         element::<HtmlInputElement>("new-value-secret").is_some_and(|input| input.checked());
     let value_valid = if secret {
@@ -446,7 +446,7 @@ pub(crate) fn open_delete(path: ConfigPath, return_focus: String) {
     }
 }
 
-pub(crate) fn cancel_delete() {
+fn cancel_delete() {
     let return_focus = DELETE_TARGET
         .with_borrow_mut(Option::take)
         .map(|target| target.return_focus);
@@ -456,7 +456,7 @@ pub(crate) fn cancel_delete() {
     }
 }
 
-pub(crate) async fn delete_selected_value() {
+async fn delete_selected_value() {
     let Some(target) = DELETE_TARGET.with_borrow_mut(Option::take) else {
         return;
     };
@@ -482,7 +482,7 @@ pub(crate) async fn delete_selected_value() {
     }
 }
 
-pub(crate) fn close_delete_dialog() {
+fn close_delete_dialog() {
     if let Some(dialog) = element::<HtmlDialogElement>("delete-dialog") {
         dialog.close();
     }
@@ -506,7 +506,7 @@ pub(crate) fn open_add_path(source: ConfigPath, return_focus: String) {
     }
 }
 
-pub(crate) fn cancel_add_path() {
+fn cancel_add_path() {
     let return_focus = ADD_PATH_TARGET
         .with_borrow_mut(Option::take)
         .map(|target| target.return_focus);
@@ -516,7 +516,7 @@ pub(crate) fn cancel_add_path() {
     }
 }
 
-pub(crate) async fn add_selected_path() {
+async fn add_selected_path() {
     // Inspect the target without consuming it so a malformed path can be
     // corrected in place, then take it before awaiting: a second activation
     // while the request is in flight would otherwise send the same alias twice,
@@ -564,13 +564,13 @@ pub(crate) async fn add_selected_path() {
     }
 }
 
-pub(crate) fn close_add_path_dialog() {
+fn close_add_path_dialog() {
     if let Some(dialog) = element::<HtmlDialogElement>("add-path-dialog") {
         dialog.close();
     }
 }
 
-pub(crate) fn show_new_value_row() {
+fn show_new_value_row() {
     set_textarea("new-value-content", "");
     if let Some(secret) = element::<HtmlInputElement>("new-value-secret") {
         secret.set_checked(false);
@@ -595,7 +595,7 @@ pub(crate) fn hide_new_value_row() {
     set_validation("new-value-content", "new-value-error", None);
 }
 
-pub(crate) fn update_new_value_classification() {
+fn update_new_value_classification() {
     let secret =
         element::<HtmlInputElement>("new-value-secret").is_some_and(|input| input.checked());
     set_hidden("new-value-content", secret);
@@ -616,7 +616,7 @@ pub(crate) fn validate_path_field() -> bool {
     message.is_none()
 }
 
-pub(crate) fn validate_name_field() -> bool {
+fn validate_name_field() -> bool {
     let Some(input) = element::<HtmlInputElement>("new-value-name") else {
         return false;
     };
@@ -641,7 +641,7 @@ pub(crate) fn validate_value_field(input_id: &str, error_id: &str) -> bool {
     message.is_none()
 }
 
-pub(crate) fn validate_secret_field(input_id: &str, error_id: &str) -> bool {
+fn validate_secret_field(input_id: &str, error_id: &str) -> bool {
     let Some(input) = element::<HtmlInputElement>(input_id) else {
         return false;
     };
@@ -671,7 +671,7 @@ pub(crate) fn set_validation(input_id: &str, error_id: &str, message: Option<&st
     set_hidden(error_id, message.is_none());
 }
 
-pub(crate) fn update_new_save_state() {
+fn update_new_save_state() {
     let name_valid = element::<HtmlInputElement>("new-value-name")
         .is_some_and(|input| !input.value().is_empty() && input.check_validity());
     let secret =

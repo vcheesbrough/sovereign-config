@@ -22,7 +22,7 @@ pub(crate) enum Icon {
     Key,
 }
 
-pub(crate) const fn icon_paths(icon: Icon) -> &'static [&'static str] {
+const fn icon_paths(icon: Icon) -> &'static [&'static str] {
     match icon {
         Icon::Save => &["m3 8.5 3.6 3.6L13 4.5"],
         Icon::AddPath => &["M8 3.5v9", "M3.5 8h9"],

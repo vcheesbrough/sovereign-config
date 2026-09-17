@@ -12,10 +12,10 @@ use crate::route::{Route, route_from_location};
 use crate::transport::fetch;
 
 /// One installer as described by `/dist/manifest.json`.
-pub(crate) struct InstallerEntry {
-    pub(crate) file: String,
-    pub(crate) checksum: Option<String>,
-    pub(crate) size: Option<f64>,
+struct InstallerEntry {
+    file: String,
+    checksum: Option<String>,
+    size: Option<f64>,
 }
 
 /// Populates the Downloads view from the server's installer manifest. Needs no
@@ -36,7 +36,7 @@ pub(crate) async fn load_downloads() {
     }
 }
 
-pub(crate) async fn fetch_installer_manifest() -> Result<Vec<InstallerEntry>, ClientError> {
+async fn fetch_installer_manifest() -> Result<Vec<InstallerEntry>, ClientError> {
     let response = fetch("/dist/manifest.json", "GET", None, &[]).await?;
     if !response.ok() {
         return Err(browser_error());
@@ -66,7 +66,7 @@ pub(crate) async fn fetch_installer_manifest() -> Result<Vec<InstallerEntry>, Cl
     Ok(entries)
 }
 
-pub(crate) fn clear_downloads_list() {
+fn clear_downloads_list() {
     if let Some(list) = window()
         .and_then(|window| window.document())
         .and_then(|document| document.get_element_by_id("downloads-list"))
@@ -75,7 +75,7 @@ pub(crate) fn clear_downloads_list() {
     }
 }
 
-pub(crate) fn render_downloads(entries: &[InstallerEntry]) {
+fn render_downloads(entries: &[InstallerEntry]) {
     let Some(document) = window().and_then(|window| window.document()) else {
         return;
     };
@@ -106,7 +106,7 @@ pub(crate) fn render_downloads(entries: &[InstallerEntry]) {
     );
 }
 
-pub(crate) fn build_download_card(
+fn build_download_card(
     document: &Document,
     entry: &InstallerEntry,
     origin: &str,
@@ -203,7 +203,7 @@ pub(crate) fn build_download_card(
     Ok(card)
 }
 
-pub(crate) async fn copy_to_clipboard(text: &str, status: &Element) {
+async fn copy_to_clipboard(text: &str, status: &Element) {
     let Some(clipboard) = window().map(|window| window.navigator().clipboard()) else {
         status.set_text_content(Some("Copy failed"));
         return;
@@ -214,7 +214,7 @@ pub(crate) async fn copy_to_clipboard(text: &str, status: &Element) {
     }
 }
 
-pub(crate) fn human_size(size: Option<f64>) -> String {
+fn human_size(size: Option<f64>) -> String {
     match size {
         Some(bytes) if bytes >= 1_048_576.0 => format!("{:.1} MB", bytes / 1_048_576.0),
         Some(bytes) if bytes >= 1024.0 => format!("{:.0} KB", bytes / 1024.0),

@@ -420,7 +420,7 @@ impl ManagedConnectionTransport for BrowserTransport {
     }
 }
 
-pub(crate) fn managed_metadata(
+fn managed_metadata(
     metadata: ProtoManagedConnectionMetadata,
 ) -> Result<ManagedConnectionMetadata, ClientError> {
     Ok(ManagedConnectionMetadata {
@@ -435,7 +435,7 @@ pub(crate) fn managed_metadata(
     })
 }
 
-pub(crate) fn managed_state(state: i32) -> Result<ManagedConnectionState, ClientError> {
+fn managed_state(state: i32) -> Result<ManagedConnectionState, ClientError> {
     match ProtoManagedConnectionState::try_from(state) {
         Ok(ProtoManagedConnectionState::Provisioning) => Ok(ManagedConnectionState::Provisioning),
         Ok(ProtoManagedConnectionState::Active) => Ok(ManagedConnectionState::Active),
@@ -450,7 +450,7 @@ pub(crate) fn managed_state(state: i32) -> Result<ManagedConnectionState, Client
     }
 }
 
-pub(crate) fn provisioned_connection(
+fn provisioned_connection(
     metadata: Option<ProtoManagedConnectionMetadata>,
     connection_url: &str,
 ) -> Result<ProvisionedManagedConnection, ClientError> {
@@ -465,7 +465,7 @@ pub(crate) fn provisioned_connection(
     })
 }
 
-pub(crate) fn listed_content(
+fn listed_content(
     classification: i32,
     content: Option<listed_value::Content>,
 ) -> Result<ValueContent, ClientError> {
@@ -482,7 +482,7 @@ pub(crate) fn listed_content(
     }
 }
 
-pub(crate) fn subtree_content(
+fn subtree_content(
     classification: i32,
     content: Option<sub_tree_value::Content>,
 ) -> Result<ValueContent, ClientError> {
@@ -499,9 +499,7 @@ pub(crate) fn subtree_content(
     }
 }
 
-pub(crate) fn proto_timestamp(
-    value: Option<prost_types::Timestamp>,
-) -> Result<Timestamp, ClientError> {
+fn proto_timestamp(value: Option<prost_types::Timestamp>) -> Result<Timestamp, ClientError> {
     let value = value.ok_or_else(browser_error)?;
     timestamp(value.seconds, value.nanos)
 }
@@ -515,7 +513,7 @@ pub(crate) fn value_client(config: &AppConfig) -> Client<BrowserTransport, Memor
     )
 }
 
-pub(crate) async fn grpc_unary<M, R>(
+async fn grpc_unary<M, R>(
     path: &str,
     message: &M,
     bearer: Option<&Secret>,
@@ -596,7 +594,7 @@ pub(crate) fn decode_grpc_web_response<R: Message + Default>(
         .map_err(|_| map_rpc_status(RpcCode::Other))
 }
 
-pub(crate) fn grpc_status_code(status: u16) -> RpcCode {
+fn grpc_status_code(status: u16) -> RpcCode {
     match status {
         3 => RpcCode::InvalidArgument,
         5 => RpcCode::NotFound,
