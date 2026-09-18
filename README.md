@@ -82,7 +82,7 @@ sovereign-config status
 sovereign-config logout
 ```
 
-Use `sovereign-config profile update <name>` to replace a URL and `sovereign-config profile default <name>` to change the default. A URL can instead be supplied as exactly one line on standard input. Profile URLs are never accepted as process arguments. Operational commands accept a global override, for example `sovereign-config --profile prod status`.
+Use `sovereign-config profile update <name>` to replace a URL and `sovereign-config profile default <name>` to change the default. A URL can instead be supplied as exactly one line on standard input. Profile URLs are never accepted as process arguments. Operational commands accept a global override, for example `sovereign-config --profile prod status`. A host with no profile store at all — a CI container, a deploy step — can instead supply the URL through `--url-file` or `SOVEREIGN_CONFIG_URL`; see [Credential inputs](#credential-inputs).
 
 `sovereign-config profile list` shows the stored profiles by name, marking the default with `*` and naming the server each one points at — its endpoint, followed by the configuration root when the profile is confined to one:
 
@@ -121,6 +121,60 @@ sovereign-config delete /apps/api --tree --yes
 Plain output from `--tree` and `list` is one absolute path per line. A `--tree` line is `ABSOLUTE_PATH=VALUE`: a path segment can never contain `=`, so the **first** `=` always separates the two. So that one value is always one line, the value escapes `\` as `\\`, a line feed as `\n`, and a carriage return as `\r`; nothing else is escaped. **Plain output is therefore not byte-exact — use `--format json` when the exact bytes matter.** Values are ordered the same way the JSON renderer orders its keys, so the two formats always agree on order. They do not always agree on what is representable: a value that also has descendants — `/a` holding a value while `/a/b` exists — is two ordinary lines in plain, but cannot be a JSON node that is both a string and an object, so `--format json` fails on it. Plain is the more permissive of the two.
 
 JSON output is deterministic and pretty printed; each stored plain-text value is represented as a JSON string and every secret is represented by the exact preservation marker `"********"`. `list` in JSON is an array of the same strings its plain form prints. Subtree JSON is relative to the selected path, so selecting `/foo/foo2/foo3` containing `/foo/foo2/foo3/deepvalue` returns `{"deepvalue":"deepvalue"}` without a `foo3` wrapper. An exact selected value is a root JSON string, and `/` is the root object. `set --tree` atomically replaces the selected subtree using the same relative shape. Omitted plain values are deleted, but existing secrets are never deleted or overwritten by a subtree replacement whether omitted or represented by their mask marker; a plain value may not collide structurally with an existing secret. Use an exact `set`, a secret rotation, or an explicit delete for those transitions.
+
+### Rendering configuration into a command (`render`)
+
+`sovereign-config render [<ABSOLUTE_PATH>...] [OPTIONS] -- <cmd> [args...]` reads one or more configuration subtrees, overlays them onto the inherited environment as environment variables, and then **replaces itself** with `<cmd>`. This is the deploy-time consumption path: a Compose stack or a CI deploy step keeps one narrow, read-only, centrally revocable connection rooted at its own subtree, instead of carrying every value inline.
+
+```sh
+sovereign-config render -- docker compose up -d --wait            # the connection root
+sovereign-config render /apps/api -- ./deploy.sh                  # one layer
+sovereign-config render /apps/api /apps/api/prod -- ./deploy.sh   # ordered, later wins
+```
+
+Paths are **layers**, read in the order given, with a later layer overriding an earlier one on a name collision. With no path at all, the layer is the connection's own root — the prefix the credential already encodes. Only the **direct children** of a layer become variables; a deeper descendant has no flat name and is ignored.
+
+**The variable name is the leaf, exactly as stored.** `/foo/AbC` holding `bAr` reaches the command as `AbC=bAr`, precisely as `export AbC=bAr` would. Nothing is uppercased, lowercased or otherwise transformed: paths are case-retentive (see [2.18.0 retains path letter case](#2180-retains-path-letter-case)), so the spelling a value was created under is the spelling the command sees, and it is the only one a deploy can predict. Uppercasing would leave `AbC` unreachable, because no path would produce it.
+
+So the case has to be right where the value is created. `/apps/api/database_url` yields `database_url`, not `DATABASE_URL`; store leaves under the exact variable names the command expects.
+
+It follows that a collision is byte-exact on the name: two layers spelling a leaf differently produce **two** variables rather than overriding, because `AbC` and `abc` are two variables to the command as well. Only an exact match overrides.
+
+Because path segments admit `-` and a leading digit but environment variable names do not, a leaf that cannot be a variable name — `db-password`, `2fa_key` — is **refused**, naming the offending path, rather than exported under a name no shell and no Compose file can reference. `-` is not folded to `_`: that mapping is many-to-one, and `db-password` and `db_password` are different values. Name leaves using letters, digits and `_` only.
+
+The inherited environment is kept, not cleared: `PATH`, `HOME` and anything the caller set on the command line survive, because a deploy step routinely supplies one variable inline alongside everything it reads from configuration. Rendered values win a collision, being the more specific statement of intent — again matched byte-exactly, so an inherited `abc` and a rendered `AbC` are two variables.
+
+```sh
+SOVEREIGN_CONFIG_IMAGE_TAG=$(cat .release-tag) \
+  sovereign-config render -- docker compose -p sovereign-config-dev up -d --wait
+```
+
+Three properties make this safe to point at a production deploy:
+
+- **No shell is involved.** Values are placed in the child's environment through `execve`, so a value containing `$(...)`, a backtick, a quote or an embedded newline arrives byte-exact and is data. There is no stage at which it could be re-parsed as syntax.
+- **The process is replaced, not wrapped.** The command's exit status and signal disposition are `render`'s own, with no supervisor in between.
+- **It fails closed.** Every read happens before the exec, so a credential, read, reveal, confinement or naming failure means the command **never runs at all**, rather than running against a half-populated environment. A layer that contributes no variables is itself a failure: the service answers an absent subtree with an empty list, so a mistyped path is indistinguishable from a real but empty one, and neither is worth launching a deploy over.
+
+  That cuts both ways, deliberately. An override layer you have not populated yet must be left off the command line until it holds something, and `render` against a connection root with no values at all will not start a command — there is no layer to drop in that case, so give the root a value first. Both are the same refusal: a layer named on the command line was named because it was meant to contribute.
+
+`render` is a read; nothing is written to disk and no output mode other than the exec form exists yet.
+
+#### Credential inputs
+
+The hosts `render` exists for — a CI container, a Compose deploy step — have no profile store and no terminal to create one at, so two further credential inputs sit alongside `--profile`. All three are global and work on every operational command. Resolution order is fixed:
+
+1. `--profile <name>` — an explicit choice always wins.
+2. `--url-file <path>` — a file holding the connection URL as one line, such as a mounted CI secret. A single trailing newline is tolerated; an embedded one is refused rather than guessed at.
+3. `SOVEREIGN_CONFIG_URL` — the variable a CI step injects.
+4. Otherwise the default profile, which is where every interactive invocation lands.
+
+**A connection URL is never a process argument**, here as everywhere else: it carries the credential, and process arguments are world-readable on a typical host. `--url-file` names a file and `SOVEREIGN_CONFIG_URL` names a variable; neither is the URL itself.
+
+`render` removes `SOVEREIGN_CONFIG_URL` from the environment it hands the command, whether or not this invocation used it — the credential that read the configuration stops at `render`. It is removed before rendered values are applied, so configuration that legitimately holds a connection URL for the executed application's own use still reaches it; only the *inherited* credential is stripped.
+
+#### Self-hosting exception
+
+Sovereign Config's own deploy steps deliberately do **not** consume their configuration through `render`, and keep their Woodpecker secrets. Reading `/sovereign-config/prod/...` in order to deploy Sovereign Config would create a circular availability dependency: a broken production deployment could not be redeployed through a path that requires production to be readable. Other repositories and the homelab stacks are the intended consumers.
 
 The native and gRPC-Web APIs use the breaking `sovereign.config.v3` protobuf package. Servers, CLIs, browser assets, and Rust clients must be upgraded together; there is no prior-version fallback or mixed-version operation.
 
@@ -241,12 +295,19 @@ Each crate has one consumer, target, or artifact. Dependencies only point down t
 | `sovereign-config-client` | The transport-agnostic client: the `Transport`, `ValueTransport` and `ManagedConnectionTransport` traits, `AccessTokenProvider`, and the `Client` facade. | core |
 | `sovereign-config-native` | The native tonic transport, OIDC device and refresh flows, and the profile store. | proto, core, client |
 | `sovereign-config-web` | The browser UI, compiled to WebAssembly, with its own gRPC-Web transport. | proto, core, client |
-| `sovereign-config-cli`, `sovereign-config-mcp`, `sovereign-config-provider` | The CLI, the MCP server, and the application provider facade. | core, client, native |
-| `sovereign-config-woodpecker-broker` | The Woodpecker CI secrets extension image. | core, client, native |
+| `sovereign-config-layers` | Ordered configuration-layer reading and merging: per-layer `GetSubTree`, per-secret `RevealSecret`, direct-children-only naming, later-wins merge, and a caching client-credentials token provider. | core, client, native |
+| `sovereign-config-mcp`, `sovereign-config-provider` | The MCP server and the application provider facade. | core, client, native |
+| `sovereign-config-cli` | The CLI, whose `render` reads layers. | core, client, native, layers |
+| `sovereign-config-woodpecker-broker` | The Woodpecker CI secrets extension image. | core, client, native, layers |
 
 `core`, `client` and `native` stay three crates. Folding `client` into `core` would put `async-trait` and the transport abstraction into the server, which needs only the data contract. Folding `native` into `client` would pull tokio, reqwest and rustix into the WebAssembly build, which implements the same traits over gRPC-Web instead.
 
-The shared layer reader planned by bored card #293 sits above `native`, not inside it. The broker's reader already needs the native transport and a cached client-credentials token provider, and only the broker and the CLI need layer merging. That crate should depend on `core`, `client` and `native`, and be consumed by the broker and the CLI.
+`sovereign-config-layers` sits above `native`, not inside it. The reader needs the native transport and a cached client-credentials token provider, and only the broker and the CLI need layer merging — the provider and the MCP server do not, and `client` must stay free of tokio for the WebAssembly UI. What stays with each consumer is everything around the read: how the layer list is arrived at (Woodpecker templates against a signed request in `woodpecker-broker/src/layers.rs`; positional paths in the CLI), how a connection is opened, and what is done with the merged map.
+
+The two consumers differ on two policies, which is why each is a parameter rather than a default:
+
+- **An unreadable layer.** The broker **skips** it, because failing a request would strip every concurrent pipeline of every secret; `render` **fails** on it, because a deploy that silently receives less configuration than it asked for is the failure it exists to remove.
+- **Letter case.** The broker **folds** the leaf name and merges on the fold, because Woodpecker matches a `from_secret:` reference by exact lowercase string; `render` reports it **exactly as stored** and merges on that, because an environment variable name is case sensitive. One leaf `/apps/api/AbC` is therefore `abc` to the broker and `AbC` to `render`, and both are right.
 
 ### Where code goes
 

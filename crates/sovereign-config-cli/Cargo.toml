@@ -20,6 +20,7 @@ rpassword = "7.5.4"
 serde_json.workspace = true
 sovereign-config-client = { path = "../sovereign-config-client" }
 sovereign-config-core = { path = "../sovereign-config-core" }
+sovereign-config-layers = { path = "../sovereign-config-layers" }
 sovereign-config-native = { path = "../sovereign-config-native" }
 tokio.workspace = true
 

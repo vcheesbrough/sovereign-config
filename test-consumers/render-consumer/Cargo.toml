@@ -1,0 +1,19 @@
+[package]
+name = "sovereign-config-render-consumer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Integration consumer: the process `sovereign-config render` execs, which reports the environment it was handed"
+publish = false
+
+[[bin]]
+name = "render-consumer"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
