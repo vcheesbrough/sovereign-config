@@ -90,7 +90,7 @@ Values shared across every repository live directly under `/woodpecker/shared`
 — write them there and nowhere else:
 
 ```sh
-printf '%s' 'registry.desync.link' | sovereign-config put /woodpecker/shared/registry
+printf '%s' 'registry.desync.link' | sovereign-config set /woodpecker/shared/registry
 ```
 
 Earlier drafts of this crate split global values across two layers —
@@ -101,7 +101,7 @@ one global layer, `/woodpecker/shared`, and every repository-independent value
 lives there regardless of whether anything else also reads it.
 
 They also kept such values canonical outside the broker's root and exposed them
-underneath it with `alias add`. That indirection is gone too: a value written
+underneath it with `alias`. That indirection is gone too: a value written
 at `/woodpecker/shared/...` needs no second step to reach the broker, and there
 is no other location where "the shared secret" also lives to fall out of sync.
 If some other system genuinely needs the same value, alias it *out* of

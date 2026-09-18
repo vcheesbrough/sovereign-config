@@ -6,6 +6,7 @@ mod json;
 mod listing;
 mod managed;
 mod path;
+mod plain;
 mod status;
 mod value;
 
@@ -26,6 +27,7 @@ pub use managed::{
     ManagedPermissions, ProvisionedManagedConnection, RevealedConnectionUrl,
 };
 pub use path::{ConfigPath, PathError};
+pub use plain::render_subtree_plain;
 pub use status::{AuthenticationStatus, ServiceStatus};
 pub use value::{
     MaskedSecret, PlainValue, RevealedSecret, Secret, SecretInput, ValueClassification,
