@@ -84,24 +84,43 @@ sovereign-config logout
 
 Use `sovereign-config profile update <name>` to replace a URL and `sovereign-config profile default <name>` to change the default. A URL can instead be supplied as exactly one line on standard input. Profile URLs are never accepted as process arguments. Operational commands accept a global override, for example `sovereign-config --profile prod status`.
 
-Read and write exact plain-text values or complete JSON subtrees with the selected profile. Every command path is absolute, begins with `/`, and is ASCII case-insensitive: `/x/FOO` and `/x/foo` are the same value, resolved and authorized without regard to case. This is case-**retentive**, not case-sensitive — the service is a case-preserving store like APFS or NTFS. The first write of a path stores the exact case it was given; later writes through a differently-cased spelling of that same path update the value but leave its case exactly as first established. Reads, listings, and JSON subtree keys return whatever case is currently established, which may not match the case just typed. Changing an established path's case requires deleting it and writing it again under the new spelling — there is no rename. Segments contain only letters, digits, `-`, and `_` — the full grammar is `/` or `^/[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$`. A profile with a configured root accepts only absolute paths within that subtree. Put content is read from standard input so it does not appear in process arguments. Interactive deletion requires typing `delete`; automation must pass `--yes` explicitly.
+`sovereign-config profile list` shows the stored profiles by name, marking the default with `*` and naming the server each one points at — its endpoint, followed by the configuration root when the profile is confined to one:
+
+```
+  dev         https://sovereign-config-dev.desync.link
+* prod        https://sovereign-config.desync.link/team/service
+```
+
+`--format json` instead renders an array of `{ "name", "default", "endpoint", "root", "url" }`, where `url` is the whole connection URL with any managed credential replaced by `*`. **Nothing a listing prints is a secret** — but the file it reads is not safe to print, because a managed profile's stored URL embeds its credential. Use this command rather than reading `config.toml`. Listing succeeds with an empty result before the first profile is added.
+
+Every value command reads `sovereign-config <verb> <ABSOLUTE_PATH> [OPTIONS]` — the path comes immediately after the verb — and acts on **exactly one value**. Add `--tree` and the same command acts on the whole subtree at that path instead: that is the only way to select subtree scope. `--format` then means one thing only, how a read is rendered: `plain` (the default) or `json`.
+
+Every command path is absolute, begins with `/`, and is ASCII case-insensitive: `/x/FOO` and `/x/foo` are the same value, resolved and authorized without regard to case. This is case-**retentive**, not case-sensitive — the service is a case-preserving store like APFS or NTFS. The first write of a path stores the exact case it was given; later writes through a differently-cased spelling of that same path update the value but leave its case exactly as first established. Reads, listings, and subtree keys return whatever case is currently established, which may not match the case just typed. Changing an established path's case requires deleting it and writing it again under the new spelling — there is no rename. Segments contain only letters, digits, `-`, and `_` — the full grammar is `/` or `^/[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$`. A profile with a configured root accepts only absolute paths within that subtree. Written content is read from standard input so it never appears in process arguments. Interactive deletion requires typing `delete`; automation must pass `--yes` explicitly.
 
 ```sh
 sovereign-config get /apps/api/settings
-printf '%s' 'enabled=true' | sovereign-config put /apps/api/settings
-printf '%s' 'database-password' | sovereign-config secret put /apps/api/database-password
-sovereign-config get /apps/api/database-password
-sovereign-config get --reveal /apps/api/database-password
-sovereign-config get /apps/api --format json
-sovereign-config get --reveal /apps/api --format json
-printf '%s' '{"enabled":"true","workers":"4"}' | sovereign-config put /apps/api --format json
+sovereign-config get /apps/api/database-password --reveal
+sovereign-config get /apps/api --tree
+sovereign-config get /apps/api --tree --reveal --format json
+printf '%s' 'enabled=true' | sovereign-config set /apps/api/settings
+printf '%s' 'database-password' | sovereign-config set /apps/api/database-password --secret
+printf '%s' '{"enabled":"true","workers":"4"}' | sovereign-config set /apps/api --tree
+sovereign-config list /apps/api
+sovereign-config list /apps/api/settings --aliases
+sovereign-config alias /apps/api/settings /apps/api-v2/settings
 sovereign-config delete /apps/api/settings --yes
-sovereign-config delete /apps/api --recurse --yes
+sovereign-config delete /apps/api --tree --yes
 ```
 
-Text get prints an exact plain value and prints `********` for a secret; it requires `--format json` when descendants exist. Add `--reveal` to return plaintext for an exact secret, or to reveal every secret leaf in a JSON result; it requires `read` permission and never changes the stored data. `secret put` is write-only and reads replacement content from standard input. `secret reveal` remains an explicit exact-value alias and requires a `read` grant. Rotation requires `write`, and exact or recursive deletion requires `write` and permanently removes the secret.
+`get <PATH>` prints the one value stored at exactly that path, byte-exact and with no trailing newline, or `********` when it is a secret; descendants below it are ignored, and a path holding no value of its own fails with `configuration value not found`. `get <PATH> --tree` prints every value at or below the path. Add `--reveal` to return secret plaintext instead of the mask — for the one value, or for every secret leaf in a subtree. Revealing requires a `read` grant and never changes the stored data.
 
-JSON output is deterministic and pretty printed; each stored plain-text value is represented as a JSON string and every secret is represented by the exact preservation marker `"********"`. JSON is relative to the selected path, so selecting `/foo/foo2/foo3` containing `/foo/foo2/foo3/deepvalue` returns `{"deepvalue":"deepvalue"}` without a `foo3` wrapper. An exact selected value is a root JSON string, and `/` is the root object. JSON put atomically replaces the selected subtree using the same relative shape. Omitted plain values are deleted, but existing secrets are never deleted or overwritten by a subtree replacement whether omitted or represented by their mask marker; a plain value may not collide structurally with an existing secret. Use an exact put, secret rotation, or explicit delete for those transitions. JSON replacement requires both independent `write` and `manage` grants covering the selected root. Exact text put requires `write`. Put and delete print only fixed success summaries and never echo values.
+`set <PATH>` stores a plain value, `set <PATH> --secret` stores a secret, and `set <PATH> --tree` atomically replaces the subtree from a JSON document. All three read their content from standard input only. Writing a plain value requires `write`; subtree replacement requires both independent `write` and `manage` grants covering the selected root. `set` and `delete` print only fixed success summaries and never echo values.
+
+`list <PATH>` prints the paths directly below a namespace: each child value as written, and each child namespace with a trailing `/`. `list <PATH> --aliases` instead prints every path that resolves to the one value at that path, including the path itself. `alias <SOURCE_PATH> <NEW_PATH>` exposes an existing value at a second path; both are then the same value, and deleting one leaves the other intact.
+
+Plain output from `--tree` and `list` is one absolute path per line. A `--tree` line is `ABSOLUTE_PATH=VALUE`: a path segment can never contain `=`, so the **first** `=` always separates the two. So that one value is always one line, the value escapes `\` as `\\`, a line feed as `\n`, and a carriage return as `\r`; nothing else is escaped. **Plain output is therefore not byte-exact — use `--format json` when the exact bytes matter.** Values are ordered the same way the JSON renderer orders its keys, so the two formats always agree on order. They do not always agree on what is representable: a value that also has descendants — `/a` holding a value while `/a/b` exists — is two ordinary lines in plain, but cannot be a JSON node that is both a string and an object, so `--format json` fails on it. Plain is the more permissive of the two.
+
+JSON output is deterministic and pretty printed; each stored plain-text value is represented as a JSON string and every secret is represented by the exact preservation marker `"********"`. `list` in JSON is an array of the same strings its plain form prints. Subtree JSON is relative to the selected path, so selecting `/foo/foo2/foo3` containing `/foo/foo2/foo3/deepvalue` returns `{"deepvalue":"deepvalue"}` without a `foo3` wrapper. An exact selected value is a root JSON string, and `/` is the root object. `set --tree` atomically replaces the selected subtree using the same relative shape. Omitted plain values are deleted, but existing secrets are never deleted or overwritten by a subtree replacement whether omitted or represented by their mask marker; a plain value may not collide structurally with an existing secret. Use an exact `set`, a secret rotation, or an explicit delete for those transitions.
 
 The native and gRPC-Web APIs use the breaking `sovereign.config.v3` protobuf package. Servers, CLIs, browser assets, and Rust clients must be upgraded together; there is no prior-version fallback or mixed-version operation.
 

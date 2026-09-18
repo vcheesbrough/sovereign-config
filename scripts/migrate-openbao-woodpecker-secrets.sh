@@ -121,7 +121,7 @@ migrate_path() {
             # value is never echoed, so only the target path appears on failure.
             if printf '%s' "$data" |
                 jq -rj --arg key "$key" '.data.data[$key]' |
-                sovereign-config secret put "$target"; then
+                sovereign-config set "$target" --secret; then
                 echo "  wrote $key -> $target"
             else
                 echo "  ERROR: write failed for $target" >&2
@@ -168,7 +168,7 @@ if [ -s "$FAILURE_LOG" ]; then
 fi
 
 if [ "$APPLY" -eq 1 ]; then
-    echo "Done. Verify with: sovereign-config get $ROOT --format json"
+    echo "Done. Verify with: sovereign-config get $ROOT --tree --format json"
     echo "Secrets read back masked; that is expected."
 else
     echo "Dry run complete. Re-run with --apply once the target paths look right."

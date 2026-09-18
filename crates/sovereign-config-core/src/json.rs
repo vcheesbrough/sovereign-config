@@ -287,7 +287,7 @@ fn invalid_json() -> ClientError {
     ClientError::new(ErrorKind::InvalidRequest, "configuration JSON is invalid")
 }
 
-fn invalid_subtree() -> ClientError {
+pub(crate) fn invalid_subtree() -> ClientError {
     ClientError::new(
         ErrorKind::InvalidRequest,
         "configuration subtree cannot be represented as JSON",

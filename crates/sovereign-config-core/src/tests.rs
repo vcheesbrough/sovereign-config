@@ -2,6 +2,7 @@ use super::{
     ConfigPath, ErrorKind, MASKED_SECRET_TEXT, MaskedSecret, PROTOCOL_VERSION, PlainValue,
     RevealedSecret, Secret, SecretInput, ServiceStatus, SubTreeMutationContent,
     SubTreeMutationValue, SubTreeValue, ValueContent, parse_subtree_json, render_subtree_json,
+    render_subtree_plain,
 };
 
 #[test]
@@ -340,4 +341,150 @@ fn secrets_are_redacted_in_all_formatters() {
 fn errors_expose_only_bounded_messages() {
     let error = super::ClientError::new(ErrorKind::Unavailable, "service unavailable");
     assert_eq!(error.to_string(), "service unavailable");
+}
+fn secret_value(path: &str) -> SubTreeValue {
+    SubTreeValue {
+        path: ConfigPath::parse(path).unwrap(),
+        value: ValueContent::Secret(MaskedSecret),
+    }
+}
+
+/// The JSON object keys a rendered subtree visits, in order — the flattened
+/// shape a plain rendering has to agree with.
+fn json_key_order(json: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut prefix: Vec<String> = Vec::new();
+    for line in json.lines() {
+        let trimmed = line.trim();
+        let Some((key, rest)) = trimmed.split_once("\": ") else {
+            if trimmed.starts_with('}') {
+                prefix.pop();
+            }
+            continue;
+        };
+        let key = key.trim_start_matches('"').to_owned();
+        if rest.starts_with('{') {
+            prefix.push(key);
+        } else {
+            let mut path = prefix.clone();
+            path.push(key);
+            keys.push(path.join("/"));
+        }
+    }
+    keys
+}
+
+#[test]
+fn subtree_plain_renders_one_escaped_line_per_absolute_path() {
+    let selected = ConfigPath::parse("/apps/api").unwrap();
+    let values = vec![
+        subtree_value("/apps/api/enabled", "true"),
+        subtree_value("/apps/api/db/host", "pg.internal"),
+        secret_value("/apps/api/db/password"),
+    ];
+    assert_eq!(
+        render_subtree_plain(&selected, &values).unwrap(),
+        "/apps/api/db/host=pg.internal\n\
+         /apps/api/db/password=********\n\
+         /apps/api/enabled=true\n"
+    );
+}
+
+#[test]
+fn subtree_plain_orders_exactly_as_the_json_renderer_does() {
+    let selected = ConfigPath::root();
+    // `-` (0x2D) sorts below `/` (0x2F), so whole-path byte ordering would put
+    // `/a-c` first; segment ordering — which JSON uses — puts `/a/b` first.
+    let values = vec![
+        subtree_value("/a-c", "second"),
+        subtree_value("/a/b", "first"),
+        subtree_value("/a/b-d", "third"),
+        subtree_value("/ab", "fourth"),
+    ];
+    let plain = render_subtree_plain(&selected, &values).unwrap();
+    let plain_paths: Vec<&str> = plain
+        .lines()
+        .map(|line| line.split_once('=').unwrap().0)
+        .collect();
+    assert_eq!(plain_paths, ["/a/b", "/a/b-d", "/a-c", "/ab"]);
+
+    let json_paths: Vec<String> = json_key_order(&render_subtree_json(&selected, &values).unwrap())
+        .into_iter()
+        .map(|key| format!("/{key}"))
+        .collect();
+    assert_eq!(plain_paths, json_paths);
+}
+
+#[test]
+fn subtree_plain_escapes_only_the_separators_that_would_split_a_line() {
+    let selected = ConfigPath::parse("/apps/api").unwrap();
+    let values = vec![
+        subtree_value("/apps/api/multiline", "line one\nline two\r\nline three"),
+        subtree_value("/apps/api/windows-path", r"C:\temp\file"),
+        subtree_value("/apps/api/equals", "key=value=more"),
+        subtree_value("/apps/api/quoted", "he said \"hi\"\ttabbed"),
+    ];
+    assert_eq!(
+        render_subtree_plain(&selected, &values).unwrap(),
+        "/apps/api/equals=key=value=more\n\
+         /apps/api/multiline=line one\\nline two\\r\\nline three\n\
+         /apps/api/quoted=he said \"hi\"\ttabbed\n\
+         /apps/api/windows-path=C:\\\\temp\\\\file\n"
+    );
+}
+
+#[test]
+fn subtree_plain_masks_secrets_until_the_caller_replaces_them() {
+    let selected = ConfigPath::parse("/apps/api").unwrap();
+    let masked = vec![secret_value("/apps/api/credential")];
+    assert_eq!(
+        render_subtree_plain(&selected, &masked).unwrap(),
+        format!("/apps/api/credential={MASKED_SECRET_TEXT}\n")
+    );
+
+    // Revealing replaces the content before rendering, exactly as the CLI does.
+    let revealed = vec![subtree_value("/apps/api/credential", "plaintext-sentinel")];
+    assert_eq!(
+        render_subtree_plain(&selected, &revealed).unwrap(),
+        "/apps/api/credential=plaintext-sentinel\n"
+    );
+}
+
+#[test]
+fn subtree_plain_renders_an_exact_value_and_its_descendants_together() {
+    let selected = ConfigPath::parse("/apps/api").unwrap();
+    assert_eq!(
+        render_subtree_plain(&selected, &[subtree_value("/apps/api", "exact")]).unwrap(),
+        "/apps/api=exact\n"
+    );
+
+    // JSON cannot represent a value that is also an object; plain simply lists
+    // both, the shorter path first.
+    let collision = vec![
+        subtree_value("/apps/api/child", "below"),
+        subtree_value("/apps/api", "exact"),
+    ];
+    assert_eq!(
+        render_subtree_plain(&selected, &collision).unwrap(),
+        "/apps/api=exact\n/apps/api/child=below\n"
+    );
+    assert!(render_subtree_json(&selected, &collision).is_err());
+}
+
+#[test]
+fn subtree_plain_renders_nothing_for_an_empty_subtree_and_rejects_foreign_paths() {
+    let selected = ConfigPath::parse("/apps/api").unwrap();
+    assert_eq!(render_subtree_plain(&selected, &[]).unwrap(), "");
+
+    for foreign in [
+        subtree_value("/apps/api-v2/leaked", "outside"),
+        subtree_value("/other", "outside"),
+    ] {
+        let error = render_subtree_plain(&selected, &[foreign]).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message(),
+            "configuration subtree cannot be represented as JSON"
+        );
+    }
 }

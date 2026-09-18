@@ -12,6 +12,22 @@ pub struct ProfileStore {
     path: PathBuf,
 }
 
+/// One stored profile, safe to display: the URL is redacted, so a managed
+/// profile's credential is never carried in it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListedProfile {
+    pub name: String,
+    pub is_default: bool,
+    /// The connection's gRPC origin — the identifying part of the URL, short
+    /// enough to show in a terminal.
+    pub endpoint: String,
+    /// The configuration root the profile is confined to, `/` when it is not
+    /// confined at all.
+    pub root: String,
+    /// The whole connection URL with any credential replaced by `*`.
+    pub redacted_url: String,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredConfig {
@@ -109,6 +125,37 @@ impl ProfileStore {
     /// Returns a bounded error for invalid names, missing profiles, malformed URLs, or unsafe storage.
     pub fn redacted(&self, name: &str) -> Result<String, ClientError> {
         Ok(self.connection(Some(name))?.redacted())
+    }
+
+    /// Lists every stored profile by name, with its redacted URL.
+    ///
+    /// An absent configuration is an empty list, not an error: having no
+    /// profiles yet is the expected state before the first `profile add`, and
+    /// nothing was asked for by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error for malformed profiles or unsafe storage.
+    pub fn list(&self) -> Result<Vec<ListedProfile>, ClientError> {
+        let Some(config) = self.load()? else {
+            return Ok(Vec::new());
+        };
+        // `BTreeMap` already iterates by name, so the order is stable across
+        // runs without sorting here.
+        config
+            .profiles
+            .iter()
+            .map(|(name, profile)| {
+                let connection = ConnectionUrl::parse(&profile.url).map_err(|_| unavailable())?;
+                Ok(ListedProfile {
+                    name: name.clone(),
+                    is_default: *name == config.default_profile,
+                    endpoint: connection.endpoint().to_owned(),
+                    root: connection.root().as_str().to_owned(),
+                    redacted_url: connection.redacted(),
+                })
+            })
+            .collect()
     }
 
     /// Reports whether another stored human profile uses the same authentication identity.
@@ -236,6 +283,13 @@ mod tests {
         .unwrap()
     }
 
+    fn confined_connection(host: &str, root: &str, credential: &str) -> ConnectionUrl {
+        ConnectionUrl::parse(&format!(
+            "https://{host}/{root}#v=1&issuer=https%3A%2F%2Fauth.example.test%2Fissuer%2F&client_id=client&client_secret={credential}"
+        ))
+        .unwrap()
+    }
+
     fn temporary_path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("sovereign-config-profiles-{}", std::process::id()))
     }
@@ -339,6 +393,64 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         symlink(&target, root.join("config.toml")).unwrap();
         assert!(profiles.add("dev", &connection).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn listing_profiles_orders_by_name_marks_the_default_and_redacts_credentials() {
+        let root = temporary_path().with_extension("list");
+        let _ = fs::remove_dir_all(&root);
+        let profiles = ProfileStore::new(root.join("config.toml"));
+
+        // Nothing stored yet is an empty list, not an error.
+        assert_eq!(profiles.list().unwrap(), Vec::new());
+
+        profiles
+            .add("prod", &connection("prod.example.test", None))
+            .unwrap();
+        profiles
+            .add("dev", &connection("dev.example.test", None))
+            .unwrap();
+        profiles
+            .add(
+                "managed",
+                &confined_connection(
+                    "managed.example.test",
+                    "team/service",
+                    "cGlwZWxpbmU6YXBwLXBhc3N3b3Jk",
+                ),
+            )
+            .unwrap();
+
+        let listed = profiles.list().unwrap();
+        let names: Vec<&str> = listed.iter().map(|profile| profile.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["dev", "managed", "prod"],
+            "listing must order by name"
+        );
+
+        // `prod` was added first, so it is still the default.
+        let defaults: Vec<&str> = listed
+            .iter()
+            .filter(|profile| profile.is_default)
+            .map(|profile| profile.name.as_str())
+            .collect();
+        assert_eq!(defaults, ["prod"]);
+
+        let managed = &listed[1];
+        assert_eq!(managed.endpoint, "https://managed.example.test");
+        assert_eq!(managed.root, "/team/service");
+        assert!(managed.redacted_url.ends_with("client_secret=*"));
+        // The listing is display material, so no credential may survive in it.
+        for profile in &listed {
+            assert!(!profile.redacted_url.contains("YXBwLXBhc3N3b3Jk"));
+            assert!(!profile.endpoint.contains("YXBwLXBhc3N3b3Jk"));
+        }
+        assert_eq!(listed[0].root, "/", "an unconfined profile is rooted at /");
+
+        profiles.set_default("dev").unwrap();
+        assert!(profiles.list().unwrap()[0].is_default);
         fs::remove_dir_all(root).unwrap();
     }
 }
