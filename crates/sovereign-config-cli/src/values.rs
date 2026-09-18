@@ -53,8 +53,10 @@ async fn get_exact(
     else {
         bail!("configuration value not found");
     };
+    // Reveal through the path the service reported, not the one typed: they
+    // resolve to the same value, but the stored spelling is the canonical one.
     let text = if reveal && matches!(found.value, ValueContent::Secret(_)) {
-        client.reveal_secret(&path).await?.expose().to_owned()
+        client.reveal_secret(&found.path).await?.expose().to_owned()
     } else {
         found.value.display_text().to_owned()
     };
