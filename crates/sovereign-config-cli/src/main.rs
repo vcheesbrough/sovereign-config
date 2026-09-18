@@ -1,7 +1,9 @@
 //! The Sovereign Config command-line client.
 
 mod cli;
+mod connection;
 mod profile;
+mod render;
 mod session;
 mod values;
 
@@ -15,16 +17,24 @@ use crate::cli::{Arguments, Command};
 #[tokio::main]
 async fn main() -> Result<()> {
     let arguments = Arguments::parse();
-    let profiles = ProfileStore::new(default_profile_path()?);
     match arguments.command {
         Command::Profile { command } => {
             if arguments.profile.is_some() {
                 bail!("--profile applies only to operational commands");
             }
-            profile::manage_profile(command, &profiles)
+            if arguments.url_file.is_some() {
+                bail!("--url-file applies only to operational commands");
+            }
+            profile::manage_profile(command, &ProfileStore::new(default_profile_path()?))
         }
         command => {
-            let connection = profiles.connection(arguments.profile.as_deref())?;
+            // Resolved here rather than in `main`'s preamble because a
+            // profile-less host — a CI container running `render` against
+            // `--url-file` or `SOVEREIGN_CONFIG_URL` — may have no state
+            // directory at all, and determining the profile path would fail
+            // before the command that never needed it got a chance to run.
+            let connection =
+                connection::resolve(arguments.profile.as_deref(), arguments.url_file.as_deref())?;
             dispatch(&connection, command).await
         }
     }
@@ -48,6 +58,7 @@ async fn dispatch(connection: &ConnectionUrl, command: Command) -> Result<()> {
             aliases,
             format,
         } => values::list(connection, &path, aliases, format).await,
+        Command::Render { paths, command } => render::render(connection, &paths, &command).await,
         Command::Alias {
             source_path,
             new_path,

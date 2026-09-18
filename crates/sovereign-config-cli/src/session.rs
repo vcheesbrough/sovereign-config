@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use sovereign_config_client::{AccessTokenProvider, Client};
 use sovereign_config_core::{ClientError, ConfigPath, ConnectionUrl, ErrorKind, Secret};
+use sovereign_config_layers::InvalidatableToken;
 use sovereign_config_native::{
     CredentialStore, DeviceFlowClient, TonicTransport, default_credential_directory,
 };
@@ -29,6 +30,14 @@ impl AccessTokenProvider for InMemoryToken {
     async fn access_token(&self) -> Result<Option<Secret>, ClientError> {
         Ok(Some(self.0.clone()))
     }
+}
+
+impl InvalidatableToken for InMemoryToken {
+    /// Nothing to drop. The CLI acquires one token per invocation and exits, so
+    /// there is no cache that could outlive a revocation — the retry a
+    /// [`LayerReader`](sovereign_config_layers::LayerReader) performs simply
+    /// replays the same token and gets the same answer.
+    fn invalidate(&self) {}
 }
 
 pub struct MissingToken;
@@ -80,14 +89,29 @@ pub fn operation_path(connection: &ConnectionUrl, path: &str, scope: Scope) -> R
 /// Returns an error when the service is unreachable, the protocol does not
 /// match, or no credential is available.
 pub async fn operational_client(connection: &ConnectionUrl) -> Result<OperationalClient> {
+    let (transport, token) = operational_transport(connection).await?;
+    Ok(Client::new(transport, token))
+}
+
+/// The same connection, handshake and token as [`operational_client`], with the
+/// two halves left unassembled.
+///
+/// `render` builds a layer reader rather than a [`Client`] on them, and both
+/// must come from one handshake: opening a second channel would double the
+/// round trips and could land on a different backend mid-read.
+///
+/// # Errors
+///
+/// Returns an error when the service is unreachable, the protocol does not
+/// match, or no credential is available.
+pub async fn operational_transport(
+    connection: &ConnectionUrl,
+) -> Result<(TonicTransport, InMemoryToken)> {
     let transport = TonicTransport::connect(connection.endpoint().to_owned()).await?;
     Client::new(transport.clone(), MissingToken)
         .service_status()
         .await?;
-    Ok(Client::new(
-        transport,
-        InMemoryToken(access_token(connection).await?),
-    ))
+    Ok((transport, InMemoryToken(access_token(connection).await?)))
 }
 
 /// Runs the OIDC device flow and stores the resulting refresh credential.

@@ -8,8 +8,8 @@
 //!
 //! So the `!Send` client lives on its own thread, driven by a `LocalSet`, and
 //! HTTP handlers talk to it over a channel. [`SovereignHandle`] is `Send +
-//! Clone` and owns no Sovereign type; everything in [`reader`] stays on the
-//! reader thread.
+//! Clone` and owns no Sovereign type; the [`LayerReader`] stays on the reader
+//! thread.
 //!
 //! Requests are therefore **serialised**. For this workload — a few layers of a
 //! handful of secrets, a few pipelines an hour — that is the right trade: it
@@ -17,9 +17,13 @@
 //! stampede the issuer. The queue is bounded and sheds to 503 rather than
 //! growing without limit. If pipeline concurrency ever outgrows one reader, the
 //! fix is a small pool of reader threads, not a redesign.
+//!
+//! The read itself — per-layer `GetSubTree`, per-secret `RevealSecret`,
+//! direct-children-only naming, later-wins merge — lives in
+//! `sovereign-config-layers`, shared with the CLI's `render`. What stays here
+//! is the threading bridge and the connection handshake.
 
-pub(crate) mod reader;
-pub(crate) mod token;
+mod connect;
 
 use std::{collections::BTreeMap, thread, time::Duration};
 
@@ -31,7 +35,7 @@ use tokio::{
 };
 
 use crate::error::BrokerError;
-use reader::SovereignReader;
+pub(crate) use connect::ConnectError;
 
 pub(crate) enum Command {
     Fetch {
@@ -107,12 +111,12 @@ pub(crate) fn spawn(
                 return;
             };
             LocalSet::new().block_on(&runtime, async move {
-                let reader = match SovereignReader::connect(&connection_url, token_ttl).await {
-                    Ok(reader) => {
-                        if ready.send(Ok(reader.root().clone())).is_err() {
+                let reader = match connect::connect(&connection_url, token_ttl).await {
+                    Ok(connected) => {
+                        if ready.send(Ok(connected.root)).is_err() {
                             return;
                         }
-                        reader
+                        connected.reader
                     }
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -124,7 +128,7 @@ pub(crate) fn spawn(
                         Command::Fetch { layers, reply } => {
                             // A caller that gave up is not an error; the next
                             // command is served regardless.
-                            let _ = reply.send(reader.fetch(&layers).await);
+                            let _ = reply.send(reader.fetch(&layers).await.map_err(Into::into));
                         }
                     }
                 }
@@ -134,20 +138,6 @@ pub(crate) fn spawn(
 
     let root = connected.recv().map_err(|_| ConnectError::Runtime)??;
     Ok(SovereignHandle { commands, root })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum ConnectError {
-    #[error("the connection URL is not a valid managed connection URL")]
-    MalformedUrl,
-    #[error("the connection URL is a human login URL, not a managed connection")]
-    UnsupportedCredential,
-    #[error("the configuration service is unreachable")]
-    Unavailable,
-    #[error("the configuration service speaks a different protocol version")]
-    IncompatibleProtocol,
-    #[error("the reader could not be started")]
-    Runtime,
 }
 
 #[cfg(test)]

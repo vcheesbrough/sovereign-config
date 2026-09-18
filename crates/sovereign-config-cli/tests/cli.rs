@@ -124,6 +124,12 @@ struct MockConfiguration {
 }
 
 struct MockStoredValue {
+    /// The spelling this path was **first** written with. The map is keyed by
+    /// the fold, because `/x/FOO` and `/x/foo` are one value, but every
+    /// response reports this — the service has been case-retentive since
+    /// 2.18.0, and a client that assumes responses are lowercase is exactly
+    /// what these tests need to catch.
+    path: String,
     value: String,
     created_at: prost_types::Timestamp,
     secret: bool,
@@ -152,8 +158,8 @@ impl Configuration for MockConfiguration {
                     |(parent, _)| if parent.is_empty() { "/" } else { parent },
                 ) == selected
             })
-            .map(|(path, stored)| ListedValue {
-                path: path.clone(),
+            .map(|(_, stored)| ListedValue {
+                path: stored.path.clone(),
                 content: Some(if stored.secret {
                     listed_value::Content::MaskedSecret(MaskedSecret {})
                 } else {
@@ -188,8 +194,8 @@ impl Configuration for MockConfiguration {
                         .strip_prefix(&path)
                         .is_some_and(|suffix| suffix.starts_with('/'))
             })
-            .map(|(path, stored)| SubTreeValue {
-                path: path.clone(),
+            .map(|(_, stored)| SubTreeValue {
+                path: stored.path.clone(),
                 content: Some(if stored.secret {
                     sub_tree_value::Content::MaskedSecret(MaskedSecret {})
                 } else {
@@ -202,7 +208,7 @@ impl Configuration for MockConfiguration {
                 },
             })
             .collect::<Vec<_>>();
-        subtree.sort_by(|first, second| first.path.cmp(&second.path));
+        subtree.sort_by_key(|value| value.path.to_ascii_lowercase());
         Ok(tonic::Response::new(GetSubTreeResponse { values: subtree }))
     }
 
@@ -217,9 +223,11 @@ impl Configuration for MockConfiguration {
             nanos: 0,
         };
         let mut values = self.values.lock().unwrap();
-        let created_at = values
-            .get(&request.path.to_ascii_lowercase())
-            .map_or(timestamp, |stored| stored.created_at);
+        let established = values.get(&request.path.to_ascii_lowercase());
+        let created_at = established.map_or(timestamp, |stored| stored.created_at);
+        // A later write through a differently-cased spelling updates the value
+        // and leaves the established case exactly as the first write set it.
+        let path = established.map_or_else(|| request.path.clone(), |stored| stored.path.clone());
         let (value, secret) = match request.content {
             Some(put_value_request::Content::PlainValue(value)) => (value, false),
             Some(put_value_request::Content::SecretValue(value)) => (value, true),
@@ -228,6 +236,7 @@ impl Configuration for MockConfiguration {
         values.insert(
             request.path.to_ascii_lowercase(),
             MockStoredValue {
+                path,
                 value,
                 created_at,
                 secret,
@@ -268,6 +277,7 @@ impl Configuration for MockConfiguration {
             values.insert(
                 value.path.to_ascii_lowercase(),
                 MockStoredValue {
+                    path: value.path.clone(),
                     value: content.clone(),
                     created_at: timestamp,
                     secret: false,
@@ -354,8 +364,9 @@ impl Configuration for MockConfiguration {
             return Err(Status::already_exists("exists"));
         }
         values.insert(
-            new_path,
+            new_path.clone(),
             MockStoredValue {
+                path: request.new_path.clone(),
                 value,
                 created_at: timestamp,
                 secret,
@@ -382,9 +393,9 @@ impl Configuration for MockConfiguration {
             .filter(|(_, candidate)| {
                 candidate.secret == stored.secret && candidate.value == stored.value
             })
-            .map(|(path, _)| path.clone())
+            .map(|(_, stored)| stored.path.clone())
             .collect::<Vec<_>>();
-        paths.sort();
+        paths.sort_by_key(|path| path.to_ascii_lowercase());
         Ok(tonic::Response::new(ListValuePathsResponse { paths }))
     }
 }
@@ -530,7 +541,7 @@ async fn value_path_aliases_are_added_listed_and_permission_checked() {
     assert_success(&listed);
     assert_eq!(
         String::from_utf8_lossy(&listed.stdout),
-        "/team/service/alias\n/team/service/original\n"
+        "/team/service/Alias\n/team/service/original\n"
     );
 
     let relative = run_cli(
@@ -998,7 +1009,7 @@ async fn plain_subtree_reads_key_every_value_by_absolute_path() {
     assert_eq!(
         String::from_utf8_lossy(&masked.stdout),
         "/team/service/banner=first\\nsecond\\r\\nthird\\\\fourth\n\
-         /team/service/db/host=pg.internal\n\
+         /team/service/db/Host=pg.internal\n\
          /team/service/db/password=********\n\
          /team/service/enabled=true\n"
     );
@@ -1012,7 +1023,7 @@ async fn plain_subtree_reads_key_every_value_by_absolute_path() {
     assert_success(&revealed);
     assert_eq!(
         String::from_utf8_lossy(&revealed.stdout),
-        format!("/team/service/db/host=pg.internal\n/team/service/db/password={secret}\n")
+        format!("/team/service/db/Host=pg.internal\n/team/service/db/password={secret}\n")
     );
     assert!(revealed.stderr.is_empty());
 
@@ -1100,7 +1111,7 @@ async fn list_shows_only_the_selected_paths_direct_children() {
     assert_success(&aliases);
     assert_eq!(
         String::from_utf8_lossy(&aliases.stdout),
-        "[\n  \"/team/service/enabled\",\n  \"/team/service/enabled-too\"\n]\n"
+        "[\n  \"/team/service/enabled\",\n  \"/team/service/Enabled-Too\"\n]\n"
     );
 }
 
@@ -1433,6 +1444,7 @@ async fn home_fallback_uses_standard_config_and_state_directories() {
         &["profile", "add", "dev"],
         Some(&format!("{url}\n")),
         false,
+        &[],
     )
     .await;
     assert_success(&add);
@@ -1442,7 +1454,7 @@ async fn home_fallback_uses_standard_config_and_state_directories() {
             .is_file()
     );
 
-    let login = run_cli_environment(home.path(), &["login"], None, false).await;
+    let login = run_cli_environment(home.path(), &["login"], None, false, &[]).await;
     assert_success(&login);
     assert_eq!(
         fs::read_dir(
@@ -2006,6 +2018,557 @@ async fn assert_login_failure(result: DeviceResult, expected: &str) {
     assert!(credential_files(home.path()).is_empty());
 }
 
+// `render` reads configuration and then replaces itself with the command it
+// was given. Because the process is gone by then, every assertion about what
+// it produced has to be made from inside that command — which is what
+// `test-consumers/render-consumer` is for: it reports its own environment as
+// JSON and exits with a status the test chooses.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn render_hands_a_layer_to_the_command_it_execs() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    render_profile(home.path(), &services).await;
+    store_plain(home.path(), "/team/service/HOST", "api.example.test").await;
+    store_secret(home.path(), "/team/service/DB_PASSWORD", "db-sentinel").await;
+    // Stored lowercase, so it arrives lowercase. Nothing is uppercased: the
+    // variable name is the leaf, and `export lower_case=...` is what a shell
+    // would have done with the same spelling.
+    store_plain(home.path(), "/team/service/lower_case", "as-written").await;
+    // A deeper descendant is not a direct child, so it has no variable.
+    store_plain(
+        home.path(),
+        "/team/service/nested/IGNORED",
+        "not-a-variable",
+    )
+    .await;
+
+    let environment = rendered(
+        home.path(),
+        &["--profile", "deploy", "render", "/team/service"],
+        &[],
+    )
+    .await;
+
+    assert_eq!(environment["HOST"], "api.example.test");
+    assert_eq!(environment["DB_PASSWORD"], "db-sentinel");
+    assert_eq!(environment["lower_case"], "as-written");
+    assert!(
+        !environment.contains_key("LOWER_CASE"),
+        "a lowercase leaf was uppercased"
+    );
+    assert!(
+        !environment.contains_key("IGNORED"),
+        "a deeper descendant became a variable"
+    );
+}
+
+// The rule in one line: `/foo/AbC=bAr` rendered is `export AbC=bAr`. Paths
+// have been case-retentive since 2.18.0, so the spelling written is the
+// spelling stored and the spelling the command sees. Uppercasing would make
+// `AbC` unreachable — no path would produce it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leaf_reaches_the_command_under_its_exact_stored_spelling() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    render_profile(home.path(), &services).await;
+    store_plain(home.path(), "/team/service/AbC", "bAr").await;
+
+    let environment = rendered(
+        home.path(),
+        &["--profile", "deploy", "render", "/team/service"],
+        &[],
+    )
+    .await;
+
+    assert_eq!(environment["AbC"], "bAr");
+    for other in ["ABC", "abc", "Abc"] {
+        assert!(
+            !environment.contains_key(other),
+            "the name was transformed into {other}"
+        );
+    }
+}
+
+// Two layers spelling a leaf differently are two variables, not one — which is
+// what the command sees too, since `AbC` and `abc` are distinct to it. Only an
+// exact-name collision overrides.
+#[tokio::test(flavor = "multi_thread")]
+async fn layers_collide_only_on_the_exact_name() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    render_profile(home.path(), &services).await;
+    store_plain(home.path(), "/team/service/AbC", "shared-mixed").await;
+    store_plain(home.path(), "/team/service/token", "shared-token").await;
+    store_plain(home.path(), "/team/service/prod/abc", "prod-lower").await;
+    store_plain(home.path(), "/team/service/prod/token", "prod-token").await;
+
+    let environment = rendered(
+        home.path(),
+        &[
+            "--profile",
+            "deploy",
+            "render",
+            "/team/service",
+            "/team/service/prod",
+        ],
+        &[],
+    )
+    .await;
+
+    assert_eq!(environment["AbC"], "shared-mixed");
+    assert_eq!(environment["abc"], "prod-lower");
+    assert_eq!(environment["token"], "prod-token");
+}
+
+// The connection root is the whole point of a per-consumer credential: a
+// deploy step should not have to repeat a prefix the credential already
+// encodes.
+#[tokio::test(flavor = "multi_thread")]
+async fn render_with_no_path_reads_the_connection_root() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    render_profile(home.path(), &services).await;
+    store_plain(home.path(), "/team/service/HOST", "root-relative").await;
+
+    let environment = rendered(home.path(), &["--profile", "deploy", "render"], &[]).await;
+    assert_eq!(environment["HOST"], "root-relative");
+}
+
+// A deploy step routinely supplies one variable inline — an image tag, say —
+// alongside everything it reads from configuration, so the inherited
+// environment has to survive. Configuration wins a collision, being the more
+// specific statement of intent.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_inherited_environment_survives_and_configuration_wins_a_collision() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    render_profile(home.path(), &services).await;
+    store_plain(home.path(), "/team/service/HOST", "from-configuration").await;
+
+    let environment = rendered(
+        home.path(),
+        &["--profile", "deploy", "render", "/team/service"],
+        &[("DEPLOY_IMAGE_TAG", "v1.2.3"), ("HOST", "from-the-caller")],
+    )
+    .await;
+
+    assert_eq!(environment["DEPLOY_IMAGE_TAG"], "v1.2.3");
+    assert!(environment.contains_key("HOME"), "HOME did not survive");
+    assert_eq!(environment["HOST"], "from-configuration");
+}
+
+// The credential read the configuration; the command that consumes it has no
+// business holding it. Stripped whether or not this invocation used it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_credential_never_reaches_the_executed_command() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let url = render_profile(home.path(), &services).await;
+    store_plain(home.path(), "/team/service/HOST", "api.example.test").await;
+
+    for arguments in [
+        vec!["--profile", "deploy", "render", "/team/service"],
+        vec!["render", "/team/service"],
+    ] {
+        let environment =
+            rendered(home.path(), &arguments, &[("SOVEREIGN_CONFIG_URL", &url)]).await;
+        assert_eq!(environment["HOST"], "api.example.test");
+        assert!(
+            !environment.contains_key("SOVEREIGN_CONFIG_URL"),
+            "the credential reached the command"
+        );
+        for value in environment.values() {
+            assert!(
+                !value.contains(MANAGED_CREDENTIAL),
+                "the credential reached the command inside another variable"
+            );
+        }
+    }
+}
+
+// There is no shell between `render` and the command, so a value that looks
+// like shell syntax is data. This is the property that makes it safe to point
+// at a production deploy.
+#[tokio::test(flavor = "multi_thread")]
+async fn values_reach_the_command_byte_exact_and_are_never_interpreted() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    render_profile(home.path(), &services).await;
+    let hostile = [
+        ("Spaces", "one two  three"),
+        ("single_QUOTES", "it's 'quoted'"),
+        ("double_quotes", "say \"hello\""),
+        ("substitution", "$(rm -rf /) ${HOME} $HOME"),
+        ("backticks", "`id`"),
+        ("newlines", "first\nsecond\n\nfourth"),
+        ("everything", "$(`id`) 'a' \"b\"\n\\$c"),
+    ];
+    for (leaf, value) in hostile {
+        store_secret(home.path(), &format!("/team/service/{leaf}"), value).await;
+    }
+
+    let environment = rendered(
+        home.path(),
+        &["--profile", "deploy", "render", "/team/service"],
+        &[],
+    )
+    .await;
+
+    for (leaf, value) in hostile {
+        // Indexed by the leaf itself: the name is the path segment exactly, so
+        // a mixed-case leaf is a mixed-case variable.
+        assert_eq!(environment[leaf], value, "{leaf} did not arrive byte-exact");
+    }
+}
+
+// Layers merge in the order given, later winning — and reversing the order
+// reverses the winner, so nothing is inferring specificity from path depth.
+#[tokio::test(flavor = "multi_thread")]
+async fn layers_merge_in_the_order_given_with_the_later_one_winning() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    render_profile(home.path(), &services).await;
+    store_plain(home.path(), "/team/service/HOST", "shared-host").await;
+    store_plain(home.path(), "/team/service/SHARED_ONLY", "kept").await;
+    store_plain(home.path(), "/team/service/prod/HOST", "prod-host").await;
+
+    let overlaid = rendered(
+        home.path(),
+        &[
+            "--profile",
+            "deploy",
+            "render",
+            "/team/service",
+            "/team/service/prod",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(overlaid["HOST"], "prod-host");
+    assert_eq!(overlaid["SHARED_ONLY"], "kept");
+
+    let reversed = rendered(
+        home.path(),
+        &[
+            "--profile",
+            "deploy",
+            "render",
+            "/team/service/prod",
+            "/team/service",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(reversed["HOST"], "shared-host");
+}
+
+// The process is replaced rather than wrapped, so the status passes through
+// with nothing in between to swallow or mistranslate it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_executed_commands_exit_status_is_renders_own() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    render_profile(home.path(), &services).await;
+    store_plain(home.path(), "/team/service/HOST", "api.example.test").await;
+
+    for status in [0, 1, 42] {
+        let output = run_cli_with_environment(
+            home.path(),
+            &[
+                "--profile",
+                "deploy",
+                "render",
+                "/team/service",
+                "--",
+                render_consumer().to_str().unwrap(),
+                "--exit",
+                &status.to_string(),
+            ],
+            &[],
+        )
+        .await;
+        assert_eq!(
+            output.status.code(),
+            Some(status),
+            "status did not pass through"
+        );
+    }
+}
+
+// Fail closed. Every read happens before the exec, so nothing that goes wrong
+// can leave a command running against a half-populated environment. The
+// consumer always prints JSON, so its absence proves it never ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failure_before_the_exec_means_the_command_never_runs() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    render_profile(home.path(), &services).await;
+    store_plain(home.path(), "/team/service/HOST", "api.example.test").await;
+    let consumer = render_consumer();
+    let consumer = consumer.to_str().unwrap();
+
+    for (arguments, expected) in [
+        // Outside the connection root: refused before any read.
+        (
+            vec![
+                "--profile",
+                "deploy",
+                "render",
+                "/other/team",
+                "--",
+                consumer,
+            ],
+            "path is outside the selected profile root",
+        ),
+        // A path the service reports as empty. Absent and empty are the same
+        // response, so both land here rather than silently rendering nothing.
+        (
+            vec![
+                "--profile",
+                "deploy",
+                "render",
+                "/team/service/typo",
+                "--",
+                consumer,
+            ],
+            "contributed no configuration",
+        ),
+        // Not a path at all.
+        (
+            vec!["--profile", "deploy", "render", "relative", "--", consumer],
+            "path must name a configuration subtree",
+        ),
+        // No credential resolves at all.
+        (vec!["--profile", "absent", "render", "--", consumer], ""),
+    ] {
+        let output = run_cli_with_environment(home.path(), &arguments, &[]).await;
+        let combined = combined(&output);
+        assert!(
+            !output.status.success(),
+            "{arguments:?} succeeded: {combined}"
+        );
+        assert!(
+            !combined.contains('{'),
+            "{arguments:?} ran the command anyway: {combined}"
+        );
+        assert!(
+            combined.contains(expected),
+            "{arguments:?} reported {combined:?}, wanted {expected:?}"
+        );
+        assert_secrets_absent(&combined);
+    }
+}
+
+// A leaf whose name cannot be an environment variable is refused rather than
+// exported under a name nothing can reference — passing `DB-PASSWORD` through
+// would satisfy `execve` and then fail silently at the point of use.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leaf_that_cannot_be_a_variable_name_fails_before_the_exec() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    render_profile(home.path(), &services).await;
+    store_plain(home.path(), "/team/service/db-password", "sentinel").await;
+
+    let output = run_cli_with_environment(
+        home.path(),
+        &[
+            "--profile",
+            "deploy",
+            "render",
+            "/team/service",
+            "--",
+            render_consumer().to_str().unwrap(),
+        ],
+        &[],
+    )
+    .await;
+    let combined = combined(&output);
+    assert!(
+        !output.status.success(),
+        "unusable name accepted: {combined}"
+    );
+    assert!(
+        combined.contains("db-password"),
+        "unhelpful error: {combined}"
+    );
+    assert!(
+        !combined.contains('{'),
+        "the command ran anyway: {combined}"
+    );
+}
+
+// The documented order, each step proved by making the one below it fatal:
+// `--profile` beats `--url-file` beats `SOVEREIGN_CONFIG_URL`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_credential_precedence_is_profile_then_url_file_then_the_environment() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let url = render_profile(home.path(), &services).await;
+    store_plain(home.path(), "/team/service/HOST", "api.example.test").await;
+
+    let usable = home.path().join("usable.url");
+    fs::write(&usable, format!("{url}\n")).unwrap();
+    let unusable = home.path().join("unusable.url");
+    fs::write(&unusable, "not-a-connection-url\n").unwrap();
+
+    // A profile beats both of the others, even when they would fail.
+    let by_profile = rendered(
+        home.path(),
+        &[
+            "--profile",
+            "deploy",
+            "--url-file",
+            unusable.to_str().unwrap(),
+            "render",
+            "/team/service",
+        ],
+        &[("SOVEREIGN_CONFIG_URL", "not-a-connection-url")],
+    )
+    .await;
+    assert_eq!(by_profile["HOST"], "api.example.test");
+
+    // With no profile named, the file beats the variable.
+    let by_file = rendered(
+        home.path(),
+        &[
+            "--url-file",
+            usable.to_str().unwrap(),
+            "render",
+            "/team/service",
+        ],
+        &[("SOVEREIGN_CONFIG_URL", "not-a-connection-url")],
+    )
+    .await;
+    assert_eq!(by_file["HOST"], "api.example.test");
+
+    // And a broken file is not quietly passed over in favour of the variable.
+    let file_wins_even_when_broken = run_cli_with_environment(
+        home.path(),
+        &[
+            "--url-file",
+            unusable.to_str().unwrap(),
+            "render",
+            "/team/service",
+            "--",
+            render_consumer().to_str().unwrap(),
+        ],
+        &[("SOVEREIGN_CONFIG_URL", &url)],
+    )
+    .await;
+    assert!(!file_wins_even_when_broken.status.success());
+
+    // With neither, the variable is what is left.
+    let by_variable = rendered(
+        home.path(),
+        &["render", "/team/service"],
+        &[("SOVEREIGN_CONFIG_URL", &url)],
+    )
+    .await;
+    assert_eq!(by_variable["HOST"], "api.example.test");
+}
+
+// A CI container has no profile store and no state directory to build one in,
+// which must not stop an invocation that never needed either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_with_no_profile_store_can_still_render() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let url = render_profile(home.path(), &services).await;
+    store_plain(home.path(), "/team/service/HOST", "api.example.test").await;
+
+    // A different HOME entirely: no config.toml, no credentials, nothing.
+    let bare = TempDir::new().unwrap();
+    let environment = rendered(
+        bare.path(),
+        &["render", "/team/service"],
+        &[("SOVEREIGN_CONFIG_URL", &url)],
+    )
+    .await;
+    assert_eq!(environment["HOST"], "api.example.test");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn render_teaches_the_paths_before_the_options_and_the_command_last() {
+    let home = TempDir::new().unwrap();
+    let help = run_cli(home.path(), &["render", "--help"]).await;
+    assert_success(&help);
+    assert!(
+        String::from_utf8_lossy(&help.stdout)
+            .contains("sovereign-config render [<ABSOLUTE_PATH>...] [OPTIONS] -- <cmd> [args...]"),
+        "render --help does not teach the path-after-verb spelling"
+    );
+}
+
+// `--url-file` is a global credential input, so it belongs to operational
+// commands only, exactly as `--profile` does.
+#[tokio::test(flavor = "multi_thread")]
+async fn url_file_is_refused_on_the_profile_commands() {
+    let home = TempDir::new().unwrap();
+    let refused = run_cli(
+        home.path(),
+        &["--url-file", "/nonexistent", "profile", "list"],
+    )
+    .await;
+    assert!(!refused.status.success());
+    assert!(combined(&refused).contains("--url-file applies only to operational commands"));
+}
+
+/// The binary `render` execs in these tests. It sits beside the CLI under
+/// `target/<profile>/`, which is the only place cargo will have put it.
+fn render_consumer() -> PathBuf {
+    let binary = Path::new(env!("CARGO_BIN_EXE_sovereign-config"))
+        .parent()
+        .expect("a test binary always has a directory")
+        .join("render-consumer");
+    assert!(
+        binary.is_file(),
+        "{} is missing; these tests need the whole workspace built, as \
+         `cargo test --workspace` does",
+        binary.display()
+    );
+    binary
+}
+
+/// Adds the managed profile these tests render through, returning its URL so a
+/// test can also supply it as a file or a variable.
+async fn render_profile(home: &Path, services: &TestServices) -> String {
+    let url = connection_url(services, true, "team/service");
+    assert_success(
+        &run_cli_with_input(
+            home,
+            &["profile", "add", "deploy"],
+            Some(&format!("{url}\n")),
+        )
+        .await,
+    );
+    url
+}
+
+async fn store_plain(home: &Path, path: &str, value: &str) {
+    assert_success(&run_cli_with_input(home, &["set", path], Some(value)).await);
+}
+
+async fn store_secret(home: &Path, path: &str, value: &str) {
+    assert_success(&run_cli_with_input(home, &["set", path, "--secret"], Some(value)).await);
+}
+
+/// Runs `render`, execs the consumer, and returns the environment it was
+/// handed. `arguments` carries everything up to the `--`.
+async fn rendered(
+    home: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> HashMap<String, String> {
+    let consumer = render_consumer();
+    let mut full = arguments.to_vec();
+    full.push("--");
+    full.push(consumer.to_str().unwrap());
+    let output = run_cli_with_environment(home, &full, environment).await;
+    assert_success(&output);
+    serde_json::from_slice(&output.stdout).expect("the consumer prints its environment as JSON")
+}
+
 async fn add_profile(home: &Path, services: &TestServices, name: &str, managed: bool) -> Output {
     let url = connection_url(services, managed, "");
     let output =
@@ -2061,7 +2624,18 @@ async fn run_cli(home: &Path, arguments: &[&str]) -> Output {
 }
 
 async fn run_cli_with_input(home: &Path, arguments: &[&str], input: Option<&str>) -> Output {
-    run_cli_environment(home, arguments, input, true).await
+    run_cli_environment(home, arguments, input, true, &[]).await
+}
+
+/// Runs the CLI with extra variables in its environment, which is otherwise
+/// cleared. Used to supply `SOVEREIGN_CONFIG_URL` and to prove that a caller's
+/// own variables survive into an exec'd command.
+async fn run_cli_with_environment(
+    home: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Output {
+    run_cli_environment(home, arguments, None, true, environment).await
 }
 
 async fn run_cli_environment(
@@ -2069,6 +2643,7 @@ async fn run_cli_environment(
     arguments: &[&str],
     input: Option<&str>,
     use_xdg: bool,
+    environment: &[(&str, &str)],
 ) -> Output {
     let binary = env!("CARGO_BIN_EXE_sovereign-config");
     let home = home.to_owned();
@@ -2077,11 +2652,16 @@ async fn run_cli_environment(
         .map(|argument| (*argument).to_owned())
         .collect::<Vec<_>>();
     let input = input.map(str::to_owned);
+    let environment = environment
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
         let mut command = Command::new(binary);
         command
             .args(arguments)
             .env_clear()
+            .envs(environment)
             .env("HOME", &home)
             .stdin(if input.is_some() {
                 Stdio::piped()

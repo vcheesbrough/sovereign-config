@@ -19,6 +19,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sovereign-config-client = { path = "../sovereign-config-client" }
 sovereign-config-core = { path = "../sovereign-config-core" }
+sovereign-config-layers = { path = "../sovereign-config-layers" }
 sovereign-config-native = { path = "../sovereign-config-native" }
 subtle = "2.6.1"
 thiserror.workspace = true

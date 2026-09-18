@@ -2410,7 +2410,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-cli"
-version = "2.23.0"
+version = "2.24.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2422,6 +2422,7 @@ dependencies = [
  "serde_json",
  "sovereign-config-client",
  "sovereign-config-core",
+ "sovereign-config-layers",
  "sovereign-config-native",
  "sovereign-config-proto",
  "tempfile",
@@ -2433,7 +2434,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-client"
-version = "2.23.0"
+version = "2.24.0"
 dependencies = [
  "async-trait",
  "sovereign-config-core",
@@ -2442,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-core"
-version = "2.23.0"
+version = "2.24.0"
 dependencies = [
  "base64",
  "serde",
@@ -2452,8 +2453,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovereign-config-layers"
+version = "2.24.0"
+dependencies = [
+ "async-trait",
+ "sovereign-config-client",
+ "sovereign-config-core",
+ "sovereign-config-native",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sovereign-config-mcp"
-version = "2.23.0"
+version = "2.24.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2468,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-native"
-version = "2.23.0"
+version = "2.24.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -2490,7 +2503,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-proto"
-version = "2.23.0"
+version = "2.24.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -2501,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-provider"
-version = "2.23.0"
+version = "2.24.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -2519,8 +2532,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovereign-config-render-consumer"
+version = "2.24.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "sovereign-config-rust-consumer"
-version = "2.23.0"
+version = "2.24.0"
 dependencies = [
  "async-trait",
  "sovereign-config-client",
@@ -2530,7 +2550,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-rust-provider-consumer"
-version = "2.23.0"
+version = "2.24.0"
 dependencies = [
  "serde",
  "sovereign-config-provider",
@@ -2539,7 +2559,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-server"
-version = "2.23.0"
+version = "2.24.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -2574,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-web"
-version = "2.23.0"
+version = "2.24.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2593,7 +2613,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-woodpecker-broker"
-version = "2.23.0"
+version = "2.24.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -2606,6 +2626,7 @@ dependencies = [
  "sha2 0.10.9",
  "sovereign-config-client",
  "sovereign-config-core",
+ "sovereign-config-layers",
  "sovereign-config-native",
  "sovereign-config-proto",
  "subtle",
