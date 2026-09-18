@@ -2514,8 +2514,16 @@ async fn url_file_is_refused_on_the_profile_commands() {
     assert!(combined(&refused).contains("--url-file applies only to operational commands"));
 }
 
-/// The binary `render` execs in these tests. It sits beside the CLI under
-/// `target/<profile>/`, which is the only place cargo will have put it.
+/// The binary `render` execs in these tests, from `test-consumers/`.
+///
+/// `CARGO_BIN_EXE_` only names binaries of the package under test, so this
+/// resolves the sibling by path: cargo uplifts every package's binary into the
+/// same `target/<profile>/` directory this one came from.
+///
+/// It is only built when something asks cargo for it, which is why
+/// `test-consumers/render-consumer/tests/smoke.rs` exists — `cargo test` on a
+/// package with no integration tests compiles its bin as a unit-test harness
+/// and never produces the real binary.
 fn render_consumer() -> PathBuf {
     let binary = Path::new(env!("CARGO_BIN_EXE_sovereign-config"))
         .parent()
@@ -2523,8 +2531,10 @@ fn render_consumer() -> PathBuf {
         .join("render-consumer");
     assert!(
         binary.is_file(),
-        "{} is missing; these tests need the whole workspace built, as \
-         `cargo test --workspace` does",
+        "{} is missing. These tests exec it, and it is built by \
+         `cargo test --workspace` (or `cargo build -p \
+         sovereign-config-render-consumer`) — not by `cargo test -p \
+         sovereign-config-cli` alone.",
         binary.display()
     );
     binary
