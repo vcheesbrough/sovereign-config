@@ -136,11 +136,22 @@ impl Configuration for MockConfiguration {
         request: Request<ListValuesRequest>,
     ) -> Result<tonic::Response<ListValuesResponse>, Status> {
         require_access_token(&request)?;
-        let selected = request.into_inner().path;
+        let selected = request.into_inner().path.to_ascii_lowercase();
         let values = self.values.lock().unwrap();
+        // The service answers with every readable namespace in the tree, not
+        // only the selected path's children — narrowing those is the client's
+        // job, so the mock has to hand over the wide set.
+        let mut paths: Vec<String> = values.keys().flat_map(|path| ancestors(path)).collect();
+        paths.sort();
+        paths.dedup();
         let values = values
             .iter()
-            .filter(|(path, _)| path.rsplit_once('/').map_or("", |(parent, _)| parent) == selected)
+            .filter(|(path, _)| {
+                path.rsplit_once('/').map_or(
+                    "",
+                    |(parent, _)| if parent.is_empty() { "/" } else { parent },
+                ) == selected
+            })
             .map(|(path, stored)| ListedValue {
                 path: path.clone(),
                 content: Some(if stored.secret {
@@ -158,10 +169,7 @@ impl Configuration for MockConfiguration {
                 alias_paths: Vec::new(),
             })
             .collect();
-        Ok(tonic::Response::new(ListValuesResponse {
-            values,
-            paths: vec![selected],
-        }))
+        Ok(tonic::Response::new(ListValuesResponse { values, paths }))
     }
 
     async fn get_sub_tree(
@@ -381,6 +389,19 @@ impl Configuration for MockConfiguration {
     }
 }
 
+/// Every namespace at or above `path`, root first, excluding `path` itself.
+fn ancestors(path: &str) -> Vec<String> {
+    let mut namespaces = vec!["/".to_owned()];
+    let mut prefix = String::new();
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    for segment in &segments[..segments.len() - 1] {
+        prefix.push('/');
+        prefix.push_str(segment);
+        namespaces.push(prefix.clone());
+    }
+    namespaces
+}
+
 #[allow(clippy::result_large_err)]
 fn require_access_token<T>(request: &Request<T>) -> Result<(), Status> {
     let authorization = request
@@ -409,7 +430,7 @@ async fn exact_value_commands_use_absolute_paths_within_profile_root_and_hard_de
 
     let root_put = run_cli_with_input(
         home.path(),
-        &["put", "/team/service"],
+        &["set", "/team/service"],
         Some("root-value-sentinel"),
     )
     .await;
@@ -427,7 +448,7 @@ async fn exact_value_commands_use_absolute_paths_within_profile_root_and_hard_de
 
     let put = run_cli_with_input(
         home.path(),
-        &["put", "/team/service/Feature/Flag"],
+        &["set", "/team/service/Feature/Flag"],
         Some("value-sentinel\nsecond-line"),
     )
     .await;
@@ -456,7 +477,7 @@ async fn exact_value_commands_use_absolute_paths_within_profile_root_and_hard_de
 
     let relative = run_cli(home.path(), &["get", "team/service/feature/flag"]).await;
     assert!(!relative.status.success());
-    assert!(combined(&relative).contains("path must name a configuration subtree"));
+    assert!(combined(&relative).contains("path must name a configuration value"));
 
     let outside_root = run_cli(home.path(), &["get", "/other/feature-flag"]).await;
     assert!(!outside_root.status.success());
@@ -480,7 +501,7 @@ async fn value_path_aliases_are_added_listed_and_permission_checked() {
     assert_success(
         &run_cli_with_input(
             home.path(),
-            &["put", "/team/service/original"],
+            &["set", "/team/service/original"],
             Some("aliased-value-sentinel"),
         )
         .await,
@@ -488,12 +509,7 @@ async fn value_path_aliases_are_added_listed_and_permission_checked() {
 
     let added = run_cli(
         home.path(),
-        &[
-            "alias",
-            "add",
-            "/team/service/original",
-            "/team/service/Alias",
-        ],
+        &["alias", "/team/service/original", "/team/service/Alias"],
     )
     .await;
     assert_success(&added);
@@ -506,7 +522,11 @@ async fn value_path_aliases_are_added_listed_and_permission_checked() {
         "aliased-value-sentinel"
     );
 
-    let listed = run_cli(home.path(), &["alias", "list", "/team/service/ORIGINAL"]).await;
+    let listed = run_cli(
+        home.path(),
+        &["list", "/team/service/ORIGINAL", "--aliases"],
+    )
+    .await;
     assert_success(&listed);
     assert_eq!(
         String::from_utf8_lossy(&listed.stdout),
@@ -515,12 +535,7 @@ async fn value_path_aliases_are_added_listed_and_permission_checked() {
 
     let relative = run_cli(
         home.path(),
-        &[
-            "alias",
-            "add",
-            "team/service/original",
-            "/team/service/other",
-        ],
+        &["alias", "team/service/original", "/team/service/other"],
     )
     .await;
     assert!(!relative.status.success());
@@ -528,7 +543,7 @@ async fn value_path_aliases_are_added_listed_and_permission_checked() {
 
     let outside = run_cli(
         home.path(),
-        &["alias", "add", "/team/service/original", "/other/alias"],
+        &["alias", "/team/service/original", "/other/alias"],
     )
     .await;
     assert!(!outside.status.success());
@@ -536,12 +551,7 @@ async fn value_path_aliases_are_added_listed_and_permission_checked() {
 
     let denied = run_cli(
         home.path(),
-        &[
-            "alias",
-            "add",
-            "/team/service/original",
-            "/team/service/forbidden",
-        ],
+        &["alias", "/team/service/original", "/team/service/forbidden"],
     )
     .await;
     assert!(!denied.status.success());
@@ -566,7 +576,7 @@ async fn secret_commands_mask_preserve_rotate_reveal_and_delete_values() {
     let first = "configuration-secret-sentinel-one";
     let stored = run_cli_with_input(
         home.path(),
-        &["secret", "put", "/team/service/credential"],
+        &["set", "/team/service/credential", "--secret"],
         Some(first),
     )
     .await;
@@ -578,7 +588,11 @@ async fn secret_commands_mask_preserve_rotate_reveal_and_delete_values() {
     assert_success(&masked);
     assert_eq!(String::from_utf8_lossy(&masked.stdout), "********");
     assert!(!combined(&masked).contains(first));
-    let masked_json = run_cli(home.path(), &["get", "/team/service", "--format", "json"]).await;
+    let masked_json = run_cli(
+        home.path(),
+        &["get", "/team/service", "--tree", "--format", "json"],
+    )
+    .await;
     assert_success(&masked_json);
     assert_eq!(
         String::from_utf8_lossy(&masked_json.stdout),
@@ -595,7 +609,7 @@ async fn secret_commands_mask_preserve_rotate_reveal_and_delete_values() {
     assert!(revealed_by_get.stderr.is_empty());
     let revealed = run_cli(
         home.path(),
-        &["secret", "reveal", "/team/service/credential"],
+        &["get", "/team/service/credential", "--reveal"],
     )
     .await;
     assert_success(&revealed);
@@ -605,16 +619,20 @@ async fn secret_commands_mask_preserve_rotate_reveal_and_delete_values() {
     let second = "configuration-secret-sentinel-two";
     let rotated = run_cli_with_input(
         home.path(),
-        &["secret", "put", "/team/service/credential"],
+        &["set", "/team/service/credential", "--secret"],
         Some(second),
     )
     .await;
     assert_success(&rotated);
     assert!(!combined(&rotated).contains(second));
     let sibling =
-        run_cli_with_input(home.path(), &["put", "/team/service/enabled"], Some("true")).await;
+        run_cli_with_input(home.path(), &["set", "/team/service/enabled"], Some("true")).await;
     assert_success(&sibling);
-    let masked_json = run_cli(home.path(), &["get", "/team/service", "--format", "json"]).await;
+    let masked_json = run_cli(
+        home.path(),
+        &["get", "/team/service", "--tree", "--format", "json"],
+    )
+    .await;
     assert_success(&masked_json);
     assert_eq!(
         String::from_utf8_lossy(&masked_json.stdout),
@@ -623,7 +641,7 @@ async fn secret_commands_mask_preserve_rotate_reveal_and_delete_values() {
     assert!(!combined(&masked_json).contains(second));
     let json = run_cli_with_input(
         home.path(),
-        &["put", "/team/service", "--format", "json"],
+        &["set", "/team/service", "--tree"],
         Some("{\"credential\":\"********\",\"enabled\":\"false\"}"),
     )
     .await;
@@ -631,7 +649,14 @@ async fn secret_commands_mask_preserve_rotate_reveal_and_delete_values() {
     assert!(!combined(&json).contains(second));
     let revealed_json = run_cli(
         home.path(),
-        &["get", "/team/service", "--format", "json", "--reveal"],
+        &[
+            "get",
+            "/team/service",
+            "--tree",
+            "--format",
+            "json",
+            "--reveal",
+        ],
     )
     .await;
     assert_success(&revealed_json);
@@ -642,7 +667,7 @@ async fn secret_commands_mask_preserve_rotate_reveal_and_delete_values() {
     assert!(revealed_json.stderr.is_empty());
     let revealed = run_cli(
         home.path(),
-        &["secret", "reveal", "/team/service/credential"],
+        &["get", "/team/service/credential", "--reveal"],
     )
     .await;
     assert_eq!(String::from_utf8_lossy(&revealed.stdout), second);
@@ -658,7 +683,7 @@ async fn secret_commands_mask_preserve_rotate_reveal_and_delete_values() {
     assert!(!combined(&deleted).contains(second));
     let missing = run_cli(
         home.path(),
-        &["secret", "reveal", "/team/service/credential"],
+        &["get", "/team/service/credential", "--reveal"],
     )
     .await;
     assert!(!missing.status.success());
@@ -688,18 +713,28 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
         ("/team/service/foo/foo2/foo3/deepvalue", "deepvalue"),
         ("/team/service/foo/second/abc", "bar"),
     ] {
-        assert_success(&run_cli_with_input(home.path(), &["put", path], Some(value)).await);
+        assert_success(&run_cli_with_input(home.path(), &["set", path], Some(value)).await);
     }
 
-    let text_subtree = run_cli(home.path(), &["get", "/team/service/apps"]).await;
-    assert!(!text_subtree.status.success());
-    assert!(
-        combined(&text_subtree).contains("JSON format is required to read a configuration subtree")
+    // An exact read of a namespace asks for the one value at that path, which
+    // does not exist; the descendants below it are not an answer to it.
+    let exact_namespace = run_cli(home.path(), &["get", "/team/service/apps"]).await;
+    assert!(!exact_namespace.status.success());
+    assert!(combined(&exact_namespace).contains("configuration value not found"));
+
+    // `--tree` reads the same namespace, keyed by absolute path, with the
+    // embedded newline escaped so one value stays one line.
+    let plain_subtree = run_cli(home.path(), &["get", "/TEAM/SERVICE/APPS", "--tree"]).await;
+    assert_success(&plain_subtree);
+    assert_eq!(
+        String::from_utf8_lossy(&plain_subtree.stdout),
+        "/team/service/apps/enabled=true\n\
+         /team/service/apps/nested/message=hello\\nworld\n"
     );
 
     let json = run_cli(
         home.path(),
-        &["get", "/TEAM/SERVICE/APPS", "--format", "json"],
+        &["get", "/TEAM/SERVICE/APPS", "--tree", "--format", "json"],
     )
     .await;
     assert_success(&json);
@@ -710,7 +745,13 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
 
     let deep_json = run_cli(
         home.path(),
-        &["get", "/team/service/foo/foo2/foo3", "--format", "json"],
+        &[
+            "get",
+            "/team/service/foo/foo2/foo3",
+            "--tree",
+            "--format",
+            "json",
+        ],
     )
     .await;
     assert_success(&deep_json);
@@ -718,19 +759,19 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
 
     let partial_segment = run_cli(
         home.path(),
-        &["get", "/team/service/foo/s", "--format", "json"],
+        &["get", "/team/service/foo/s", "--tree", "--format", "json"],
     )
     .await;
     assert_success(&partial_segment);
     assert_eq!(partial_segment.stdout, b"{}\n");
     assert_success(
-        &run_cli_with_input(home.path(), &["put", "/team/service/foo/s"], Some("short")).await,
+        &run_cli_with_input(home.path(), &["set", "/team/service/foo/s"], Some("short")).await,
     );
     assert_success(&run_cli(home.path(), &["delete", "/team/service/foo/s", "--yes"]).await);
     assert_success(
         &run_cli_with_input(
             home.path(),
-            &["put", "/team/service/foo/s", "--format", "json"],
+            &["set", "/team/service/foo/s", "--tree"],
             Some("{\"child\":\"value\"}"),
         )
         .await,
@@ -738,7 +779,7 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
     assert_success(
         &run_cli(
             home.path(),
-            &["delete", "/team/service/foo/s", "--recurse", "--yes"],
+            &["delete", "/team/service/foo/s", "--tree", "--yes"],
         )
         .await,
     );
@@ -748,7 +789,7 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
 
     let replacement = run_cli_with_input(
         home.path(),
-        &["put", "/team/service/apps", "--format", "json"],
+        &["set", "/team/service/apps", "--tree"],
         Some("{\"enabled\":\"false\",\"new-value\":\"new\"}"),
     )
     .await;
@@ -756,7 +797,7 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
     assert_eq!(replacement.stdout, b"Subtree replaced\n");
     let replaced = run_cli(
         home.path(),
-        &["get", "/team/service/apps", "--format", "json"],
+        &["get", "/team/service/apps", "--tree", "--format", "json"],
     )
     .await;
     assert_success(&replaced);
@@ -774,7 +815,7 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
     assert_eq!(exact_json.stdout, b"\"false\"\n");
     let exact_replacement = run_cli_with_input(
         home.path(),
-        &["put", "/team/service/apps/enabled", "--format", "json"],
+        &["set", "/team/service/apps/enabled", "--tree"],
         Some("\"exact-json\""),
     )
     .await;
@@ -785,7 +826,7 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
 
     let invalid = run_cli_with_input(
         home.path(),
-        &["put", "/team/service/apps", "--format", "json"],
+        &["set", "/team/service/apps", "--tree"],
         Some("{\"enabled\":true}"),
     )
     .await;
@@ -798,7 +839,7 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
     assert_success(
         &run_cli_with_input(
             home.path(),
-            &["put", "/team/service/collision"],
+            &["set", "/team/service/collision"],
             Some("parent"),
         )
         .await,
@@ -806,14 +847,20 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
     assert_success(
         &run_cli_with_input(
             home.path(),
-            &["put", "/team/service/collision/child"],
+            &["set", "/team/service/collision/child"],
             Some("child"),
         )
         .await,
     );
     let collision = run_cli(
         home.path(),
-        &["get", "/team/service/collision", "--format", "json"],
+        &[
+            "get",
+            "/team/service/collision",
+            "--tree",
+            "--format",
+            "json",
+        ],
     )
     .await;
     assert!(!collision.status.success());
@@ -821,14 +868,14 @@ async fn json_subtrees_replace_atomically_and_recursive_delete_respects_boundari
 
     let deleted = run_cli(
         home.path(),
-        &["delete", "/team/service/apps", "--recurse", "--yes"],
+        &["delete", "/team/service/apps", "--tree", "--yes"],
     )
     .await;
     assert_success(&deleted);
     assert_eq!(deleted.stdout, b"Subtree deleted\n");
     let empty = run_cli(
         home.path(),
-        &["get", "/team/service/apps", "--format", "json"],
+        &["get", "/team/service/apps", "--tree", "--format", "json"],
     )
     .await;
     assert_success(&empty);
@@ -859,7 +906,7 @@ async fn json_root_operations_require_a_root_profile() {
         )
         .await,
     );
-    let outside = run_cli(home.path(), &["get", "/", "--format", "json"]).await;
+    let outside = run_cli(home.path(), &["get", "/", "--tree", "--format", "json"]).await;
     assert!(!outside.status.success());
     assert!(combined(&outside).contains("path is outside the selected profile root"));
 
@@ -874,14 +921,22 @@ async fn json_root_operations_require_a_root_profile() {
     );
     let root_put = run_cli_with_input(
         home.path(),
-        &["--profile", "root", "put", "/", "--format", "json"],
+        &["--profile", "root", "set", "/", "--tree"],
         Some("{\"root-value\":\"stored\"}"),
     )
     .await;
     assert_success(&root_put);
     let root_get = run_cli(
         home.path(),
-        &["--profile", "root", "get", "/", "--format", "json"],
+        &[
+            "--profile",
+            "root",
+            "get",
+            "/",
+            "--tree",
+            "--format",
+            "json",
+        ],
     )
     .await;
     assert_success(&root_get);
@@ -893,6 +948,337 @@ async fn json_root_operations_require_a_root_profile() {
         run_cli(home.path(), &["--profile", "root", "delete", "/", "--yes"]).await;
     assert!(!exact_root_delete.status.success());
     assert!(combined(&exact_root_delete).contains("path must name a configuration value"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_subtree_reads_key_every_value_by_absolute_path() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let connection = connection_url(&services, true, "team/service");
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["profile", "add", "managed"],
+            Some(&format!("{connection}\n")),
+        )
+        .await,
+    );
+
+    let secret = "plain-subtree-secret-sentinel";
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["set", "/team/service/db/Host"],
+            Some("pg.internal"),
+        )
+        .await,
+    );
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["set", "/team/service/db/password", "--secret"],
+            Some(secret),
+        )
+        .await,
+    );
+    assert_success(
+        &run_cli_with_input(home.path(), &["set", "/team/service/enabled"], Some("true")).await,
+    );
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["set", "/team/service/banner"],
+            Some("first\nsecond\r\nthird\\fourth"),
+        )
+        .await,
+    );
+
+    let masked = run_cli(home.path(), &["get", "/team/service", "--tree"]).await;
+    assert_success(&masked);
+    assert_eq!(
+        String::from_utf8_lossy(&masked.stdout),
+        "/team/service/banner=first\\nsecond\\r\\nthird\\\\fourth\n\
+         /team/service/db/host=pg.internal\n\
+         /team/service/db/password=********\n\
+         /team/service/enabled=true\n"
+    );
+    assert!(!combined(&masked).contains(secret));
+
+    let revealed = run_cli(
+        home.path(),
+        &["get", "/team/service/db", "--tree", "--reveal"],
+    )
+    .await;
+    assert_success(&revealed);
+    assert_eq!(
+        String::from_utf8_lossy(&revealed.stdout),
+        format!("/team/service/db/host=pg.internal\n/team/service/db/password={secret}\n")
+    );
+    assert!(revealed.stderr.is_empty());
+
+    // An emptied subtree prints nothing and still succeeds, matching JSON's `{}`.
+    assert_success(&run_cli(home.path(), &["delete", "/team/service", "--tree", "--yes"]).await);
+    let empty = run_cli(home.path(), &["get", "/team/service", "--tree"]).await;
+    assert_success(&empty);
+    assert_eq!(empty.stdout, b"");
+    assert_secrets_absent(&combined(&empty));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_shows_only_the_selected_paths_direct_children() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let connection = connection_url(&services, true, "team/service");
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["profile", "add", "managed"],
+            Some(&format!("{connection}\n")),
+        )
+        .await,
+    );
+
+    for (path, value) in [
+        ("/team/service/enabled", "true"),
+        ("/team/service/apps/api/port", "8080"),
+        ("/team/service/apps/web/port", "8081"),
+        ("/team/service/elsewhere/deep/leaf", "deep"),
+    ] {
+        assert_success(&run_cli_with_input(home.path(), &["set", path], Some(value)).await);
+    }
+
+    // `/team/service/apps/api` and `/team/service/elsewhere/deep` are readable
+    // namespaces too, but they are not children of `/team/service`.
+    let listed = run_cli(home.path(), &["list", "/team/service"]).await;
+    assert_success(&listed);
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout),
+        "/team/service/apps/\n/team/service/elsewhere/\n/team/service/enabled\n"
+    );
+
+    let nested = run_cli(
+        home.path(),
+        &["list", "/TEAM/SERVICE/APPS", "--format", "json"],
+    )
+    .await;
+    assert_success(&nested);
+    assert_eq!(
+        String::from_utf8_lossy(&nested.stdout),
+        "[\n  \"/team/service/apps/api/\",\n  \"/team/service/apps/web/\"\n]\n"
+    );
+
+    let leaf = run_cli(home.path(), &["list", "/team/service/apps/api"]).await;
+    assert_success(&leaf);
+    assert_eq!(leaf.stdout, b"/team/service/apps/api/port\n");
+
+    let outside = run_cli(home.path(), &["list", "/other"]).await;
+    assert!(!outside.status.success());
+    assert!(combined(&outside).contains("path is outside the selected profile root"));
+
+    assert_success(
+        &run_cli(
+            home.path(),
+            &[
+                "alias",
+                "/team/service/enabled",
+                "/team/service/Enabled-Too",
+            ],
+        )
+        .await,
+    );
+    let aliases = run_cli(
+        home.path(),
+        &[
+            "list",
+            "/team/service/enabled",
+            "--aliases",
+            "--format",
+            "json",
+        ],
+    )
+    .await;
+    assert_success(&aliases);
+    assert_eq!(
+        String::from_utf8_lossy(&aliases.stdout),
+        "[\n  \"/team/service/enabled\",\n  \"/team/service/enabled-too\"\n]\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn profiles_are_listed_by_name_with_the_default_marked_and_credentials_redacted() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+
+    // No configuration yet: an empty listing, not an error.
+    let empty = run_cli(home.path(), &["profile", "list"]).await;
+    assert_success(&empty);
+    assert_eq!(empty.stdout, b"");
+    let empty_json = run_cli(home.path(), &["profile", "list", "--format", "json"]).await;
+    assert_success(&empty_json);
+    assert_eq!(empty_json.stdout, b"[]\n");
+
+    // Added out of alphabetical order, and the first added is the default.
+    for (name, root) in [("prod", "team/service"), ("dev", "")] {
+        let url = connection_url(&services, name == "prod", root);
+        assert_success(
+            &run_cli_with_input(
+                home.path(),
+                &["profile", "add", name],
+                Some(&format!("{url}\n")),
+            )
+            .await,
+        );
+    }
+
+    let listed = run_cli(home.path(), &["profile", "list"]).await;
+    assert_success(&listed);
+    let plain = String::from_utf8_lossy(&listed.stdout).into_owned();
+    let lines: Vec<&str> = plain.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines[0].starts_with("  dev "),
+        "names order ahead of the default marker: {plain}"
+    );
+    assert!(
+        lines[1].starts_with("* prod"),
+        "the default profile is marked: {plain}"
+    );
+    // A confined profile shows the root it is confined to; an unconfined one
+    // shows only its endpoint.
+    assert!(lines[1].ends_with("/team/service"), "{plain}");
+    assert!(lines[0].ends_with(&services.endpoint), "{plain}");
+    assert_secrets_absent(&combined(&listed));
+
+    let json = run_cli(home.path(), &["profile", "list", "--format", "json"]).await;
+    assert_success(&json);
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("listing must be JSON");
+    let entries = parsed.as_array().expect("listing must be an array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["name"], "dev");
+    assert_eq!(entries[0]["default"], false);
+    assert_eq!(entries[0]["root"], "/");
+    assert_eq!(entries[1]["name"], "prod");
+    assert_eq!(entries[1]["default"], true);
+    assert_eq!(entries[1]["root"], "/team/service");
+    // `prod` is managed, so its URL must carry the mask, never the credential.
+    assert!(
+        entries[1]["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("client_secret=*")
+    );
+    assert_secrets_absent(&combined(&json));
+
+    assert_success(&run_cli(home.path(), &["profile", "default", "dev"]).await);
+    let moved = run_cli(home.path(), &["profile", "list"]).await;
+    assert_success(&moved);
+    assert!(
+        String::from_utf8_lossy(&moved.stdout).starts_with("* dev"),
+        "the marker follows the default"
+    );
+
+    // `--profile` selects a profile for operational commands, so it is
+    // rejected here exactly as it is on the other profile subcommands.
+    let overridden = run_cli(home.path(), &["--profile", "dev", "profile", "list"]).await;
+    assert!(!overridden.status.success());
+    assert!(combined(&overridden).contains("--profile applies only to operational commands"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_value_command_teaches_the_path_before_the_options() {
+    let home = TempDir::new().unwrap();
+    for (verb, expected) in [
+        ("get", "sovereign-config get <ABSOLUTE_PATH> [OPTIONS]"),
+        ("set", "sovereign-config set <ABSOLUTE_PATH> [OPTIONS]"),
+        (
+            "delete",
+            "sovereign-config delete <ABSOLUTE_PATH> [OPTIONS]",
+        ),
+        ("list", "sovereign-config list <ABSOLUTE_PATH> [OPTIONS]"),
+        (
+            "alias",
+            "sovereign-config alias <SOURCE_ABSOLUTE_PATH> <NEW_ABSOLUTE_PATH>",
+        ),
+    ] {
+        let help = run_cli(home.path(), &[verb, "--help"]).await;
+        assert_success(&help);
+        assert!(
+            String::from_utf8_lossy(&help.stdout).contains(expected),
+            "{verb} --help does not teach `{expected}`"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_replaced_command_spellings_no_longer_parse() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let connection = connection_url(&services, true, "team/service");
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["profile", "add", "managed"],
+            Some(&format!("{connection}\n")),
+        )
+        .await,
+    );
+    assert_success(
+        &run_cli_with_input(home.path(), &["set", "/team/service/value"], Some("kept")).await,
+    );
+
+    for (arguments, expected) in [
+        (
+            vec!["put", "/team/service/value"],
+            "unrecognized subcommand",
+        ),
+        (
+            vec!["secret", "put", "/team/service/value"],
+            "unrecognized subcommand",
+        ),
+        (
+            vec!["secret", "reveal", "/team/service/value"],
+            "unrecognized subcommand",
+        ),
+        (
+            vec!["alias", "add", "/team/service/value", "/team/service/other"],
+            "unexpected argument",
+        ),
+        (
+            vec!["delete", "/team/service/value", "--recurse", "--yes"],
+            "unexpected argument \'--recurse\'",
+        ),
+        (
+            vec!["get", "/team/service/value", "--format", "text"],
+            "invalid value \'text\'",
+        ),
+        (
+            vec!["set", "/team/service/value", "--format", "json"],
+            "unexpected argument \'--format\'",
+        ),
+        // `alias` now takes two paths, so the old noun is read as one — and
+        // rejected as a path rather than silently listing anything.
+        (
+            vec!["alias", "list", "/team/service/value"],
+            "path must name a configuration value",
+        ),
+    ] {
+        let output = run_cli(home.path(), &arguments).await;
+        assert!(
+            !output.status.success(),
+            "{arguments:?} should no longer be accepted"
+        );
+        assert!(
+            combined(&output).contains(expected),
+            "{arguments:?} did not report `{expected}`: {}",
+            combined(&output)
+        );
+    }
+
+    // Nothing above reached the service, so the value is untouched.
+    let kept = run_cli(home.path(), &["get", "/team/service/value"]).await;
+    assert_success(&kept);
+    assert_eq!(kept.stdout, b"kept");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1002,7 +1388,9 @@ async fn profiles_support_defaults_updates_and_global_overrides_without_revealin
         1
     );
 
-    for unsupported in ["list", "show", "remove"] {
+    // `list` left this set when it was implemented; `show` and `remove` are
+    // still not part of the profile surface.
+    for unsupported in ["show", "remove"] {
         let output = run_cli(home.path(), &["profile", unsupported]).await;
         assert!(!output.status.success());
         assert_secrets_absent(&combined(&output));
@@ -1230,7 +1618,7 @@ async fn core_managed_connection_urls_round_trip_the_stdin_profile_flow() {
     assert_success(&add);
     let put = run_cli_with_input(
         home.path(),
-        &["put", "/team/service/flag"],
+        &["set", "/team/service/flag"],
         Some("managed-flow-value"),
     )
     .await;
@@ -1308,7 +1696,7 @@ async fn rotated_managed_credentials_require_a_profile_update_with_the_new_url()
     assert_success(
         &run_cli_with_input(
             home.path(),
-            &["put", "/team/service/flag"],
+            &["set", "/team/service/flag"],
             Some("rotated-flow-value"),
         )
         .await,
