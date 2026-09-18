@@ -17,7 +17,7 @@
 //! names a file and `SOVEREIGN_CONFIG_URL` names a variable; neither is the URL
 //! itself.
 
-use std::{fs, path::Path};
+use std::{fs::File, io::Read, path::Path};
 
 use anyhow::{Context, Result, bail};
 use sovereign_config_core::ConnectionUrl;
@@ -67,22 +67,37 @@ fn profiles() -> Result<ProfileStore> {
 }
 
 fn from_file(path: &Path) -> Result<ConnectionUrl> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("connection URL file {} is unreadable", path.display()))?;
-    if metadata.len() > MAX_CONNECTION_URL_BYTES {
-        bail!(
-            "connection URL file {} is not a connection URL",
-            path.display()
-        );
-    }
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("connection URL file {} is unreadable", path.display()))?;
-    parse(&contents).with_context(|| {
+    let unreadable = || format!("connection URL file {} is unreadable", path.display());
+    let not_a_url = || {
         format!(
             "connection URL file {} is not a connection URL",
             path.display()
         )
-    })
+    };
+    // Bound the **read**, not the size the filesystem reports. A FIFO, a
+    // process substitution and every character device report length zero, so a
+    // guard on `metadata().len()` would wave all of them through and then read
+    // without limit — and for a regular file it is a stat that the file can
+    // outgrow before the read. Taking one byte more than the limit is enough to
+    // know the input is over it.
+    let mut contents = String::new();
+    File::open(path)
+        .with_context(unreadable)?
+        .take(MAX_CONNECTION_URL_BYTES + 1)
+        .read_to_string(&mut contents)
+        .with_context(unreadable)?;
+    if contents.len() as u64 > MAX_CONNECTION_URL_BYTES {
+        // Distinct from the parse refusal below, and deliberately so: it names
+        // the one thing the caller can act on, and it is the only externally
+        // visible difference between bounding the read and bounding a reported
+        // size — which is what lets a test tell the two apart without having to
+        // hang on an endless stream to prove it.
+        bail!(
+            "connection URL file {} is larger than {MAX_CONNECTION_URL_BYTES} bytes",
+            path.display()
+        );
+    }
+    parse(&contents).with_context(not_a_url)
 }
 
 /// Parses a URL that arrived as text, tolerating one trailing line ending.

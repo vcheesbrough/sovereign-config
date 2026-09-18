@@ -2187,6 +2187,39 @@ async fn the_credential_never_reaches_the_executed_command() {
     }
 }
 
+// The one deliberate exception to the stripping above, pinned so it cannot
+// change by accident in either direction. An application deployed by `render`
+// may itself use the provider SDK and need a connection URL of its own, so a
+// leaf named `SOVEREIGN_CONFIG_URL` reaches the command — while the credential
+// that read *this* configuration never does, whatever it was set to.
+#[tokio::test(flavor = "multi_thread")]
+async fn configuration_may_set_the_credential_variable_the_inherited_one_still_cannot() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let url = render_profile(home.path(), &services).await;
+    let its_own = "https://other.example.test/#v=1&issuer=x&client_id=y";
+    store_plain(home.path(), "/team/service/SOVEREIGN_CONFIG_URL", its_own).await;
+
+    let environment = rendered(
+        home.path(),
+        &["--profile", "deploy", "render", "/team/service"],
+        &[("SOVEREIGN_CONFIG_URL", &url)],
+    )
+    .await;
+
+    assert_eq!(environment["SOVEREIGN_CONFIG_URL"], its_own);
+    assert!(
+        !environment["SOVEREIGN_CONFIG_URL"].contains(MANAGED_CREDENTIAL),
+        "the inherited credential survived under the configured value"
+    );
+    for value in environment.values() {
+        assert!(
+            !value.contains(MANAGED_CREDENTIAL),
+            "the credential reached the command"
+        );
+    }
+}
+
 // There is no shell between `render` and the command, so a value that looks
 // like shell syntax is data. This is the property that makes it safe to point
 // at a production deploy.
@@ -2498,6 +2531,67 @@ async fn render_teaches_the_paths_before_the_options_and_the_command_last() {
             .contains("sovereign-config render [<ABSOLUTE_PATH>...] [OPTIONS] -- <cmd> [args...]"),
         "render --help does not teach the path-after-verb spelling"
     );
+}
+
+// A FIFO — and a process substitution, and every character device — reports
+// length zero, so a guard on the size the filesystem reports would wave one
+// through and then read it without limit. `--url-file` must work for these and
+// still be bounded by the bytes it actually reads. PR #28 self-review.
+//
+// The oversized case asserts the *size* refusal specifically, not merely a
+// failure. Bounding a reported size would let those bytes through and refuse
+// them later at parsing, with a different message — so this distinguishes the
+// two implementations without having to hang on an endless stream to do it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_url_stream_reporting_no_length_is_accepted_and_still_bounded() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let url = connection_url(&services, true, "team/service");
+
+    for (name, contents, expected) in [
+        ("usable.fifo", format!("{url}\n"), None),
+        (
+            "oversized.fifo",
+            "x".repeat(16 * 1024 + 1),
+            Some("is larger than 16384 bytes"),
+        ),
+    ] {
+        let fifo = home.path().join(name);
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo should run")
+                .success(),
+            "could not create {name}"
+        );
+        // Opening a FIFO for writing blocks until a reader arrives, so the
+        // writer has to be running while the CLI reads. It writes a finite
+        // amount and closes, which is what gives the reader its EOF.
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                let _ = fs::write(&fifo, contents);
+            })
+        };
+
+        let output = run_cli(
+            home.path(),
+            &["--url-file", fifo.to_str().unwrap(), "status"],
+        )
+        .await;
+        writer.join().expect("the writer thread should finish");
+
+        let combined = combined(&output);
+        match expected {
+            None => assert_success(&output),
+            Some(message) => {
+                assert!(!output.status.success(), "oversized stream accepted");
+                assert!(combined.contains(message), "unexpected refusal: {combined}");
+            }
+        }
+        assert_secrets_absent(&combined);
+    }
 }
 
 // `--url-file` is a global credential input, so it belongs to operational

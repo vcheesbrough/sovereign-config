@@ -155,6 +155,8 @@ Three properties make this safe to point at a production deploy:
 - **The process is replaced, not wrapped.** The command's exit status and signal disposition are `render`'s own, with no supervisor in between.
 - **It fails closed.** Every read happens before the exec, so a credential, read, reveal, confinement or naming failure means the command **never runs at all**, rather than running against a half-populated environment. A layer that contributes no variables is itself a failure: the service answers an absent subtree with an empty list, so a mistyped path is indistinguishable from a real but empty one, and neither is worth launching a deploy over.
 
+  That cuts both ways, deliberately. An override layer you have not populated yet must be left off the command line until it holds something, and `render` against a connection root with no values at all will not start a command — there is no layer to drop in that case, so give the root a value first. Both are the same refusal: a layer named on the command line was named because it was meant to contribute.
+
 `render` is a read; nothing is written to disk and no output mode other than the exec form exists yet.
 
 #### Credential inputs
