@@ -1,16 +1,17 @@
 //! A caching client-credentials token provider.
 //!
-//! `sovereign-config-provider` deliberately acquires a fresh token per load.
-//! The broker is a long-lived service on the pipeline-start path, so it caches
-//! instead — but conservatively:
+//! `sovereign-config-provider` deliberately acquires a fresh token per load, and
+//! so does the CLI, which runs once and exits. A long-lived service on the
+//! pipeline-start path — the Woodpecker broker — caches instead, but
+//! conservatively:
 //!
 //! - the cached lifetime is `min(expires_in - skew, ceiling)`, floored, so a
 //!   provider that reports an implausibly long life still gets re-checked;
 //! - `expires_in` is optional in OAuth 2.0, so its absence falls back to the
 //!   ceiling rather than caching indefinitely;
-//! - the cache can be invalidated, and the reader does so on any
-//!   `Unauthenticated` response. Without that, a token revoked before it lapsed
-//!   would break every request until the TTL ran out.
+//! - the cache can be invalidated, and [`LayerReader`](crate::LayerReader) does
+//!   so on any `Unauthenticated` response. Without that, a token revoked before
+//!   it lapsed would break every request until the TTL ran out.
 //!
 //! Lives on the reader thread, so interior mutability is a plain [`RefCell`]
 //! and the provider is `!Send` like everything else here.
@@ -25,14 +26,16 @@ use sovereign_config_client::AccessTokenProvider;
 use sovereign_config_core::{ClientError, Secret};
 use sovereign_config_native::DeviceFlowClient;
 
+use crate::reader::InvalidatableToken;
+
 /// Re-acquire this far before the reported expiry, to cover the round trip and
-/// clock skew between the broker and the issuer.
+/// clock skew between the consumer and the issuer.
 const REFRESH_SKEW: Duration = Duration::from_secs(30);
 /// Never cache for less than this, so a pathological `expires_in` cannot turn
 /// every request into two round trips.
 const MIN_TTL: Duration = Duration::from_secs(15);
 
-pub(crate) struct CachedTokenProvider {
+pub struct CachedTokenProvider {
     issuer: String,
     client_id: String,
     authentication: Secret,
@@ -41,7 +44,8 @@ pub(crate) struct CachedTokenProvider {
 }
 
 impl CachedTokenProvider {
-    pub(crate) fn new(
+    #[must_use]
+    pub fn new(
         issuer: String,
         client_id: String,
         authentication: Secret,
@@ -54,14 +58,6 @@ impl CachedTokenProvider {
             ceiling,
             cached: RefCell::new(None),
         }
-    }
-
-    /// Drops the cached token so the next request acquires a fresh one.
-    ///
-    /// Called when the service rejects a token the cache still considered
-    /// valid — the authoritative signal that it is not.
-    pub(crate) fn invalidate(&self) {
-        self.cached.borrow_mut().take();
     }
 
     fn cached_token(&self) -> Option<Secret> {
@@ -94,13 +90,23 @@ impl AccessTokenProvider for CachedTokenProvider {
     }
 }
 
+impl InvalidatableToken for CachedTokenProvider {
+    /// Drops the cached token so the next request acquires a fresh one.
+    ///
+    /// Called when the service rejects a token the cache still considered
+    /// valid — the authoritative signal that it is not.
+    fn invalidate(&self) {
+        self.cached.borrow_mut().take();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use sovereign_config_core::Secret;
 
-    use super::{CachedTokenProvider, MIN_TTL};
+    use super::{CachedTokenProvider, InvalidatableToken, MIN_TTL};
 
     fn provider(ceiling: Duration) -> CachedTokenProvider {
         CachedTokenProvider::new(

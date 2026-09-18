@@ -1,0 +1,21 @@
+[package]
+name = "sovereign-config-layers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ordered configuration-layer reading and merging, shared by the CLI and the Woodpecker broker"
+
+[dependencies]
+async-trait.workspace = true
+sovereign-config-client = { path = "../sovereign-config-client" }
+sovereign-config-core = { path = "../sovereign-config-core" }
+sovereign-config-native = { path = "../sovereign-config-native" }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
