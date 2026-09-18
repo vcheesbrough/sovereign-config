@@ -84,6 +84,15 @@ sovereign-config logout
 
 Use `sovereign-config profile update <name>` to replace a URL and `sovereign-config profile default <name>` to change the default. A URL can instead be supplied as exactly one line on standard input. Profile URLs are never accepted as process arguments. Operational commands accept a global override, for example `sovereign-config --profile prod status`.
 
+`sovereign-config profile list` shows the stored profiles by name, marking the default with `*` and naming the server each one points at — its endpoint, followed by the configuration root when the profile is confined to one:
+
+```
+  dev         https://sovereign-config-dev.desync.link
+* prod        https://sovereign-config.desync.link/team/service
+```
+
+`--format json` instead renders an array of `{ "name", "default", "endpoint", "root", "url" }`, where `url` is the whole connection URL with any managed credential replaced by `*`. **Nothing a listing prints is a secret** — but the file it reads is not safe to print, because a managed profile's stored URL embeds its credential. Use this command rather than reading `config.toml`. Listing succeeds with an empty result before the first profile is added.
+
 Every value command reads `sovereign-config <verb> <ABSOLUTE_PATH> [OPTIONS]` — the path comes immediately after the verb — and acts on **exactly one value**. Add `--tree` and the same command acts on the whole subtree at that path instead: that is the only way to select subtree scope. `--format` then means one thing only, how a read is rendered: `plain` (the default) or `json`.
 
 Every command path is absolute, begins with `/`, and is ASCII case-insensitive: `/x/FOO` and `/x/foo` are the same value, resolved and authorized without regard to case. This is case-**retentive**, not case-sensitive — the service is a case-preserving store like APFS or NTFS. The first write of a path stores the exact case it was given; later writes through a differently-cased spelling of that same path update the value but leave its case exactly as first established. Reads, listings, and subtree keys return whatever case is currently established, which may not match the case just typed. Changing an established path's case requires deleting it and writing it again under the new spelling — there is no rename. Segments contain only letters, digits, `-`, and `_` — the full grammar is `/` or `^/[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$`. A profile with a configured root accepts only absolute paths within that subtree. Written content is read from standard input so it never appears in process arguments. Interactive deletion requires typing `delete`; automation must pass `--yes` explicitly.

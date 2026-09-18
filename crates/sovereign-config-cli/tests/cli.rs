@@ -1105,6 +1105,87 @@ async fn list_shows_only_the_selected_paths_direct_children() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn profiles_are_listed_by_name_with_the_default_marked_and_credentials_redacted() {
+    let services = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+
+    // No configuration yet: an empty listing, not an error.
+    let empty = run_cli(home.path(), &["profile", "list"]).await;
+    assert_success(&empty);
+    assert_eq!(empty.stdout, b"");
+    let empty_json = run_cli(home.path(), &["profile", "list", "--format", "json"]).await;
+    assert_success(&empty_json);
+    assert_eq!(empty_json.stdout, b"[]\n");
+
+    // Added out of alphabetical order, and the first added is the default.
+    for (name, root) in [("prod", "team/service"), ("dev", "")] {
+        let url = connection_url(&services, name == "prod", root);
+        assert_success(
+            &run_cli_with_input(
+                home.path(),
+                &["profile", "add", name],
+                Some(&format!("{url}\n")),
+            )
+            .await,
+        );
+    }
+
+    let listed = run_cli(home.path(), &["profile", "list"]).await;
+    assert_success(&listed);
+    let plain = String::from_utf8_lossy(&listed.stdout).into_owned();
+    let lines: Vec<&str> = plain.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines[0].starts_with("  dev "),
+        "names order ahead of the default marker: {plain}"
+    );
+    assert!(
+        lines[1].starts_with("* prod"),
+        "the default profile is marked: {plain}"
+    );
+    // A confined profile shows the root it is confined to; an unconfined one
+    // shows only its endpoint.
+    assert!(lines[1].ends_with("/team/service"), "{plain}");
+    assert!(lines[0].ends_with(&services.endpoint), "{plain}");
+    assert_secrets_absent(&combined(&listed));
+
+    let json = run_cli(home.path(), &["profile", "list", "--format", "json"]).await;
+    assert_success(&json);
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("listing must be JSON");
+    let entries = parsed.as_array().expect("listing must be an array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["name"], "dev");
+    assert_eq!(entries[0]["default"], false);
+    assert_eq!(entries[0]["root"], "/");
+    assert_eq!(entries[1]["name"], "prod");
+    assert_eq!(entries[1]["default"], true);
+    assert_eq!(entries[1]["root"], "/team/service");
+    // `prod` is managed, so its URL must carry the mask, never the credential.
+    assert!(
+        entries[1]["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("client_secret=*")
+    );
+    assert_secrets_absent(&combined(&json));
+
+    assert_success(&run_cli(home.path(), &["profile", "default", "dev"]).await);
+    let moved = run_cli(home.path(), &["profile", "list"]).await;
+    assert_success(&moved);
+    assert!(
+        String::from_utf8_lossy(&moved.stdout).starts_with("* dev"),
+        "the marker follows the default"
+    );
+
+    // `--profile` selects a profile for operational commands, so it is
+    // rejected here exactly as it is on the other profile subcommands.
+    let overridden = run_cli(home.path(), &["--profile", "dev", "profile", "list"]).await;
+    assert!(!overridden.status.success());
+    assert!(combined(&overridden).contains("--profile applies only to operational commands"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn every_value_command_teaches_the_path_before_the_options() {
     let home = TempDir::new().unwrap();
     for (verb, expected) in [
@@ -1307,7 +1388,9 @@ async fn profiles_support_defaults_updates_and_global_overrides_without_revealin
         1
     );
 
-    for unsupported in ["list", "show", "remove"] {
+    // `list` left this set when it was implemented; `show` and `remove` are
+    // still not part of the profile surface.
+    for unsupported in ["show", "remove"] {
         let output = run_cli(home.path(), &["profile", unsupported]).await;
         assert!(!output.status.success());
         assert_secrets_absent(&combined(&output));

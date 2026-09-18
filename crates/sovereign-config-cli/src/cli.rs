@@ -53,8 +53,8 @@ pub enum Command {
         /// Return secret plaintext instead of the mask
         #[arg(long)]
         reveal: bool,
-        #[arg(long, value_enum, default_value_t = ValueFormat::Plain)]
-        format: ValueFormat,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Plain)]
+        format: OutputFormat,
     },
     /// Write one configuration value, or replace the subtree at that path
     #[command(override_usage = "sovereign-config set <ABSOLUTE_PATH> [OPTIONS]")]
@@ -89,8 +89,8 @@ pub enum Command {
         /// List every path resolving to the value at this path instead
         #[arg(long)]
         aliases: bool,
-        #[arg(long, value_enum, default_value_t = ValueFormat::Plain)]
-        format: ValueFormat,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Plain)]
+        format: OutputFormat,
     },
     /// Expose an existing configuration value at an additional path
     #[command(override_usage = "sovereign-config alias <SOURCE_ABSOLUTE_PATH> <NEW_ABSOLUTE_PATH>")]
@@ -108,9 +108,10 @@ pub enum Command {
     },
 }
 
-/// How a read is rendered. Plain is line oriented; JSON is byte exact.
+/// How a read is rendered. Plain is line oriented and meant to be read; JSON
+/// is byte exact and meant to be parsed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum ValueFormat {
+pub enum OutputFormat {
     Plain,
     Json,
 }
@@ -119,6 +120,11 @@ pub enum ValueFormat {
 pub enum ProfileCommand {
     /// Add a profile from a connection URL read at a hidden prompt
     Add { name: String },
+    /// List the stored profiles and mark the default one
+    List {
+        #[arg(long, value_enum, default_value_t = OutputFormat::Plain)]
+        format: OutputFormat,
+    },
     /// Replace a profile's connection URL
     Update { name: String },
     /// Select the profile used when `--profile` is absent

@@ -11,7 +11,7 @@ use sovereign_config_core::{
     parse_subtree_json, render_subtree_json, render_subtree_plain,
 };
 
-use crate::cli::ValueFormat;
+use crate::cli::OutputFormat;
 use crate::session::{OperationalClient, Scope, operation_path, operational_client};
 
 /// Reads one value, or every value at or below the path when `tree` is set.
@@ -25,7 +25,7 @@ pub async fn get(
     path: &str,
     tree: bool,
     reveal: bool,
-    format: ValueFormat,
+    format: OutputFormat,
 ) -> Result<()> {
     if tree {
         get_tree(connection, path, reveal, format).await
@@ -38,7 +38,7 @@ async fn get_exact(
     connection: &ConnectionUrl,
     path: &str,
     reveal: bool,
-    format: ValueFormat,
+    format: OutputFormat,
 ) -> Result<()> {
     let path = operation_path(connection, path, Scope::Exact)?;
     let client = operational_client(connection).await?;
@@ -61,8 +61,8 @@ async fn get_exact(
         found.value.display_text().to_owned()
     };
     match format {
-        ValueFormat::Plain => print!("{text}"),
-        ValueFormat::Json => print!(
+        OutputFormat::Plain => print!("{text}"),
+        OutputFormat::Json => print!(
             "{}",
             render_subtree_json(
                 &path,
@@ -80,7 +80,7 @@ async fn get_tree(
     connection: &ConnectionUrl,
     path: &str,
     reveal: bool,
-    format: ValueFormat,
+    format: OutputFormat,
 ) -> Result<()> {
     let path = operation_path(connection, path, Scope::Tree)?;
     let client = operational_client(connection).await?;
@@ -91,8 +91,8 @@ async fn get_tree(
     print!(
         "{}",
         match format {
-            ValueFormat::Plain => render_subtree_plain(&path, &subtree.values)?,
-            ValueFormat::Json => render_subtree_json(&path, &subtree.values)?,
+            OutputFormat::Plain => render_subtree_plain(&path, &subtree.values)?,
+            OutputFormat::Json => render_subtree_json(&path, &subtree.values)?,
         }
     );
     Ok(())
@@ -200,7 +200,7 @@ pub async fn list(
     connection: &ConnectionUrl,
     path: &str,
     aliases: bool,
-    format: ValueFormat,
+    format: OutputFormat,
 ) -> Result<()> {
     // `--aliases` names one value's own paths, so it takes the exact grammar;
     // a namespace listing takes the subtree grammar and may be the tree root.
@@ -219,12 +219,12 @@ pub async fn list(
         direct_children(&path, &client.list_values(&path).await?)
     };
     match format {
-        ValueFormat::Plain => {
+        OutputFormat::Plain => {
             for entry in &entries {
                 println!("{entry}");
             }
         }
-        ValueFormat::Json => println!("{}", serde_json::to_string_pretty(&entries)?),
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&entries)?),
     }
     Ok(())
 }

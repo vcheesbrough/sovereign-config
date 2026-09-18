@@ -3,11 +3,13 @@
 
 use std::io::{self, IsTerminal, Read};
 
+use serde_json::{Value, json};
+
 use anyhow::{Result, anyhow, bail};
 use sovereign_config_core::ConnectionUrl;
-use sovereign_config_native::ProfileStore;
+use sovereign_config_native::{ListedProfile, ProfileStore};
 
-use crate::cli::ProfileCommand;
+use crate::cli::{OutputFormat, ProfileCommand};
 use crate::session::credential_store;
 
 const MAX_CONNECTION_URL_BYTES: u64 = 16 * 1024;
@@ -44,6 +46,55 @@ pub fn manage_profile(command: ProfileCommand, profiles: &ProfileStore) -> Resul
         ProfileCommand::Default { name } => {
             profiles.set_default(&name)?;
             println!("Default profile updated");
+        }
+        ProfileCommand::List { format } => list_profiles(&profiles.list()?, format)?,
+    }
+    Ok(())
+}
+
+/// Prints the stored profiles. Nothing here is secret: a managed profile's
+/// URL arrives with its credential already replaced by `*`.
+fn list_profiles(profiles: &[ListedProfile], format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Plain => {
+            // Pad to the longest name so the endpoints line up, and mark the
+            // default with `*` in a leading column, as `git branch` does.
+            let width = profiles
+                .iter()
+                .map(|profile| profile.name.len())
+                .max()
+                .unwrap_or_default();
+            for profile in profiles {
+                let marker = if profile.is_default { '*' } else { ' ' };
+                // A confined profile reads as its endpoint plus the root it is
+                // confined to; an unconfined one is just the endpoint, since
+                // a bare trailing `/` would say nothing.
+                let root = if profile.root == "/" {
+                    ""
+                } else {
+                    &profile.root
+                };
+                println!(
+                    "{marker} {name:width$}  {endpoint}{root}",
+                    name = profile.name,
+                    endpoint = profile.endpoint,
+                );
+            }
+        }
+        OutputFormat::Json => {
+            let rendered: Vec<Value> = profiles
+                .iter()
+                .map(|profile| {
+                    json!({
+                        "name": profile.name,
+                        "default": profile.is_default,
+                        "endpoint": profile.endpoint,
+                        "root": profile.root,
+                        "url": profile.redacted_url,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&rendered)?);
         }
     }
     Ok(())
