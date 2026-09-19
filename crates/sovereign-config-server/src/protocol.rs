@@ -26,7 +26,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use http::{Request, Response};
+use http::{Method, Request, Response};
 use tonic::body::BoxBody;
 use tower::{Layer, Service};
 
@@ -64,6 +64,32 @@ fn route_version(path: &str, recognised: &[&'static str]) -> Option<&'static str
         .iter()
         .copied()
         .find(|candidate| *candidate == version)
+}
+
+/// How a request relates to the per-version metric.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Attribution {
+    /// A well-formed call on a protocol version this build serves.
+    Served(&'static str),
+    /// A call addressed to `sovereign.config` that names no served version, or
+    /// is not shaped like a call at all.
+    Unrecognised,
+    /// Not protocol traffic: counted nowhere and given no extension.
+    NotProtocolTraffic,
+}
+
+/// Classifies a request for the per-version metric.
+///
+/// Only `POST` is protocol traffic. gRPC and gRPC-Web never use another method,
+/// while this port also serves web assets — so a crawler or probe issuing a
+/// plain `GET` against a versioned path is not a client of that version, and
+/// counting it would raise a standing false alarm in the `attempted` series
+/// that operators are told to investigate.
+fn attribute(method: &Method, path: &str, recognised: &[&'static str]) -> Attribution {
+    if *method != Method::POST || !path.starts_with("/sovereign.config.") {
+        return Attribution::NotProtocolTraffic;
+    }
+    route_version(path, recognised).map_or(Attribution::Unrecognised, Attribution::Served)
 }
 
 #[derive(Clone)]
@@ -122,21 +148,25 @@ where
         let replacement = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, replacement);
 
-        let version = route_version(request.uri().path(), self.recognised);
-        // A non-gRPC route — a web asset, a health probe — is not protocol
-        // traffic and must not inflate the unrecognised bucket, which exists to
-        // surface a *versioned* route this build does not know.
-        if let Some(version) = version {
-            self.metrics.record_attempted(version);
-            request
-                .extensions_mut()
-                .insert(NegotiatedProtocolVersion(Some(version)));
-        } else if request.uri().path().starts_with("/sovereign.config.") {
-            self.metrics
-                .record_attempted(crate::metrics::UNRECOGNISED_PROTOCOL_LABEL);
-            request
-                .extensions_mut()
-                .insert(NegotiatedProtocolVersion(None));
+        match attribute(request.method(), request.uri().path(), self.recognised) {
+            Attribution::Served(version) => {
+                self.metrics.record_attempted(version);
+                request
+                    .extensions_mut()
+                    .insert(NegotiatedProtocolVersion(Some(version)));
+            }
+            Attribution::Unrecognised => {
+                self.metrics
+                    .record_attempted(crate::metrics::UNRECOGNISED_PROTOCOL_LABEL);
+                request
+                    .extensions_mut()
+                    .insert(NegotiatedProtocolVersion(None));
+            }
+            // A web asset, a health probe, a crawler's GET: not protocol traffic,
+            // so it must not inflate any bucket — least of all the unrecognised
+            // one, which exists to surface a *versioned* call this build does
+            // not know.
+            Attribution::NotProtocolTraffic => {}
         }
 
         Box::pin(async move { inner.call(request).await })
@@ -148,7 +178,9 @@ mod serving_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::route_version;
+    use http::Method;
+
+    use super::{Attribution, attribute, route_version};
     use crate::metrics::ProtocolMetrics;
 
     const RECOGNISED: [&str; 2] = ["v3", "vtest"];
@@ -198,6 +230,58 @@ mod tests {
             "/sovereign.config.v3.System/GetVersion/extra",
         ] {
             assert_eq!(route_version(path, &RECOGNISED), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn only_post_is_attributed_to_a_protocol_version() {
+        let path = "/sovereign.config.v3.System/GetVersion";
+
+        assert_eq!(
+            attribute(&Method::POST, path, &RECOGNISED),
+            Attribution::Served("v3")
+        );
+        // gRPC and gRPC-Web are POST-only, and this port also serves web assets,
+        // so any other method on a versioned path is a crawler or a probe rather
+        // than a client of that version.
+        for method in [
+            Method::GET,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::PUT,
+            Method::DELETE,
+        ] {
+            assert_eq!(
+                attribute(&method, path, &RECOGNISED),
+                Attribution::NotProtocolTraffic,
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_post_to_an_unserved_or_malformed_versioned_path_is_unrecognised() {
+        for path in [
+            "/sovereign.config.v99.System/GetVersion",
+            "/sovereign.config.v3",
+            "/sovereign.config.v3.System",
+        ] {
+            assert_eq!(
+                attribute(&Method::POST, path, &RECOGNISED),
+                Attribution::Unrecognised,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn routes_outside_the_package_namespace_are_not_protocol_traffic() {
+        for path in ["/grpc.health.v1.Health/Check", "/assets/index.js", "/"] {
+            assert_eq!(
+                attribute(&Method::POST, path, &RECOGNISED),
+                Attribution::NotProtocolTraffic,
+                "{path}"
+            );
         }
     }
 

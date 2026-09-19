@@ -14,6 +14,15 @@ pub enum RpcCode {
     Unauthenticated,
     PermissionDenied,
     FailedPrecondition,
+    /// The server has no handler for the route that was called.
+    ///
+    /// For a client built from one protocol version's stubs this means the
+    /// server does not speak what the client speaks: either that version's
+    /// package has been retired, or the server predates an RPC the client
+    /// relies on. It is what an already-connected client sees on its next call
+    /// after a retirement, so it must read as a protocol incompatibility rather
+    /// than an opaque internal error.
+    Unimplemented,
     InvalidArgument,
     NotFound,
     AlreadyExists,
@@ -30,7 +39,7 @@ pub fn map_rpc_status(code: RpcCode) -> ClientError {
         RpcCode::PermissionDenied => {
             ClientError::new(ErrorKind::PermissionDenied, "permission denied")
         }
-        RpcCode::FailedPrecondition => ClientError::new(
+        RpcCode::FailedPrecondition | RpcCode::Unimplemented => ClientError::new(
             ErrorKind::IncompatibleProtocol,
             "service protocol is incompatible",
         ),
@@ -468,5 +477,17 @@ mod tests {
             map_rpc_status(RpcCode::Unavailable).to_string(),
             "service is unavailable"
         );
+    }
+
+    /// `UNIMPLEMENTED` is what a client built from one version's stubs sees once
+    /// the server stops routing that version, so it has to read as a protocol
+    /// incompatibility. Left to fall through to `Other`, a retirement would
+    /// surface to every still-connected client as an opaque internal error.
+    #[test]
+    fn a_route_the_server_does_not_implement_is_a_protocol_incompatibility() {
+        let error = map_rpc_status(RpcCode::Unimplemented);
+
+        assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
+        assert_eq!(error, map_rpc_status(RpcCode::FailedPrecondition));
     }
 }

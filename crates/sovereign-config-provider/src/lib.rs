@@ -65,8 +65,12 @@
 //!
 //! A build fails only once the server has *retired* every version this crate
 //! speaks — an announced, observable event rather than a side effect of an
-//! upgrade. See `## Protocol versioning` in the repository `README.md` for the
-//! deprecation procedure and the metric that gates it.
+//! upgrade. Either way it surfaces as [`ProviderError::IncompatibleProtocol`]:
+//! from [`Provider::connect`] when no version is shared, and from
+//! [`Provider::load`] for a provider that connected *before* the retirement,
+//! whose next call reaches a route the server no longer has. See
+//! `## Protocol versioning` in the repository `README.md` for the deprecation
+//! procedure and the metric that gates it.
 //!
 //! Release 2.15.0 widened the canonical path grammar to permit `_` in segments.
 //! A build older than 2.15.0 rejects such a path as non-canonical and fails the

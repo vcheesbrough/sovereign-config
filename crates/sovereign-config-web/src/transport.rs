@@ -603,6 +603,7 @@ fn grpc_status_code(status: u16) -> RpcCode {
         7 => RpcCode::PermissionDenied,
         9 => RpcCode::FailedPrecondition,
         10 | 14 => RpcCode::Unavailable,
+        12 => RpcCode::Unimplemented,
         16 => RpcCode::Unauthenticated,
         _ => RpcCode::Other,
     }
