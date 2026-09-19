@@ -6,13 +6,13 @@ mod tests {
 
     use async_trait::async_trait;
     use sovereign_config_client::{
-        AccessTokenProvider, Client, Transport, ValueTransport, VersionReply,
+        AccessTokenProvider, Client, Handshake, Transport, ValueTransport, VersionReply,
     };
     use sovereign_config_core::{
         AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind,
-        ListedValue, MaskedSecret, PlainValue, PutMetadata, ReplaceMetadata, RevealedSecret,
-        Secret, SecretInput, SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, Timestamp,
-        ValueContent, ValueListing, ValuePaths, ValueSubTree,
+        ListedValue, MaskedSecret, PlainValue, ProtocolVersion, PutMetadata, ReplaceMetadata,
+        RevealedSecret, Secret, SecretInput, SubTreeMutationContent, SubTreeMutationValue,
+        SubTreeValue, Timestamp, ValueContent, ValueListing, ValuePaths, ValueSubTree,
     };
 
     #[derive(Clone)]
@@ -32,16 +32,22 @@ mod tests {
         values: RefCell<BTreeMap<ConfigPath, StoredValue>>,
     }
 
+    /// A consumer's own transport negotiates like any other: it is asked for
+    /// one version, on that version's routes, and answers with the set it
+    /// serves.
     #[async_trait(?Send)]
-    impl Transport for ConsumerTransport {
-        async fn get_version(&self, protocol_version: &str) -> Result<VersionReply, ClientError> {
+    impl Handshake for ConsumerTransport {
+        async fn get_version(&self, version: ProtocolVersion) -> Result<VersionReply, ClientError> {
             Ok(VersionReply {
                 application_version: "consumer-fixture".into(),
-                protocol_version: protocol_version.into(),
-                supported_protocol_versions: vec![protocol_version.into()],
+                protocol_version: version.as_str().into(),
+                supported_protocol_versions: vec![version.as_str().into()],
             })
         }
+    }
 
+    #[async_trait(?Send)]
+    impl Transport for ConsumerTransport {
         async fn get_identity(&self, _: &Secret) -> Result<AuthenticationStatus, ClientError> {
             Ok(AuthenticationStatus {
                 authenticated: true,

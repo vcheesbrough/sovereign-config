@@ -9,4 +9,4 @@ mod transport;
 pub use credentials::{CredentialStore, default_credential_directory};
 pub use oidc::{DeviceAuthorization, DeviceFlowClient, TokenSet};
 pub use profiles::{ListedProfile, ProfileStore, default_profile_path};
-pub use transport::TonicTransport;
+pub use transport::{TonicChannel, TonicTransport};

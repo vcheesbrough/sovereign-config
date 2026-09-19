@@ -607,7 +607,13 @@ async fn a_server_newer_than_this_build_still_connects() {
         .await
         .expect("a server still serving v3 must connect");
 
-    // And the session works, not merely the handshake.
+    // A version this build does not speak is never dialled, however new it is:
+    // the session settles on the highest version *both* ends speak, and that is
+    // the version its traffic is counted under.
+    assert_eq!(provider.protocol_version(), "v3");
+    // And the session works, not merely the handshake. The mock serves only the
+    // `sovereign.config.v3` routes, so a load that succeeds is a load that was
+    // dialled on v3 — the assertion above, made on the wire.
     let loaded: serde_json::Value = provider.load().await.expect("load must succeed");
     assert_eq!(loaded["feature"], "on");
 }

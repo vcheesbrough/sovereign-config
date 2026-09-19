@@ -32,10 +32,11 @@ impl ProtocolVersion {
     /// inverts `sovereign_config_protocol_requests_total`, which is the gate for
     /// retiring a version, so it would report the live version as dead.
     ///
-    /// `sovereign-config-native` and `sovereign-config-web` each assert that the
-    /// versions they dispatch equal this list, so adding a variant fails their
-    /// tests until the routes exist. Do not silence those tests — they are the
-    /// only thing standing between a new variant and that inversion.
+    /// That cannot be reached by accident. Adding a variant to this enum is a
+    /// **compile error** in `sovereign-config-native` and `sovereign-config-web`
+    /// until each has a dialer for it: both select their route set with an
+    /// exhaustive `match` over [`ProtocolVersion`]. Write the dialer, and the
+    /// build goes green; there is nothing to remember and no test to silence.
     pub const ALL: &'static [Self] = &[Self::V3];
 
     /// The version a client asks for when it has no reason to ask for an older

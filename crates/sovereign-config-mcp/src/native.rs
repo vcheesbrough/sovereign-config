@@ -8,7 +8,7 @@
 //! or expands a delegated prefix.
 
 use async_trait::async_trait;
-use sovereign_config_client::{AccessTokenProvider, Client};
+use sovereign_config_client::{AccessTokenProvider, Client, negotiate};
 use sovereign_config_core::{
     AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl,
     DeleteMetadata, DisplayName, ErrorKind, ManagedConnectionMetadata, ManagedPermissions,
@@ -16,8 +16,8 @@ use sovereign_config_core::{
     SecretInput, ServiceStatus, SubTreeMutationValue, ValueListing, ValuePaths, ValueSubTree,
 };
 use sovereign_config_native::{
-    CredentialStore, DeviceFlowClient, ProfileStore, TonicTransport, default_credential_directory,
-    default_profile_path,
+    CredentialStore, DeviceFlowClient, ProfileStore, TonicChannel, TonicTransport,
+    default_credential_directory, default_profile_path,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -95,21 +95,36 @@ impl NativeBackend {
         &self,
     ) -> Result<Client<TonicTransport, InMemoryToken>, ClientError> {
         let connection = self.connection()?;
-        let transport = TonicTransport::connect(connection.endpoint().to_owned()).await?;
-        Client::new(transport.clone(), MissingToken)
-            .service_status()
-            .await?;
+        let (_, transport) = Self::negotiated(&connection).await?;
         let token = Self::access_token(&connection).await?;
         Ok(Client::new(transport, InMemoryToken(token)))
+    }
+
+    /// Connects and negotiates, returning what the service reported together
+    /// with the transport that speaks it. The two always travel as a pair, so
+    /// what this backend reports is what its later calls are routed on.
+    async fn negotiated(
+        connection: &ConnectionUrl,
+    ) -> Result<(ServiceStatus, TonicTransport), ClientError> {
+        let channel = TonicChannel::connect(connection.endpoint().to_owned()).await?;
+        let status = negotiate(&channel).await?;
+        let transport = channel.speaking(status.protocol_version);
+        Ok((status, transport))
     }
 }
 
 #[async_trait(?Send)]
 impl Backend for NativeBackend {
     async fn service_status(&self) -> Result<ServiceStatus, ClientError> {
-        let connection = self.connection()?;
-        let transport = TonicTransport::connect(connection.endpoint().to_owned()).await?;
-        Client::new(transport, MissingToken).service_status().await
+        let (status, transport) = Self::negotiated(&self.connection()?).await?;
+        // The version the `status` tool prints is read back off the transport
+        // that would carry this session's traffic, rather than reported
+        // alongside it — so an operator is never told a version the client is
+        // not the one dialling.
+        Ok(ServiceStatus {
+            protocol_version: transport.protocol_version(),
+            ..status
+        })
     }
 
     async fn authentication_status(&self) -> Result<AuthenticationStatus, ClientError> {
@@ -119,10 +134,7 @@ impl Backend for NativeBackend {
                 authenticated: false,
             });
         };
-        let transport = TonicTransport::connect(connection.endpoint().to_owned()).await?;
-        Client::new(transport.clone(), MissingToken)
-            .service_status()
-            .await?;
+        let (_, transport) = Self::negotiated(&connection).await?;
         Client::new(transport, InMemoryToken(token))
             .authentication_status()
             .await
@@ -286,15 +298,5 @@ struct InMemoryToken(Secret);
 impl AccessTokenProvider for InMemoryToken {
     async fn access_token(&self) -> Result<Option<Secret>, ClientError> {
         Ok(Some(self.0.clone()))
-    }
-}
-
-/// Supplies no token, for public calls such as version negotiation.
-struct MissingToken;
-
-#[async_trait(?Send)]
-impl AccessTokenProvider for MissingToken {
-    async fn access_token(&self) -> Result<Option<Secret>, ClientError> {
-        Ok(None)
     }
 }

@@ -1,12 +1,12 @@
 use serde::Deserialize;
-use sovereign_config_client::{ManagedConnectionTransport, Transport, ValueTransport};
+use sovereign_config_client::{ManagedConnectionTransport, Transport, ValueTransport, negotiate};
 use sovereign_config_core::{
     ClientError, ConfigPath, ConnectionId, ConnectionUrl, DisplayName, ErrorKind,
     ManagedConnectionMetadata, ManagedConnectionState, ManagedPermission, ManagedPermissions,
-    PlainValue, ProvisionedManagedConnection, Secret, SecretInput, SubTreeMutationContent,
-    SubTreeMutationValue,
+    PlainValue, ProtocolVersion, ProvisionedManagedConnection, Secret, SecretInput,
+    SubTreeMutationContent, SubTreeMutationValue,
 };
-use sovereign_config_native::TonicTransport;
+use sovereign_config_native::{TonicChannel, TonicTransport};
 use sovereign_config_proto::sovereign::config::v3::{
     AddValuePathRequest, AddValuePathResponse, CreateManagedConnectionRequest,
     CreateManagedConnectionResponse, DeleteValuesRequest, DeleteValuesResponse, GetIdentityRequest,
@@ -388,13 +388,16 @@ async fn tonic_transport_satisfies_shared_contract() {
             .add_service(ManagedConnectionsServer::new(ContractManagedConnections))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
-    let transport = TonicTransport::connect(format!("http://{address}"))
+    let channel = TonicChannel::connect(format!("http://{address}"))
         .await
         .unwrap();
 
-    let version = transport.get_version("v3").await.unwrap();
-    assert_eq!(version.application_version, "contract-version");
-    assert_eq!(version.protocol_version, "v3");
+    let service = negotiate(&channel).await.unwrap();
+    assert_eq!(service.application_version, "contract-version");
+    assert_eq!(service.protocol_version, ProtocolVersion::V3);
+    // Everything below travels on the version just negotiated, because that is
+    // the only thing a value-carrying transport can be built from.
+    let transport = channel.speaking(service.protocol_version);
 
     let listing = transport
         .list_values(

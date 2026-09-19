@@ -780,14 +780,26 @@ async fn a_protocol_mismatch_fails_startup() {
 }
 
 /// The broker is deployed independently of the server, so a server that has
-/// gained a newer protocol version must not stop it starting.
+/// gained a newer protocol version must not stop it starting — and the reads
+/// it goes on to serve must travel on the version it negotiated, not on the
+/// newest one the server happened to mention. The mock serves only the
+/// `sovereign.config.v3` routes, so secrets coming back at all is that
+/// assertion made on the wire: a broker dialling `v4` would get `UNIMPLEMENTED`
+/// on every pipeline instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_server_newer_than_this_build_starts_normally() {
+async fn a_server_newer_than_this_build_starts_and_still_reads_on_its_own_version() {
     let mut state = MockState::happy();
     state.supported_protocol_versions = vec!["v3".to_owned(), "v4".to_owned()];
-    Harness::start(Arc::new(state))
+    let harness = Harness::start(Arc::new(state))
         .await
         .expect("a server still serving v3 must start the broker");
+
+    let (status, body) = harness
+        .post_secrets("vcheesbrough", "sovereign-config")
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(!Harness::names_and_values(&body).is_empty());
 }
 
 /// Values must reach the HTTP response and nothing else.
