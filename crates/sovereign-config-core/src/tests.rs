@@ -351,8 +351,8 @@ fn protocol_negotiation_accepts_a_server_newer_than_this_client() {
 #[test]
 fn protocol_negotiation_rejects_a_server_outside_the_range() {
     // Both boundaries: a server too new (v3 retired) and one too old.
-    for advertised in [advertised(&["v4", "v5"]), advertised(&["v1", "v2"])] {
-        let error = ServiceStatus::negotiate("9.0.0".into(), "v4", &advertised)
+    for offered in [advertised(&["v4", "v5"]), advertised(&["v1", "v2"])] {
+        let error = ServiceStatus::negotiate("9.0.0".into(), "v4", &offered)
             .expect_err("a server with no version in common must be rejected");
         assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
     }
