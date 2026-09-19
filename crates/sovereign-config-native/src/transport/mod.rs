@@ -104,9 +104,7 @@ impl TonicChannel {
 #[async_trait(?Send)]
 impl Handshake for TonicChannel {
     async fn get_version(&self, version: ProtocolVersion) -> Result<VersionReply, ClientError> {
-        dialer(version, self.channel.clone())
-            .get_version(version)
-            .await
+        dialer(version, self.channel.clone()).get_version().await
     }
 }
 

@@ -11,8 +11,8 @@
 
 use async_trait::async_trait;
 use sovereign_config_client::{
-    Handshake, ManagedConnectionTransport, SessionTransport, Transport, ValueTransport,
-    VersionReply, timestamp,
+    ManagedConnectionTransport, SessionTransport, Transport, ValueTransport, VersionReply,
+    timestamp,
 };
 use sovereign_config_core::{
     AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl,
@@ -88,19 +88,17 @@ pub(super) const ROUTES: &[&str] = &[
 #[derive(Clone, Copy)]
 pub(super) struct Dialer;
 
+#[async_trait(?Send)]
 impl SessionTransport for Dialer {
     fn version(&self) -> ProtocolVersion {
         VERSION
     }
-}
 
-#[async_trait(?Send)]
-impl Handshake for Dialer {
-    async fn get_version(&self, version: ProtocolVersion) -> Result<VersionReply, ClientError> {
+    async fn get_version(&self) -> Result<VersionReply, ClientError> {
         let response: GetVersionResponse = grpc_unary(
             GET_VERSION,
             &GetVersionRequest {
-                protocol_version: version.as_str().to_owned(),
+                protocol_version: VERSION.as_str().to_owned(),
             },
             None,
         )

@@ -129,11 +129,24 @@ where
             // the question for every version at once: an older route could not
             // produce a better answer, and asking would only add round trips.
             Ok(reply) => {
-                return ServiceStatus::negotiate(
+                let status = ServiceStatus::negotiate(
                     reply.application_version,
                     &reply.protocol_version,
                     &reply.supported_protocol_versions,
-                );
+                )?;
+                // Never settle above the version that answered. A server can
+                // advertise a version whose routes are not (yet) registered —
+                // a rolling deploy looks exactly like that to a client whose
+                // handshake lands on an old replica — and the walk has already
+                // proved those routes absent. Taking the advertised set at its
+                // word there would hand back a session that connects and then
+                // fails every call, with no renegotiation to recover it. The
+                // cap is a no-op whenever the selected version is the answering
+                // one or older, which is every other case.
+                return Ok(ServiceStatus {
+                    protocol_version: status.protocol_version.min(version),
+                    ..status
+                });
             }
             Err(error) if error.kind == ErrorKind::IncompatibleProtocol => incompatible = error,
             Err(error) => return Err(error),
@@ -229,12 +242,22 @@ pub trait ManagedConnectionTransport: Transport {
 /// one place rather than one per RPC surface. Each `sovereign.config.vN` client
 /// module implements it, holding that version's stubs or route paths and its
 /// proto↔core mapping — which is what makes retiring a version a deletion.
-pub trait SessionTransport: Handshake + ValueTransport + ManagedConnectionTransport {
+#[async_trait(?Send)]
+pub trait SessionTransport: ValueTransport + ManagedConnectionTransport {
     /// The version whose routes this dialer dials.
     ///
     /// Declared by the same module that owns the routes, so a session reports
     /// the version it is actually speaking rather than one carried alongside.
     fn version(&self) -> ProtocolVersion;
+
+    /// Asks the service about **this** version, on this version's route.
+    ///
+    /// It takes no version, deliberately. A dialer can only ask about the
+    /// version whose routes it dials, so the version named in the request and
+    /// the package named in the path are read from one module and cannot
+    /// disagree. Choosing *which* version to ask about is [`Handshake`]'s job,
+    /// and it makes that choice by selecting the dialer.
+    async fn get_version(&self) -> Result<VersionReply, ClientError>;
 }
 
 #[async_trait(?Send)]

@@ -62,41 +62,40 @@ pub(crate) struct BrowserHandshake;
 #[async_trait(?Send)]
 impl Handshake for BrowserHandshake {
     async fn get_version(&self, version: ProtocolVersion) -> Result<VersionReply, ClientError> {
-        dialer(version).get_version(version).await
+        dialer(version).get_version().await
     }
 }
 
 /// The browser's transport for the version its session negotiated.
 ///
-/// A session that has not negotiated has no version to dial, and says so:
-/// every call fails with an incompatible-protocol error rather than guessing a
-/// route. That is the only honest answer — the page load that would have
-/// settled the version is the one that failed.
-#[derive(Clone, Copy)]
+/// A session that has not negotiated has no version to dial, and says so
+/// rather than guessing a route. What it says is the failure that stopped the
+/// handshake, carried from the page load: an unreachable service reported as
+/// an incompatible protocol would point an operator at versions rather than at
+/// the service, and nothing renegotiates for the life of the page to correct
+/// it.
+#[derive(Clone)]
 pub(crate) struct BrowserTransport {
-    version: Option<ProtocolVersion>,
+    protocol: Result<ProtocolVersion, ClientError>,
 }
 
 impl BrowserTransport {
     /// The transport for the version this page negotiated at load.
     pub(crate) fn for_session() -> Self {
         Self {
-            version: negotiated_protocol(),
+            protocol: negotiated_protocol(),
         }
     }
 
     #[cfg(test)]
-    pub(crate) const fn unnegotiated() -> Self {
-        Self { version: None }
+    pub(crate) const fn unnegotiated(failure: ClientError) -> Self {
+        Self {
+            protocol: Err(failure),
+        }
     }
 
-    fn dialer(self) -> Result<Box<dyn SessionTransport>, ClientError> {
-        self.version.map(dialer).ok_or_else(|| {
-            ClientError::new(
-                ErrorKind::IncompatibleProtocol,
-                "service protocol is incompatible",
-            )
-        })
+    fn dialer(&self) -> Result<Box<dyn SessionTransport>, ClientError> {
+        self.protocol.clone().map(dialer)
     }
 }
 
@@ -406,31 +405,53 @@ pub(crate) async fn fetch(
 
 #[cfg(test)]
 mod tests {
-    use sovereign_config_core::{ErrorKind, ProtocolVersion};
+    use std::collections::BTreeSet;
+
+    use sovereign_config_core::{ClientError, ErrorKind, ProtocolVersion};
 
     use super::{BrowserTransport, routes};
 
-    /// Every route a browser session can post to. One fewer than the calls the
-    /// transport offers, because plain and secret writes are the same RPC.
-    const ROUTE_COUNT: usize = 14;
+    /// The RPCs a version's routes have to cover: `System` (2),
+    /// `Configuration` (8) and `ManagedConnections` (4). Written as the sum so
+    /// a service gaining an RPC is a visible change here rather than a literal
+    /// someone edits to match, and one fewer than the calls the transport
+    /// offers, because plain and secret writes are the same RPC.
+    const ROUTE_COUNT: usize = 2 + 8 + 4;
 
     /// The browser builds its requests from compiled-in gRPC-Web paths, and the
     /// server counts a request under the version the path names. A session that
     /// negotiated `vN` and posted to `vN-1` would therefore be attributed to the
     /// wrong version, inverting the gate for retiring one — so every route a
-    /// version dials has to name that version.
+    /// version declares has to name that version, and a version has to declare
+    /// a route for every RPC.
     ///
     /// Table-driven over `ProtocolVersion::ALL`: a version added to that list is
-    /// covered here the moment it is declared.
+    /// covered the moment it is declared.
+    ///
+    /// **This asserts a declared table, not what was dialled**, which is weaker
+    /// than the native crate's `protocol_dispatch.rs` — that one issues every
+    /// RPC against a recording server and asserts on the path received. The
+    /// browser's routes are only observable through `fetch`, which needs a
+    /// browser: `cargo test` runs this crate natively, where there is no window
+    /// to intercept. The on-the-wire equivalent therefore belongs in the
+    /// Playwright suite, and is not built here. What this does catch is a `vN`
+    /// module copied from an older one and left pointing at the older package,
+    /// which is the likely mistake — the paths are plain strings, so drift is
+    /// easier here than with tonic's generated routes, not harder.
     #[test]
-    fn every_route_the_browser_dials_names_the_version_it_speaks() {
+    fn every_route_a_version_declares_names_that_version() {
         for version in ProtocolVersion::ALL.iter().copied() {
             let routes = routes(version);
 
             assert_eq!(
                 routes.len(),
                 ROUTE_COUNT,
-                "{version}: every route the transport posts to should be listed"
+                "{version}: every RPC the transport posts should have a route listed"
+            );
+            assert_eq!(
+                routes.iter().collect::<BTreeSet<_>>().len(),
+                ROUTE_COUNT,
+                "{version}: a repeated route means an RPC's own route is missing"
             );
             let expected_package = format!("/sovereign.config.{version}.");
             for route in routes {
@@ -444,15 +465,25 @@ mod tests {
 
     /// A page whose handshake failed has agreed no version, and there is no
     /// sensible guess: dialling the newest this build speaks is exactly the
-    /// mis-attribution the rest of this design removes. Such a session reports
-    /// an incompatible protocol instead, without reaching the network.
+    /// mis-attribution the rest of this design removes. Such a session reaches
+    /// the network not at all, and reports **why** the handshake failed —
+    /// reporting an unreachable service as an incompatible protocol would send
+    /// an operator looking in the wrong place for the life of the page.
     #[test]
-    fn a_session_that_never_negotiated_dials_nothing() {
-        let error = BrowserTransport::unnegotiated()
-            .dialer()
-            .err()
-            .expect("an unnegotiated session must not produce a dialer");
+    fn a_session_that_never_negotiated_dials_nothing_and_says_why() {
+        for failure in [
+            ClientError::new(ErrorKind::Unavailable, "service is unavailable"),
+            ClientError::new(
+                ErrorKind::IncompatibleProtocol,
+                "service protocol is incompatible",
+            ),
+        ] {
+            let error = BrowserTransport::unnegotiated(failure.clone())
+                .dialer()
+                .err()
+                .expect("an unnegotiated session must not produce a dialer");
 
-        assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
+            assert_eq!(error, failure);
+        }
     }
 }

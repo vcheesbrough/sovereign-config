@@ -7,7 +7,7 @@ use js_sys::{Date, Reflect};
 use sha2::{Digest, Sha256};
 use sovereign_config_client::{Client, negotiate};
 use sovereign_config_core::{ClientError, ErrorKind, ProtocolVersion, Secret};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Response, Url, UrlSearchParams, window};
@@ -23,24 +23,33 @@ use crate::transport::{BrowserHandshake, BrowserTransport, MemoryAuthentication,
 thread_local! {
     pub(crate) static TOKENS: RefCell<Option<MemoryTokens>> = const { RefCell::new(None) };
 
-    /// The protocol version this page negotiated, and therefore the only
-    /// version its requests may travel on.
+    /// The protocol version this page negotiated — and therefore the only
+    /// version its requests may travel on — or the error that stopped it.
     ///
     /// Held for the life of the page, alongside the session it belongs to: the
     /// browser negotiates once at load, like every other client, and does not
-    /// renegotiate. `None` until that handshake succeeds — a request made
-    /// before then has no agreed version to dial and fails rather than
-    /// guessing one.
-    static PROTOCOL: Cell<Option<ProtocolVersion>> = const { Cell::new(None) };
+    /// renegotiate. The failure is kept, not just the absence of a version,
+    /// because every request made afterwards reports it: an unreachable
+    /// service surfaced as an incompatible protocol would send an operator
+    /// looking at versions rather than at the service.
+    static PROTOCOL: RefCell<Result<ProtocolVersion, ClientError>> =
+        const { RefCell::new(Err(NOT_NEGOTIATED)) };
 }
 
-/// The version negotiated at page load, if the handshake got that far.
-pub(crate) fn negotiated_protocol() -> Option<ProtocolVersion> {
-    PROTOCOL.with(Cell::get)
+/// Before any handshake has run. Nothing may be dialled on it, and no request
+/// should reach it: the page negotiates at load, ahead of every view.
+const NOT_NEGOTIATED: ClientError = ClientError::new(
+    ErrorKind::IncompatibleProtocol,
+    "service protocol is incompatible",
+);
+
+/// The version negotiated at page load, or why the handshake did not get there.
+pub(crate) fn negotiated_protocol() -> Result<ProtocolVersion, ClientError> {
+    PROTOCOL.with_borrow(Clone::clone)
 }
 
-fn set_negotiated_protocol(version: Option<ProtocolVersion>) {
-    PROTOCOL.with(|slot| slot.set(version));
+fn set_negotiated_protocol(outcome: Result<ProtocolVersion, ClientError>) {
+    PROTOCOL.with_borrow_mut(|slot| *slot = outcome);
 }
 
 const STATE_KEY: &str = "sovereign-config.pkce-state";
@@ -133,8 +142,9 @@ pub(crate) async fn refresh_status(config: &AppConfig) -> bool {
         Ok(status) => status,
         Err(error) => {
             // Nothing may be dialled on a version that was never agreed, so the
-            // page keeps no stale one from an earlier load.
-            set_negotiated_protocol(None);
+            // page keeps no stale one from an earlier load — and keeps this
+            // failure, which is what every later request reports.
+            set_negotiated_protocol(Err(error.clone()));
             // Unhide before setting the text: a live region only announces a
             // mutation to content already exposed in the accessibility tree,
             // so setting the text first — while still `hidden` — makes the
@@ -143,12 +153,16 @@ pub(crate) async fn refresh_status(config: &AppConfig) -> bool {
             set_hidden("service-value", false);
             set_text("service-value", "Service unavailable");
             show_error(error.message());
-            // There is no route to ask about the session on either, so its
-            // state is simply unknown — the same position a failed identity
-            // check leaves the page in, and answered the same way: keep Log
-            // out reachable, and show no name the service has not confirmed.
-            set_hidden("login", true);
-            set_hidden("logout", false);
+            // There is no route to ask about the session on either, so the
+            // service can confirm no name and none is shown. Which button to
+            // offer is not a guess, though: token state is local. A page
+            // holding no session must still be able to start one — login is a
+            // redirect to the identity provider and never touches this service
+            // — and a page holding one keeps Log out, for the same reason a
+            // failed identity check does.
+            let session = logged_in();
+            set_hidden("login", session);
+            set_hidden("logout", !session);
             render_identity(false);
             return false;
         }
@@ -157,7 +171,7 @@ pub(crate) async fn refresh_status(config: &AppConfig) -> bool {
     // the standing evidence that it answered. The protocol version it also
     // returns is a client-compatibility concern, not an operator's, so it
     // stays out of the header — it governs the routes below instead.
-    set_negotiated_protocol(Some(status.protocol_version));
+    set_negotiated_protocol(Ok(status.protocol_version));
     set_text("service-value", "");
     set_hidden("service-value", true);
     set_text("version-value", &status.application_version);

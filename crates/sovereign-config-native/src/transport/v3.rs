@@ -13,8 +13,8 @@
 
 use async_trait::async_trait;
 use sovereign_config_client::{
-    Handshake, ManagedConnectionTransport, RpcCode, SessionTransport, Transport, ValueTransport,
-    VersionReply, map_rpc_status, timestamp,
+    ManagedConnectionTransport, RpcCode, SessionTransport, Transport, ValueTransport, VersionReply,
+    map_rpc_status, timestamp,
 };
 use sovereign_config_core::{
     AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl,
@@ -66,19 +66,17 @@ impl Dialer {
     }
 }
 
+#[async_trait(?Send)]
 impl SessionTransport for Dialer {
     fn version(&self) -> ProtocolVersion {
         VERSION
     }
-}
 
-#[async_trait(?Send)]
-impl Handshake for Dialer {
-    async fn get_version(&self, version: ProtocolVersion) -> Result<VersionReply, ClientError> {
+    async fn get_version(&self) -> Result<VersionReply, ClientError> {
         let response = self
             .system()
             .get_version(GetVersionRequest {
-                protocol_version: version.as_str().to_owned(),
+                protocol_version: VERSION.as_str().to_owned(),
             })
             .await
             .map_err(|status| map_status(&status))?
