@@ -30,7 +30,12 @@ use super::{
     Permission, bearer_token, canonical_prefix, grpc_authentication_layer, is_operational_rpc,
     is_web_asset_request, require_rs256, validate_introspection,
 };
-use crate::{config::AuthenticationConfig, metrics::AuthenticationMetrics};
+use crate::{
+    config::AuthenticationConfig,
+    metrics::{AuthenticationMetrics, ProtocolMetrics},
+    protocol::ProtocolVersionLayer,
+    system::SERVED_PROTOCOL_VERSIONS,
+};
 
 const TEST_CLIENT_ID: &str = "introspection-client";
 const TEST_CLIENT_SECRET: &str = "introspection-secret-sentinel";
@@ -389,6 +394,52 @@ fn only_health_and_version_are_operational() {
     ));
 }
 
+/// `GetVersion` must stay unauthenticated on **every** served version, not just
+/// on whichever one happened to be hardcoded.
+///
+/// Negotiation runs before any token exists, so a served version whose
+/// `GetVersion` required authentication would fail every client at connect —
+/// before it could discover which versions are served. Deriving the exemption
+/// from `SERVED_PROTOCOL_VERSIONS` is what stops a newly introduced version
+/// being unreachable, so this asserts the derivation rather than a literal.
+#[test]
+fn the_version_handshake_is_unauthenticated_on_every_served_version() {
+    for served in SERVED_PROTOCOL_VERSIONS {
+        assert!(
+            is_operational_rpc(&format!(
+                "/sovereign.config.{}.System/GetVersion",
+                served.as_str()
+            )),
+            "GetVersion must be unauthenticated on served version {served}"
+        );
+    }
+}
+
+#[test]
+fn only_the_version_handshake_of_a_served_version_is_exempt() {
+    // An unserved version gets no exemption: it has no route to reach anyway,
+    // and exempting arbitrary packages would widen the unauthenticated surface.
+    assert!(!is_operational_rpc(
+        "/sovereign.config.v99.System/GetVersion"
+    ));
+    // Only `GetVersion` is exempt, never another method on the same service.
+    assert!(!is_operational_rpc(
+        "/sovereign.config.v3.System/GetIdentity"
+    ));
+    // Near-misses must not slip through the strip-prefix/strip-suffix match.
+    for path in [
+        "/sovereign.config.v3.System/GetVersionExtra",
+        "/sovereign.config.v3.Other.System/GetVersion",
+        "/prefix/sovereign.config.v3.System/GetVersion",
+        "/sovereign.config..System/GetVersion",
+    ] {
+        assert!(
+            !is_operational_rpc(path),
+            "{path} must require authentication"
+        );
+    }
+}
+
 #[test]
 fn browser_asset_requests_do_not_require_authentication() {
     assert!(is_web_asset_request(&Method::GET, "/"));
@@ -475,8 +526,11 @@ async fn grpc_web_authentication_failures_are_framed() {
 }
 
 async fn grpc_web_status(authenticator: Authenticator, headers: HeaderMap) -> u16 {
-    let layer =
-        grpc_authentication_layer(authenticator, Arc::new(AuthenticationMetrics::default()));
+    let layer = grpc_authentication_layer(
+        authenticator,
+        Arc::new(AuthenticationMetrics::default()),
+        Arc::new(ProtocolMetrics::new(&["v3"])),
+    );
     let inner = service_fn(|_: Request<BoxBody>| async {
         Ok::<_, Infallible>(Response::new(empty_body()))
     });
@@ -517,6 +571,7 @@ async fn middleware_bypasses_only_operational_rpcs_and_propagates_principal() {
     let layer = AuthenticationLayer::new(
         authenticator(server.url.clone(), Duration::from_secs(1)),
         Arc::new(AuthenticationMetrics::default()),
+        Arc::new(ProtocolMetrics::new(&["v3"])),
     );
     let inner = service_fn(|request: Request<()>| async move {
         if request.uri().path() == "/protected.Service/Call" {
@@ -559,4 +614,85 @@ async fn middleware_bypasses_only_operational_rpcs_and_propagates_principal() {
         "16"
     );
     assert_eq!(server.state.calls.load(Ordering::Relaxed), 1);
+}
+
+/// The `authenticated` series is the retirement gate, so it must move only for
+/// traffic that actually passed authentication.
+///
+/// Drives the production layer order — protocol layer outside, authentication
+/// inside — with one request that authenticates and one that does not. Both are
+/// `attempted`; only the first is `authenticated`. The unauthenticated one
+/// stands in for everything that can reach a public endpoint without being a
+/// consumer: a scanner, or an application whose credentials were revoked but
+/// whose process still retries. Neither would break if the version were
+/// retired, so neither may hold the gate above zero.
+#[tokio::test]
+async fn only_authenticated_traffic_moves_the_retirement_gate() {
+    let server = fake_server(
+        StatusCode::OK,
+        valid_response_json().to_string(),
+        Duration::ZERO,
+    )
+    .await;
+    let protocol_metrics = Arc::new(ProtocolMetrics::new(&["v3"]));
+    let stack = tower::ServiceBuilder::new()
+        .layer(ProtocolVersionLayer::new(
+            Arc::clone(&protocol_metrics),
+            &["v3"],
+        ))
+        .layer(AuthenticationLayer::new(
+            authenticator(server.url.clone(), Duration::from_secs(1)),
+            Arc::new(AuthenticationMetrics::default()),
+            Arc::clone(&protocol_metrics),
+        ));
+    let inner =
+        service_fn(|_: Request<()>| async { Ok::<_, Infallible>(Response::new(empty_body())) });
+
+    let mut authenticated = Request::builder()
+        .method(Method::POST)
+        .uri("/sovereign.config.v3.Configuration/GetSubTree")
+        .body(())
+        .unwrap();
+    *authenticated.headers_mut() = authenticated_headers();
+    stack
+        .clone()
+        .service(inner)
+        .oneshot(authenticated)
+        .await
+        .unwrap();
+
+    let anonymous = Request::builder()
+        .method(Method::POST)
+        .uri("/sovereign.config.v3.Configuration/GetSubTree")
+        .body(())
+        .unwrap();
+    stack
+        .clone()
+        .service(inner)
+        .oneshot(anonymous)
+        .await
+        .unwrap();
+
+    // The handshake bypasses authentication entirely, so it is attempted-only:
+    // anyone may call it, and it says nothing about ongoing use.
+    let handshake = Request::builder()
+        .method(Method::POST)
+        .uri("/sovereign.config.v3.System/GetVersion")
+        .body(())
+        .unwrap();
+    stack.service(inner).oneshot(handshake).await.unwrap();
+
+    let rendered = protocol_metrics.render();
+    assert!(
+        rendered.contains(
+            "sovereign_config_protocol_requests_total{version=\"v3\",outcome=\"attempted\"} 3"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "sovereign_config_protocol_requests_total{version=\"v3\",outcome=\"authenticated\"} 1"
+        ),
+        "{rendered}"
+    );
 }

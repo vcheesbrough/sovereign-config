@@ -15,14 +15,23 @@ use tonic::{Request, Response, Status};
 
 use crate::{APPLICATION_VERSION, auth::AuthenticatedPrincipal};
 
-/// Every protocol version this server serves, oldest first.
+/// Every protocol version **this binary routes**, oldest first.
 ///
-/// Adding a version here is the *last* step of introducing one: it advertises
-/// the version to clients, so the service implementing it must already be
-/// registered on the router. Removing one is the last step of retiring it, and
-/// is gated on `sovereign_config_protocol_requests_total` reading zero for that
-/// version — see the README.
-pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ProtocolVersion] = ProtocolVersion::ALL;
+/// Deliberately its own list rather than an alias of [`ProtocolVersion::ALL`],
+/// which is the set the *client* crates can speak. The two are different facts
+/// and must move independently: declaring a variant in core says "a client in
+/// this workspace can speak it", while naming it here says "this server has a
+/// service registered for it". Aliasing them would make those one edit, and a
+/// version declared but not yet registered would be advertised immediately —
+/// negotiation would succeed and then every RPC on it would return
+/// `Unimplemented`.
+///
+/// Adding a version here is therefore the *last* step of introducing one: the
+/// `add_service` call for it must already be on the router. Removing one is the
+/// last step of retiring it, gated on the `outcome="authenticated"` series of
+/// `sovereign_config_protocol_requests_total` reading zero for that version —
+/// see the README.
+pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V3];
 
 /// The metric label for every version in [`SERVED_PROTOCOL_VERSIONS`].
 ///
@@ -135,6 +144,23 @@ mod tests {
             .map(|version| version.as_str().to_owned())
             .collect();
         assert_eq!(response.supported_protocol_versions, expected);
+    }
+
+    /// The served set is advertised verbatim and documented oldest-first, which
+    /// clients rely on when picking the highest mutually supported version.
+    ///
+    /// This was previously free because the list aliased `ProtocolVersion::ALL`,
+    /// whose own ordering is already pinned in core. Now that the two are
+    /// separate facts — what this binary routes versus what a client can speak —
+    /// the server's own list needs its own guard.
+    #[test]
+    fn the_served_set_is_ordered_oldest_first() {
+        assert!(
+            SERVED_PROTOCOL_VERSIONS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "SERVED_PROTOCOL_VERSIONS must be ascending: {SERVED_PROTOCOL_VERSIONS:?}"
+        );
     }
 
     #[test]

@@ -12,21 +12,41 @@ use std::{
 /// that something is addressing a protocol version this build does not know.
 pub(crate) const UNRECOGNISED_PROTOCOL_LABEL: &str = "unrecognised";
 
-/// Per-protocol-version request counts.
+/// Per-protocol-version request counts, in two series.
 ///
-/// This is the input to the retirement decision: a protocol version may not be
-/// removed until its counter has read zero across an observation window, since
-/// clients have no fallback and the provider does not cache. Counting at
-/// `GetVersion` would not answer that question — negotiation happens once at
-/// connect, so a long-lived provider would register a single connect and then
-/// go quiet while its traffic continued.
+/// - `outcome="attempted"` counts every request whose route names the version,
+///   before authentication runs. It answers "is anything still *trying* to
+///   speak this version?", and includes traffic that is not a consumer at all —
+///   an internet scanner, a decommissioned application whose credentials were
+///   revoked but whose process still retries.
+/// - `outcome="authenticated"` counts the subset that then passed
+///   authentication. It answers "is any **real consumer** still speaking this
+///   version?" and is the input to the retirement decision.
+///
+/// The split exists because the gate has to be reachable. The gRPC endpoint is
+/// public, so the attempted series can be held above zero indefinitely by
+/// traffic that would not break on retirement; gating on it would mean either
+/// never retiring a version or learning to ignore a counter documented as
+/// authoritative. Nothing unauthenticated can move the authenticated series.
+///
+/// `attempted >= authenticated` always holds, and the difference is refused
+/// traffic. The unauthenticated `GetVersion` handshake is attempted-only by
+/// construction, which is right: anyone may call it, and negotiation happens
+/// once at connect, so a long-lived provider would otherwise register a single
+/// connect and then go quiet while its traffic continued.
 ///
 /// The label domain is fixed at construction from compiled-in strings and is
 /// never taken from a request, so no route path can widen it. Anything outside
 /// that domain lands in [`UNRECOGNISED_PROTOCOL_LABEL`].
 pub(crate) struct ProtocolMetrics {
-    versions: Vec<(&'static str, AtomicU64)>,
+    versions: Vec<VersionCounters>,
     unrecognised: AtomicU64,
+}
+
+struct VersionCounters {
+    label: &'static str,
+    attempted: AtomicU64,
+    authenticated: AtomicU64,
 }
 
 impl ProtocolMetrics {
@@ -35,43 +55,64 @@ impl ProtocolMetrics {
         Self {
             versions: versions
                 .iter()
-                .map(|label| (*label, AtomicU64::new(0)))
+                .map(|label| VersionCounters {
+                    label,
+                    attempted: AtomicU64::new(0),
+                    authenticated: AtomicU64::new(0),
+                })
                 .collect(),
             unrecognised: AtomicU64::new(0),
         }
     }
 
-    /// Counts one request against `version`, or against the unrecognised bucket
-    /// when it is not a label this instance was built with.
-    pub(crate) fn record(&self, version: &str) {
-        match self
-            .versions
+    fn counters(&self, version: &str) -> Option<&VersionCounters> {
+        self.versions
             .iter()
-            .find(|(label, _)| *label == version)
-            .map(|(_, counter)| counter)
-        {
-            Some(counter) => counter.fetch_add(1, Ordering::Relaxed),
+            .find(|counters| counters.label == version)
+    }
+
+    /// Counts one request arriving on `version`, before authentication, or
+    /// against the unrecognised bucket when it is not a label this instance was
+    /// built with.
+    pub(crate) fn record_attempted(&self, version: &str) {
+        match self.counters(version) {
+            Some(counters) => counters.attempted.fetch_add(1, Ordering::Relaxed),
             None => self.unrecognised.fetch_add(1, Ordering::Relaxed),
         };
     }
 
+    /// Counts one request on `version` that passed authentication. A version
+    /// outside the label domain is ignored rather than bucketed: it was already
+    /// counted as unrecognised on arrival, and has no service to reach.
+    pub(crate) fn record_authenticated(&self, version: &str) {
+        if let Some(counters) = self.counters(version) {
+            counters.authenticated.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn render(&self) -> String {
         let mut output = String::from(
-            "# HELP sovereign_config_protocol_requests_total gRPC requests by protocol version.\n\
+            "# HELP sovereign_config_protocol_requests_total gRPC requests by protocol version and outcome.\n\
              # TYPE sovereign_config_protocol_requests_total counter\n",
         );
-        for (label, counter) in &self.versions {
-            let value = counter.load(Ordering::Relaxed);
-            writeln!(
-                output,
-                "sovereign_config_protocol_requests_total{{version=\"{label}\"}} {value}",
-            )
-            .expect("writing metrics to a String cannot fail");
+        for counters in &self.versions {
+            for (outcome, counter) in [
+                ("attempted", &counters.attempted),
+                ("authenticated", &counters.authenticated),
+            ] {
+                let value = counter.load(Ordering::Relaxed);
+                writeln!(
+                    output,
+                    "sovereign_config_protocol_requests_total{{version=\"{}\",outcome=\"{outcome}\"}} {value}",
+                    counters.label,
+                )
+                .expect("writing metrics to a String cannot fail");
+            }
         }
         let value = self.unrecognised.load(Ordering::Relaxed);
         writeln!(
             output,
-            "sovereign_config_protocol_requests_total{{version=\"{UNRECOGNISED_PROTOCOL_LABEL}\"}} {value}",
+            "sovereign_config_protocol_requests_total{{version=\"{UNRECOGNISED_PROTOCOL_LABEL}\",outcome=\"attempted\"}} {value}",
         )
         .expect("writing metrics to a String cannot fail");
         output

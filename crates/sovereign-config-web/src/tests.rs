@@ -361,3 +361,29 @@ fn grpc_web_decoder_accepts_trailers_only_status_headers() {
     assert_eq!(error.kind, ErrorKind::PermissionDenied);
     assert_eq!(error.message(), "permission denied");
 }
+
+/// Every protocol version the browser transport can actually dial.
+///
+/// `BrowserTransport` posts to literal `/sovereign.config.v3.…` gRPC-Web paths,
+/// so that is the only version it speaks regardless of what negotiation chose.
+const DISPATCHABLE_VERSIONS: &[sovereign_config_core::ProtocolVersion] =
+    &[sovereign_config_core::ProtocolVersion::V3];
+
+/// Tripwire for the gap between negotiating a version and dialling it.
+///
+/// The browser reports the negotiated version in its header alongside the
+/// application version. If a variant is added to `ProtocolVersion::ALL` without
+/// adding routes here, the UI displays a version it is not speaking and every
+/// request still goes to the v3 paths — which also makes
+/// `sovereign_config_protocol_requests_total` attribute browser traffic to the
+/// wrong version, inverting the retirement gate. Add the `vN` paths rather than
+/// widening this list.
+#[test]
+fn this_transport_dials_every_version_the_client_may_negotiate() {
+    assert_eq!(
+        DISPATCHABLE_VERSIONS,
+        sovereign_config_core::ProtocolVersion::ALL,
+        "ProtocolVersion::ALL gained a version the browser transport cannot dial; \
+         add its gRPC-Web route paths before listing it as speakable"
+    );
+}

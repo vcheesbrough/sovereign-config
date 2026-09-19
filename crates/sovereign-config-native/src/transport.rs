@@ -590,13 +590,44 @@ mod tests {
     use std::{future::pending, time::Duration};
 
     use sovereign_config_client::Transport;
-    use sovereign_config_core::{ErrorKind, Secret};
+    use sovereign_config_core::{ErrorKind, ProtocolVersion, Secret};
     use sovereign_config_proto::sovereign::config::v3::{
         GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
         system_server::{System, SystemServer},
     };
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status, transport::Server};
+
+    /// Every protocol version this transport can actually dial.
+    ///
+    /// This transport is built from the generated `sovereign.config.v3` stubs,
+    /// so every RPC it issues travels on a `/sovereign.config.v3.…` route
+    /// regardless of what negotiation selected.
+    const DISPATCHABLE_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V3];
+
+    /// Tripwire for the gap between negotiating a version and dialling it.
+    ///
+    /// `ServiceStatus::negotiate` picks from `ProtocolVersion::ALL` and the
+    /// result is shown to operators, but this transport dispatches on compiled
+    /// route paths. If a variant is added to `ALL` without route support here,
+    /// the client negotiates and reports the new version while every RPC —
+    /// including that `GetVersion` — still travels on the old one's routes.
+    /// `sovereign_config_protocol_requests_total` then reads exactly backwards:
+    /// the live version looks dead and the unused one looks busy, which is the
+    /// signal the README makes the precondition for deleting a version.
+    ///
+    /// Nothing else catches this, because with a single version the two sets
+    /// coincide. If this fails, add the `vN` dispatch here rather than widening
+    /// the list.
+    #[test]
+    fn this_transport_dials_every_version_the_client_may_negotiate() {
+        assert_eq!(
+            DISPATCHABLE_VERSIONS,
+            ProtocolVersion::ALL,
+            "ProtocolVersion::ALL gained a version this transport cannot dial; \
+             add its route dispatch before listing it as speakable"
+        );
+    }
 
     use super::{TonicTransport, validate_service_endpoint};
 

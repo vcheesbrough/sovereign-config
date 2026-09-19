@@ -22,6 +22,20 @@ pub enum ProtocolVersion {
 
 impl ProtocolVersion {
     /// Every version this build speaks, oldest first.
+    ///
+    /// **A version may only appear here once a transport can actually dial it.**
+    /// Negotiation selects from this list and the result is reported to
+    /// operators, but the transports dispatch on compiled-in route paths — so a
+    /// version listed here without matching route support would be negotiated,
+    /// displayed, and then never used: every RPC would travel on the older
+    /// version's routes while the client believed otherwise. That silently
+    /// inverts `sovereign_config_protocol_requests_total`, which is the gate for
+    /// retiring a version, so it would report the live version as dead.
+    ///
+    /// `sovereign-config-native` and `sovereign-config-web` each assert that the
+    /// versions they dispatch equal this list, so adding a variant fails their
+    /// tests until the routes exist. Do not silence those tests — they are the
+    /// only thing standing between a new variant and that inversion.
     pub const ALL: &'static [Self] = &[Self::V3];
 
     /// The version a client asks for when it has no reason to ask for an older

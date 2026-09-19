@@ -453,18 +453,36 @@ To add `vN`:
 2. Compile it in `crates/sovereign-config-proto/build.rs` and expose it as a `vN` module in that crate's `lib.rs`, alongside `v3`.
 3. Write the `vN` ↔ core mapping shim. **This layer must be only the proto↔core translation.** Domain types in `sovereign-config-core` stay version-free, so a second version is a translation shim over one implementation rather than a forked server. If you find yourself duplicating logic rather than mapping types, the change belongs in core, not in the shim.
 4. Register the `vN` services on the router in `crates/sovereign-config-server/src/main.rs`, **leaving every existing `add_service` line in place.**
-5. Add `VN` to `ProtocolVersion` in `crates/sovereign-config-core/src/status.rs`, declared *after* the existing variants — ordering is declaration order, because `"v10"` sorts below `"v3"` as a string.
+5. Teach the **clients** to dial `vN`, then declare it:
+   - Add `vN` route dispatch to `crates/sovereign-config-native/src/transport.rs` and `crates/sovereign-config-web/src/transport.rs`. Both build their requests from compiled-in route paths, so negotiating `vN` does nothing on its own.
+   - Add `VN` to `ProtocolVersion` in `crates/sovereign-config-core/src/status.rs`, declared *after* the existing variants — ordering is declaration order, because `"v10"` sorts below `"v3"` as a string. This says only that clients in this workspace can *speak* `vN`; it advertises nothing.
+   - Update `DISPATCHABLE_VERSIONS` in each transport's tests to match.
+
+   **Do not skip the first bullet.** `ProtocolVersion::ALL` is what negotiation selects from and what the CLI, MCP server and browser display as the session's version, but the transports dispatch on route paths. A version declared without route support is negotiated and reported while every RPC still travels on the old version's routes — so `sovereign_config_protocol_requests_total` reads backwards, showing the version actually carrying the traffic as idle and the unused one as busy. Since that counter is the retirement gate below, the result is a gate that says it is safe to delete the version everything is using. Each transport has a `this_transport_dials_every_version_the_client_may_negotiate` test that fails until the routes exist; fix it by adding dispatch, never by widening the list.
 6. Add `vN` to `SERVED_PROTOCOL_VERSIONS` and `SERVED_PROTOCOL_LABELS` in `crates/sovereign-config-server/src/system.rs`. Do this **last**: it advertises the version to clients, so the services implementing it must already be registered.
+
+Two things you do *not* have to edit, because they derive from `SERVED_PROTOCOL_VERSIONS` and would be easy to miss:
+
+- **The unauthenticated-RPC allowlist.** `GetVersion` is called before any token exists, so it must stay unauthenticated on every served version. `is_operational_rpc` in `crates/sovereign-config-server/src/auth.rs` matches `/sovereign.config.<served>.System/GetVersion` against the served set rather than listing paths, so step 6 exempts `vN` automatically. Were it a hardcoded list, forgetting it would refuse every `vN` client at connect with an authentication error — before it could discover that the older version is still served.
+- **The per-version metric label**, which comes from `SERVED_PROTOCOL_LABELS` in the same step.
 
 Deploy the server before any client change. Clients now negotiate `vN` automatically; clients that have not been rebuilt continue on `v3`.
 
 ### Retiring a version
 
-**Confirm the version has no traffic before removing it.** `sovereign_config_protocol_requests_total{version="v3"}` counts every request on that version's routes. A version may be retired only once that counter has been flat at zero across an observation window long enough to cover the slowest-moving consumer — at minimum a full deployment cycle of every application that embeds the provider.
+**Confirm no real consumer still speaks the version before removing it.** The gate is the **authenticated** series:
+
+```
+sovereign_config_protocol_requests_total{version="v3",outcome="authenticated"}
+```
+
+A version may be retired only once that series has been flat at zero across an observation window long enough to cover the slowest-moving consumer — at minimum a full deployment cycle of every application that embeds the provider.
+
+Gate on `authenticated`, **not** on `attempted`. The gRPC endpoint is public, so `outcome="attempted"` counts everything whose route names the version before authentication runs — including an internet scanner, or a decommissioned application whose credentials were revoked months ago but whose process still retries. None of those breaks when the version is retired, yet any of them can hold `attempted` above zero indefinitely; gating on it would mean never retiring anything, or learning to ignore the counter. Nothing unauthenticated can move `authenticated`. A non-zero `attempted` with `authenticated` at zero is worth a look in the logs, but it is not a reason to keep the version.
 
 This is a precondition, not a courtesy. The provider does not cache: it holds no last-known-good configuration, by deliberate design, because retaining one would keep revealed secrets in process memory for the application's lifetime. An application still speaking a version you delete therefore fails on its **next configuration load**, with no fallback and no degraded mode.
 
-Once the counter reads zero:
+Once the authenticated series reads zero:
 
 1. Delete `proto/sovereign/config/v3/` and its entry in `crates/sovereign-config-proto/build.rs` and `lib.rs`.
 2. Delete the `v3` mapping shim module.
@@ -478,7 +496,16 @@ Announce the retirement to every consuming repository before it ships. A client 
 
 The application writes structured redacted JSON logs to stdout. Authentication events contain only the RPC path and bounded outcome/reason values. Internal Alloy discovers `/metrics` using the Docker labels in `compose.yaml`; that endpoint is not routed through Traefik. `sovereign_config_authentication_total` reports bounded success/failure reasons without request-derived labels. OTLP export is introduced by its separate card.
 
-`sovereign_config_protocol_requests_total{version="…"}` counts gRPC requests by the protocol version their route names. **This metric is the input to the retirement decision** described under [Protocol versioning](#protocol-versioning): a protocol version may not be removed until its counter has been flat at zero across a full deployment cycle of every consuming application, because clients have no fallback. It answers "is anything still speaking `v3`?", which `GetVersion` alone cannot — negotiation happens once at connect, so a long-lived provider registers a single connect and then goes quiet while its traffic continues. The `version` label is drawn from a compiled-in list and never from the request; traffic on a versioned route this build does not serve is counted under `version="unrecognised"` rather than creating a label of its own.
+`sovereign_config_protocol_requests_total{version="…",outcome="…"}` counts gRPC requests by the protocol version their route names, in two series:
+
+| `outcome` | Counts | Answers |
+| --- | --- | --- |
+| `attempted` | Every request on a well-formed route of that version, **before** authentication. | Is anything still *trying* to speak this version? Includes scanners and clients with revoked credentials. |
+| `authenticated` | The subset of those that passed authentication. | Is any **real consumer** still speaking this version? |
+
+**The `authenticated` series is the input to the retirement decision** described under [Protocol versioning](#protocol-versioning): a protocol version may not be removed until it has been flat at zero across a full deployment cycle of every consuming application, because clients have no fallback. It is a separate series precisely so the gate is reachable — the endpoint is public, and traffic that would not break on retirement can hold `attempted` above zero forever. `attempted ≥ authenticated` always holds, and the difference is refused traffic.
+
+Both answer a question `GetVersion` alone cannot — negotiation happens once at connect, so a long-lived provider registers a single connect and then goes quiet while its traffic continues. The `GetVersion` handshake is itself unauthenticated, so it appears under `attempted` only. The `version` label is drawn from a compiled-in list and never from the request. Traffic on a `/sovereign.config.` route this build does not serve — an unknown version, or a path not shaped like `<version>.<Service>/<Method>` — is counted under `version="unrecognised",outcome="attempted"` rather than creating a label of its own or being credited to a real version.
 
 ## Release Gate
 
