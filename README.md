@@ -39,7 +39,7 @@ export SOVEREIGN_CONFIG_MANAGER_GROUP='sovereign-config-connections'
 docker compose up -d
 ```
 
-`SOVEREIGN_CONFIG_PUBLIC_ORIGIN` is the exact canonical HTTPS origin embedded in generated connection URLs. It must carry no userinfo, no path other than `/`, no query, and no fragment; numeric-loopback HTTP is accepted only in tests. `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE` names the environment-specific Authentik user attribute that carries managed grants, matching the scope mapping in that environment's blueprint. `SOVEREIGN_CONFIG_MANAGER_GROUP` names the Authentik group each managed connection's service account is added to purely so an operator can browse them together; it grants no permissions and must match a plain group entry in that environment's blueprint. The Authentik administration origin is derived from `SOVEREIGN_CONFIG_OIDC_ISSUER`, so the API and issuer origins can never diverge.
+`SOVEREIGN_CONFIG_PUBLIC_ORIGIN` is the exact canonical HTTPS origin embedded in generated connection URLs. It must carry no userinfo, no path other than `/`, no query, and no fragment; numeric-loopback HTTP is accepted only in tests. `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE` names the environment-specific Authentik user attribute that carries managed grants, matching the scope mapping in that environment's blueprint. `SOVEREIGN_CONFIG_MANAGER_GROUP` names the Authentik group each managed connection's service account is added to purely so an operator can browse them together; it grants no permissions and must match a plain group entry in that environment's blueprint. Both names are enumerated per environment under [Authentik objects by environment](#authentik-objects-by-environment). The Authentik administration origin is derived from `SOVEREIGN_CONFIG_OIDC_ISSUER`, so the API and issuer origins can never diverge.
 
 `SOVEREIGN_CONFIG_IMAGE_TAG` selects the published Zot image; it defaults to `local` for local builds. `SOVEREIGN_CONFIG_ENV` labels metrics and logs and defaults to `dev`. PostgreSQL is pinned by digest. The service starts only after PostgreSQL reports healthy.
 
@@ -227,14 +227,54 @@ Authentik 2026.5.2 or newer is required. That version includes configurable gran
 
 The issuing providers use the selected Authentik signing certificate, five-minute access tokens, and rotating refresh tokens bounded to eight hours. Browser and human CLI clients request `openid sovereign-config offline_access`. Browser access tokens remain only in WASM memory; the rotating refresh credential is held in tab-scoped session storage so a reload can obtain a fresh access token without persisting a long-lived login across browser sessions. Logout, refresh expiry, or refresh rejection clears the browser session. Use authorization code with PKCE or device flow and keep all tokens out of shell history and logs.
 
+### Authentik objects by environment
+
+Every Authentik object this application relies on is created by that environment's blueprint, and **the two environments share nothing that carries authorization**. Each name below exists in exactly one environment; a principal added to a production object has no development access and vice versa. The only objects both blueprints own are the `sovereign-config-device-code` flow and the brand assignment that references it, which are identical in each and carry no permissions.
+
+Nothing here is created by Sovereign Config itself except the per-connection service accounts noted at the end of each table — the server never seeds users, groups, roles, or authorization state.
+
+#### Production — `authentik/blueprint.yaml`
+
+| Object | Authentik kind | Purpose | Confers permission? |
+| --- | --- | --- | --- |
+| `sovereign-config-production-config-contributor` | Group | The contributor group. Carries the attribute `sovereign_config_prod_grants` set to `[{prefix: "/", permissions: [read, write, manage]}]`, so its members hold every permission on the whole production tree. **Add human operators here.** | Yes — through its grant attribute, not through the group name |
+| `sovereign-config-connections` | Group | Organizational only. Every managed access-URL service account Sovereign Config provisions is added here so an operator can browse them together in Authentik. Carries no roles and no attributes. Named by `SOVEREIGN_CONFIG_MANAGER_GROUP`; membership failure is best-effort and never blocks a connection. | No — deliberately none |
+| `sovereign-config-connection-manager` | Group | Binds the RBAC role of the same name to the connection-manager service account, which is its only member. Not for human membership. | Yes — Authentik RBAC, via its role |
+| `sovereign-config-connection-manager` | RBAC role | Global `authentik_core.add_user`, `add_token`, `view_token`, and `view_group` — metadata only. `view_token_key` is deliberately never granted, so no token key is ever readable, and the role is not a superuser and has no Admin UI access. | Yes — global, narrow |
+| `sovereign-config-connection-manager-objects` | Initial-permissions policy | Attaches object-level `view_user`, `change_user`, `delete_user`, `view_token`, and `set_token_key` to the role above **for the objects it creates only**, so it cannot read, change, or delete an unrelated user or token. | Yes — per object created |
+| `sovereign-config-connection-manager` | Service account (user) | The connection-manager identity, in `goauthentik.io/service-accounts`, a member of the manager group above. Isolated from the introspection credential and from the browser. | Through its group |
+| `sovereign-config-connection-manager-api` | Token (`intent: api`, non-expiring) | The API token that identity authenticates with. Supplied to the server as `MANAGER_API_TOKEN_FILE` / `SOVEREIGN_CONFIG_MANAGER_API_TOKEN`. | Acts as the service account |
+| `sovereign_config_prod_grants` | User/group attribute | The direct grant attribute for this environment, named to the server by `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE`. Set it on a user, a service account, or any group for access narrower than the contributor group. | Yes — this is where production authorization actually lives |
+| `sovereign-config production grants` | OAuth2 scope mapping (scope `sovereign-config`) | Reads `sovereign_config_prod_grants` from the requesting user **and every group they belong to**, deduplicates, and emits the common `sovereign_config_grants` claim. | Emits the claim the server evaluates |
+| `<display-name-slug>-<connection-id>` | Service accounts (created at runtime) | One per managed access URL, created by the connection manager, granted exactly `{"prefix": "<root>", "permissions": [...]}` in `sovereign_config_prod_grants`, and added to `sovereign-config-connections`. | Yes — exactly the grant it was minted with |
+
+#### Development — `authentik/blueprint-dev.yaml`
+
+| Object | Authentik kind | Purpose | Confers permission? |
+| --- | --- | --- | --- |
+| `sovereign-config-development-config-contributor` | Group | The development contributor group. Carries `sovereign_config_dev_grants` set to `[{prefix: "/", permissions: [read, write, manage]}]`. | Yes — through its grant attribute |
+| `sovereign-config-dev-connections` | Group | Browsing group for development managed access-URL service accounts. No roles, no attributes. Named by `SOVEREIGN_CONFIG_MANAGER_GROUP` in the development deployment. | No — deliberately none |
+| `sovereign-config-dev-connection-manager` | Group | Binds the development RBAC role to the development connection-manager service account, its only member. | Yes — Authentik RBAC, via its role |
+| `sovereign-config-dev-connection-manager` | RBAC role | Same narrow global permissions as production: `add_user`, `add_token`, `view_token`, `view_group`. No `view_token_key`, not a superuser. | Yes — global, narrow |
+| `sovereign-config-dev-connection-manager-objects` | Initial-permissions policy | Same per-object `view`/`change`/`delete_user`, `view_token`, `set_token_key` attachment as production. | Yes — per object created |
+| `sovereign-config-dev-connection-manager` | Service account (user) | The development connection-manager identity. | Through its group |
+| `sovereign-config-dev-connection-manager-api` | Token (`intent: api`, non-expiring) | Its API token, supplied to the development deployment as `MANAGER_API_TOKEN_FILE` / `SOVEREIGN_CONFIG_MANAGER_API_TOKEN`. | Acts as the service account |
+| `sovereign_config_dev_grants` | User/group attribute | The development direct grant attribute, named by `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE`. | Yes — this is where development authorization lives |
+| `sovereign-config development grants` | OAuth2 scope mapping (scope `sovereign-config`) | Reads `sovereign_config_dev_grants` from the user and their groups and emits the same `sovereign_config_grants` claim. | Emits the claim the server evaluates |
+| `<display-name-slug>-<connection-id>` | Service accounts (created at runtime) | One per development managed access URL, granted in `sovereign_config_dev_grants` and added to `sovereign-config-dev-connections`. | Yes — exactly the grant it was minted with |
+
+The environment-specific names the server must be told about are exactly two, and both must match the blueprint that was applied to the same Authentik instance:
+
+| Deployment variable | Production | Development |
+| --- | --- | --- |
+| `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE` | `sovereign_config_prod_grants` | `sovereign_config_dev_grants` |
+| `SOVEREIGN_CONFIG_MANAGER_GROUP` | `sovereign-config-connections` | `sovereign-config-dev-connections` |
+
+Note that the production connection-manager objects carry **no** environment word in their names (`sovereign-config-connection-manager`, `sovereign-config-connections`) while their development counterparts are infixed with `-dev-`, whereas the contributor groups spell both environments out in full (`-production-` / `-development-`). Read the name, not the pattern.
+
 ### Configuration grants
 
-Each blueprint creates an environment-specific contributor group that bundles global `read`, `write`, and `manage` grants:
-
-| Environment | Contributor group | Direct grant attribute |
-| --- | --- | --- |
-| Production | `sovereign-config-production-config-contributor` | `sovereign_config_prod_grants` |
-| Development | `sovereign-config-development-config-contributor` | `sovereign_config_dev_grants` |
+Each blueprint creates an environment-specific contributor group that bundles global `read`, `write`, and `manage` grants — `sovereign-config-production-config-contributor` against `sovereign_config_prod_grants`, and `sovereign-config-development-config-contributor` against `sovereign_config_dev_grants`.
 
 Add a user or service account only to the contributor groups required for that environment. Group membership is an Authentik administration convenience, not a Sovereign Config role: the environment's scope mapping emits the existing granular `sovereign_config_grants` claim, and the server independently evaluates `read`, `write`, or `manage` for every operation. No contributor role name is sent to or expanded by the server.
 
