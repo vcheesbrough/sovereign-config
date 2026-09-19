@@ -61,23 +61,43 @@ In addition to baseline §3 (git safety) and §7 (MCP/secrets):
 
 ## 3. Protocol Compatibility
 
-Protocol compatibility is verified via the native gRPC `System.GetVersion`
-endpoint. Clients (cli/mcp/provider) are likely running an **earlier** protocol
-version than the server.
+Compatibility is a **supported range**, negotiated at connect through the native
+gRPC `System.GetVersion` endpoint: the server advertises every version it
+serves, and the client picks the highest both speak. Clients (cli/mcp/provider)
+are likely running an **earlier** protocol version than the server, and that is
+explicitly supported — a server upgrade alone must never break them.
+
+**The full procedure for introducing and retiring a protocol version is
+`## Protocol versioning` in `README.md`.** Read it before changing anything in
+`proto/`. The rules below are the agent-facing summary, not a second copy.
 
 - **Any protocol change requires explicit permission, requested up front.**
   Raise it as the first thing when planning or estimating the work — before
   implementation, while there is still a decision to make. Never let a protocol
-  change surface mid-implementation or be discovered in the diff.
+  change surface mid-implementation or be discovered in the diff. This covers a
+  behaviour change to an existing endpoint as much as a signature change.
 - Treat a card's "no protocol change / client-side only" scope as a **claim to
   verify**, not an assumption. If the work turns out to need one, stop and ask.
 - A protocol version defines not only signatures/datatypes but also the **key
   behaviour** of endpoints. Earlier behaviour contracts cannot be broken without
   a protocol version change.
+- **Edits to an existing `proto/sovereign/config/vN/` package are additive
+  only** — a new field with an unused number, a new message, a new RPC. Anything
+  else is a new package served alongside the old one, never an edit in place.
+- **Never change the `GetVersionResponse.protocol_version` echo semantics.** It
+  returns the version the client *requested*; echoing the server's newest
+  instead would fail every already-deployed client the day a newer version
+  ships. Its regression tests are named in the README section.
 - Breaking changes are a **last resort** and must be avoided wherever possible.
   If unavoidable: document it and communicate it to all clients.
 - New protocol versions may be added, but **the server must continue to support
-  older versions.**
+  older versions.** A version is retired only once
+  `sovereign_config_protocol_requests_total` has read zero for it across a full
+  deployment cycle — the provider does not cache, so a client on a retired
+  version fails on its next load with no fallback.
+- Remember the converse: a change can break clients **without** being a protocol
+  change (releases 2.15.0 and 2.18.0 both did). Negotiation does not protect
+  against that class.
 
 *Kanban workflow and automated test coverage follow the agent-shared baseline
 unchanged — see baseline §1 and §6. Start a card with the **`start-iteration`**

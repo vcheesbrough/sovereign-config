@@ -38,6 +38,7 @@ mod tests {
             Ok(VersionReply {
                 application_version: "consumer-fixture".into(),
                 protocol_version: protocol_version.into(),
+                supported_protocol_versions: vec![protocol_version.into()],
             })
         }
 

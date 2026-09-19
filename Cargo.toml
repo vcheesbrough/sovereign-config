@@ -14,11 +14,12 @@ members = [
   "test-consumers/render-consumer",
   "test-consumers/rust-client",
   "test-consumers/rust-provider",
+  "test-consumers/sovereign-config-proto-testversion",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "2.24.0"
+version = "2.25.0"
 edition = "2024"
 rust-version = "1.94"
 license = "PolyForm-Noncommercial-1.0.0"

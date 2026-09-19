@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+// A second protobuf package that exists **only to test concurrent protocol
+// serving**. It is never compiled into a released binary and commits to no
+// wire contract: it may be changed or deleted freely.
+//
+// Its job is to prove, before a real `sovereign.config.v4` is ever needed, that
+// two versioned packages register on one tonic router, dispatch on their own
+// route paths without shadowing each other, and are counted separately by
+// `sovereign_config_protocol_requests_total`. A mechanism that has never
+// concurrently served is unproven, and a flaw in it would surface during a real
+// migration — the worst possible moment.
+//
+// It deliberately carries only the negotiation surface. The real procedure for
+// introducing a version is in `## Protocol versioning` in `README.md`.
+
+package sovereign.config.vtest;
+
+service System {
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+}
+
+message GetVersionRequest {
+  string protocol_version = 1;
+}
+
+message GetVersionResponse {
+  string application_version = 1;
+  string protocol_version = 2;
+  repeated string supported_protocol_versions = 3;
+}
+
+// A client compiled before `supported_protocol_versions` existed, as its
+// generated code saw `sovereign.config.v3.GetVersionResponse`: fields 1 and 2
+// and nothing else.
+//
+// Decoding a current server's response into this message is how the "already
+// deployed applications need no rebuild" guarantee is tested. Keep it frozen —
+// adding field 3 here would make the test pass for the wrong reason.
+message LegacyGetVersionResponse {
+  string application_version = 1;
+  string protocol_version = 2;
+}

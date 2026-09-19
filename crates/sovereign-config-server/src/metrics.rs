@@ -3,6 +3,77 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+/// The bucket a request counts against when its route names no protocol version
+/// this server recognises — a health probe, a gRPC reflection call, or a path
+/// that is simply not ours.
+pub(crate) const UNRECOGNISED_PROTOCOL_LABEL: &str = "unrecognised";
+
+/// Per-protocol-version request counts.
+///
+/// This is the input to the retirement decision: a protocol version may not be
+/// removed until its counter has read zero across an observation window, since
+/// clients have no fallback and the provider does not cache. Counting at
+/// `GetVersion` would not answer that question — negotiation happens once at
+/// connect, so a long-lived provider would register a single connect and then
+/// go quiet while its traffic continued.
+///
+/// The label domain is fixed at construction from compiled-in strings and is
+/// never taken from a request, so no route path can widen it. Anything outside
+/// that domain lands in [`UNRECOGNISED_PROTOCOL_LABEL`].
+pub(crate) struct ProtocolMetrics {
+    versions: Vec<(&'static str, AtomicU64)>,
+    unrecognised: AtomicU64,
+}
+
+impl ProtocolMetrics {
+    /// Counters for exactly `versions`, which must be compiled-in labels.
+    pub(crate) fn new(versions: &[&'static str]) -> Self {
+        Self {
+            versions: versions
+                .iter()
+                .map(|label| (*label, AtomicU64::new(0)))
+                .collect(),
+            unrecognised: AtomicU64::new(0),
+        }
+    }
+
+    /// Counts one request against `version`, or against the unrecognised bucket
+    /// when it is not a label this instance was built with.
+    pub(crate) fn record(&self, version: &str) {
+        match self
+            .versions
+            .iter()
+            .find(|(label, _)| *label == version)
+            .map(|(_, counter)| counter)
+        {
+            Some(counter) => counter.fetch_add(1, Ordering::Relaxed),
+            None => self.unrecognised.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    pub(crate) fn render(&self) -> String {
+        let mut output = String::from(
+            "# HELP sovereign_config_protocol_requests_total gRPC requests by protocol version.\n\
+             # TYPE sovereign_config_protocol_requests_total counter\n",
+        );
+        for (label, counter) in &self.versions {
+            let value = counter.load(Ordering::Relaxed);
+            writeln!(
+                output,
+                "sovereign_config_protocol_requests_total{{version=\"{label}\"}} {value}",
+            )
+            .expect("writing metrics to a String cannot fail");
+        }
+        let value = self.unrecognised.load(Ordering::Relaxed);
+        writeln!(
+            output,
+            "sovereign_config_protocol_requests_total{{version=\"{UNRECOGNISED_PROTOCOL_LABEL}\"}} {value}",
+        )
+        .expect("writing metrics to a String cannot fail");
+        output
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AuthenticationResult {
     Success,

@@ -92,12 +92,17 @@ impl System for MockSystem {
         &self,
         request: Request<GetVersionRequest>,
     ) -> Result<tonic::Response<GetVersionResponse>, Status> {
-        if request.into_inner().protocol_version != "v3" {
-            return Err(Status::failed_precondition("protocol mismatch"));
-        }
+        // Mirrors the real server: a version this fixture does not serve is
+        // answered with the served set rather than rejected.
+        let requested = request.into_inner().protocol_version;
         Ok(tonic::Response::new(GetVersionResponse {
             application_version: "1.5.0-test".to_owned(),
-            protocol_version: "v3".to_owned(),
+            protocol_version: if requested == "v3" {
+                requested
+            } else {
+                "v3".to_owned()
+            },
+            supported_protocol_versions: vec!["v3".to_owned()],
         }))
     }
 

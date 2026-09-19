@@ -4,7 +4,9 @@ mod config;
 mod encryption;
 mod managed;
 mod metrics;
+mod protocol;
 mod rpc;
+mod system;
 mod values;
 mod web;
 
@@ -15,7 +17,7 @@ use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, rou
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::{net::TcpListener, signal};
 use tonic::{
-    Request, Response, Status,
+    Request,
     transport::{Endpoint, Server},
 };
 use tonic_health::pb::{
@@ -31,14 +33,14 @@ use auth::{Authenticator, grpc_authentication_layer};
 use authentik::AuthentikAdminClient;
 use config::{Config, ManagedConnectionConfig, required_env};
 use managed::{ManagedConnectionsService, ManagedSettings};
-use metrics::{AuthenticationMetrics, ManagedConnectionMetrics};
-use sovereign_config_core::{PROTOCOL_VERSION, Secret};
+use metrics::{AuthenticationMetrics, ManagedConnectionMetrics, ProtocolMetrics};
+use protocol::ProtocolVersionLayer;
+use sovereign_config_core::Secret;
 use sovereign_config_proto::sovereign::config::v3::{
-    GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
     configuration_server::ConfigurationServer,
-    managed_connections_server::ManagedConnectionsServer,
-    system_server::{System, SystemServer},
+    managed_connections_server::ManagedConnectionsServer, system_server::SystemServer,
 };
+use system::{SERVED_PROTOCOL_LABELS, SystemService};
 use values::{ConfigurationService, encrypt_stored_secrets};
 use web::WebAssetsLayer;
 
@@ -57,67 +59,26 @@ struct AppState {
     database: PgPool,
     authentication_metrics: Arc<AuthenticationMetrics>,
     managed_metrics: Arc<ManagedConnectionMetrics>,
+    protocol_metrics: Arc<ProtocolMetrics>,
 }
 
-#[derive(Clone, Default)]
-struct SystemService;
-
-#[tonic::async_trait]
-impl System for SystemService {
-    async fn get_version(
-        &self,
-        request: Request<GetVersionRequest>,
-    ) -> Result<Response<GetVersionResponse>, Status> {
-        let requested = request.into_inner().protocol_version;
-        if requested != PROTOCOL_VERSION {
-            return Err(Status::failed_precondition(format!(
-                "protocol mismatch: client requested {requested:?}, server requires {PROTOCOL_VERSION}"
-            )));
-        }
-
-        Ok(Response::new(GetVersionResponse {
-            application_version: APPLICATION_VERSION.to_owned(),
-            protocol_version: PROTOCOL_VERSION.to_owned(),
-        }))
-    }
-
-    async fn get_identity(
-        &self,
-        request: Request<GetIdentityRequest>,
-    ) -> Result<Response<GetIdentityResponse>, Status> {
-        if request
-            .extensions()
-            .get::<auth::AuthenticatedPrincipal>()
-            .is_none()
-        {
-            return Err(Status::unauthenticated("authentication required"));
-        }
-        Ok(Response::new(GetIdentityResponse {
-            authenticated: true,
-        }))
+impl AppState {
+    fn render_metrics(&self, up: u8) -> String {
+        format!(
+            "sovereign_config_up {up}\n{}{}{}",
+            self.authentication_metrics.render(),
+            self.managed_metrics.render(),
+            self.protocol_metrics.render(),
+        )
     }
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     match sqlx::query("SELECT 1").execute(&state.database).await {
-        Ok(_) => (
-            StatusCode::OK,
-            format!(
-                "sovereign_config_up 1\n{}{}",
-                state.authentication_metrics.render(),
-                state.managed_metrics.render()
-            ),
-        ),
+        Ok(_) => (StatusCode::OK, state.render_metrics(1)),
         Err(error) => {
             error!(error = %error, "database health probe failed");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "sovereign_config_up 0\n{}{}",
-                    state.authentication_metrics.render(),
-                    state.managed_metrics.render()
-                ),
-            )
+            (StatusCode::SERVICE_UNAVAILABLE, state.render_metrics(0))
         }
     }
 }
@@ -144,6 +105,7 @@ async fn main() -> Result<()> {
     let authenticator = Authenticator::new(config.authentication)?;
     let authentication_metrics = Arc::new(AuthenticationMetrics::default());
     let managed_metrics = Arc::new(ManagedConnectionMetrics::default());
+    let protocol_metrics = Arc::new(ProtocolMetrics::new(SERVED_PROTOCOL_LABELS));
     let (managed_admin, managed_settings) = managed_dependencies(config.managed)?;
     let database = connect_database(&config.database_url).await?;
     let value_cipher = Arc::new(config.value_cipher);
@@ -153,13 +115,26 @@ async fn main() -> Result<()> {
         database,
         authentication_metrics: Arc::clone(&authentication_metrics),
         managed_metrics: Arc::clone(&managed_metrics),
+        protocol_metrics: Arc::clone(&protocol_metrics),
     };
     spawn_metrics_server(config.metrics_addr, state.clone()).await?;
     let (_health_reporter, health_service) = serving_health_service().await;
 
-    info!(grpc_addr = %config.grpc_addr, metrics_addr = %config.metrics_addr, protocol_version = PROTOCOL_VERSION, "sovereign-config started");
+    info!(
+        grpc_addr = %config.grpc_addr,
+        metrics_addr = %config.metrics_addr,
+        protocol_versions = SERVED_PROTOCOL_LABELS.join(","),
+        "sovereign-config started"
+    );
     Server::builder()
         .accept_http1(true)
+        // Outermost, so every request is attributed to the protocol version its
+        // route names — including one rejected by authentication, which is
+        // still traffic on that version.
+        .layer(ProtocolVersionLayer::new(
+            protocol_metrics,
+            SERVED_PROTOCOL_LABELS,
+        ))
         .layer(grpc_authentication_layer(
             authenticator,
             authentication_metrics,
@@ -322,13 +297,8 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use tonic::Code;
-
-    use super::{
-        APPLICATION_VERSION, PROTOCOL_VERSION, System, SystemService, application_version,
-    };
-    use sovereign_config_proto::sovereign::config::v3::GetVersionRequest;
-    use tonic::Request;
+    use super::{APPLICATION_VERSION, SYSTEM_SERVICE_NAME, application_version};
+    use crate::system::SERVED_PROTOCOL_VERSIONS;
 
     #[test]
     fn configured_release_version_overrides_cargo_version() {
@@ -343,29 +313,17 @@ mod tests {
         assert_eq!(APPLICATION_VERSION, expected);
     }
 
-    #[tokio::test]
-    async fn version_rejects_protocol_mismatch() {
-        let result = SystemService
-            .get_version(Request::new(GetVersionRequest {
-                protocol_version: "v999".to_owned(),
-            }))
-            .await;
-
-        let status = result.expect_err("mismatched protocol must be rejected");
-        assert_eq!(status.code(), Code::FailedPrecondition);
-    }
-
-    #[tokio::test]
-    async fn version_returns_the_current_protocol() {
-        let response = SystemService
-            .get_version(Request::new(GetVersionRequest {
-                protocol_version: PROTOCOL_VERSION.to_owned(),
-            }))
-            .await
-            .expect("matching protocol must succeed")
-            .into_inner();
-
-        assert_eq!(response.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(response.application_version, APPLICATION_VERSION);
+    #[test]
+    fn the_health_probe_names_a_served_protocol_package() {
+        // The local healthcheck binary asks for this service by name; a
+        // retirement that left it naming a deleted package would break the
+        // container health probe rather than fail a test.
+        assert!(
+            SERVED_PROTOCOL_VERSIONS
+                .iter()
+                .any(|version| SYSTEM_SERVICE_NAME
+                    == format!("sovereign.config.{}.System", version.as_str())),
+            "{SYSTEM_SERVICE_NAME} must name a served protocol version"
+        );
     }
 }

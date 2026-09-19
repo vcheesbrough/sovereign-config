@@ -176,7 +176,7 @@ The hosts `render` exists for — a CI container, a Compose deploy step — have
 
 Sovereign Config's own deploy steps deliberately do **not** consume their configuration through `render`, and keep their Woodpecker secrets. Reading `/sovereign-config/prod/...` in order to deploy Sovereign Config would create a circular availability dependency: a broken production deployment could not be redeployed through a path that requires production to be readable. Other repositories and the homelab stacks are the intended consumers.
 
-The native and gRPC-Web APIs use the breaking `sovereign.config.v3` protobuf package. Servers, CLIs, browser assets, and Rust clients must be upgraded together; there is no prior-version fallback or mixed-version operation.
+The native and gRPC-Web APIs use the `sovereign.config.v3` protobuf package. A client is not required to match the server's release: each connection negotiates a protocol version from the set the server advertises, so a client that speaks an older version than the server's newest keeps working and mixed-version operation is supported. Upgrading the server alone is therefore safe. See [Protocol versioning](#protocol-versioning) for how a version is introduced and retired, and note that protocol compatibility is a separate question from the client-visible behaviour changes described under [Upgrade](#upgrade) — 2.15.0 and 2.18.0 each broke older clients without any protocol version change.
 
 The version-1 URL origin is the native gRPC endpoint, its path is the canonical configuration root, and its fragment contains the OIDC issuer and client ID. Without `client_secret`, login uses device flow. With `client_secret`, the value is unpadded Base64URL-encoded `service-account-username:app-password`; the CLI obtains a fresh client-credentials access token for each operation and does not support login or logout for that profile. The entire managed URL is a secret even though its credential is encoded.
 
@@ -317,7 +317,7 @@ The connection-manager identity is isolated from the introspection credential an
 
 ## Application provider
 
-`sovereign-config-provider` is an ergonomic Rust facade for consuming a managed connection from application code: it parses the version-1 connection URL, obtains a fresh client-credentials token, reads only the encoded subtree over native gRPC, transparently reveals secret leaves, and deserializes the result into a `serde` type. It is a thin layer over the shared core/client/native crates and adds no new URL format, authentication, or transport. It is distributed as tagged workspace source only — there is no provider container or prebuilt library artifact — and must be built from the same tag as the server. See `crates/sovereign-config-provider/README.md` for the API, error surface, and the no-cache/no-retry contract.
+`sovereign-config-provider` is an ergonomic Rust facade for consuming a managed connection from application code: it parses the version-1 connection URL, obtains a fresh client-credentials token, reads only the encoded subtree over native gRPC, transparently reveals secret leaves, and deserializes the result into a `serde` type. It is a thin layer over the shared core/client/native crates and adds no new URL format, authentication, or transport. It is distributed as tagged workspace source only — there is no provider container or prebuilt library artifact. It does not have to be built from the server's tag: it negotiates a protocol version on connect (see [Protocol versioning](#protocol-versioning)), so a server upgrade does not require redeploying its consumers. See `crates/sovereign-config-provider/README.md` for the API, error surface, and the no-cache/no-retry contract.
 
 ## Woodpecker CI secrets extension
 
@@ -403,9 +403,82 @@ Exposing one value at several paths is a deliberate administrative act that requ
 
 The browser opens on configuration values; `/` resolves there, and the Access URLs and Downloads views are reached from a menu on the brand mark. The header carries the signed-in operator's name, taken from the OIDC ID token and used for that label alone, alongside the application and protocol versions the service reports; an unreachable service is called out there rather than on a page of its own. Configuration URLs use `/configuration/<path>` and are always lowercase, but the path field, grid rows, and JSON editor all display each value under the exact case it was stored with; the final segment of each stored path is the value name. A drag-resizable sidebar carries the whole readable namespace tree, drawn with box-drawing characters and labeling each namespace with whichever case one of its own values established first — when two values under one namespace disagree on its case, the tie is broken deterministically, not by displaying two rows. Selecting a node opens that path directly, a node holding values of its own is shown in bold, and a node that is the root of an access URL carries a key. The tree is built from one whole-estate read, so a principal scoped to a prefix — which cannot read the root subtree — still gets the tree, without the bold markers. Below the sidebar breakpoint the tree is not shown and the path selector is the way to move between paths. The path selector offers namespaces containing readable values and also accepts a valid namespace that does not exist yet, which is how a value is first created under a namespace the tree cannot yet show. Leaving a path that holds an unsaved value edit — including through the browser's Back button — raises a confirmation before the edit is discarded. Each path's own access URLs are listed and can be created, rotated, and revoked beneath its values, with the selected node as the root; the Access URLs page remains the estate-wide view. Listing filters every returned value through server-side `read` permission, while row saves and deletes both require `write` permission. A secret is one padlocked field: blank behind a masked placeholder, never pre-filled with stored content, and the same box a replacement is typed into — so writing a new secret never requires the permission to read the current one. Opening the padlock is the explicit action that reveals the stored plaintext and leaves it editable in place. Revealed values are cleared when the padlock is shut, reloaded, navigated away from, logged out, or when any request fails. Per-row and per-entry actions are icon buttons whose tooltip and accessible name both name the value they act on. The JSON switch is off by default; when enabled it loads the entire selected subtree with all-or-nothing `read` authorization and replaces the grid with a pretty JSON editor. Saving preserves masked secrets, atomically replaces plain values, and leaves per-value deletion unavailable in JSON mode.
 
+## Protocol versioning
+
+Applications embedding `sovereign-config-provider` are deployed independently of the server and are expected to lag it. A server upgrade must therefore never break them. This section is the whole procedure for introducing and retiring a protocol version; it is self-contained and needs no reading of source.
+
+### How negotiation works
+
+1. The client sends `GetVersion` with the newest protocol version *it* speaks.
+2. The server answers with `supported_protocol_versions` — every version it serves, oldest first — and never rejects the request, whatever was asked for.
+3. `GetVersionResponse.protocol_version` **echoes the version the session will speak**: the version the client asked for, whenever the server serves it.
+4. The client selects the highest version present in both sets, and fails with a bounded incompatible-protocol error only when there is no overlap.
+
+A server older than 2.25.0 sends no `supported_protocol_versions`. Clients treat an empty set as "this server serves exactly the version it echoed", so negotiation still succeeds against one.
+
+### The rule that makes this work
+
+**Adding a protocol version must never change what an existing version's clients see.**
+
+The echo in step 3 is why. Clients compiled before `supported_protocol_versions` existed ignore that field entirely and compare the echoed `protocol_version` against the single version they were built with. If the server ever echoed *its own newest* version instead of the requested one, every one of those clients would fail on the day a newer version shipped — and they are already deployed, so they cannot be fixed retroactively. That is the fleet-wide outage this mechanism exists to prevent.
+
+The echo falls back to the server's newest version only when the requested version is not served at all. A client asking for a version it speaks can never observe that fallback; a client whose version has been *retired* does, and hard-fails, which is intended.
+
+The regression tests that protect this are `a_server_newer_than_this_build_still_connects` and `a_client_compiled_without_the_supported_set_still_decodes_and_negotiates`. Do not weaken them.
+
+### What forces a new version, and what does not
+
+A new version is **not** needed for:
+
+- adding a field with an unused number;
+- adding a message;
+- adding an RPC to an existing service.
+
+Existing clients skip unknown fields and never call new RPCs.
+
+A new version **is** required for:
+
+- renaming, renumbering, retyping, removing or repurposing an existing field;
+- changing what an existing RPC does — the behaviour of a call is part of the contract, not just its signature.
+
+Note the converse, because it has bitten this project twice: a change can break clients *without* being a protocol change. Releases 2.15.0 (path grammar) and 2.18.0 (path letter case) were both additive to the `v3` contract and still broke older clients, because those clients validated responses more strictly than the contract required. Version negotiation does not protect against that class; see [Upgrade](#upgrade) for how those were sequenced.
+
+### Introducing a new version
+
+Each version is its own protobuf package, because the gRPC route path embeds the package name — `/sovereign.config.v3.System/GetVersion`. Distinct packages mean distinct routes, so two versions serve concurrently on one router with no dispatch ambiguity. This is proven end to end by `test-consumers/sovereign-config-proto-testversion`, a dev-only package registered alongside `v3` in the server's own tests; read those tests if you want to see the mechanism working before you rely on it.
+
+To add `vN`:
+
+1. Copy `proto/sovereign/config/v3/service.proto` to `proto/sovereign/config/vN/service.proto` and change its `package` line to `sovereign.config.vN`. Make the breaking change there, and only there.
+2. Compile it in `crates/sovereign-config-proto/build.rs` and expose it as a `vN` module in that crate's `lib.rs`, alongside `v3`.
+3. Write the `vN` ↔ core mapping shim. **This layer must be only the proto↔core translation.** Domain types in `sovereign-config-core` stay version-free, so a second version is a translation shim over one implementation rather than a forked server. If you find yourself duplicating logic rather than mapping types, the change belongs in core, not in the shim.
+4. Register the `vN` services on the router in `crates/sovereign-config-server/src/main.rs`, **leaving every existing `add_service` line in place.**
+5. Add `VN` to `ProtocolVersion` in `crates/sovereign-config-core/src/status.rs`, declared *after* the existing variants — ordering is declaration order, because `"v10"` sorts below `"v3"` as a string.
+6. Add `vN` to `SERVED_PROTOCOL_VERSIONS` and `SERVED_PROTOCOL_LABELS` in `crates/sovereign-config-server/src/system.rs`. Do this **last**: it advertises the version to clients, so the services implementing it must already be registered.
+
+Deploy the server before any client change. Clients now negotiate `vN` automatically; clients that have not been rebuilt continue on `v3`.
+
+### Retiring a version
+
+**Confirm the version has no traffic before removing it.** `sovereign_config_protocol_requests_total{version="v3"}` counts every request on that version's routes. A version may be retired only once that counter has been flat at zero across an observation window long enough to cover the slowest-moving consumer — at minimum a full deployment cycle of every application that embeds the provider.
+
+This is a precondition, not a courtesy. The provider does not cache: it holds no last-known-good configuration, by deliberate design, because retaining one would keep revealed secrets in process memory for the application's lifetime. An application still speaking a version you delete therefore fails on its **next configuration load**, with no fallback and no degraded mode.
+
+Once the counter reads zero:
+
+1. Delete `proto/sovereign/config/v3/` and its entry in `crates/sovereign-config-proto/build.rs` and `lib.rs`.
+2. Delete the `v3` mapping shim module.
+3. Delete the `v3` `add_service` lines in `crates/sovereign-config-server/src/main.rs`.
+4. Remove `V3` from `ProtocolVersion`, `SERVED_PROTOCOL_VERSIONS` and `SERVED_PROTOCOL_LABELS`.
+5. Update `SYSTEM_SERVICE_NAME` in `main.rs`, which the container health probe asks for by name.
+
+Announce the retirement to every consuming repository before it ships. A client outside the supported range fails with `IncompatibleProtocol` at connect, which is a clear error but not a recoverable one.
+
 ## Observability
 
 The application writes structured redacted JSON logs to stdout. Authentication events contain only the RPC path and bounded outcome/reason values. Internal Alloy discovers `/metrics` using the Docker labels in `compose.yaml`; that endpoint is not routed through Traefik. `sovereign_config_authentication_total` reports bounded success/failure reasons without request-derived labels. OTLP export is introduced by its separate card.
+
+`sovereign_config_protocol_requests_total{version="…"}` counts gRPC requests by the protocol version their route names. **This metric is the input to the retirement decision** described under [Protocol versioning](#protocol-versioning): a protocol version may not be removed until its counter has been flat at zero across a full deployment cycle of every consuming application, because clients have no fallback. It answers "is anything still speaking `v3`?", which `GetVersion` alone cannot — negotiation happens once at connect, so a long-lived provider registers a single connect and then goes quiet while its traffic continues. The `version` label is drawn from a compiled-in list and never from the request; traffic on a versioned route this build does not serve is counted under `version="unrecognised"` rather than creating a label of its own.
 
 ## Release Gate
 

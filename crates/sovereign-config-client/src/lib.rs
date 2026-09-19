@@ -3,9 +3,9 @@
 use async_trait::async_trait;
 use sovereign_config_core::{
     AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata,
-    DisplayName, ErrorKind, ManagedConnectionMetadata, ManagedPermissions, PROTOCOL_VERSION,
-    PlainValue, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret, Secret,
-    SecretInput, ServiceStatus, SubTreeMutationValue, Timestamp, ValueListing, ValuePaths,
+    DisplayName, ErrorKind, ManagedConnectionMetadata, ManagedPermissions, PlainValue,
+    ProtocolVersion, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret,
+    Secret, SecretInput, ServiceStatus, SubTreeMutationValue, Timestamp, ValueListing, ValuePaths,
     ValueSubTree,
 };
 
@@ -46,10 +46,14 @@ pub fn map_rpc_status(code: RpcCode) -> ClientError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VersionReply {
     pub application_version: String,
+    /// The version the session will speak, echoed by the server.
     pub protocol_version: String,
+    /// Every version the server serves. Empty from a server older than 2.25.0,
+    /// which [`ServiceStatus::negotiate`] treats as `[protocol_version]`.
+    pub supported_protocol_versions: Vec<String>,
 }
 
 #[async_trait(?Send)]
@@ -366,19 +370,23 @@ where
 
     /// Fetches and negotiates the service version without caching or retrying.
     ///
+    /// Asks for the newest version this build speaks and settles on the highest
+    /// version the server also serves, so a server ahead of this build still
+    /// works.
+    ///
     /// # Errors
     ///
     /// Returns a bounded transport or protocol compatibility error.
     pub async fn service_status(&self) -> Result<ServiceStatus, ClientError> {
-        let reply = self.transport.get_version(PROTOCOL_VERSION).await?;
-        let status = ServiceStatus::negotiate(reply.application_version, reply.protocol_version);
-        if !status.compatible {
-            return Err(ClientError::new(
-                ErrorKind::IncompatibleProtocol,
-                "service protocol is incompatible",
-            ));
-        }
-        Ok(status)
+        let reply = self
+            .transport
+            .get_version(ProtocolVersion::PREFERRED.as_str())
+            .await?;
+        ServiceStatus::negotiate(
+            reply.application_version,
+            &reply.protocol_version,
+            &reply.supported_protocol_versions,
+        )
     }
 
     /// Fetches authenticated identity state with a freshly supplied access token.
@@ -419,6 +427,7 @@ mod tests {
             Ok(VersionReply {
                 application_version: "1.5.0".into(),
                 protocol_version: protocol.into(),
+                supported_protocol_versions: vec![protocol.into()],
             })
         }
 

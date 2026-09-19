@@ -1,9 +1,17 @@
 use super::{
-    ConfigPath, ErrorKind, MASKED_SECRET_TEXT, MaskedSecret, PROTOCOL_VERSION, PlainValue,
+    ConfigPath, ErrorKind, MASKED_SECRET_TEXT, MaskedSecret, PlainValue, ProtocolVersion,
     RevealedSecret, Secret, SecretInput, ServiceStatus, SubTreeMutationContent,
     SubTreeMutationValue, SubTreeValue, ValueContent, parse_subtree_json, render_subtree_json,
     render_subtree_plain,
 };
+
+/// The versions a server advertises, as `GetVersionResponse` carries them.
+fn advertised(versions: &[&str]) -> Vec<String> {
+    versions
+        .iter()
+        .map(|version| (*version).to_owned())
+        .collect()
+}
 
 #[test]
 fn paths_are_canonical_and_root_is_explicit() {
@@ -324,9 +332,72 @@ fn secret_types_and_json_masks_are_safe_by_construction() {
 }
 
 #[test]
-fn protocol_negotiation_is_exact() {
-    assert!(ServiceStatus::negotiate("1.5.0".into(), PROTOCOL_VERSION.into()).compatible);
-    assert!(!ServiceStatus::negotiate("1.5.0".into(), "v1".into()).compatible);
+fn protocol_negotiation_selects_a_version_inside_the_advertised_range() {
+    let status = ServiceStatus::negotiate("1.5.0".into(), "v3", &advertised(&["v3"]))
+        .expect("a server serving v3 must negotiate");
+    assert_eq!(status.protocol_version, ProtocolVersion::V3);
+    assert_eq!(status.application_version, "1.5.0");
+}
+
+#[test]
+fn protocol_negotiation_accepts_a_server_newer_than_this_client() {
+    // The outage this mechanism exists to prevent: the server has gained a
+    // version this build has never heard of and still serves the one it speaks.
+    let status = ServiceStatus::negotiate("9.0.0".into(), "v3", &advertised(&["v3", "v4"]))
+        .expect("a newer server still serving v3 must negotiate");
+    assert_eq!(status.protocol_version, ProtocolVersion::V3);
+}
+
+#[test]
+fn protocol_negotiation_rejects_a_server_outside_the_range() {
+    // Both boundaries: a server too new (v3 retired) and one too old.
+    for advertised in [advertised(&["v4", "v5"]), advertised(&["v1", "v2"])] {
+        let error = ServiceStatus::negotiate("9.0.0".into(), "v4", &advertised)
+            .expect_err("a server with no version in common must be rejected");
+        assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
+    }
+}
+
+#[test]
+fn protocol_negotiation_falls_back_to_the_echo_when_no_set_is_advertised() {
+    // A server older than 2.25.0 sends no `supported_protocol_versions`.
+    let status = ServiceStatus::negotiate("2.24.0".into(), "v3", &[])
+        .expect("a pre-2.25.0 server must still negotiate on its echo alone");
+    assert_eq!(status.protocol_version, ProtocolVersion::V3);
+
+    let error = ServiceStatus::negotiate("2.24.0".into(), "v1", &[])
+        .expect_err("an echo this build does not speak must be rejected");
+    assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
+}
+
+#[test]
+fn protocol_version_ordering_is_declaration_order_not_lexicographic() {
+    // The hazard this ordering exists to avoid: a tenth version sorts *below* a
+    // third one as a string, so comparing version strings would negotiate the
+    // older session.
+    assert!("v10" < "v3");
+
+    // `ALL` is oldest-first and strictly ascending, which is what makes
+    // selecting the highest mutual version a reverse scan.
+    assert!(
+        ProtocolVersion::ALL
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "ProtocolVersion::ALL must be declared oldest-first"
+    );
+    assert_eq!(
+        ProtocolVersion::ALL.last().copied(),
+        Some(ProtocolVersion::PREFERRED),
+        "PREFERRED must be the newest version in ALL"
+    );
+}
+
+#[test]
+fn protocol_version_parsing_ignores_versions_this_build_does_not_speak() {
+    assert_eq!(ProtocolVersion::parse("v3"), Some(ProtocolVersion::V3));
+    for unknown in ["v1", "v4", "v10", "V3", "3", ""] {
+        assert_eq!(ProtocolVersion::parse(unknown), None, "{unknown:?}");
+    }
 }
 
 #[test]

@@ -67,6 +67,7 @@ enum LayerOutcome {
 
 struct MockState {
     protocol_version: String,
+    supported_protocol_versions: Vec<String>,
     /// Layer path -> what `GetSubTree` does for it.
     layers: BTreeMap<String, LayerOutcome>,
     plain: BTreeMap<String, String>,
@@ -126,7 +127,14 @@ impl MockState {
         );
 
         Self {
-            protocol_version: sovereign_config_core::PROTOCOL_VERSION.to_owned(),
+            protocol_version: sovereign_config_core::ProtocolVersion::PREFERRED
+                .as_str()
+                .to_owned(),
+            supported_protocol_versions: vec![
+                sovereign_config_core::ProtocolVersion::PREFERRED
+                    .as_str()
+                    .to_owned(),
+            ],
             layers,
             plain,
             secrets,
@@ -152,6 +160,7 @@ impl System for MockSystem {
         Ok(Response::new(GetVersionResponse {
             application_version: "2.15.0".to_owned(),
             protocol_version: self.0.protocol_version.clone(),
+            supported_protocol_versions: self.0.supported_protocol_versions.clone(),
         }))
     }
 
@@ -763,10 +772,22 @@ async fn health_is_unauthenticated() {
 async fn a_protocol_mismatch_fails_startup() {
     let mut state = MockState::happy();
     state.protocol_version = "v2".to_owned();
+    state.supported_protocol_versions = vec!["v2".to_owned()];
     match Harness::start(Arc::new(state)).await {
         Ok(_) => panic!("the broker started against an incompatible service"),
         Err(error) => assert_eq!(error, ConnectError::IncompatibleProtocol),
     }
+}
+
+/// The broker is deployed independently of the server, so a server that has
+/// gained a newer protocol version must not stop it starting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_newer_than_this_build_starts_normally() {
+    let mut state = MockState::happy();
+    state.supported_protocol_versions = vec!["v3".to_owned(), "v4".to_owned()];
+    Harness::start(Arc::new(state))
+        .await
+        .expect("a server still serving v3 must start the broker");
 }
 
 /// Values must reach the HTTP response and nothing else.

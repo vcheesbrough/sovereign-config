@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use sovereign_config_client::Transport;
-use sovereign_config_core::{ConfigPath, ConnectionUrl, PROTOCOL_VERSION, Secret, ServiceStatus};
+use sovereign_config_core::{ConfigPath, ConnectionUrl, ProtocolVersion, Secret, ServiceStatus};
 use sovereign_config_layers::{CachedTokenProvider, LayerReader, Naming, OnMissing};
 use sovereign_config_native::TonicTransport;
 
@@ -38,12 +38,15 @@ pub(crate) async fn connect(url: &Secret, token_ttl: Duration) -> Result<Connect
         .await
         .map_err(|_| ConnectError::Unavailable)?;
     let reply = transport
-        .get_version(PROTOCOL_VERSION)
+        .get_version(ProtocolVersion::PREFERRED.as_str())
         .await
         .map_err(|_| ConnectError::Unavailable)?;
-    if !ServiceStatus::negotiate(reply.application_version, reply.protocol_version).compatible {
-        return Err(ConnectError::IncompatibleProtocol);
-    }
+    ServiceStatus::negotiate(
+        reply.application_version,
+        &reply.protocol_version,
+        &reply.supported_protocol_versions,
+    )
+    .map_err(|_| ConnectError::IncompatibleProtocol)?;
     let tokens = CachedTokenProvider::new(
         connection.issuer().to_owned(),
         connection.client_id().to_owned(),

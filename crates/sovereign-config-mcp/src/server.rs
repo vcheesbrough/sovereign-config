@@ -269,11 +269,12 @@ impl<B: Backend> Server<B> {
     async fn status(&self) -> Result<String, ToolFailure> {
         let service = self.backend.service_status().await?;
         let authentication = self.backend.authentication_status().await?;
+        // No `compatible` flag: reaching here *is* compatibility, since
+        // negotiation fails the call outright when no version is shared.
         Ok(format!(
-            "Service {} (protocol {}; compatible={})\nAuthentication: {}",
+            "Service {} (protocol {})\nAuthentication: {}",
             service.application_version,
             service.protocol_version,
-            service.compatible,
             if authentication.authenticated {
                 "logged in"
             } else {
