@@ -10,7 +10,6 @@ mod plain;
 mod status;
 mod value;
 
-pub const PROTOCOL_VERSION: &str = "v3";
 pub const MASKED_SECRET_TEXT: &str = "********";
 
 pub use connection::{ConnectionUrl, ConnectionUrlError};
@@ -28,7 +27,7 @@ pub use managed::{
 };
 pub use path::{ConfigPath, PathError};
 pub use plain::render_subtree_plain;
-pub use status::{AuthenticationStatus, ServiceStatus};
+pub use status::{AuthenticationStatus, ProtocolVersion, ServiceStatus};
 pub use value::{
     MaskedSecret, PlainValue, RevealedSecret, Secret, SecretInput, ValueClassification,
     ValueContent,

@@ -5,7 +5,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -47,8 +47,11 @@ enum SubtreeOutcome {
 struct MockState {
     application_version: String,
     protocol_version: String,
+    supported_protocol_versions: Vec<String>,
     token_ok: bool,
-    subtree: SubtreeOutcome,
+    /// Behind a `Mutex` so a test can change what the service does *between*
+    /// loads, which is how the no-caching guarantee is asserted.
+    subtree: Mutex<SubtreeOutcome>,
     plain: BTreeMap<String, String>,
     secrets: BTreeMap<String, String>,
     token_requests: AtomicUsize,
@@ -72,8 +75,9 @@ impl MockState {
         Self {
             application_version: "2.0.0".to_owned(),
             protocol_version: "v3".to_owned(),
+            supported_protocol_versions: vec!["v3".to_owned()],
             token_ok: true,
-            subtree: SubtreeOutcome::Ok,
+            subtree: Mutex::new(SubtreeOutcome::Ok),
             plain,
             secrets,
             token_requests: AtomicUsize::new(0),
@@ -94,6 +98,7 @@ impl System for MockSystem {
         Ok(Response::new(GetVersionResponse {
             application_version: self.0.application_version.clone(),
             protocol_version: self.0.protocol_version.clone(),
+            supported_protocol_versions: self.0.supported_protocol_versions.clone(),
         }))
     }
 
@@ -123,7 +128,8 @@ impl Configuration for MockConfiguration {
         _: Request<GetSubTreeRequest>,
     ) -> Result<Response<GetSubTreeResponse>, Status> {
         self.0.subtree_requests.fetch_add(1, Ordering::SeqCst);
-        match &self.0.subtree {
+        let outcome = self.0.subtree.lock().expect("subtree outcome lock").clone();
+        match &outcome {
             SubtreeOutcome::Status(code) => Err(Status::new(*code, "denied")),
             SubtreeOutcome::Malformed => Ok(Response::new(GetSubTreeResponse {
                 values: vec![SubTreeValue {
@@ -477,6 +483,51 @@ async fn each_load_reacquires_token_and_rereads_without_cache() {
     assert_eq!(harness.mock.reveal_requests.load(Ordering::SeqCst), 2);
 }
 
+/// The rejected design, asserted rather than merely absent.
+///
+/// Caching a last-known-good subtree would hold revealed secrets in process
+/// memory for the application's lifetime, so the provider deliberately does not
+/// do it: a server that stops answering fails the *next* load instead of
+/// silently serving a stale value. The supported-version range removes the
+/// fleet-outage reason to want a cache; this asserts the cache never arrives by
+/// the back door.
+#[tokio::test]
+async fn a_server_that_fails_after_a_successful_load_is_not_served_from_cache() {
+    let harness = Harness::start(Arc::new(MockState::happy())).await;
+    let provider = Provider::connect(&harness.url).await.unwrap();
+
+    let first: AppConfig = provider.load().await.expect("the first load must succeed");
+    assert_eq!(first.feature, "on");
+
+    // The server stops answering after that successful load.
+    *harness.mock.subtree.lock().unwrap() = SubtreeOutcome::Status(Code::Unavailable);
+
+    assert_eq!(load_error(&provider).await, ProviderError::Unavailable);
+    assert_eq!(
+        harness.mock.subtree_requests.load(Ordering::SeqCst),
+        2,
+        "the second load must reach the server rather than answer from memory"
+    );
+}
+
+/// The same guarantee across a protocol retirement: a connected provider does
+/// not keep serving once the server has dropped the version it speaks.
+#[tokio::test]
+async fn a_load_after_the_server_becomes_incompatible_fails_rather_than_serving_stale_values() {
+    let harness = Harness::start(Arc::new(MockState::happy())).await;
+    let provider = Provider::connect(&harness.url).await.unwrap();
+    let _first: AppConfig = provider.load().await.expect("the first load must succeed");
+
+    // A retired protocol version is refused at the RPC, not at connect: the
+    // provider connected before the retirement and never reconnects.
+    *harness.mock.subtree.lock().unwrap() = SubtreeOutcome::Status(Code::FailedPrecondition);
+
+    assert_eq!(
+        load_error(&provider).await,
+        ProviderError::IncompatibleProtocol
+    );
+}
+
 #[tokio::test]
 async fn token_rejection_is_authentication_failed() {
     let mut state = MockState::happy();
@@ -493,7 +544,7 @@ async fn token_rejection_is_authentication_failed() {
 #[tokio::test]
 async fn grpc_unauthenticated_is_authentication_failed() {
     let mut state = MockState::happy();
-    state.subtree = SubtreeOutcome::Status(Code::Unauthenticated);
+    state.subtree = Mutex::new(SubtreeOutcome::Status(Code::Unauthenticated));
     let harness = Harness::start(Arc::new(state)).await;
     let provider = Provider::connect(&harness.url).await.unwrap();
     assert_eq!(
@@ -505,7 +556,7 @@ async fn grpc_unauthenticated_is_authentication_failed() {
 #[tokio::test]
 async fn denied_path_is_permission_denied() {
     let mut state = MockState::happy();
-    state.subtree = SubtreeOutcome::Status(Code::PermissionDenied);
+    state.subtree = Mutex::new(SubtreeOutcome::Status(Code::PermissionDenied));
     let harness = Harness::start(Arc::new(state)).await;
     let provider = Provider::connect(&harness.url).await.unwrap();
     assert_eq!(load_error(&provider).await, ProviderError::PermissionDenied);
@@ -516,6 +567,7 @@ async fn denied_path_is_permission_denied() {
 async fn protocol_mismatch_is_incompatible_at_connect() {
     let mut state = MockState::happy();
     state.protocol_version = "v2".to_owned();
+    state.supported_protocol_versions = vec!["v2".to_owned()];
     let harness = Harness::start(Arc::new(state)).await;
     match Provider::connect(&harness.url).await {
         Ok(_) => panic!("connect unexpectedly succeeded"),
@@ -523,10 +575,63 @@ async fn protocol_mismatch_is_incompatible_at_connect() {
     }
 }
 
+/// The regression that protects the deployed fleet.
+///
+/// A server that has gained a newer protocol version must keep serving this
+/// build's version and must keep echoing the version that was *requested*. A
+/// server echoing its own newest version instead would fail every already
+/// deployed application the day that version ships, which is the fleet-wide
+/// outage the supported range exists to prevent.
+#[tokio::test]
+async fn a_server_newer_than_this_build_still_connects() {
+    let mut state = MockState::happy();
+    state.application_version = "99.0.0".to_owned();
+    state.protocol_version = "v3".to_owned();
+    state.supported_protocol_versions = vec!["v3".to_owned(), "v4".to_owned()];
+    let harness = Harness::start(Arc::new(state)).await;
+
+    let provider = Provider::connect(&harness.url)
+        .await
+        .expect("a server still serving v3 must connect");
+
+    // And the session works, not merely the handshake.
+    let loaded: serde_json::Value = provider.load().await.expect("load must succeed");
+    assert_eq!(loaded["feature"], "on");
+}
+
+/// A server that has *retired* this build's version hard-fails, which is the
+/// announced, observable end of the deprecation window rather than a surprise.
+#[tokio::test]
+async fn a_server_that_retired_this_version_is_incompatible() {
+    let mut state = MockState::happy();
+    state.protocol_version = "v5".to_owned();
+    state.supported_protocol_versions = vec!["v4".to_owned(), "v5".to_owned()];
+    let harness = Harness::start(Arc::new(state)).await;
+
+    match Provider::connect(&harness.url).await {
+        Ok(_) => panic!("connect unexpectedly succeeded"),
+        Err(error) => assert_eq!(error, ProviderError::IncompatibleProtocol),
+    }
+}
+
+/// A server older than 2.25.0 advertises no supported set at all. Negotiation
+/// must fall back to its echoed version rather than treating the empty set as
+/// "serves nothing".
+#[tokio::test]
+async fn a_server_advertising_no_supported_set_still_connects() {
+    let mut state = MockState::happy();
+    state.supported_protocol_versions = Vec::new();
+    let harness = Harness::start(Arc::new(state)).await;
+
+    Provider::connect(&harness.url)
+        .await
+        .expect("a pre-2.25.0 server must still connect");
+}
+
 #[tokio::test]
 async fn malformed_subtree_value_is_internal() {
     let mut state = MockState::happy();
-    state.subtree = SubtreeOutcome::Malformed;
+    state.subtree = Mutex::new(SubtreeOutcome::Malformed);
     let harness = Harness::start(Arc::new(state)).await;
     let provider = Provider::connect(&harness.url).await.unwrap();
     assert_eq!(load_error(&provider).await, ProviderError::Internal);

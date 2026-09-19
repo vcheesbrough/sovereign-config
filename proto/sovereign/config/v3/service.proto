@@ -14,6 +14,22 @@ syntax = "proto3";
 // remains valid. It is not backward compatible for clients, however — a client
 // built before 2.15.0 rejects a path containing `_` and fails the entire
 // response carrying it. Upgrade clients before storing an underscored path.
+//
+// Changing this file: additive only.
+//
+// Clients are deployed independently and are expected to lag the server, so a
+// server upgrade must not change what an already-compiled v3 client sees. Only
+// these edits are permitted here:
+//
+//   - adding a new field with a previously unused number;
+//   - adding a new message;
+//   - adding a new RPC to an existing service.
+//
+// Renaming, renumbering, retyping, removing or repurposing an existing field,
+// and changing what an existing RPC does, are all breaking. They require a new
+// `sovereign.config.vN` package in a new directory alongside this one, served
+// concurrently with this one — never an edit here. See `## Protocol versioning`
+// in `README.md` for the introduction and retirement procedure.
 
 package sovereign.config.v3;
 
@@ -230,5 +246,24 @@ message GetVersionRequest {
 
 message GetVersionResponse {
   string application_version = 1;
+
+  // The protocol version this session will speak: the version the request
+  // asked for, whenever the server serves it.
+  //
+  // Do not change this to the server's own newest version. Clients compiled
+  // before `supported_protocol_versions` existed ignore field 3 and compare
+  // this value against the single version they were built with, so echoing a
+  // newer version here fails every one of them the day a newer version ships —
+  // exactly the fleet-wide outage the supported set exists to prevent.
+  //
+  // Only when the requested version is not served at all does this fall back
+  // to the server's newest. A client that requests a version it speaks can
+  // never observe that fallback, so the guarantee above is unaffected; a client
+  // whose version has been retired hard-fails, which is intended.
   string protocol_version = 2;
+
+  // Every protocol version this server serves, so a client that speaks more
+  // than one can select the highest they share. Empty from a server older than
+  // 2.25.0; treat that as the single version echoed in field 2.
+  repeated string supported_protocol_versions = 3;
 }

@@ -352,6 +352,7 @@ impl System for ContractSystem {
         Ok(tonic::Response::new(GetVersionResponse {
             application_version: "contract-version".to_owned(),
             protocol_version: "v3".to_owned(),
+            supported_protocol_versions: vec!["v3".to_owned()],
         }))
     }
 

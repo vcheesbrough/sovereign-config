@@ -56,9 +56,17 @@
 //!
 //! # Compatibility
 //!
-//! This crate is distributed as tagged workspace source and must be built from
-//! the same tag as the Sovereign Config server it talks to. It speaks the `v3`
-//! protocol and targets the workspace `rust-version`.
+//! This crate is distributed as tagged workspace source and targets the
+//! workspace `rust-version`. It does **not** have to be built from the same tag
+//! as the server it talks to: it speaks a set of protocol versions, and
+//! [`Provider::connect`] negotiates the highest version both ends serve. A
+//! server upgraded ahead of this build keeps working, so a server deploy does
+//! not require redeploying the applications that consume it.
+//!
+//! A build fails only once the server has *retired* every version this crate
+//! speaks — an announced, observable event rather than a side effect of an
+//! upgrade. See `## Protocol versioning` in the repository `README.md` for the
+//! deprecation procedure and the metric that gates it.
 //!
 //! Release 2.15.0 widened the canonical path grammar to permit `_` in segments.
 //! A build older than 2.15.0 rejects such a path as non-canonical and fails the
@@ -90,7 +98,7 @@ use std::collections::BTreeMap;
 use serde::de::DeserializeOwned;
 use sovereign_config_client::{AccessTokenProvider, Transport, ValueTransport};
 use sovereign_config_core::{
-    ConfigPath, ConnectionUrl, PROTOCOL_VERSION, ServiceStatus, ValueContent,
+    ConfigPath, ConnectionUrl, ProtocolVersion, ServiceStatus, ValueContent,
 };
 use sovereign_config_native::TonicTransport;
 
@@ -121,8 +129,8 @@ impl Provider {
     /// - [`ProviderError::MalformedUrl`] — the URL is invalid or non-canonical.
     /// - [`ProviderError::UnsupportedCredential`] — the URL is a human
     ///   device-flow URL rather than a managed connection.
-    /// - [`ProviderError::IncompatibleProtocol`] — the service protocol does
-    ///   not match this release.
+    /// - [`ProviderError::IncompatibleProtocol`] — the service serves no
+    ///   protocol version this release speaks.
     /// - [`ProviderError::Unavailable`] — the gRPC endpoint is unreachable.
     pub async fn connect(url: &str) -> Result<Self, ProviderError> {
         let connection = ConnectionUrl::parse(url)?;
@@ -131,11 +139,14 @@ impl Provider {
             .ok_or(ProviderError::UnsupportedCredential)?
             .clone();
         let transport = TonicTransport::connect(connection.endpoint().to_owned()).await?;
-        let reply = transport.get_version(PROTOCOL_VERSION).await?;
-        let status = ServiceStatus::negotiate(reply.application_version, reply.protocol_version);
-        if !status.compatible {
-            return Err(ProviderError::IncompatibleProtocol);
-        }
+        let reply = transport
+            .get_version(ProtocolVersion::PREFERRED.as_str())
+            .await?;
+        ServiceStatus::negotiate(
+            reply.application_version,
+            &reply.protocol_version,
+            &reply.supported_protocol_versions,
+        )?;
         let token = ManagedTokenProvider::new(
             connection.issuer().to_owned(),
             connection.client_id().to_owned(),

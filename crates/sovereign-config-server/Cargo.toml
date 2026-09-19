@@ -37,8 +37,14 @@ sovereign-config-proto = { path = "../sovereign-config-proto" }
 sovereign-config-core = { path = "../sovereign-config-core" }
 
 [dev-dependencies]
+prost.workspace = true
 serde_yaml.workspace = true
 tempfile = "3.27.0"
+tokio-stream = { version = "0.1.18", features = ["net"] }
+# A second protobuf package, registered alongside v3 only in integration tests,
+# so concurrent protocol serving is proven before a real v4 relies on it. Never
+# reaches the release binary.
+sovereign-config-proto-testversion = { path = "../../test-consumers/sovereign-config-proto-testversion" }
 
 [lints]
 workspace = true

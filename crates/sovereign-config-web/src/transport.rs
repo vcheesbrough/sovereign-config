@@ -96,6 +96,7 @@ impl Transport for BrowserTransport {
         Ok(VersionReply {
             application_version: response.application_version,
             protocol_version: response.protocol_version,
+            supported_protocol_versions: response.supported_protocol_versions,
         })
     }
 
