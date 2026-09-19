@@ -30,6 +30,13 @@ syntax = "proto3";
 // `sovereign.config.vN` package in a new directory alongside this one, served
 // concurrently with this one — never an edit here. See `## Protocol versioning`
 // in `README.md` for the introduction and retirement procedure.
+//
+// One deliberate exception exists: release 2.25.0 changed what `GetVersion`
+// does, in place, so that it answers with the served set instead of rejecting
+// an unrecognised version. Negotiation could not be introduced any other way
+// without the flag-day upgrade it exists to remove. It is recorded under
+// `### 2.25.0 widens GetVersion` in `README.md`. It is the bootstrap of the
+// mechanism, not a precedent for further in-place behaviour changes.
 
 package sovereign.config.v3;
 

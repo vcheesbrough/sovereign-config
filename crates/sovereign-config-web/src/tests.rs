@@ -387,3 +387,12 @@ fn this_transport_dials_every_version_the_client_may_negotiate() {
          add its gRPC-Web route paths before listing it as speakable"
     );
 }
+
+/// gRPC status 12 (`UNIMPLEMENTED`) is what the browser sees once the server
+/// stops routing the protocol version it was built against. It must read as an
+/// incompatibility, not as the opaque failure every unmapped status becomes.
+#[test]
+fn grpc_web_decoder_reports_an_unimplemented_route_as_an_incompatible_protocol() {
+    let error = decode_grpc_web_response::<GetIdentityResponse>(&[], Some(12)).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
+}

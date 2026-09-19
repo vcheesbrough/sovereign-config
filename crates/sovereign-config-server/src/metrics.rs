@@ -14,8 +14,9 @@ pub(crate) const UNRECOGNISED_PROTOCOL_LABEL: &str = "unrecognised";
 
 /// Per-protocol-version request counts, in two series.
 ///
-/// - `outcome="attempted"` counts every request whose route names the version,
-///   before authentication runs. It answers "is anything still *trying* to
+/// - `outcome="attempted"` counts every `POST` whose route names the version,
+///   before authentication runs. Other methods are never counted: gRPC and
+///   gRPC-Web are `POST`-only, and this port also serves web assets. It answers "is anything still *trying* to
 ///   speak this version?", and includes traffic that is not a consumer at all —
 ///   an internet scanner, a decommissioned application whose credentials were
 ///   revoked but whose process still retries.

@@ -86,23 +86,39 @@ impl Drop for TestServices {
 #[derive(Default)]
 struct MockSystem;
 
+/// The protocol versions this fixture serves, oldest first.
+///
+/// The handshake below is driven from this list rather than from literals, so
+/// the fixture encodes the server's rule instead of one answer that happens to
+/// match it. With a single entry every request is answered `v3` either way;
+/// the point is that adding a version here makes the fixture echo and advertise
+/// correctly without anyone having to remember a branch.
+const MOCK_SERVED_VERSIONS: &[&str] = &["v3"];
+
 #[tonic::async_trait]
 impl System for MockSystem {
     async fn get_version(
         &self,
         request: Request<GetVersionRequest>,
     ) -> Result<tonic::Response<GetVersionResponse>, Status> {
-        // Mirrors the real server: a version this fixture does not serve is
-        // answered with the served set rather than rejected.
+        // The real server's rule: never reject, echo the requested version when
+        // it is served, otherwise fall back to the newest served.
         let requested = request.into_inner().protocol_version;
+        let protocol_version = if MOCK_SERVED_VERSIONS.contains(&requested.as_str()) {
+            requested
+        } else {
+            (*MOCK_SERVED_VERSIONS
+                .last()
+                .expect("the fixture serves at least one version"))
+            .to_owned()
+        };
         Ok(tonic::Response::new(GetVersionResponse {
             application_version: "1.5.0-test".to_owned(),
-            protocol_version: if requested == "v3" {
-                requested
-            } else {
-                "v3".to_owned()
-            },
-            supported_protocol_versions: vec!["v3".to_owned()],
+            protocol_version,
+            supported_protocol_versions: MOCK_SERVED_VERSIONS
+                .iter()
+                .map(|version| (*version).to_owned())
+                .collect(),
         }))
     }
 

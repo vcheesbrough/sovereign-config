@@ -511,20 +511,33 @@ async fn a_server_that_fails_after_a_successful_load_is_not_served_from_cache() 
 }
 
 /// The same guarantee across a protocol retirement: a connected provider does
-/// not keep serving once the server has dropped the version it speaks.
+/// not keep serving once the server has dropped the version it speaks — and it
+/// is told *why*.
+///
+/// Retiring a version deletes its `add_service` lines, so the routes cease to
+/// exist and tonic answers `UNIMPLEMENTED`. That is the only status a retirement
+/// can produce for an already-connected client: nothing in the server emits
+/// `FAILED_PRECONDITION` any more, now that `GetVersion` no longer rejects. The
+/// provider connected before the retirement and never reconnects, so this is
+/// where it finds out — and an opaque "internal error" at that moment would be
+/// the worst possible diagnostic for the operator who just retired the version.
 #[tokio::test]
-async fn a_load_after_the_server_becomes_incompatible_fails_rather_than_serving_stale_values() {
+async fn a_load_after_the_servers_version_is_retired_reports_an_incompatible_protocol() {
     let harness = Harness::start(Arc::new(MockState::happy())).await;
     let provider = Provider::connect(&harness.url).await.unwrap();
     let _first: AppConfig = provider.load().await.expect("the first load must succeed");
 
-    // A retired protocol version is refused at the RPC, not at connect: the
-    // provider connected before the retirement and never reconnects.
-    *harness.mock.subtree.lock().unwrap() = SubtreeOutcome::Status(Code::FailedPrecondition);
+    *harness.mock.subtree.lock().unwrap() = SubtreeOutcome::Status(Code::Unimplemented);
 
     assert_eq!(
         load_error(&provider).await,
-        ProviderError::IncompatibleProtocol
+        ProviderError::IncompatibleProtocol,
+        "a retired version must not surface as an opaque internal error"
+    );
+    assert_eq!(
+        harness.mock.subtree_requests.load(Ordering::SeqCst),
+        2,
+        "the second load must reach the server rather than answer from memory"
     );
 }
 
