@@ -65,10 +65,94 @@ pub struct VersionReply {
     pub supported_protocol_versions: Vec<String>,
 }
 
+/// A connection that has not yet agreed a protocol version.
+///
+/// `GetVersion` is the one RPC a client may issue before negotiation, and it
+/// travels on a versioned route like any other — so asking for a version and
+/// dialling one are the same act, and the caller names the version it is
+/// dialling. [`negotiate`] is what turns a handshake into a session.
+#[async_trait(?Send)]
+pub trait Handshake {
+    /// Issues `GetVersion` **on `version`'s own route**, asking for `version`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::IncompatibleProtocol`] when the service has no
+    /// route for `version`, and a bounded transport error otherwise.
+    async fn get_version(&self, version: ProtocolVersion) -> Result<VersionReply, ClientError>;
+}
+
+/// A transport bound to the one protocol version its session negotiated.
+///
+/// Every RPC issued through it travels on that version's routes. There is no
+/// way to obtain one without naming a version, which is what keeps the version
+/// an operator is shown and the version on the wire the same thing.
 #[async_trait(?Send)]
 pub trait Transport {
-    async fn get_version(&self, protocol_version: &str) -> Result<VersionReply, ClientError>;
     async fn get_identity(&self, bearer: &Secret) -> Result<AuthenticationStatus, ClientError>;
+}
+
+/// Negotiates the version a session will speak, newest first.
+///
+/// Asks for the newest version this build speaks and settles on the highest
+/// version the server also serves, so a server ahead of this build still works.
+///
+/// The walk exists because `GetVersion` is itself routed by version: a server
+/// that does not serve the newest version this build speaks has no route to
+/// answer on, and replies `UNIMPLEMENTED` rather than a version list. Trying
+/// the next older version is what lets a **newer client reach an older
+/// server** — the mirror of the older-client case negotiation already covers.
+/// A pre-2.25.0 server, which rejects an unserved version outright rather than
+/// answering, is reached the same way.
+///
+/// This runs once per session. A version retired under an already-connected
+/// client is deliberately **not** renegotiated: the next call fails with
+/// [`ErrorKind::IncompatibleProtocol`], which is the provider's documented
+/// fail-fast contract and keeps a retirement visible rather than papered over
+/// by a retry.
+///
+/// # Errors
+///
+/// Returns a bounded transport error, or [`ErrorKind::IncompatibleProtocol`]
+/// when no version is common to this build and the service.
+pub async fn negotiate<H>(handshake: &H) -> Result<ServiceStatus, ClientError>
+where
+    H: Handshake + ?Sized,
+{
+    let mut incompatible = ClientError::new(
+        ErrorKind::IncompatibleProtocol,
+        "service protocol is incompatible",
+    );
+    for version in ProtocolVersion::ALL.iter().rev().copied() {
+        match handshake.get_version(version).await {
+            // The reply carries the server's whole served set, so it settles
+            // the question for every version at once: an older route could not
+            // produce a better answer, and asking would only add round trips.
+            Ok(reply) => {
+                let status = ServiceStatus::negotiate(
+                    reply.application_version,
+                    &reply.protocol_version,
+                    &reply.supported_protocol_versions,
+                )?;
+                // Never settle above the version that answered. A server can
+                // advertise a version whose routes are not (yet) registered —
+                // a rolling deploy looks exactly like that to a client whose
+                // handshake lands on an old replica — and the walk has already
+                // proved those routes absent. Taking the advertised set at its
+                // word there would hand back a session that connects and then
+                // fails every call, with no renegotiation to recover it. The
+                // cap is a no-op whenever the selected version is the answering
+                // one or older, which is every other case.
+                return Ok(ServiceStatus {
+                    protocol_version: status.protocol_version.min(version),
+                    ..status
+                });
+            }
+            Err(error) if error.kind == ErrorKind::IncompatibleProtocol => incompatible = error,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(incompatible)
 }
 
 #[async_trait(?Send)]
@@ -149,6 +233,31 @@ pub trait ManagedConnectionTransport: Transport {
         connection_id: &ConnectionId,
         bearer: &Secret,
     ) -> Result<(), ClientError>;
+}
+
+/// Everything one protocol version's routes can carry.
+///
+/// A transport holds the dialer for the version its session negotiated as a
+/// single object of this trait, so selecting a version is one decision made in
+/// one place rather than one per RPC surface. Each `sovereign.config.vN` client
+/// module implements it, holding that version's stubs or route paths and its
+/// proto↔core mapping — which is what makes retiring a version a deletion.
+#[async_trait(?Send)]
+pub trait SessionTransport: ValueTransport + ManagedConnectionTransport {
+    /// The version whose routes this dialer dials.
+    ///
+    /// Declared by the same module that owns the routes, so a session reports
+    /// the version it is actually speaking rather than one carried alongside.
+    fn version(&self) -> ProtocolVersion;
+
+    /// Asks the service about **this** version, on this version's route.
+    ///
+    /// It takes no version, deliberately. A dialer can only ask about the
+    /// version whose routes it dials, so the version named in the request and
+    /// the package named in the path are read from one module and cannot
+    /// disagree. Choosing *which* version to ask about is [`Handshake`]'s job,
+    /// and it makes that choice by selecting the dialer.
+    async fn get_version(&self) -> Result<VersionReply, ClientError>;
 }
 
 #[async_trait(?Send)]
@@ -377,27 +486,6 @@ where
         }
     }
 
-    /// Fetches and negotiates the service version without caching or retrying.
-    ///
-    /// Asks for the newest version this build speaks and settles on the highest
-    /// version the server also serves, so a server ahead of this build still
-    /// works.
-    ///
-    /// # Errors
-    ///
-    /// Returns a bounded transport or protocol compatibility error.
-    pub async fn service_status(&self) -> Result<ServiceStatus, ClientError> {
-        let reply = self
-            .transport
-            .get_version(ProtocolVersion::PREFERRED.as_str())
-            .await?;
-        ServiceStatus::negotiate(
-            reply.application_version,
-            &reply.protocol_version,
-            &reply.supported_protocol_versions,
-        )
-    }
-
     /// Fetches authenticated identity state with a freshly supplied access token.
     ///
     /// # Errors
@@ -420,32 +508,73 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     use async_trait::async_trait;
-    use sovereign_config_core::{AuthenticationStatus, ClientError, ErrorKind, Secret};
+    use sovereign_config_core::{
+        AuthenticationStatus, ClientError, ErrorKind, ProtocolVersion, Secret,
+    };
 
-    use super::{AccessTokenProvider, Client, RpcCode, Transport, VersionReply, map_rpc_status};
+    use super::{
+        AccessTokenProvider, Client, Handshake, RpcCode, Transport, VersionReply, map_rpc_status,
+        negotiate,
+    };
 
     struct CountingTransport(Rc<Cell<usize>>);
 
     #[async_trait(?Send)]
     impl Transport for CountingTransport {
-        async fn get_version(&self, protocol: &str) -> Result<VersionReply, ClientError> {
-            self.0.set(self.0.get() + 1);
-            Ok(VersionReply {
-                application_version: "1.5.0".into(),
-                protocol_version: protocol.into(),
-                supported_protocol_versions: vec![protocol.into()],
-            })
-        }
-
         async fn get_identity(&self, _: &Secret) -> Result<AuthenticationStatus, ClientError> {
             self.0.set(self.0.get() + 1);
             Ok(AuthenticationStatus {
                 authenticated: true,
             })
         }
+    }
+
+    /// A handshake that records which versions it was asked for, in order, and
+    /// answers each one however the test scripted it.
+    struct ScriptedHandshake {
+        asked: RefCell<Vec<ProtocolVersion>>,
+        answer: Box<dyn Fn(ProtocolVersion) -> Result<VersionReply, ClientError>>,
+    }
+
+    impl ScriptedHandshake {
+        fn new(
+            answer: impl Fn(ProtocolVersion) -> Result<VersionReply, ClientError> + 'static,
+        ) -> Self {
+            Self {
+                asked: RefCell::new(Vec::new()),
+                answer: Box::new(answer),
+            }
+        }
+
+        fn asked(&self) -> Vec<ProtocolVersion> {
+            self.asked.borrow().clone()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl Handshake for ScriptedHandshake {
+        async fn get_version(&self, version: ProtocolVersion) -> Result<VersionReply, ClientError> {
+            self.asked.borrow_mut().push(version);
+            (self.answer)(version)
+        }
+    }
+
+    fn serving(version: ProtocolVersion) -> VersionReply {
+        VersionReply {
+            application_version: "1.5.0".into(),
+            protocol_version: version.as_str().into(),
+            supported_protocol_versions: vec![version.as_str().into()],
+        }
+    }
+
+    fn incompatible() -> ClientError {
+        map_rpc_status(RpcCode::Unimplemented)
     }
 
     struct Authentication;
@@ -461,10 +590,69 @@ mod tests {
     async fn each_operation_calls_transport_without_cache_or_retry() {
         let calls = Rc::new(Cell::new(0));
         let client = Client::new(CountingTransport(Rc::clone(&calls)), Authentication);
-        client.service_status().await.unwrap();
-        client.service_status().await.unwrap();
         client.authentication_status().await.unwrap();
-        assert_eq!(calls.get(), 3);
+        client.authentication_status().await.unwrap();
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// The handshake asks for the newest version this build speaks, on that
+    /// version's own route, and stops as soon as one answers: a served version
+    /// reports the server's whole set, so no older route can improve on it.
+    #[tokio::test]
+    async fn negotiation_asks_the_newest_version_first_and_stops_when_it_answers() {
+        let handshake = ScriptedHandshake::new(|version| Ok(serving(version)));
+
+        let status = negotiate(&handshake).await.unwrap();
+
+        assert_eq!(status.protocol_version, ProtocolVersion::PREFERRED);
+        assert_eq!(handshake.asked(), [ProtocolVersion::PREFERRED]);
+    }
+
+    /// A server that does not serve this build's newest version has no route to
+    /// answer its `GetVersion` on, so the handshake works down the versions it
+    /// speaks. Without this walk a newer client could never reach an older
+    /// server, whatever the two of them have in common.
+    #[tokio::test]
+    async fn a_service_without_the_newest_route_is_asked_for_each_older_version() {
+        let handshake = ScriptedHandshake::new(|_| Err(incompatible()));
+
+        let error = negotiate(&handshake).await.unwrap_err();
+
+        let oldest_first: Vec<_> = ProtocolVersion::ALL.to_vec();
+        let mut newest_first = oldest_first;
+        newest_first.reverse();
+        assert_eq!(handshake.asked(), newest_first);
+        assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
+    }
+
+    /// Only a missing route is worth trying an older version for. An
+    /// unreachable service is not a compatibility question, and retrying it
+    /// once per version would multiply the wait a caller was promised.
+    #[tokio::test]
+    async fn an_unreachable_service_is_not_asked_a_second_time() {
+        let handshake = ScriptedHandshake::new(|_| Err(map_rpc_status(RpcCode::Unavailable)));
+
+        let error = negotiate(&handshake).await.unwrap_err();
+
+        assert_eq!(error.kind, ErrorKind::Unavailable);
+        assert_eq!(handshake.asked(), [ProtocolVersion::PREFERRED]);
+    }
+
+    /// A server may serve versions from the future. They are not candidates,
+    /// and nothing may be dialled on them — the session settles on the highest
+    /// version *both* ends speak, or fails.
+    #[tokio::test]
+    async fn a_version_only_the_server_speaks_is_never_negotiated() {
+        let handshake = ScriptedHandshake::new(|version| {
+            Ok(VersionReply {
+                supported_protocol_versions: vec![version.as_str().into(), "v9000".into()],
+                ..serving(version)
+            })
+        });
+
+        let status = negotiate(&handshake).await.unwrap();
+
+        assert_eq!(status.protocol_version, ProtocolVersion::PREFERRED);
     }
 
     #[test]

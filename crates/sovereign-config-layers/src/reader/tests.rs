@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
 use async_trait::async_trait;
-use sovereign_config_client::{AccessTokenProvider, Transport, ValueTransport, VersionReply};
+use sovereign_config_client::{AccessTokenProvider, Transport, ValueTransport};
 use sovereign_config_core::{
     AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind,
     MaskedSecret, PlainValue, PutMetadata, ReplaceMetadata, RevealedSecret, Secret, SecretInput,
@@ -114,10 +114,6 @@ impl MockTransport {
 
 #[async_trait(?Send)]
 impl Transport for MockTransport {
-    async fn get_version(&self, _: &str) -> Result<VersionReply, ClientError> {
-        unreachable!("the reader never negotiates protocol")
-    }
-
     async fn get_identity(&self, _: &Secret) -> Result<AuthenticationStatus, ClientError> {
         unreachable!("the reader never checks identity")
     }

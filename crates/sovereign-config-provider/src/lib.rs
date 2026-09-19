@@ -100,11 +100,9 @@ mod token;
 use std::collections::BTreeMap;
 
 use serde::de::DeserializeOwned;
-use sovereign_config_client::{AccessTokenProvider, Transport, ValueTransport};
-use sovereign_config_core::{
-    ConfigPath, ConnectionUrl, ProtocolVersion, ServiceStatus, ValueContent,
-};
-use sovereign_config_native::TonicTransport;
+use sovereign_config_client::{AccessTokenProvider, ValueTransport, negotiate};
+use sovereign_config_core::{ConfigPath, ConnectionUrl, ValueContent};
+use sovereign_config_native::{TonicChannel, TonicTransport};
 
 #[cfg(feature = "config")]
 pub use config_source::SovereignConfigSource;
@@ -142,15 +140,11 @@ impl Provider {
             .client_authentication()
             .ok_or(ProviderError::UnsupportedCredential)?
             .clone();
-        let transport = TonicTransport::connect(connection.endpoint().to_owned()).await?;
-        let reply = transport
-            .get_version(ProtocolVersion::PREFERRED.as_str())
-            .await?;
-        ServiceStatus::negotiate(
-            reply.application_version,
-            &reply.protocol_version,
-            &reply.supported_protocol_versions,
-        )?;
+        let channel = TonicChannel::connect(connection.endpoint().to_owned()).await?;
+        // The version negotiated here is the version every later `load` travels
+        // on: `speaking` is the only way to a transport that can read values,
+        // so the handshake's answer cannot be dropped on the floor.
+        let transport = channel.speaking(negotiate(&channel).await?.protocol_version);
         let token = ManagedTokenProvider::new(
             connection.issuer().to_owned(),
             connection.client_id().to_owned(),
@@ -247,6 +241,18 @@ impl Provider {
     #[must_use]
     pub fn root(&self) -> &str {
         self.root.as_str()
+    }
+
+    /// The protocol version this connection negotiated, and the version every
+    /// [`Provider::load`] travels on.
+    ///
+    /// Returned as a string slice so consumers depend only on this crate. Not
+    /// secret; safe to log or include in diagnostics, and worth logging at
+    /// startup — it is what the service's per-version traffic counters will
+    /// attribute this application to.
+    #[must_use]
+    pub fn protocol_version(&self) -> &'static str {
+        self.transport.protocol_version().as_str()
     }
 }
 

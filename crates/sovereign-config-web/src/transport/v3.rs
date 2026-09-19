@@ -1,21 +1,26 @@
-//! gRPC-Web transport: the
-//! `Transport`/`ValueTransport`/`ManagedConnectionTransport` impls for the
-//! browser, frame decoding, and proto-to-core mapping.
+//! The `sovereign.config.v3` dialer for the browser: this version's gRPC-Web
+//! route paths and its proto↔core mapping, and nothing else.
+//!
+//! Every route here names `sovereign.config.v3`, because the gRPC route path
+//! embeds the package name. That is what makes a version's dispatch deletable:
+//! retiring `v3` is deleting this file and its arm of [`super::dialer`].
+//!
+//! Domain types stay version-free in `sovereign-config-core`, so a second
+//! version is a second translation shim over one set of domain types — never a
+//! forked client.
 
 use async_trait::async_trait;
-use js_sys::{Date, Uint8Array};
-use prost::Message;
 use sovereign_config_client::{
-    AccessTokenProvider, Client, ManagedConnectionTransport, RpcCode, Transport, ValueTransport,
-    VersionReply, map_rpc_status, timestamp,
+    ManagedConnectionTransport, SessionTransport, Transport, ValueTransport, VersionReply,
+    timestamp,
 };
 use sovereign_config_core::{
     AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl,
-    DeleteMetadata, DisplayName, ErrorKind, ListedValue, ManagedConnectionMetadata,
-    ManagedConnectionState, ManagedPermissions, MaskedSecret, PlainValue,
-    ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedConnectionUrl,
-    RevealedSecret, Secret, SecretInput, SubTreeMutationContent, SubTreeMutationValue,
-    SubTreeValue, Timestamp, ValueContent, ValueListing, ValuePaths, ValueSubTree,
+    DeleteMetadata, DisplayName, ListedValue, ManagedConnectionMetadata, ManagedConnectionState,
+    ManagedPermissions, MaskedSecret, PlainValue, ProtocolVersion, ProvisionedManagedConnection,
+    PutMetadata, ReplaceMetadata, RevealedConnectionUrl, RevealedSecret, Secret, SecretInput,
+    SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, Timestamp, ValueContent,
+    ValueListing, ValuePaths, ValueSubTree,
 };
 use sovereign_config_proto::sovereign::config::v3::{
     AddValuePathRequest, AddValuePathResponse, CreateManagedConnectionRequest,
@@ -31,64 +36,69 @@ use sovereign_config_proto::sovereign::config::v3::{
     SubTreeMutationValue as ProtoSubTreeMutationValue, ValueClassification as ProtoClassification,
     listed_value, put_value_request, sub_tree_mutation_value, sub_tree_value,
 };
-use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
-use web_sys::{Headers, Request, RequestCache, RequestInit, Response, window};
 
-use crate::browser::{AppConfig, browser_error};
-use crate::session::{
-    TOKENS, clear_persisted_refresh_token, persist_refresh_token, refresh_tokens,
-};
+use crate::browser::browser_error;
 
+use super::grpc_unary;
+
+/// The version this module speaks. Reported as the session's version, so it is
+/// read from the same place the routes come from.
+const VERSION: ProtocolVersion = ProtocolVersion::V3;
+
+const GET_VERSION: &str = "/sovereign.config.v3.System/GetVersion";
+const GET_IDENTITY: &str = "/sovereign.config.v3.System/GetIdentity";
+const LIST_VALUES: &str = "/sovereign.config.v3.Configuration/ListValues";
+const GET_SUB_TREE: &str = "/sovereign.config.v3.Configuration/GetSubTree";
+const PUT_VALUE: &str = "/sovereign.config.v3.Configuration/PutValue";
+const REPLACE_SUB_TREE: &str = "/sovereign.config.v3.Configuration/ReplaceSubTree";
+const DELETE_VALUES: &str = "/sovereign.config.v3.Configuration/DeleteValues";
+const REVEAL_SECRET: &str = "/sovereign.config.v3.Configuration/RevealSecret";
+const ADD_VALUE_PATH: &str = "/sovereign.config.v3.Configuration/AddValuePath";
+const LIST_VALUE_PATHS: &str = "/sovereign.config.v3.Configuration/ListValuePaths";
+const LIST_MANAGED_CONNECTIONS: &str =
+    "/sovereign.config.v3.ManagedConnections/ListManagedConnections";
+const CREATE_MANAGED_CONNECTION: &str =
+    "/sovereign.config.v3.ManagedConnections/CreateManagedConnection";
+const ROTATE_MANAGED_CONNECTION: &str =
+    "/sovereign.config.v3.ManagedConnections/RotateManagedConnection";
+const REVOKE_MANAGED_CONNECTION: &str =
+    "/sovereign.config.v3.ManagedConnections/RevokeManagedConnection";
+
+/// Every route this version dials, for the test that checks each one names the
+/// version the session negotiated.
+#[cfg(test)]
+pub(super) const ROUTES: &[&str] = &[
+    GET_VERSION,
+    GET_IDENTITY,
+    LIST_VALUES,
+    GET_SUB_TREE,
+    PUT_VALUE,
+    REPLACE_SUB_TREE,
+    DELETE_VALUES,
+    REVEAL_SECRET,
+    ADD_VALUE_PATH,
+    LIST_VALUE_PATHS,
+    LIST_MANAGED_CONNECTIONS,
+    CREATE_MANAGED_CONNECTION,
+    ROTATE_MANAGED_CONNECTION,
+    REVOKE_MANAGED_CONNECTION,
+];
+
+/// The `v3` gRPC-Web routes and mapping.
 #[derive(Clone, Copy)]
-pub(crate) struct BrowserTransport;
-
-pub(crate) struct MemoryAuthentication {
-    pub(crate) client_id: String,
-}
+pub(super) struct Dialer;
 
 #[async_trait(?Send)]
-impl AccessTokenProvider for MemoryAuthentication {
-    async fn access_token(&self) -> Result<Option<Secret>, ClientError> {
-        let Some(tokens) = TOKENS.with_borrow_mut(Option::take) else {
-            return Ok(None);
-        };
-        let now = Date::now();
-        if now < tokens.access_expires_at_ms {
-            let access_token = tokens.access_token.clone();
-            TOKENS.with_borrow_mut(|slot| *slot = Some(tokens));
-            return Ok(Some(access_token));
-        }
-        if now >= tokens.refresh_expires_at_ms {
-            clear_persisted_refresh_token();
-            return Ok(None);
-        }
-        match refresh_tokens(&self.client_id, &tokens).await {
-            Ok(refreshed) => {
-                let access_token = refreshed.access_token.clone();
-                persist_refresh_token(&refreshed);
-                TOKENS.with_borrow_mut(|slot| *slot = Some(refreshed));
-                Ok(Some(access_token))
-            }
-            Err(error) if error.kind == ErrorKind::Unavailable => {
-                TOKENS.with_borrow_mut(|slot| *slot = Some(tokens));
-                Err(error)
-            }
-            Err(error) => {
-                clear_persisted_refresh_token();
-                Err(error)
-            }
-        }
+impl SessionTransport for Dialer {
+    fn version(&self) -> ProtocolVersion {
+        VERSION
     }
-}
 
-#[async_trait(?Send)]
-impl Transport for BrowserTransport {
-    async fn get_version(&self, protocol_version: &str) -> Result<VersionReply, ClientError> {
+    async fn get_version(&self) -> Result<VersionReply, ClientError> {
         let response: GetVersionResponse = grpc_unary(
-            "/sovereign.config.v3.System/GetVersion",
+            GET_VERSION,
             &GetVersionRequest {
-                protocol_version: protocol_version.to_owned(),
+                protocol_version: VERSION.as_str().to_owned(),
             },
             None,
         )
@@ -99,14 +109,13 @@ impl Transport for BrowserTransport {
             supported_protocol_versions: response.supported_protocol_versions,
         })
     }
+}
 
+#[async_trait(?Send)]
+impl Transport for Dialer {
     async fn get_identity(&self, bearer: &Secret) -> Result<AuthenticationStatus, ClientError> {
-        let response: GetIdentityResponse = grpc_unary(
-            "/sovereign.config.v3.System/GetIdentity",
-            &GetIdentityRequest {},
-            Some(bearer),
-        )
-        .await?;
+        let response: GetIdentityResponse =
+            grpc_unary(GET_IDENTITY, &GetIdentityRequest {}, Some(bearer)).await?;
         Ok(AuthenticationStatus {
             authenticated: response.authenticated,
         })
@@ -114,14 +123,14 @@ impl Transport for BrowserTransport {
 }
 
 #[async_trait(?Send)]
-impl ValueTransport for BrowserTransport {
+impl ValueTransport for Dialer {
     async fn list_values(
         &self,
         path: &ConfigPath,
         bearer: &Secret,
     ) -> Result<ValueListing, ClientError> {
         let response: ListValuesResponse = grpc_unary(
-            "/sovereign.config.v3.Configuration/ListValues",
+            LIST_VALUES,
             &ListValuesRequest {
                 path: path.as_str().to_owned(),
             },
@@ -160,7 +169,7 @@ impl ValueTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<ValueSubTree, ClientError> {
         let response: GetSubTreeResponse = grpc_unary(
-            "/sovereign.config.v3.Configuration/GetSubTree",
+            GET_SUB_TREE,
             &GetSubTreeRequest {
                 path: path.as_str().to_owned(),
             },
@@ -191,21 +200,12 @@ impl ValueTransport for BrowserTransport {
         value: &PlainValue,
         bearer: &Secret,
     ) -> Result<PutMetadata, ClientError> {
-        let response: PutValueResponse = grpc_unary(
-            "/sovereign.config.v3.Configuration/PutValue",
-            &PutValueRequest {
-                path: path.as_str().to_owned(),
-                content: Some(put_value_request::Content::PlainValue(
-                    value.expose().to_owned(),
-                )),
-            },
-            Some(bearer),
+        put(
+            path,
+            put_value_request::Content::PlainValue(value.expose().to_owned()),
+            bearer,
         )
-        .await?;
-        Ok(PutMetadata {
-            created_at: proto_timestamp(response.created_at)?,
-            updated_at: proto_timestamp(response.updated_at)?,
-        })
+        .await
     }
 
     async fn put_secret(
@@ -214,21 +214,12 @@ impl ValueTransport for BrowserTransport {
         value: &SecretInput,
         bearer: &Secret,
     ) -> Result<PutMetadata, ClientError> {
-        let response: PutValueResponse = grpc_unary(
-            "/sovereign.config.v3.Configuration/PutValue",
-            &PutValueRequest {
-                path: path.as_str().to_owned(),
-                content: Some(put_value_request::Content::SecretValue(
-                    value.expose().to_owned(),
-                )),
-            },
-            Some(bearer),
+        put(
+            path,
+            put_value_request::Content::SecretValue(value.expose().to_owned()),
+            bearer,
         )
-        .await?;
-        Ok(PutMetadata {
-            created_at: proto_timestamp(response.created_at)?,
-            updated_at: proto_timestamp(response.updated_at)?,
-        })
+        .await
     }
 
     async fn replace_subtree(
@@ -238,25 +229,10 @@ impl ValueTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<ReplaceMetadata, ClientError> {
         let response: ReplaceSubTreeResponse = grpc_unary(
-            "/sovereign.config.v3.Configuration/ReplaceSubTree",
+            REPLACE_SUB_TREE,
             &ReplaceSubTreeRequest {
                 path: path.as_str().to_owned(),
-                values: values
-                    .iter()
-                    .map(|value| ProtoSubTreeMutationValue {
-                        path: value.path.as_str().to_owned(),
-                        content: Some(match &value.value {
-                            SubTreeMutationContent::Plain(value) => {
-                                sub_tree_mutation_value::Content::PlainValue(
-                                    value.expose().to_owned(),
-                                )
-                            }
-                            SubTreeMutationContent::PreserveSecret => {
-                                sub_tree_mutation_value::Content::PreserveSecret(PreserveSecret {})
-                            }
-                        }),
-                    })
-                    .collect(),
+                values: values.iter().map(mutation_value).collect(),
             },
             Some(bearer),
         )
@@ -274,7 +250,7 @@ impl ValueTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<DeleteMetadata, ClientError> {
         let response: DeleteValuesResponse = grpc_unary(
-            "/sovereign.config.v3.Configuration/DeleteValues",
+            DELETE_VALUES,
             &DeleteValuesRequest {
                 path: path.as_str().to_owned(),
                 recurse,
@@ -294,7 +270,7 @@ impl ValueTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<RevealedSecret, ClientError> {
         let response: RevealSecretResponse = grpc_unary(
-            "/sovereign.config.v3.Configuration/RevealSecret",
+            REVEAL_SECRET,
             &RevealSecretRequest {
                 path: path.as_str().to_owned(),
             },
@@ -314,7 +290,7 @@ impl ValueTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<AddPathMetadata, ClientError> {
         let response: AddValuePathResponse = grpc_unary(
-            "/sovereign.config.v3.Configuration/AddValuePath",
+            ADD_VALUE_PATH,
             &AddValuePathRequest {
                 source_path: source.as_str().to_owned(),
                 new_path: new_path.as_str().to_owned(),
@@ -333,7 +309,7 @@ impl ValueTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<ValuePaths, ClientError> {
         let response: ListValuePathsResponse = grpc_unary(
-            "/sovereign.config.v3.Configuration/ListValuePaths",
+            LIST_VALUE_PATHS,
             &ListValuePathsRequest {
                 path: path.as_str().to_owned(),
             },
@@ -350,13 +326,13 @@ impl ValueTransport for BrowserTransport {
 }
 
 #[async_trait(?Send)]
-impl ManagedConnectionTransport for BrowserTransport {
+impl ManagedConnectionTransport for Dialer {
     async fn list_managed_connections(
         &self,
         bearer: &Secret,
     ) -> Result<Vec<ManagedConnectionMetadata>, ClientError> {
         let response: ListManagedConnectionsResponse = grpc_unary(
-            "/sovereign.config.v3.ManagedConnections/ListManagedConnections",
+            LIST_MANAGED_CONNECTIONS,
             &ListManagedConnectionsRequest {},
             Some(bearer),
         )
@@ -376,7 +352,7 @@ impl ManagedConnectionTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<ProvisionedManagedConnection, ClientError> {
         let response: CreateManagedConnectionResponse = grpc_unary(
-            "/sovereign.config.v3.ManagedConnections/CreateManagedConnection",
+            CREATE_MANAGED_CONNECTION,
             &CreateManagedConnectionRequest {
                 display_name: display_name.as_str().to_owned(),
                 root: root.as_str().to_owned(),
@@ -394,7 +370,7 @@ impl ManagedConnectionTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<ProvisionedManagedConnection, ClientError> {
         let response: RotateManagedConnectionResponse = grpc_unary(
-            "/sovereign.config.v3.ManagedConnections/RotateManagedConnection",
+            ROTATE_MANAGED_CONNECTION,
             &RotateManagedConnectionRequest {
                 connection_id: connection_id.as_str().to_owned(),
             },
@@ -410,7 +386,7 @@ impl ManagedConnectionTransport for BrowserTransport {
         bearer: &Secret,
     ) -> Result<(), ClientError> {
         let _: RevokeManagedConnectionResponse = grpc_unary(
-            "/sovereign.config.v3.ManagedConnections/RevokeManagedConnection",
+            REVOKE_MANAGED_CONNECTION,
             &RevokeManagedConnectionRequest {
                 connection_id: connection_id.as_str().to_owned(),
             },
@@ -418,6 +394,42 @@ impl ManagedConnectionTransport for BrowserTransport {
         )
         .await?;
         Ok(())
+    }
+}
+
+/// Plain and secret writes are the same RPC with a different content arm, so
+/// the two entry points differ only in the arm they build.
+async fn put(
+    path: &ConfigPath,
+    content: put_value_request::Content,
+    bearer: &Secret,
+) -> Result<PutMetadata, ClientError> {
+    let response: PutValueResponse = grpc_unary(
+        PUT_VALUE,
+        &PutValueRequest {
+            path: path.as_str().to_owned(),
+            content: Some(content),
+        },
+        Some(bearer),
+    )
+    .await?;
+    Ok(PutMetadata {
+        created_at: proto_timestamp(response.created_at)?,
+        updated_at: proto_timestamp(response.updated_at)?,
+    })
+}
+
+fn mutation_value(value: &SubTreeMutationValue) -> ProtoSubTreeMutationValue {
+    ProtoSubTreeMutationValue {
+        path: value.path.as_str().to_owned(),
+        content: Some(match &value.value {
+            SubTreeMutationContent::Plain(value) => {
+                sub_tree_mutation_value::Content::PlainValue(value.expose().to_owned())
+            }
+            SubTreeMutationContent::PreserveSecret => {
+                sub_tree_mutation_value::Content::PreserveSecret(PreserveSecret {})
+            }
+        }),
     }
 }
 
@@ -503,138 +515,4 @@ fn subtree_content(
 fn proto_timestamp(value: Option<prost_types::Timestamp>) -> Result<Timestamp, ClientError> {
     let value = value.ok_or_else(browser_error)?;
     timestamp(value.seconds, value.nanos)
-}
-
-pub(crate) fn value_client(config: &AppConfig) -> Client<BrowserTransport, MemoryAuthentication> {
-    Client::new(
-        BrowserTransport,
-        MemoryAuthentication {
-            client_id: config.client_id.clone(),
-        },
-    )
-}
-
-async fn grpc_unary<M, R>(
-    path: &str,
-    message: &M,
-    bearer: Option<&Secret>,
-) -> Result<R, ClientError>
-where
-    M: Message,
-    R: Message + Default,
-{
-    let encoded = message.encode_to_vec();
-    let mut framed = Vec::with_capacity(encoded.len() + 5);
-    framed.push(0);
-    let encoded_length = u32::try_from(encoded.len()).map_err(|_| browser_error())?;
-    framed.extend_from_slice(&encoded_length.to_be_bytes());
-    framed.extend_from_slice(&encoded);
-    let body = Uint8Array::from(framed.as_slice());
-    let mut headers = vec![
-        ("content-type", "application/grpc-web+proto"),
-        ("x-grpc-web", "1"),
-    ];
-    let authorization;
-    if let Some(bearer) = bearer {
-        authorization = format!("Bearer {}", bearer.expose());
-        headers.push(("authorization", authorization.as_str()));
-    }
-    let response = fetch(path, "POST", Some(body.into()), &headers).await?;
-    if !response.ok() {
-        return Err(map_rpc_status(RpcCode::Unavailable));
-    }
-    let header_status = response
-        .headers()
-        .get("grpc-status")
-        .ok()
-        .flatten()
-        .and_then(|value| value.parse::<u16>().ok());
-    let buffer = JsFuture::from(response.array_buffer().map_err(|_| browser_error())?)
-        .await
-        .map_err(|_| browser_error())?;
-    decode_grpc_web_response(&Uint8Array::new(&buffer).to_vec(), header_status)
-}
-
-#[cfg(test)]
-pub(crate) fn decode_grpc_web<R: Message + Default>(bytes: &[u8]) -> Result<R, ClientError> {
-    decode_grpc_web_response(bytes, None)
-}
-
-pub(crate) fn decode_grpc_web_response<R: Message + Default>(
-    bytes: &[u8],
-    header_status: Option<u16>,
-) -> Result<R, ClientError> {
-    let mut offset = 0;
-    let mut payload = None;
-    let mut status = None;
-    while offset + 5 <= bytes.len() {
-        let flags = bytes[offset];
-        let length = u32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
-        offset += 5;
-        if offset + length > bytes.len() {
-            return Err(map_rpc_status(RpcCode::Other));
-        }
-        let frame = &bytes[offset..offset + length];
-        if flags & 0x80 == 0 {
-            payload = Some(frame);
-        } else if let Ok(trailers) = std::str::from_utf8(frame) {
-            status = trailers.lines().find_map(|line| {
-                line.strip_prefix("grpc-status:")
-                    .and_then(|value| value.trim().parse::<u16>().ok())
-            });
-        }
-        offset += length;
-    }
-    let status = status
-        .or(header_status)
-        .ok_or_else(|| map_rpc_status(RpcCode::Other))?;
-    if status != 0 {
-        return Err(map_rpc_status(grpc_status_code(status)));
-    }
-    R::decode(payload.ok_or_else(|| map_rpc_status(RpcCode::Other))?)
-        .map_err(|_| map_rpc_status(RpcCode::Other))
-}
-
-fn grpc_status_code(status: u16) -> RpcCode {
-    match status {
-        3 => RpcCode::InvalidArgument,
-        5 => RpcCode::NotFound,
-        6 => RpcCode::AlreadyExists,
-        7 => RpcCode::PermissionDenied,
-        9 => RpcCode::FailedPrecondition,
-        10 | 14 => RpcCode::Unavailable,
-        12 => RpcCode::Unimplemented,
-        16 => RpcCode::Unauthenticated,
-        _ => RpcCode::Other,
-    }
-}
-
-pub(crate) async fn fetch(
-    url: &str,
-    method: &str,
-    body: Option<JsValue>,
-    headers: &[(&str, &str)],
-) -> Result<Response, ClientError> {
-    let request_headers = Headers::new().map_err(|_| browser_error())?;
-    for (name, value) in headers {
-        request_headers
-            .append(name, value)
-            .map_err(|_| browser_error())?;
-    }
-    let options = RequestInit::new();
-    options.set_method(method);
-    options.set_cache(RequestCache::NoStore);
-    options.set_headers(&request_headers);
-    if let Some(body) = body.as_ref() {
-        options.set_body(body);
-    }
-    let request = Request::new_with_str_and_init(url, &options).map_err(|_| browser_error())?;
-    let response = JsFuture::from(
-        window()
-            .ok_or_else(browser_error)?
-            .fetch_with_request(&request),
-    )
-    .await
-    .map_err(|_| map_rpc_status(RpcCode::Unavailable))?;
-    response.dyn_into().map_err(|_| browser_error())
 }

@@ -7,10 +7,10 @@
 
 use std::time::Duration;
 
-use sovereign_config_client::Transport;
-use sovereign_config_core::{ConfigPath, ConnectionUrl, ProtocolVersion, Secret, ServiceStatus};
+use sovereign_config_client::negotiate;
+use sovereign_config_core::{ConfigPath, ConnectionUrl, ErrorKind, Secret};
 use sovereign_config_layers::{CachedTokenProvider, LayerReader, Naming, OnMissing};
-use sovereign_config_native::TonicTransport;
+use sovereign_config_native::{TonicChannel, TonicTransport};
 
 pub(crate) type BrokerReader = LayerReader<TonicTransport, CachedTokenProvider>;
 
@@ -34,19 +34,18 @@ pub(crate) async fn connect(url: &Secret, token_ttl: Duration) -> Result<Connect
         .client_authentication()
         .ok_or(ConnectError::UnsupportedCredential)?
         .clone();
-    let transport = TonicTransport::connect(connection.endpoint().to_owned())
+    let channel = TonicChannel::connect(connection.endpoint().to_owned())
         .await
         .map_err(|_| ConnectError::Unavailable)?;
-    let reply = transport
-        .get_version(ProtocolVersion::PREFERRED.as_str())
+    let status = negotiate(&channel)
         .await
-        .map_err(|_| ConnectError::Unavailable)?;
-    ServiceStatus::negotiate(
-        reply.application_version,
-        &reply.protocol_version,
-        &reply.supported_protocol_versions,
-    )
-    .map_err(|_| ConnectError::IncompatibleProtocol)?;
+        .map_err(|error| match error.kind {
+            ErrorKind::IncompatibleProtocol => ConnectError::IncompatibleProtocol,
+            _ => ConnectError::Unavailable,
+        })?;
+    // Every layer read the broker serves for the life of this connection
+    // travels on the version negotiated here, and is counted under it.
+    let transport = channel.speaking(status.protocol_version);
     let tokens = CachedTokenProvider::new(
         connection.issuer().to_owned(),
         connection.client_id().to_owned(),

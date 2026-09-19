@@ -1,16 +1,26 @@
-use std::{net::IpAddr, time::Duration};
+//! The `sovereign.config.v3` dialer: this version's generated stubs and its
+//! proto↔core mapping, and nothing else.
+//!
+//! Every route this module dials names `sovereign.config.v3`, because tonic
+//! builds each route path from the package its stubs were generated for. That
+//! is what makes a version's dispatch deletable: retiring `v3` is deleting this
+//! file and its arm of [`super::dialer`].
+//!
+//! Domain types stay version-free in `sovereign-config-core`, so a second
+//! version is a second translation shim over one set of domain types — never a
+//! forked client. If something here starts looking like logic rather than
+//! translation, it belongs in core.
 
 use async_trait::async_trait;
-use http::Uri;
 use sovereign_config_client::{
-    ManagedConnectionTransport, RpcCode, Transport, ValueTransport, VersionReply, map_rpc_status,
-    timestamp,
+    ManagedConnectionTransport, RpcCode, SessionTransport, Transport, ValueTransport, VersionReply,
+    map_rpc_status, timestamp,
 };
 use sovereign_config_core::{
     AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl,
     DeleteMetadata, DisplayName, ListedValue, ManagedConnectionMetadata, ManagedConnectionState,
-    ManagedPermissions, MaskedSecret, PlainValue, ProvisionedManagedConnection, PutMetadata,
-    ReplaceMetadata, RevealedConnectionUrl, RevealedSecret, Secret, SecretInput,
+    ManagedPermissions, MaskedSecret, PlainValue, ProtocolVersion, ProvisionedManagedConnection,
+    PutMetadata, ReplaceMetadata, RevealedConnectionUrl, RevealedSecret, Secret, SecretInput,
     SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, ValueContent, ValueListing,
     ValuePaths, ValueSubTree,
 };
@@ -25,29 +35,84 @@ use sovereign_config_proto::sovereign::config::v3::{
     listed_value, managed_connections_client::ManagedConnectionsClient, put_value_request,
     sub_tree_mutation_value, sub_tree_value, system_client::SystemClient,
 };
-use tonic::{
-    Code, Request,
-    metadata::MetadataValue,
-    transport::{Channel, Endpoint},
-};
+use tonic::transport::Channel;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+use super::{authenticated_request, map_status};
 
-#[derive(Clone)]
-pub struct TonicTransport {
+/// The version this module speaks. Reported as the session's version, so it is
+/// read from the same place the routes come from.
+const VERSION: ProtocolVersion = ProtocolVersion::V3;
+
+/// The `v3` stubs, bound to one connected channel.
+pub(super) struct Dialer {
     channel: Channel,
 }
 
+impl Dialer {
+    pub(super) const fn new(channel: Channel) -> Self {
+        Self { channel }
+    }
+
+    fn configuration(&self) -> ConfigurationClient<Channel> {
+        ConfigurationClient::new(self.channel.clone())
+    }
+
+    fn managed_connections(&self) -> ManagedConnectionsClient<Channel> {
+        ManagedConnectionsClient::new(self.channel.clone())
+    }
+
+    fn system(&self) -> SystemClient<Channel> {
+        SystemClient::new(self.channel.clone())
+    }
+}
+
 #[async_trait(?Send)]
-impl ValueTransport for TonicTransport {
+impl SessionTransport for Dialer {
+    fn version(&self) -> ProtocolVersion {
+        VERSION
+    }
+
+    async fn get_version(&self) -> Result<VersionReply, ClientError> {
+        let response = self
+            .system()
+            .get_version(GetVersionRequest {
+                protocol_version: VERSION.as_str().to_owned(),
+            })
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        Ok(VersionReply {
+            application_version: response.application_version,
+            protocol_version: response.protocol_version,
+            supported_protocol_versions: response.supported_protocol_versions,
+        })
+    }
+}
+
+#[async_trait(?Send)]
+impl Transport for Dialer {
+    async fn get_identity(&self, bearer: &Secret) -> Result<AuthenticationStatus, ClientError> {
+        let response = self
+            .system()
+            .get_identity(authenticated_request(GetIdentityRequest {}, bearer)?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        Ok(AuthenticationStatus {
+            authenticated: response.authenticated,
+        })
+    }
+}
+
+#[async_trait(?Send)]
+impl ValueTransport for Dialer {
     async fn list_values(
         &self,
         path: &ConfigPath,
         bearer: &Secret,
     ) -> Result<ValueListing, ClientError> {
-        let mut client = ConfigurationClient::new(self.channel.clone());
-        let response = client
+        let response = self
+            .configuration()
             .list_values(authenticated_request(
                 ListValuesRequest {
                     path: path.as_str().to_owned(),
@@ -91,8 +156,8 @@ impl ValueTransport for TonicTransport {
         path: &ConfigPath,
         bearer: &Secret,
     ) -> Result<ValueSubTree, ClientError> {
-        let mut client = ConfigurationClient::new(self.channel.clone());
-        let response = client
+        let response = self
+            .configuration()
             .get_sub_tree(authenticated_request(
                 GetSubTreeRequest {
                     path: path.as_str().to_owned(),
@@ -126,26 +191,12 @@ impl ValueTransport for TonicTransport {
         value: &PlainValue,
         bearer: &Secret,
     ) -> Result<PutMetadata, ClientError> {
-        let mut client = ConfigurationClient::new(self.channel.clone());
-        let response = client
-            .put_value(authenticated_request(
-                PutValueRequest {
-                    path: path.as_str().to_owned(),
-                    content: Some(put_value_request::Content::PlainValue(
-                        value.expose().to_owned(),
-                    )),
-                },
-                bearer,
-            )?)
-            .await
-            .map_err(|status| map_status(&status))?
-            .into_inner();
-        let created_at = response.created_at.ok_or_else(invalid_response)?;
-        let updated_at = response.updated_at.ok_or_else(invalid_response)?;
-        Ok(PutMetadata {
-            created_at: timestamp(created_at.seconds, created_at.nanos)?,
-            updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
-        })
+        self.put(
+            path,
+            put_value_request::Content::PlainValue(value.expose().to_owned()),
+            bearer,
+        )
+        .await
     }
 
     async fn put_secret(
@@ -154,26 +205,12 @@ impl ValueTransport for TonicTransport {
         value: &SecretInput,
         bearer: &Secret,
     ) -> Result<PutMetadata, ClientError> {
-        let mut client = ConfigurationClient::new(self.channel.clone());
-        let response = client
-            .put_value(authenticated_request(
-                PutValueRequest {
-                    path: path.as_str().to_owned(),
-                    content: Some(put_value_request::Content::SecretValue(
-                        value.expose().to_owned(),
-                    )),
-                },
-                bearer,
-            )?)
-            .await
-            .map_err(|status| map_status(&status))?
-            .into_inner();
-        let created_at = response.created_at.ok_or_else(invalid_response)?;
-        let updated_at = response.updated_at.ok_or_else(invalid_response)?;
-        Ok(PutMetadata {
-            created_at: timestamp(created_at.seconds, created_at.nanos)?,
-            updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
-        })
+        self.put(
+            path,
+            put_value_request::Content::SecretValue(value.expose().to_owned()),
+            bearer,
+        )
+        .await
     }
 
     async fn replace_subtree(
@@ -182,29 +219,12 @@ impl ValueTransport for TonicTransport {
         values: &[SubTreeMutationValue],
         bearer: &Secret,
     ) -> Result<ReplaceMetadata, ClientError> {
-        let mut client = ConfigurationClient::new(self.channel.clone());
-        let response = client
+        let response = self
+            .configuration()
             .replace_sub_tree(authenticated_request(
                 ReplaceSubTreeRequest {
                     path: path.as_str().to_owned(),
-                    values: values
-                        .iter()
-                        .map(|value| ProtoSubTreeMutationValue {
-                            path: value.path.as_str().to_owned(),
-                            content: Some(match &value.value {
-                                SubTreeMutationContent::Plain(value) => {
-                                    sub_tree_mutation_value::Content::PlainValue(
-                                        value.expose().to_owned(),
-                                    )
-                                }
-                                SubTreeMutationContent::PreserveSecret => {
-                                    sub_tree_mutation_value::Content::PreserveSecret(
-                                        PreserveSecret {},
-                                    )
-                                }
-                            }),
-                        })
-                        .collect(),
+                    values: values.iter().map(mutation_value).collect(),
                 },
                 bearer,
             )?)
@@ -224,8 +244,8 @@ impl ValueTransport for TonicTransport {
         recurse: bool,
         bearer: &Secret,
     ) -> Result<DeleteMetadata, ClientError> {
-        let mut client = ConfigurationClient::new(self.channel.clone());
-        let response = client
+        let response = self
+            .configuration()
             .delete_values(authenticated_request(
                 DeleteValuesRequest {
                     path: path.as_str().to_owned(),
@@ -248,8 +268,8 @@ impl ValueTransport for TonicTransport {
         path: &ConfigPath,
         bearer: &Secret,
     ) -> Result<RevealedSecret, ClientError> {
-        let mut client = ConfigurationClient::new(self.channel.clone());
-        let response = client
+        let response = self
+            .configuration()
             .reveal_secret(authenticated_request(
                 RevealSecretRequest {
                     path: path.as_str().to_owned(),
@@ -271,8 +291,8 @@ impl ValueTransport for TonicTransport {
         new_path: &ConfigPath,
         bearer: &Secret,
     ) -> Result<AddPathMetadata, ClientError> {
-        let mut client = ConfigurationClient::new(self.channel.clone());
-        let response = client
+        let response = self
+            .configuration()
             .add_value_path(authenticated_request(
                 AddValuePathRequest {
                     source_path: source.as_str().to_owned(),
@@ -294,8 +314,8 @@ impl ValueTransport for TonicTransport {
         path: &ConfigPath,
         bearer: &Secret,
     ) -> Result<ValuePaths, ClientError> {
-        let mut client = ConfigurationClient::new(self.channel.clone());
-        let response = client
+        let response = self
+            .configuration()
             .list_value_paths(authenticated_request(
                 ListValuePathsRequest {
                     path: path.as_str().to_owned(),
@@ -315,13 +335,13 @@ impl ValueTransport for TonicTransport {
 }
 
 #[async_trait(?Send)]
-impl ManagedConnectionTransport for TonicTransport {
+impl ManagedConnectionTransport for Dialer {
     async fn list_managed_connections(
         &self,
         bearer: &Secret,
     ) -> Result<Vec<ManagedConnectionMetadata>, ClientError> {
-        let mut client = ManagedConnectionsClient::new(self.channel.clone());
-        let response = client
+        let response = self
+            .managed_connections()
             .list_managed_connections(authenticated_request(
                 ListManagedConnectionsRequest {},
                 bearer,
@@ -343,8 +363,8 @@ impl ManagedConnectionTransport for TonicTransport {
         permissions: &ManagedPermissions,
         bearer: &Secret,
     ) -> Result<ProvisionedManagedConnection, ClientError> {
-        let mut client = ManagedConnectionsClient::new(self.channel.clone());
-        let response = client
+        let response = self
+            .managed_connections()
             .create_managed_connection(authenticated_request(
                 CreateManagedConnectionRequest {
                     display_name: display_name.as_str().to_owned(),
@@ -364,8 +384,8 @@ impl ManagedConnectionTransport for TonicTransport {
         connection_id: &ConnectionId,
         bearer: &Secret,
     ) -> Result<ProvisionedManagedConnection, ClientError> {
-        let mut client = ManagedConnectionsClient::new(self.channel.clone());
-        let response = client
+        let response = self
+            .managed_connections()
             .rotate_managed_connection(authenticated_request(
                 RotateManagedConnectionRequest {
                     connection_id: connection_id.as_str().to_owned(),
@@ -383,8 +403,7 @@ impl ManagedConnectionTransport for TonicTransport {
         connection_id: &ConnectionId,
         bearer: &Secret,
     ) -> Result<(), ClientError> {
-        let mut client = ManagedConnectionsClient::new(self.channel.clone());
-        client
+        self.managed_connections()
             .revoke_managed_connection(authenticated_request(
                 RevokeManagedConnectionRequest {
                     connection_id: connection_id.as_str().to_owned(),
@@ -394,6 +413,50 @@ impl ManagedConnectionTransport for TonicTransport {
             .await
             .map_err(|status| map_status(&status))?;
         Ok(())
+    }
+}
+
+impl Dialer {
+    /// Plain and secret writes are the same RPC with a different content arm,
+    /// so the two entry points differ only in the arm they build.
+    async fn put(
+        &self,
+        path: &ConfigPath,
+        content: put_value_request::Content,
+        bearer: &Secret,
+    ) -> Result<PutMetadata, ClientError> {
+        let response = self
+            .configuration()
+            .put_value(authenticated_request(
+                PutValueRequest {
+                    path: path.as_str().to_owned(),
+                    content: Some(content),
+                },
+                bearer,
+            )?)
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+        let created_at = response.created_at.ok_or_else(invalid_response)?;
+        let updated_at = response.updated_at.ok_or_else(invalid_response)?;
+        Ok(PutMetadata {
+            created_at: timestamp(created_at.seconds, created_at.nanos)?,
+            updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
+        })
+    }
+}
+
+fn mutation_value(value: &SubTreeMutationValue) -> ProtoSubTreeMutationValue {
+    ProtoSubTreeMutationValue {
+        path: value.path.as_str().to_owned(),
+        content: Some(match &value.value {
+            SubTreeMutationContent::Plain(value) => {
+                sub_tree_mutation_value::Content::PlainValue(value.expose().to_owned())
+            }
+            SubTreeMutationContent::PreserveSecret => {
+                sub_tree_mutation_value::Content::PreserveSecret(PreserveSecret {})
+            }
+        }),
     }
 }
 
@@ -479,246 +542,6 @@ fn subtree_content(
     }
 }
 
-fn authenticated_request<T>(message: T, bearer: &Secret) -> Result<Request<T>, ClientError> {
-    let mut request = Request::new(message);
-    let authorization = MetadataValue::try_from(format!("Bearer {}", bearer.expose()))
-        .map_err(|_| map_rpc_status(RpcCode::InvalidArgument))?;
-    request
-        .metadata_mut()
-        .insert("authorization", authorization);
-    Ok(request)
-}
-
 fn invalid_response() -> ClientError {
     map_rpc_status(RpcCode::Other)
-}
-
-impl TonicTransport {
-    /// Connects to a native gRPC endpoint without configuring retries.
-    ///
-    /// # Errors
-    ///
-    /// Returns a bounded invalid-request or unavailable error.
-    pub async fn connect(endpoint: String) -> Result<Self, ClientError> {
-        Self::connect_with_timeouts(endpoint, CONNECT_TIMEOUT, REQUEST_TIMEOUT).await
-    }
-
-    async fn connect_with_timeouts(
-        endpoint: String,
-        connect_timeout: Duration,
-        request_timeout: Duration,
-    ) -> Result<Self, ClientError> {
-        validate_service_endpoint(&endpoint)?;
-        let endpoint = Endpoint::new(endpoint)
-            .map_err(|_| map_rpc_status(RpcCode::InvalidArgument))?
-            .connect_timeout(connect_timeout)
-            .timeout(request_timeout);
-        let channel = tokio::time::timeout(connect_timeout, endpoint.connect())
-            .await
-            .map_err(|_| map_rpc_status(RpcCode::Unavailable))?
-            .map_err(|_| map_rpc_status(RpcCode::Unavailable))?;
-        Ok(Self { channel })
-    }
-}
-
-fn validate_service_endpoint(endpoint: &str) -> Result<(), ClientError> {
-    let uri = endpoint
-        .parse::<Uri>()
-        .map_err(|_| map_rpc_status(RpcCode::InvalidArgument))?;
-    let valid = match (uri.scheme_str(), uri.host()) {
-        (Some("https"), Some(_)) => true,
-        (Some("http"), Some(host)) => host
-            .trim_matches(['[', ']'])
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback()),
-        _ => false,
-    };
-    if !valid {
-        return Err(map_rpc_status(RpcCode::InvalidArgument));
-    }
-    Ok(())
-}
-
-#[async_trait(?Send)]
-impl Transport for TonicTransport {
-    async fn get_version(&self, protocol_version: &str) -> Result<VersionReply, ClientError> {
-        let mut client = SystemClient::new(self.channel.clone());
-        let response = client
-            .get_version(GetVersionRequest {
-                protocol_version: protocol_version.to_owned(),
-            })
-            .await
-            .map_err(|status| map_status(&status))?
-            .into_inner();
-        Ok(VersionReply {
-            application_version: response.application_version,
-            protocol_version: response.protocol_version,
-            supported_protocol_versions: response.supported_protocol_versions,
-        })
-    }
-
-    async fn get_identity(&self, bearer: &Secret) -> Result<AuthenticationStatus, ClientError> {
-        let mut client = SystemClient::new(self.channel.clone());
-        let response = client
-            .get_identity(authenticated_request(GetIdentityRequest {}, bearer)?)
-            .await
-            .map_err(|status| map_status(&status))?
-            .into_inner();
-        Ok(AuthenticationStatus {
-            authenticated: response.authenticated,
-        })
-    }
-}
-
-fn map_status(status: &tonic::Status) -> ClientError {
-    map_rpc_status(match status.code() {
-        Code::Unauthenticated => RpcCode::Unauthenticated,
-        Code::PermissionDenied => RpcCode::PermissionDenied,
-        Code::FailedPrecondition => RpcCode::FailedPrecondition,
-        Code::Unimplemented => RpcCode::Unimplemented,
-        Code::InvalidArgument => RpcCode::InvalidArgument,
-        Code::NotFound => RpcCode::NotFound,
-        Code::AlreadyExists => RpcCode::AlreadyExists,
-        Code::Aborted | Code::Cancelled | Code::DeadlineExceeded | Code::Unavailable => {
-            RpcCode::Unavailable
-        }
-        _ => RpcCode::Other,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{future::pending, time::Duration};
-
-    use sovereign_config_client::Transport;
-    use sovereign_config_core::{ErrorKind, ProtocolVersion, Secret};
-    use sovereign_config_proto::sovereign::config::v3::{
-        GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
-        system_server::{System, SystemServer},
-    };
-    use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::{Request, Response, Status, transport::Server};
-
-    /// Every protocol version this transport can actually dial.
-    ///
-    /// This transport is built from the generated `sovereign.config.v3` stubs,
-    /// so every RPC it issues travels on a `/sovereign.config.v3.…` route
-    /// regardless of what negotiation selected.
-    const DISPATCHABLE_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V3];
-
-    /// Tripwire for the gap between negotiating a version and dialling it.
-    ///
-    /// `ServiceStatus::negotiate` picks from `ProtocolVersion::ALL` and the
-    /// result is shown to operators, but this transport dispatches on compiled
-    /// route paths. If a variant is added to `ALL` without route support here,
-    /// the client negotiates and reports the new version while every RPC —
-    /// including that `GetVersion` — still travels on the old one's routes.
-    /// `sovereign_config_protocol_requests_total` then reads exactly backwards:
-    /// the live version looks dead and the unused one looks busy, which is the
-    /// signal the README makes the precondition for deleting a version.
-    ///
-    /// Nothing else catches this, because with a single version the two sets
-    /// coincide. If this fails, add the `vN` dispatch here rather than widening
-    /// the list.
-    #[test]
-    fn this_transport_dials_every_version_the_client_may_negotiate() {
-        assert_eq!(
-            DISPATCHABLE_VERSIONS,
-            ProtocolVersion::ALL,
-            "ProtocolVersion::ALL gained a version this transport cannot dial; \
-             add its route dispatch before listing it as speakable"
-        );
-    }
-
-    use super::{TonicTransport, validate_service_endpoint};
-
-    struct HangingSystem;
-
-    #[tonic::async_trait]
-    impl System for HangingSystem {
-        async fn get_version(
-            &self,
-            _: Request<GetVersionRequest>,
-        ) -> Result<Response<GetVersionResponse>, Status> {
-            pending().await
-        }
-
-        async fn get_identity(
-            &self,
-            _: Request<GetIdentityRequest>,
-        ) -> Result<Response<GetIdentityResponse>, Status> {
-            pending().await
-        }
-    }
-
-    #[test]
-    fn service_endpoints_require_https_except_for_loopback() {
-        assert!(validate_service_endpoint("https://config.example.test").is_ok());
-        assert!(validate_service_endpoint("http://127.0.0.1:50051").is_ok());
-        assert!(validate_service_endpoint("http://[::1]:50051").is_ok());
-        assert!(validate_service_endpoint("http://config.example.test").is_err());
-        assert!(validate_service_endpoint("ftp://config.example.test").is_err());
-        assert!(validate_service_endpoint("not-a-url").is_err());
-    }
-
-    #[tokio::test]
-    async fn stalled_connection_is_bounded_and_unavailable() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let peer = tokio::spawn(async move {
-            let (_socket, _) = listener.accept().await.unwrap();
-            pending::<()>().await;
-        });
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            TonicTransport::connect_with_timeouts(
-                format!("https://{address}"),
-                Duration::from_millis(25),
-                Duration::from_secs(1),
-            ),
-        )
-        .await
-        .expect("connection timeout was not enforced");
-        let error = result
-            .err()
-            .expect("stalled connection unexpectedly succeeded");
-
-        assert_eq!(error.kind, ErrorKind::Unavailable);
-        peer.abort();
-    }
-
-    #[tokio::test]
-    async fn stalled_rpcs_are_bounded_and_unavailable() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(
-            Server::builder()
-                .add_service(SystemServer::new(HangingSystem))
-                .serve_with_incoming(TcpListenerStream::new(listener)),
-        );
-        let transport = TonicTransport::connect_with_timeouts(
-            format!("http://{address}"),
-            Duration::from_secs(1),
-            Duration::from_millis(25),
-        )
-        .await
-        .unwrap();
-
-        let version = tokio::time::timeout(Duration::from_secs(1), transport.get_version("v1"))
-            .await
-            .expect("version RPC timeout was not enforced")
-            .unwrap_err();
-        let identity = tokio::time::timeout(
-            Duration::from_secs(1),
-            transport.get_identity(&Secret::new("token-sentinel")),
-        )
-        .await
-        .expect("identity RPC timeout was not enforced")
-        .unwrap_err();
-
-        assert_eq!(version.kind, ErrorKind::Unavailable);
-        assert_eq!(identity.kind, ErrorKind::Unavailable);
-        server.abort();
-    }
 }

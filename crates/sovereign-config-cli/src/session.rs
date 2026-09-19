@@ -3,11 +3,11 @@
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use sovereign_config_client::{AccessTokenProvider, Client};
+use sovereign_config_client::{AccessTokenProvider, Client, negotiate};
 use sovereign_config_core::{ClientError, ConfigPath, ConnectionUrl, ErrorKind, Secret};
 use sovereign_config_layers::InvalidatableToken;
 use sovereign_config_native::{
-    CredentialStore, DeviceFlowClient, TonicTransport, default_credential_directory,
+    CredentialStore, DeviceFlowClient, TonicChannel, TonicTransport, default_credential_directory,
 };
 
 /// A client that has already proved the service is reachable and speaks this
@@ -38,15 +38,6 @@ impl InvalidatableToken for InMemoryToken {
     /// [`LayerReader`](sovereign_config_layers::LayerReader) performs simply
     /// replays the same token and gets the same answer.
     fn invalidate(&self) {}
-}
-
-pub struct MissingToken;
-
-#[async_trait(?Send)]
-impl AccessTokenProvider for MissingToken {
-    async fn access_token(&self) -> Result<Option<Secret>, ClientError> {
-        Ok(None)
-    }
 }
 
 /// Parses a typed path in the grammar `scope` selects and confines it to the
@@ -107,10 +98,8 @@ pub async fn operational_client(connection: &ConnectionUrl) -> Result<Operationa
 pub async fn operational_transport(
     connection: &ConnectionUrl,
 ) -> Result<(TonicTransport, InMemoryToken)> {
-    let transport = TonicTransport::connect(connection.endpoint().to_owned()).await?;
-    Client::new(transport.clone(), MissingToken)
-        .service_status()
-        .await?;
+    let channel = TonicChannel::connect(connection.endpoint().to_owned()).await?;
+    let transport = channel.speaking(negotiate(&channel).await?.protocol_version);
     Ok((transport, InMemoryToken(access_token(connection).await?)))
 }
 
@@ -163,12 +152,15 @@ pub fn logout(connection: &ConnectionUrl) -> Result<()> {
 /// Returns an error when the service is unreachable or reports an invalid
 /// authentication status.
 pub async fn status(connection: &ConnectionUrl) -> Result<()> {
-    let transport = TonicTransport::connect(connection.endpoint().to_owned()).await?;
-    let public_client = Client::new(transport.clone(), MissingToken);
-    let service = public_client.service_status().await?;
+    let channel = TonicChannel::connect(connection.endpoint().to_owned()).await?;
+    let service = negotiate(&channel).await?;
+    // The transport is built from the version just reported, so the protocol
+    // printed here is the one the identity check below travels on.
+    let transport = channel.speaking(service.protocol_version);
     println!(
         "Service {} (protocol {})",
-        service.application_version, service.protocol_version
+        service.application_version,
+        transport.protocol_version()
     );
 
     let Some(access_token) = maybe_access_token(connection).await? else {
