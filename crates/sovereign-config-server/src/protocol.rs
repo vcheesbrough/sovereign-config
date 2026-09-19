@@ -9,7 +9,15 @@
 //! Counting here rather than at `GetVersion` is what makes the count usable for
 //! retirement: negotiation happens once at connect, so a long-lived provider
 //! would otherwise register one connect and then go quiet while its traffic
-//! continued. See `## Protocol versioning` in `README.md`.
+//! continued.
+//!
+//! This layer records the `attempted` series only, because it runs before
+//! authentication and cannot know the outcome — the authentication layer's
+//! refusal carries its `grpc-status` in trailers, which cannot be read without
+//! consuming the body. The `authenticated` series is recorded by the
+//! authentication layer instead, which reads the extension this layer attached.
+//! See [`ProtocolMetrics`] for why the gate needs both, and
+//! `## Protocol versioning` in `README.md`.
 
 use std::{
     future::Future,
@@ -37,11 +45,21 @@ pub(crate) struct NegotiatedProtocolVersion(pub(crate) Option<&'static str>);
 /// The version label a `/sovereign.config.<version>.<Service>/<Method>` path
 /// names, or `None` for any other route.
 ///
+/// The whole shape is required, not just the prefix: a bare
+/// `/sovereign.config.v3`, or one with no method, is not a request any client
+/// of that version would send, and counting it against the version would let
+/// junk traffic hold the retirement gate above zero. Such a path falls through
+/// to the unrecognised bucket instead.
+///
 /// Returns one of `recognised`'s own `'static` strings rather than a slice of
 /// the path, so nothing derived from the request can reach a metric label.
 fn route_version(path: &str, recognised: &[&'static str]) -> Option<&'static str> {
     let rest = path.strip_prefix("/sovereign.config.")?;
-    let version = rest.split('.').next()?;
+    let (qualified_service, method) = rest.split_once('/')?;
+    let (version, service) = qualified_service.split_once('.')?;
+    if service.is_empty() || method.is_empty() || method.contains('/') {
+        return None;
+    }
     recognised
         .iter()
         .copied()
@@ -109,13 +127,13 @@ where
         // traffic and must not inflate the unrecognised bucket, which exists to
         // surface a *versioned* route this build does not know.
         if let Some(version) = version {
-            self.metrics.record(version);
+            self.metrics.record_attempted(version);
             request
                 .extensions_mut()
                 .insert(NegotiatedProtocolVersion(Some(version)));
         } else if request.uri().path().starts_with("/sovereign.config.") {
             self.metrics
-                .record(crate::metrics::UNRECOGNISED_PROTOCOL_LABEL);
+                .record_attempted(crate::metrics::UNRECOGNISED_PROTOCOL_LABEL);
             request
                 .extensions_mut()
                 .insert(NegotiatedProtocolVersion(None));
@@ -164,6 +182,25 @@ mod tests {
         }
     }
 
+    /// A recognised version is only credited with a request shaped like one its
+    /// clients would send. Anything looser lets junk — a scanner probing
+    /// `/sovereign.config.v3` — land in the real bucket and hold the retirement
+    /// gate above zero.
+    #[test]
+    fn route_version_requires_the_whole_service_and_method_shape() {
+        for path in [
+            "/sovereign.config.v3",
+            "/sovereign.config.v3.",
+            "/sovereign.config.v3.System",
+            "/sovereign.config.v3.System/",
+            "/sovereign.config.v3./GetVersion",
+            "/sovereign.config.v3/GetVersion",
+            "/sovereign.config.v3.System/GetVersion/extra",
+        ] {
+            assert_eq!(route_version(path, &RECOGNISED), None, "{path}");
+        }
+    }
+
     #[test]
     fn route_version_never_returns_a_version_it_was_not_given() {
         // The label-injection guard: an arbitrary package segment must not
@@ -184,23 +221,30 @@ mod tests {
     #[test]
     fn metrics_render_every_recognised_version_and_the_unrecognised_bucket() {
         let metrics = ProtocolMetrics::new(&["v3"]);
-        metrics.record("v3");
-        metrics.record("v3");
-        metrics.record("v99");
+        metrics.record_attempted("v3");
+        metrics.record_attempted("v3");
+        metrics.record_authenticated("v3");
+        metrics.record_attempted("v99");
+        // An unrecognised version has no authenticated series to land in.
+        metrics.record_authenticated("v99");
 
         let rendered = metrics.render();
 
-        assert!(rendered.contains("sovereign_config_protocol_requests_total{version=\"v3\"} 2"));
-        assert!(
-            rendered
-                .contains("sovereign_config_protocol_requests_total{version=\"unrecognised\"} 1")
-        );
+        assert!(rendered.contains(
+            "sovereign_config_protocol_requests_total{version=\"v3\",outcome=\"attempted\"} 2"
+        ));
+        assert!(rendered.contains(
+            "sovereign_config_protocol_requests_total{version=\"v3\",outcome=\"authenticated\"} 1"
+        ));
+        assert!(rendered.contains(
+            "sovereign_config_protocol_requests_total{version=\"unrecognised\",outcome=\"attempted\"} 1"
+        ));
         assert_eq!(
             rendered
                 .matches("sovereign_config_protocol_requests_total{")
                 .count(),
-            2,
-            "only the compiled-in labels plus the unrecognised bucket are emitted"
+            3,
+            "two series per compiled-in label plus the unrecognised bucket, and nothing else"
         );
     }
 }

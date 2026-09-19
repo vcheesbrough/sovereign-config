@@ -162,9 +162,13 @@ impl Harness {
             .expect("the harness must accept a connection")
     }
 
-    /// The value of `sovereign_config_protocol_requests_total` for `version`.
+    /// The `attempted` series of `sovereign_config_protocol_requests_total` for
+    /// `version`. The harness has no authentication layer, so nothing here can
+    /// move the `authenticated` series; that is covered in `auth/tests.rs`.
     fn requests(&self, version: &str) -> u64 {
-        let needle = format!("sovereign_config_protocol_requests_total{{version=\"{version}\"}} ");
+        let needle = format!(
+            "sovereign_config_protocol_requests_total{{version=\"{version}\",outcome=\"attempted\"}} "
+        );
         self.metrics
             .render()
             .lines()
@@ -322,12 +326,21 @@ async fn a_request_refused_beneath_the_layer_is_still_counted() {
         .expect_err("the rejecting layer must refuse the request");
     assert_eq!(refused.code(), tonic::Code::Unauthenticated);
 
+    let rendered = metrics.render();
     assert!(
-        metrics
-            .render()
-            .contains("sovereign_config_protocol_requests_total{version=\"v3\"} 1"),
-        "a refused request is still traffic on its protocol version: {}",
-        metrics.render()
+        rendered.contains(
+            "sovereign_config_protocol_requests_total{version=\"v3\",outcome=\"attempted\"} 1"
+        ),
+        "a refused request is still an attempt on its protocol version: {rendered}"
+    );
+    // And it is *only* an attempt. A refused request must never reach the
+    // series that gates retirement, or anything able to reach the public
+    // endpoint could hold a version open indefinitely.
+    assert!(
+        rendered.contains(
+            "sovereign_config_protocol_requests_total{version=\"v3\",outcome=\"authenticated\"} 0"
+        ),
+        "a refused request must not count as authenticated: {rendered}"
     );
 }
 
@@ -369,7 +382,9 @@ async fn a_versioned_route_this_build_does_not_serve_is_counted_as_unrecognised(
     );
     let rendered = metrics.render();
     assert!(
-        rendered.contains("sovereign_config_protocol_requests_total{version=\"unrecognised\"} 1"),
+        rendered.contains(
+            "sovereign_config_protocol_requests_total{version=\"unrecognised\",outcome=\"attempted\"} 1"
+        ),
         "traffic on an unserved version is visible, but under a fixed label: {rendered}"
     );
     assert!(

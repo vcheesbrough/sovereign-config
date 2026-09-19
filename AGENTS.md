@@ -91,10 +91,13 @@ explicitly supported — a server upgrade alone must never break them.
 - Breaking changes are a **last resort** and must be avoided wherever possible.
   If unavoidable: document it and communicate it to all clients.
 - New protocol versions may be added, but **the server must continue to support
-  older versions.** A version is retired only once
+  older versions.** A version is retired only once the
+  `outcome="authenticated"` series of
   `sovereign_config_protocol_requests_total` has read zero for it across a full
   deployment cycle — the provider does not cache, so a client on a retired
-  version fails on its next load with no fallback.
+  version fails on its next load with no fallback. Gate on `authenticated`, never
+  `attempted`: the endpoint is public, so unauthenticated traffic can hold the
+  latter above zero indefinitely.
 - Remember the converse: a change can break clients **without** being a protocol
   change (releases 2.15.0 and 2.18.0 both did). Negotiation does not protect
   against that class.

@@ -129,15 +129,18 @@ async fn main() -> Result<()> {
     Server::builder()
         .accept_http1(true)
         // Outermost, so every request is attributed to the protocol version its
-        // route names — including one rejected by authentication, which is
-        // still traffic on that version.
+        // route names — including one rejected by authentication, which still
+        // counts as `attempted`. It must also stay outside the authentication
+        // layer because that layer reads the version extension this one
+        // attaches in order to record the `authenticated` series.
         .layer(ProtocolVersionLayer::new(
-            protocol_metrics,
+            Arc::clone(&protocol_metrics),
             SERVED_PROTOCOL_LABELS,
         ))
         .layer(grpc_authentication_layer(
             authenticator,
             authentication_metrics,
+            protocol_metrics,
         ))
         .layer(web_assets)
         .add_service(health_service)
