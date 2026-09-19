@@ -3,9 +3,13 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-/// The bucket a request counts against when its route names no protocol version
-/// this server recognises — a health probe, a gRPC reflection call, or a path
-/// that is simply not ours.
+/// The bucket a request counts against when its route names a `sovereign.config`
+/// protocol version this server does not serve.
+///
+/// Routes outside `/sovereign.config.` — health probes, gRPC reflection, web
+/// assets — are not protocol traffic and are counted nowhere in this family.
+/// Folding them in here would bury the one signal the bucket exists to give:
+/// that something is addressing a protocol version this build does not know.
 pub(crate) const UNRECOGNISED_PROTOCOL_LABEL: &str = "unrecognised";
 
 /// Per-protocol-version request counts.

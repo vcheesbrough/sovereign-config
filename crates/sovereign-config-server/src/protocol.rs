@@ -26,9 +26,11 @@ use crate::metrics::ProtocolMetrics;
 
 /// The protocol version a request arrived on, taken from its route prefix.
 ///
-/// Present on every gRPC request this server dispatches, including one whose
-/// version it does not recognise, so a handler can tell "not ours" from
-/// "absent".
+/// Present on every request whose route names a `sovereign.config` package,
+/// carrying `None` when that package is a protocol version this build does not
+/// serve. Routes outside `/sovereign.config.` — health probes, gRPC reflection,
+/// web assets — carry no extension at all, so absence means "not protocol
+/// traffic" and `Some`/`None` distinguishes served from unserved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NegotiatedProtocolVersion(pub(crate) Option<&'static str>);
 

@@ -23,8 +23,10 @@ use sovereign_config_proto_testversion::sovereign::config::vtest::{
 use tokio::net::TcpListener;
 use tonic::{
     Request, Response, Status,
+    body::BoxBody,
     transport::{Channel, Endpoint, Server},
 };
+use tower::{Layer, Service};
 
 use crate::{
     metrics::ProtocolMetrics,
@@ -62,6 +64,48 @@ impl TestSystem for TestVersionService {
             protocol_version: request.into_inner().protocol_version,
             supported_protocol_versions: seen.into_iter().collect(),
         }))
+    }
+}
+
+/// Rejects every request without calling the service beneath it, standing in
+/// for the authentication layer refusing a request.
+#[derive(Clone, Copy)]
+struct RejectingLayer;
+
+impl<S> Layer<S> for RejectingLayer {
+    type Service = RejectingService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RejectingService(inner)
+    }
+}
+
+#[derive(Clone)]
+struct RejectingService<S>(S);
+
+impl<S, B> Service<http::Request<B>> for RejectingService<S>
+where
+    S: Service<http::Request<B>, Response = http::Response<BoxBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = http::Response<BoxBody>;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(context)
+    }
+
+    fn call(&mut self, _: http::Request<B>) -> Self::Future {
+        let refusal = Status::unauthenticated("authentication required").into_http();
+        Box::pin(async move { Ok(refusal) })
     }
 }
 
@@ -230,6 +274,61 @@ async fn a_client_compiled_without_the_supported_set_still_decodes_and_negotiate
     assert_eq!(legacy.application_version, current.application_version);
     // The exact-equality gate such a client performs, verbatim.
     assert_eq!(legacy.protocol_version, "v3");
+}
+
+/// Pins the layer ordering that `main.rs` depends on.
+///
+/// `ProtocolVersionLayer` must sit **outside** the authentication layer, so a
+/// request that authentication refuses is still counted as traffic on its
+/// protocol version. Tower documents that the first layer added is called
+/// first, and tonic's `Server::layer` delegates to `ServiceBuilder::layer`, so
+/// this holds today — but nothing else would catch it changing.
+///
+/// The failure mode is silent and expensive: an under-counting metric reads
+/// zero for a version that is still in use, which is exactly the signal the
+/// README makes the precondition for deleting that version's package. The
+/// resulting outage would have no failing test behind it.
+#[tokio::test]
+async fn a_request_refused_beneath_the_layer_is_still_counted() {
+    let metrics = Arc::new(ProtocolMetrics::new(&["v3"]));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("an ephemeral port must bind");
+    let address = listener.local_addr().expect("the bound address is known");
+
+    let layer_metrics = Arc::clone(&metrics);
+    tokio::spawn(async move {
+        let _ = Server::builder()
+            // Same order as `main.rs`: the protocol layer first, the refusing
+            // layer (standing in for authentication) beneath it.
+            .layer(ProtocolVersionLayer::new(layer_metrics, &["v3"]))
+            .layer(RejectingLayer)
+            .add_service(V3Server::new(SystemService))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await;
+    });
+
+    let channel = Endpoint::from_shared(format!("http://{address}"))
+        .expect("the endpoint must parse")
+        .connect_timeout(Duration::from_secs(5))
+        .connect()
+        .await
+        .expect("the server must accept a connection");
+    let refused = V3Client::new(channel)
+        .get_version(V3Request {
+            protocol_version: "v3".to_owned(),
+        })
+        .await
+        .expect_err("the rejecting layer must refuse the request");
+    assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+
+    assert!(
+        metrics
+            .render()
+            .contains("sovereign_config_protocol_requests_total{version=\"v3\"} 1"),
+        "a refused request is still traffic on its protocol version: {}",
+        metrics.render()
+    );
 }
 
 #[tokio::test]

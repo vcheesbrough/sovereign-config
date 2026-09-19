@@ -46,7 +46,7 @@ pub fn map_rpc_status(code: RpcCode) -> ClientError {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VersionReply {
     pub application_version: String,
     /// The version the session will speak, echoed by the server.
