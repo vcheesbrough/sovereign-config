@@ -14,8 +14,7 @@ other adapters use the shared crates directly and must not depend on this one.
 ## Distribution
 
 The provider is distributed as **tagged workspace source only** — there is no
-container image or prebuilt library artifact. Depend on it from the same tag as
-the Sovereign Config server it talks to:
+container image or prebuilt library artifact. Pin it to a tag:
 
 ```toml
 [dependencies]
@@ -24,8 +23,13 @@ serde = { version = "1", features = ["derive"] }
 ```
 
 - **Supported Rust:** the workspace `rust-version` (currently 1.94), edition 2024.
-- **Protocol:** `v3`. The provider negotiates protocol compatibility on connect
-  and fails closed on mismatch. Server and provider must share a release tag.
+- **Protocol:** speaks `v3`. On connect the provider negotiates the highest
+  protocol version it and the server share, and fails closed only when they
+  share none. It does **not** have to be built from the server's tag: a server
+  upgraded ahead of this build keeps working, so deploying a new server does not
+  require redeploying the applications that consume it. A build stops working
+  only once the server has *retired* every version it speaks — an announced,
+  observable event. See `## Protocol versioning` in the repository `README.md`.
 
 ## Usage
 

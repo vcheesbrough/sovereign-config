@@ -29,15 +29,17 @@ use tracing::{info, warn};
 
 use crate::{
     config::{AcceptedIdentity, AuthenticationConfig},
-    metrics::{AuthenticationMetrics, AuthenticationResult},
+    metrics::{AuthenticationMetrics, AuthenticationResult, ProtocolMetrics},
+    protocol::NegotiatedProtocolVersion,
+    system::SERVED_PROTOCOL_VERSIONS,
 };
 
 const REQUIRED_SCOPE: &str = "sovereign-config";
 const MAX_INTROSPECTION_RESPONSE_BYTES: usize = 64 * 1024;
-const OPERATIONAL_RPCS: [&str; 3] = [
+/// Routes that bypass authentication and are not protocol-versioned.
+const OPERATIONAL_RPCS: [&str; 2] = [
     "/grpc.health.v1.Health/Check",
     "/grpc.health.v1.Health/Watch",
-    "/sovereign.config.v3.System/GetVersion",
 ];
 
 #[derive(Clone)]
@@ -378,8 +380,28 @@ fn canonical_prefix(prefix: &str) -> Option<String> {
         .map(|path| path.fold())
 }
 
+/// `GetVersion` on any protocol version this server serves.
+///
+/// Derived from [`SERVED_PROTOCOL_VERSIONS`] rather than listed, so introducing
+/// or retiring a version cannot leave this behind. Getting that wrong is not a
+/// small bug: negotiation happens *before* any token exists — `Provider::connect`
+/// calls `get_version` before building its token provider — so a served version
+/// whose `GetVersion` required authentication would fail every client at connect
+/// with an authentication error, before it could discover which versions are
+/// actually served. That is precisely the fleet-wide breakage the supported
+/// range exists to prevent.
+fn is_unauthenticated_version_handshake(path: &str) -> bool {
+    path.strip_prefix("/sovereign.config.")
+        .and_then(|rest| rest.strip_suffix(".System/GetVersion"))
+        .is_some_and(|version| {
+            SERVED_PROTOCOL_VERSIONS
+                .iter()
+                .any(|served| served.as_str() == version)
+        })
+}
+
 fn is_operational_rpc(path: &str) -> bool {
-    OPERATIONAL_RPCS.contains(&path)
+    OPERATIONAL_RPCS.contains(&path) || is_unauthenticated_version_handshake(path)
 }
 
 fn is_web_asset_request(method: &Method, path: &str) -> bool {
@@ -390,13 +412,19 @@ fn is_web_asset_request(method: &Method, path: &str) -> bool {
 pub(crate) struct AuthenticationLayer {
     authenticator: Authenticator,
     metrics: Arc<AuthenticationMetrics>,
+    protocol_metrics: Arc<ProtocolMetrics>,
 }
 
 impl AuthenticationLayer {
-    pub(crate) fn new(authenticator: Authenticator, metrics: Arc<AuthenticationMetrics>) -> Self {
+    pub(crate) fn new(
+        authenticator: Authenticator,
+        metrics: Arc<AuthenticationMetrics>,
+        protocol_metrics: Arc<ProtocolMetrics>,
+    ) -> Self {
         Self {
             authenticator,
             metrics,
+            protocol_metrics,
         }
     }
 }
@@ -406,9 +434,10 @@ pub(crate) type GrpcAuthenticationLayer = Stack<AuthenticationLayer, Stack<GrpcW
 pub(crate) fn grpc_authentication_layer(
     authenticator: Authenticator,
     metrics: Arc<AuthenticationMetrics>,
+    protocol_metrics: Arc<ProtocolMetrics>,
 ) -> GrpcAuthenticationLayer {
     Stack::new(
-        AuthenticationLayer::new(authenticator, metrics),
+        AuthenticationLayer::new(authenticator, metrics, protocol_metrics),
         Stack::new(GrpcWebLayer::new(), Identity::new()),
     )
 }
@@ -421,6 +450,7 @@ impl<S> Layer<S> for AuthenticationLayer {
             inner,
             authenticator: self.authenticator.clone(),
             metrics: Arc::clone(&self.metrics),
+            protocol_metrics: Arc::clone(&self.protocol_metrics),
         }
     }
 }
@@ -430,6 +460,7 @@ pub(crate) struct AuthenticationService<S> {
     inner: S,
     authenticator: Authenticator,
     metrics: Arc<AuthenticationMetrics>,
+    protocol_metrics: Arc<ProtocolMetrics>,
 }
 
 impl<S, B> Service<Request<B>> for AuthenticationService<S>
@@ -458,11 +489,23 @@ where
 
         let authenticator = self.authenticator.clone();
         let metrics = Arc::clone(&self.metrics);
+        let protocol_metrics = Arc::clone(&self.protocol_metrics);
         let rpc = request.uri().path().to_owned();
         Box::pin(async move {
             match authenticator.authenticate(request.headers()).await {
                 Ok(principal) => {
                     metrics.increment(AuthenticationResult::Success);
+                    // The retirement gate counts only traffic that authenticated:
+                    // a scanner or a client with revoked credentials can hold the
+                    // attempted series above zero forever, but would not break if
+                    // the version were retired. The version comes from the
+                    // extension the protocol layer attached, so the label stays
+                    // one of its compiled-in strings.
+                    if let Some(NegotiatedProtocolVersion(Some(version))) =
+                        request.extensions().get::<NegotiatedProtocolVersion>()
+                    {
+                        protocol_metrics.record_authenticated(version);
+                    }
                     info!(
                         rpc,
                         outcome = "success",

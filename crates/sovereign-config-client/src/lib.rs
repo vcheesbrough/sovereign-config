@@ -3,9 +3,9 @@
 use async_trait::async_trait;
 use sovereign_config_core::{
     AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata,
-    DisplayName, ErrorKind, ManagedConnectionMetadata, ManagedPermissions, PROTOCOL_VERSION,
-    PlainValue, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret, Secret,
-    SecretInput, ServiceStatus, SubTreeMutationValue, Timestamp, ValueListing, ValuePaths,
+    DisplayName, ErrorKind, ManagedConnectionMetadata, ManagedPermissions, PlainValue,
+    ProtocolVersion, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret,
+    Secret, SecretInput, ServiceStatus, SubTreeMutationValue, Timestamp, ValueListing, ValuePaths,
     ValueSubTree,
 };
 
@@ -14,6 +14,15 @@ pub enum RpcCode {
     Unauthenticated,
     PermissionDenied,
     FailedPrecondition,
+    /// The server has no handler for the route that was called.
+    ///
+    /// For a client built from one protocol version's stubs this means the
+    /// server does not speak what the client speaks: either that version's
+    /// package has been retired, or the server predates an RPC the client
+    /// relies on. It is what an already-connected client sees on its next call
+    /// after a retirement, so it must read as a protocol incompatibility rather
+    /// than an opaque internal error.
+    Unimplemented,
     InvalidArgument,
     NotFound,
     AlreadyExists,
@@ -30,7 +39,7 @@ pub fn map_rpc_status(code: RpcCode) -> ClientError {
         RpcCode::PermissionDenied => {
             ClientError::new(ErrorKind::PermissionDenied, "permission denied")
         }
-        RpcCode::FailedPrecondition => ClientError::new(
+        RpcCode::FailedPrecondition | RpcCode::Unimplemented => ClientError::new(
             ErrorKind::IncompatibleProtocol,
             "service protocol is incompatible",
         ),
@@ -49,7 +58,11 @@ pub fn map_rpc_status(code: RpcCode) -> ClientError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VersionReply {
     pub application_version: String,
+    /// The version the session will speak, echoed by the server.
     pub protocol_version: String,
+    /// Every version the server serves. Empty from a server older than 2.25.0,
+    /// which [`ServiceStatus::negotiate`] treats as `[protocol_version]`.
+    pub supported_protocol_versions: Vec<String>,
 }
 
 #[async_trait(?Send)]
@@ -366,19 +379,23 @@ where
 
     /// Fetches and negotiates the service version without caching or retrying.
     ///
+    /// Asks for the newest version this build speaks and settles on the highest
+    /// version the server also serves, so a server ahead of this build still
+    /// works.
+    ///
     /// # Errors
     ///
     /// Returns a bounded transport or protocol compatibility error.
     pub async fn service_status(&self) -> Result<ServiceStatus, ClientError> {
-        let reply = self.transport.get_version(PROTOCOL_VERSION).await?;
-        let status = ServiceStatus::negotiate(reply.application_version, reply.protocol_version);
-        if !status.compatible {
-            return Err(ClientError::new(
-                ErrorKind::IncompatibleProtocol,
-                "service protocol is incompatible",
-            ));
-        }
-        Ok(status)
+        let reply = self
+            .transport
+            .get_version(ProtocolVersion::PREFERRED.as_str())
+            .await?;
+        ServiceStatus::negotiate(
+            reply.application_version,
+            &reply.protocol_version,
+            &reply.supported_protocol_versions,
+        )
     }
 
     /// Fetches authenticated identity state with a freshly supplied access token.
@@ -419,6 +436,7 @@ mod tests {
             Ok(VersionReply {
                 application_version: "1.5.0".into(),
                 protocol_version: protocol.into(),
+                supported_protocol_versions: vec![protocol.into()],
             })
         }
 
@@ -459,5 +477,17 @@ mod tests {
             map_rpc_status(RpcCode::Unavailable).to_string(),
             "service is unavailable"
         );
+    }
+
+    /// `UNIMPLEMENTED` is what a client built from one version's stubs sees once
+    /// the server stops routing that version, so it has to read as a protocol
+    /// incompatibility. Left to fall through to `Other`, a retirement would
+    /// surface to every still-connected client as an opaque internal error.
+    #[test]
+    fn a_route_the_server_does_not_implement_is_a_protocol_incompatibility() {
+        let error = map_rpc_status(RpcCode::Unimplemented);
+
+        assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
+        assert_eq!(error, map_rpc_status(RpcCode::FailedPrecondition));
     }
 }

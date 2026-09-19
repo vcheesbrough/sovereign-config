@@ -115,10 +115,7 @@ fn sample_provisioned() -> ProvisionedManagedConnection {
 impl Backend for MockBackend {
     async fn service_status(&self) -> Result<ServiceStatus, ClientError> {
         self.guard()?;
-        Ok(ServiceStatus::negotiate(
-            "9.9.9".to_owned(),
-            "v3".to_owned(),
-        ))
+        ServiceStatus::negotiate("9.9.9".to_owned(), "v3", &["v3".to_owned()])
     }
 
     async fn authentication_status(&self) -> Result<AuthenticationStatus, ClientError> {
