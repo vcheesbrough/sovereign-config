@@ -5,18 +5,31 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sovereign_config_core::{ConfigPath, MASKED_SECRET_TEXT};
-use sovereign_config_proto::sovereign::config::v3::{
-    SubTreeMutationValue, sub_tree_mutation_value,
-};
 use tonic::Status;
 
 use super::paths::paths_collide;
+
+/// One entry of a subtree mutation exactly as a caller sent it, in no
+/// protocol version's terms. Nothing about it has been validated, and
+/// `content` is `None` when the wire message carried none: rejecting either is
+/// [`normalize`]'s job, so every version fails a bad subtree in the same order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SubTreeEntry {
+    pub(super) path: String,
+    pub(super) content: Option<SubTreeEntryContent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum SubTreeEntryContent {
+    PlainValue(String),
+    PreserveSecret,
+}
 
 /// A subtree mutation whose paths are all valid, at or below the root, free
 /// of nesting and duplicates, folded, and sorted by fold key.
 pub(super) struct NormalizedSubtree {
     /// Each value's `path` holds its fold key.
-    pub(super) values: Vec<SubTreeMutationValue>,
+    pub(super) values: Vec<SubTreeEntry>,
     /// Fold key to the exact case it was written with, for the paths whose
     /// case differs from their fold. Consulted only where a path is written.
     pub(super) displays: BTreeMap<String, String>,
@@ -35,7 +48,7 @@ fn invalid_subtree() -> Status {
 )]
 pub(super) fn normalize(
     root: &ConfigPath,
-    mut values: Vec<SubTreeMutationValue>,
+    mut values: Vec<SubTreeEntry>,
 ) -> Result<NormalizedSubtree, Status> {
     let mut displays: BTreeMap<String, String> = BTreeMap::new();
     for value in &mut values {
@@ -44,9 +57,8 @@ pub(super) fn normalize(
             return Err(invalid_subtree());
         }
         match value.content.as_ref() {
-            Some(sub_tree_mutation_value::Content::PlainValue(content))
-                if !content.contains('\0') => {}
-            Some(sub_tree_mutation_value::Content::PreserveSecret(_)) => {}
+            Some(SubTreeEntryContent::PlainValue(content)) if !content.contains('\0') => {}
+            Some(SubTreeEntryContent::PreserveSecret) => {}
             _ => return Err(invalid_subtree()),
         }
         let fold = value_path.fold();
@@ -83,18 +95,15 @@ pub(super) fn normalize(
 /// locked): a marker with no secret behind it becomes a plain masked token.
 /// Markers colliding with an existing secret still fail [`plain_paths`].
 pub(super) fn resolve_preserve_markers(
-    values: &mut [SubTreeMutationValue],
+    values: &mut [SubTreeEntry],
     secret_paths: &BTreeSet<String>,
 ) {
     for value in values {
-        let Some(sub_tree_mutation_value::Content::PreserveSecret(_)) = value.content.as_ref()
-        else {
+        let Some(SubTreeEntryContent::PreserveSecret) = value.content.as_ref() else {
             continue;
         };
         if !secret_paths.contains(&value.path) {
-            value.content = Some(sub_tree_mutation_value::Content::PlainValue(
-                MASKED_SECRET_TEXT.into(),
-            ));
+            value.content = Some(SubTreeEntryContent::PlainValue(MASKED_SECRET_TEXT.into()));
         }
     }
 }
@@ -107,20 +116,20 @@ pub(super) fn resolve_preserve_markers(
     reason = "tonic::Status is the crate's RPC error type and is returned by value"
 )]
 pub(super) fn plain_paths(
-    values: &[SubTreeMutationValue],
+    values: &[SubTreeEntry],
     secret_paths: &BTreeSet<String>,
 ) -> Result<Vec<String>, Status> {
     let plain_paths: Vec<String> = values
         .iter()
         .filter_map(|value| match value.content.as_ref() {
-            Some(sub_tree_mutation_value::Content::PlainValue(_)) => Some(value.path.clone()),
+            Some(SubTreeEntryContent::PlainValue(_)) => Some(value.path.clone()),
             _ => None,
         })
         .collect();
     let preserve_paths = values
         .iter()
         .filter_map(|value| match value.content.as_ref() {
-            Some(sub_tree_mutation_value::Content::PreserveSecret(_)) => Some(value.path.as_str()),
+            Some(SubTreeEntryContent::PreserveSecret) => Some(value.path.as_str()),
             _ => None,
         })
         .collect::<BTreeSet<_>>();
@@ -142,26 +151,23 @@ mod tests {
     use std::collections::BTreeSet;
 
     use sovereign_config_core::{ConfigPath, MASKED_SECRET_TEXT};
-    use sovereign_config_proto::sovereign::config::v3::{
-        PreserveSecret, SubTreeMutationValue, sub_tree_mutation_value,
-    };
     use tonic::Code;
 
-    use super::{normalize, plain_paths, resolve_preserve_markers};
+    use super::{
+        SubTreeEntry, SubTreeEntryContent, normalize, plain_paths, resolve_preserve_markers,
+    };
 
-    fn plain(path: &str, value: &str) -> SubTreeMutationValue {
-        SubTreeMutationValue {
+    fn plain(path: &str, value: &str) -> SubTreeEntry {
+        SubTreeEntry {
             path: path.into(),
-            content: Some(sub_tree_mutation_value::Content::PlainValue(value.into())),
+            content: Some(SubTreeEntryContent::PlainValue(value.into())),
         }
     }
 
-    fn preserve(path: &str) -> SubTreeMutationValue {
-        SubTreeMutationValue {
+    fn preserve(path: &str) -> SubTreeEntry {
+        SubTreeEntry {
             path: path.into(),
-            content: Some(sub_tree_mutation_value::Content::PreserveSecret(
-                PreserveSecret {},
-            )),
+            content: Some(SubTreeEntryContent::PreserveSecret),
         }
     }
 
@@ -203,7 +209,7 @@ mod tests {
         rejects(normalize(&root("/"), vec![plain("/a", "x\0y")]));
         rejects(normalize(
             &root("/"),
-            vec![SubTreeMutationValue {
+            vec![SubTreeEntry {
                 path: "/a".into(),
                 content: None,
             }],
@@ -229,13 +235,11 @@ mod tests {
         resolve_preserve_markers(&mut values, &secrets(&["/a/kept"]));
         assert!(matches!(
             values[0].content,
-            Some(sub_tree_mutation_value::Content::PreserveSecret(_))
+            Some(SubTreeEntryContent::PreserveSecret)
         ));
         assert_eq!(
             values[1].content,
-            Some(sub_tree_mutation_value::Content::PlainValue(
-                MASKED_SECRET_TEXT.into()
-            ))
+            Some(SubTreeEntryContent::PlainValue(MASKED_SECRET_TEXT.into()))
         );
     }
 
