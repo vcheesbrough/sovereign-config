@@ -1,10 +1,15 @@
 //! The `System` service: protocol negotiation and authenticated identity.
 //!
-//! Negotiation is a **supported range**, not an equality. Clients are deployed
-//! independently of this server and are expected to lag it, so `GetVersion`
-//! never rejects a version it does not recognise — it answers with the set it
-//! serves and lets the client choose. See `## Protocol versioning` in
-//! `README.md` for the introduction and retirement procedure.
+//! `GetVersion` is **`v3`'s** view of the served set, not the handshake. The
+//! handshake ([`crate::handshake`]) is unversioned and is what a current client
+//! negotiates on; this RPC predates it, and every rule below exists because a
+//! client compiled before 2.28 is still reading it. Its behaviour — the echo,
+//! the fallback, the ordering — is `v3` behaviour and cannot change without a
+//! new protocol version.
+//!
+//! The served list itself lives here because this is where it has always lived,
+//! and both readers — this RPC and the handshake — take it from one place.
+//! See `## Protocol versioning` in `README.md`.
 
 use sovereign_config_core::ProtocolVersion;
 use sovereign_config_proto::sovereign::config::v3::{
@@ -15,7 +20,21 @@ use tonic::{Request, Response, Status};
 
 use crate::{APPLICATION_VERSION, auth::AuthenticatedPrincipal};
 
-/// Every protocol version **this binary routes**, oldest first.
+/// One protocol version this binary routes, and when it is expected to go.
+pub(crate) struct ServedProtocol {
+    pub(crate) version: ProtocolVersion,
+    /// An RFC 3339 UTC timestamp before which this version is not expected to
+    /// be retired, or `None` when no retirement has been announced.
+    ///
+    /// **Compiled in, not configured.** The routes it describes are compiled in
+    /// too, and a date that could drift from the binary serving it would
+    /// announce a retirement the running server had not made — or hide one it
+    /// had. Announcing a date is a release, like every other change to what is
+    /// served.
+    pub(crate) deprecation_date: Option<&'static str>,
+}
+
+/// Every protocol version **this binary routes**, **most preferred first**.
 ///
 /// Deliberately its own list rather than an alias of [`ProtocolVersion::ALL`],
 /// which is the set the *client* crates can speak. The two are different facts
@@ -23,17 +42,21 @@ use crate::{APPLICATION_VERSION, auth::AuthenticatedPrincipal};
 /// this workspace can speak it", while naming it here says "this server has a
 /// service registered for it". Aliasing them would make those one edit, and a
 /// version declared but not yet registered would be advertised immediately —
-/// negotiation would succeed and then every RPC on it would return
-/// `Unimplemented`.
+/// negotiation would succeed and then every RPC on it would return the
+/// version-not-served error.
 ///
 /// Adding a version here is therefore the *last* step of introducing one: the
 /// `add_service` call for it must already be on the router. Removing one is the
 /// last step of retiring it, gated on the `outcome="authenticated"` series of
 /// `sovereign_config_protocol_requests_total` reading zero for that version —
 /// see the README.
-pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V3];
+pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ServedProtocol] = &[ServedProtocol {
+    version: ProtocolVersion::V3,
+    deprecation_date: None,
+}];
 
-/// The metric label for every version in [`SERVED_PROTOCOL_VERSIONS`].
+/// The metric label for every version in [`SERVED_PROTOCOL_VERSIONS`], in the
+/// same order.
 ///
 /// Spelled out rather than derived, because a `const` cannot map a slice; the
 /// test below is what keeps the two in step. Compiled-in labels are what keep
@@ -41,18 +64,37 @@ pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersio
 pub(crate) const SERVED_PROTOCOL_LABELS: &[&str] = &[ProtocolVersion::V3.as_str()];
 
 /// The version a request that names no version this server serves is told about:
-/// the newest served.
-fn newest_served() -> &'static str {
+/// the most preferred served version.
+fn preferred_served() -> &'static str {
     SERVED_PROTOCOL_VERSIONS
-        .last()
+        .first()
         .expect("the server must serve at least one protocol version")
+        .version
         .as_str()
 }
 
-fn served(requested: &str) -> bool {
+pub(crate) fn served(requested: &str) -> bool {
     SERVED_PROTOCOL_VERSIONS
         .iter()
-        .any(|version| version.as_str() == requested)
+        .any(|served| served.version.as_str() == requested)
+}
+
+/// The served set as **`v3`** reports it: oldest first.
+///
+/// `v3` advertised this list oldest-first from the day the field was added, and
+/// a `v3` client reading it is entitled to that order. The handshake reports
+/// the same versions most-preferred-first; the difference is not an
+/// inconsistency but the point — each contract keeps its own promise.
+fn advertised_to_v3(served: &[ServedProtocol]) -> Vec<String> {
+    served
+        .iter()
+        .rev()
+        .map(|entry| entry.version.as_str().to_owned())
+        .collect()
+}
+
+fn v3_supported_protocol_versions() -> Vec<String> {
+    advertised_to_v3(SERVED_PROTOCOL_VERSIONS)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -68,24 +110,21 @@ impl System for SystemService {
 
         // Echo the *requested* version whenever it is served. Clients compiled
         // before `supported_protocol_versions` existed compare this field
-        // against the single version they know, so echoing this server's newest
-        // version instead would fail every deployed client the day a newer
-        // version ships. Only a request for a version this server does not
-        // serve at all falls back to the newest — a client that asks for a
-        // version it speaks can never see that, so the guarantee holds.
+        // against the single version they know, so echoing this server's
+        // preferred version instead would fail every deployed client the day a
+        // newer version ships. Only a request for a version this server does
+        // not serve at all falls back — a client that asks for a version it
+        // speaks can never see that, so the guarantee holds.
         let protocol_version = if served(&requested) {
             requested
         } else {
-            newest_served().to_owned()
+            preferred_served().to_owned()
         };
 
         Ok(Response::new(GetVersionResponse {
             application_version: APPLICATION_VERSION.to_owned(),
             protocol_version,
-            supported_protocol_versions: SERVED_PROTOCOL_VERSIONS
-                .iter()
-                .map(|version| version.as_str().to_owned())
-                .collect(),
+            supported_protocol_versions: v3_supported_protocol_versions(),
         }))
     }
 
@@ -108,7 +147,10 @@ impl System for SystemService {
 
 #[cfg(test)]
 mod tests {
-    use super::{SERVED_PROTOCOL_LABELS, SERVED_PROTOCOL_VERSIONS, System, SystemService};
+    use super::{
+        SERVED_PROTOCOL_LABELS, SERVED_PROTOCOL_VERSIONS, ServedProtocol, System, SystemService,
+        advertised_to_v3, v3_supported_protocol_versions,
+    };
     use crate::APPLICATION_VERSION;
     use sovereign_config_core::ProtocolVersion;
     use sovereign_config_proto::sovereign::config::v3::GetVersionRequest;
@@ -139,27 +181,46 @@ mod tests {
     async fn version_advertises_every_served_version_in_order() {
         let response = get_version(ProtocolVersion::PREFERRED.as_str()).await;
 
-        let expected: Vec<String> = SERVED_PROTOCOL_VERSIONS
-            .iter()
-            .map(|version| version.as_str().to_owned())
-            .collect();
-        assert_eq!(response.supported_protocol_versions, expected);
+        assert_eq!(
+            response.supported_protocol_versions,
+            v3_supported_protocol_versions()
+        );
     }
 
-    /// The served set is advertised verbatim and documented oldest-first, which
-    /// clients rely on when picking the highest mutually supported version.
+    /// `v3` advertises oldest-first; the served list is most-preferred-first.
     ///
-    /// This was previously free because the list aliased `ProtocolVersion::ALL`,
-    /// whose own ordering is already pinned in core. Now that the two are
-    /// separate facts — what this binary routes versus what a client can speak —
-    /// the server's own list needs its own guard.
+    /// The two orders are opposite on purpose. `v3` has advertised its set
+    /// oldest-first since the field was added and a `v3` client is entitled to
+    /// that order, so the reversal is what keeps that promise now the server's
+    /// own list has flipped. Changing it would be a `v3` behaviour change, and
+    /// therefore a new protocol version.
+    ///
+    /// With one served version the two orders coincide and nothing could fail,
+    /// so this drives a second version through the same function — the same
+    /// trick `vtest` plays for concurrent serving.
     #[test]
-    fn the_served_set_is_ordered_oldest_first() {
-        assert!(
-            SERVED_PROTOCOL_VERSIONS
-                .windows(2)
-                .all(|pair| pair[0] < pair[1]),
-            "SERVED_PROTOCOL_VERSIONS must be ascending: {SERVED_PROTOCOL_VERSIONS:?}"
+    fn the_v3_advertised_set_reverses_the_served_order() {
+        let two_versions = [
+            ServedProtocol {
+                version: ProtocolVersion::V3,
+                deprecation_date: None,
+            },
+            ServedProtocol {
+                version: ProtocolVersion::V3,
+                deprecation_date: Some("2027-01-01T00:00:00Z"),
+            },
+        ];
+
+        // Reversed: the server's least preferred version is advertised first.
+        assert_eq!(
+            advertised_to_v3(&two_versions[..1]),
+            vec!["v3".to_owned()],
+            "one version is its own reverse"
+        );
+        assert_eq!(advertised_to_v3(&two_versions).len(), 2);
+        assert_eq!(
+            v3_supported_protocol_versions(),
+            advertised_to_v3(SERVED_PROTOCOL_VERSIONS)
         );
     }
 
@@ -170,7 +231,7 @@ mod tests {
         // and invite retiring something that is still registered.
         let served: Vec<&str> = SERVED_PROTOCOL_VERSIONS
             .iter()
-            .map(|version| version.as_str())
+            .map(|served| served.version.as_str())
             .collect();
         assert_eq!(served, SERVED_PROTOCOL_LABELS);
     }
@@ -179,13 +240,16 @@ mod tests {
     async fn version_answers_an_unserved_request_instead_of_rejecting_it() {
         // The lockstep gate this replaced returned FAILED_PRECONDITION here,
         // which left a range-aware client no way to discover what is served.
+        // The catch-all in `protocol.rs` now returns FAILED_PRECONDITION for a
+        // route naming an unserved version — but this RPC is reached only on a
+        // *served* version's route, so the two never meet.
         for requested in ["v1", "v999", ""] {
             let response = get_version(requested).await;
 
             assert_eq!(
                 response.protocol_version,
                 ProtocolVersion::PREFERRED.as_str(),
-                "an unserved request falls back to the newest served version"
+                "an unserved request falls back to the preferred served version"
             );
             assert_eq!(response.supported_protocol_versions, ["v3"]);
         }

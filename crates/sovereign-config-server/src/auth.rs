@@ -30,16 +30,26 @@ use tracing::{info, warn};
 use crate::{
     config::{AcceptedIdentity, AuthenticationConfig},
     metrics::{AuthenticationMetrics, AuthenticationResult, ProtocolMetrics},
-    protocol::NegotiatedProtocolVersion,
-    system::SERVED_PROTOCOL_VERSIONS,
+    protocol::{NegotiatedProtocolVersion, UnservedVersionLayer},
+    system::served,
 };
 
 const REQUIRED_SCOPE: &str = "sovereign-config";
 const MAX_INTROSPECTION_RESPONSE_BYTES: usize = 64 * 1024;
+/// The unversioned handshake.
+///
+/// Unauthenticated by decision, recorded in `README.md`: a client has no token
+/// before it has negotiated, `System.GetVersion` already publishes the same
+/// list, and keeping it outside authentication leaves each protocol version
+/// free to change its own scheme. The cost is that the served list and the
+/// client lists sent to it are public, which the handshake service is written
+/// for — it never rejects and never mints a label from a request.
+const HANDSHAKE_RPC: &str = "/sovereign.config.Handshake/Negotiate";
 /// Routes that bypass authentication and are not protocol-versioned.
-const OPERATIONAL_RPCS: [&str; 2] = [
+const OPERATIONAL_RPCS: [&str; 3] = [
     "/grpc.health.v1.Health/Check",
     "/grpc.health.v1.Health/Watch",
+    HANDSHAKE_RPC,
 ];
 
 #[derive(Clone)]
@@ -382,22 +392,21 @@ fn canonical_prefix(prefix: &str) -> Option<String> {
 
 /// `GetVersion` on any protocol version this server serves.
 ///
-/// Derived from [`SERVED_PROTOCOL_VERSIONS`] rather than listed, so introducing
-/// or retiring a version cannot leave this behind. Getting that wrong is not a
-/// small bug: negotiation happens *before* any token exists — `Provider::connect`
-/// calls `get_version` before building its token provider — so a served version
-/// whose `GetVersion` required authentication would fail every client at connect
-/// with an authentication error, before it could discover which versions are
-/// actually served. That is precisely the fleet-wide breakage the supported
-/// range exists to prevent.
+/// Kept unauthenticated for the clients that predate the handshake: every one
+/// of them negotiates here, *before* any token exists — a 2.27 `Provider`
+/// calls `get_version` before building its token provider. A served version
+/// whose `GetVersion` required authentication would fail every such client at
+/// connect with an authentication error, before it could discover which
+/// versions are actually served.
+///
+/// Derived from the served set rather than listed, so introducing or retiring a
+/// version cannot leave this behind. It is also what a current client's legacy
+/// fallback reaches: a handshake refused `UNAUTHENTICATED` means a server that
+/// has none, and this route is the one such a server exempts.
 fn is_unauthenticated_version_handshake(path: &str) -> bool {
     path.strip_prefix("/sovereign.config.")
         .and_then(|rest| rest.strip_suffix(".System/GetVersion"))
-        .is_some_and(|version| {
-            SERVED_PROTOCOL_VERSIONS
-                .iter()
-                .any(|served| served.as_str() == version)
-        })
+        .is_some_and(served)
 }
 
 fn is_operational_rpc(path: &str) -> bool {
@@ -429,16 +438,38 @@ impl AuthenticationLayer {
     }
 }
 
-pub(crate) type GrpcAuthenticationLayer = Stack<AuthenticationLayer, Stack<GrpcWebLayer, Identity>>;
+pub(crate) type GrpcServiceLayer =
+    Stack<AuthenticationLayer, Stack<UnservedVersionLayer, Stack<GrpcWebLayer, Identity>>>;
 
-pub(crate) fn grpc_authentication_layer(
+/// The gRPC stack, outermost first: gRPC-Web, then the version-not-served
+/// catch-all, then authentication.
+///
+/// **Both boundaries are load-bearing.**
+///
+/// The catch-all is *inside* `GrpcWebLayer` so that its answer is framed on the
+/// way out. A browser dials the same versioned routes as any other client, and
+/// a raw gRPC trailers-only response is not something a gRPC-Web client can
+/// decode — a retirement would reach the browser as a transport failure with no
+/// version in it. Everything the authentication layer returns already relies on
+/// this same framing.
+///
+/// The catch-all is *outside* `AuthenticationLayer` because an unserved version
+/// has no authentication scheme left to apply: its shims, and whatever rules
+/// they carried, are gone. A client whose credentials also expired while it was
+/// away should still be told that its protocol version is what stopped working,
+/// rather than be sent to renew a token that will not help.
+pub(crate) fn grpc_service_layer(
     authenticator: Authenticator,
     metrics: Arc<AuthenticationMetrics>,
     protocol_metrics: Arc<ProtocolMetrics>,
-) -> GrpcAuthenticationLayer {
+    served_versions: &'static [&'static str],
+) -> GrpcServiceLayer {
     Stack::new(
         AuthenticationLayer::new(authenticator, metrics, protocol_metrics),
-        Stack::new(GrpcWebLayer::new(), Identity::new()),
+        Stack::new(
+            UnservedVersionLayer::new(served_versions),
+            Stack::new(GrpcWebLayer::new(), Identity::new()),
+        ),
     )
 }
 

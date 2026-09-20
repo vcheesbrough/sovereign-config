@@ -29,8 +29,12 @@ use tonic::{
 use tower::{Layer, Service};
 
 use crate::{
+    handshake::HandshakeService,
     metrics::ProtocolMetrics,
-    protocol::{NegotiatedProtocolVersion, ProtocolVersionLayer},
+    protocol::{
+        ERROR_KIND_METADATA, NegotiatedProtocolVersion, ProtocolVersionLayer,
+        REQUESTED_VERSION_METADATA, UnservedVersionLayer, VERSION_NOT_SERVED_KIND,
+    },
     system::{SERVED_PROTOCOL_LABELS, SystemService},
 };
 
@@ -67,21 +71,43 @@ impl TestSystem for TestVersionService {
     }
 }
 
-/// Rejects every request without calling the service beneath it, standing in
-/// for the authentication layer refusing a request.
+/// Stands in for the authentication layer.
+///
+/// When `refusing`, it rejects every request that reaches it without calling
+/// the service beneath — which is what a real refusal does, and is how these
+/// tests tell whether something answered *before* authentication or after it.
+/// When not, it is a pass-through, so a route's own answer can be observed.
 #[derive(Clone, Copy)]
-struct RejectingLayer;
+struct RejectingLayer {
+    refusing: bool,
+}
+
+impl RejectingLayer {
+    const fn refusing() -> Self {
+        Self { refusing: true }
+    }
+
+    const fn permitting() -> Self {
+        Self { refusing: false }
+    }
+}
 
 impl<S> Layer<S> for RejectingLayer {
     type Service = RejectingService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        RejectingService(inner)
+        RejectingService {
+            inner,
+            refusing: self.refusing,
+        }
     }
 }
 
 #[derive(Clone)]
-struct RejectingService<S>(S);
+struct RejectingService<S> {
+    inner: S,
+    refusing: bool,
+}
 
 impl<S, B> Service<http::Request<B>> for RejectingService<S>
 where
@@ -100,12 +126,17 @@ where
         &mut self,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.0.poll_ready(context)
+        self.inner.poll_ready(context)
     }
 
-    fn call(&mut self, _: http::Request<B>) -> Self::Future {
-        let refusal = Status::unauthenticated("authentication required").into_http();
-        Box::pin(async move { Ok(refusal) })
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if self.refusing {
+            let refusal = Status::unauthenticated("authentication required").into_http();
+            return Box::pin(async move { Ok(refusal) });
+        }
+        let replacement = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, replacement);
+        Box::pin(async move { inner.call(request).await })
     }
 }
 
@@ -306,7 +337,7 @@ async fn a_request_refused_beneath_the_layer_is_still_counted() {
             // Same order as `main.rs`: the protocol layer first, the refusing
             // layer (standing in for authentication) beneath it.
             .layer(ProtocolVersionLayer::new(layer_metrics, &["v3"]))
-            .layer(RejectingLayer)
+            .layer(RejectingLayer::refusing())
             .add_service(V3Server::new(SystemService))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
@@ -392,4 +423,345 @@ async fn a_versioned_route_this_build_does_not_serve_is_counted_as_unrecognised(
         "a request must never introduce a label of its own: {rendered}"
     );
     drop(harness);
+}
+
+/// A server standing in for the deployed shape: the protocol layer outermost,
+/// then gRPC-Web, then the version-not-served catch-all, then something that
+/// refuses every request the way authentication does. Only `v3` is registered.
+///
+/// The refusing layer is the point. If the catch-all sat *inside*
+/// authentication, everything below would come back `UNAUTHENTICATED` and a
+/// client whose token had also expired would never learn that its protocol
+/// version is what actually went away.
+struct DeployedShape {
+    address: SocketAddr,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl DeployedShape {
+    /// The deployed shape, with the stand-in authentication layer refusing
+    /// every request that reaches it.
+    async fn start() -> Self {
+        Self::start_with(RejectingLayer::refusing()).await
+    }
+
+    /// The same stack with authentication passing everything through, so a
+    /// route's own answer is what comes back. On the real server authentication
+    /// runs before the router, so an unknown method on a *served* version is
+    /// refused before it can be answered — which is correct, and which is why
+    /// observing the router's own answer needs this.
+    async fn start_permitting() -> Self {
+        Self::start_with(RejectingLayer::permitting()).await
+    }
+
+    async fn start_with(authentication: RejectingLayer) -> Self {
+        let metrics = Arc::new(ProtocolMetrics::new(SERVED_PROTOCOL_LABELS));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral port must bind");
+        let address = listener.local_addr().expect("the bound address is known");
+        let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel();
+
+        let router = Server::builder()
+            .accept_http1(true)
+            .layer(ProtocolVersionLayer::new(
+                Arc::clone(&metrics),
+                SERVED_PROTOCOL_LABELS,
+            ))
+            .layer(tower::layer::util::Stack::new(
+                authentication,
+                tower::layer::util::Stack::new(
+                    UnservedVersionLayer::new(SERVED_PROTOCOL_LABELS),
+                    tower::layer::util::Stack::new(
+                        tonic_web::GrpcWebLayer::new(),
+                        tower::layer::util::Identity::new(),
+                    ),
+                ),
+            ))
+            .add_service(V3Server::new(SystemService))
+            .add_service(TestServer::new(TestVersionService));
+
+        tokio::spawn(async move {
+            router
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = shutdown_signal.await;
+                    },
+                )
+                .await
+                .expect("the server must serve");
+        });
+
+        Self {
+            address,
+            shutdown: Some(shutdown),
+        }
+    }
+
+    async fn channel(&self) -> Channel {
+        Endpoint::from_shared(format!("http://{}", self.address))
+            .expect("the endpoint must parse")
+            .connect_timeout(Duration::from_secs(5))
+            .connect()
+            .await
+            .expect("the server must accept a connection")
+    }
+
+    /// Posts one empty gRPC-Web frame to `path` and returns the response, the
+    /// way a browser dials a route.
+    async fn grpc_web(&self, path: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("http://{}{path}", self.address))
+            .header("content-type", "application/grpc-web+proto")
+            .header("x-grpc-web", "1")
+            // A length-prefixed empty message: the smallest well-formed frame.
+            .body(vec![0u8, 0, 0, 0, 0])
+            .send()
+            .await
+            .expect("the server must answer a gRPC-Web request")
+    }
+}
+
+impl Drop for DeployedShape {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+/// `grpc-status` and the error-kind metadata, wherever gRPC-Web put them.
+///
+/// tonic-web may answer a trailers-only response in headers or in a trailer
+/// frame at the end of the body, and which one is an implementation detail this
+/// test has no business pinning. A browser reads either.
+async fn grpc_web_trailers(response: reqwest::Response) -> String {
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| format!("{name}: {}", value.to_str().unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = response.bytes().await.expect("the body must be readable");
+    format!("{headers}\n{}", String::from_utf8_lossy(&body))
+}
+
+/// The catch-all: a route naming a version this build does not serve is
+/// answered version-not-served, by its own error kind, naming the version.
+#[tokio::test]
+async fn an_unserved_version_gets_the_version_not_served_error() {
+    let server = DeployedShape::start().await;
+
+    let refused = TestClient::new(server.channel().await)
+        .get_version(TestRequest {
+            protocol_version: TEST_VERSION.to_owned(),
+        })
+        .await
+        .expect_err("an unserved version must be refused");
+
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        refused
+            .metadata()
+            .get(ERROR_KIND_METADATA)
+            .map(|value| value.to_str().unwrap()),
+        Some(VERSION_NOT_SERVED_KIND),
+        "the error names its own kind, so it is never mistaken for a mistyped route"
+    );
+    assert_eq!(
+        refused
+            .metadata()
+            .get(REQUESTED_VERSION_METADATA)
+            .map(|value| value.to_str().unwrap()),
+        Some(TEST_VERSION),
+        "the error names the version that was asked for"
+    );
+}
+
+/// The catch-all answers *before* authentication.
+///
+/// The stand-in layer beneath it refuses everything with `UNAUTHENTICATED`. A
+/// served version's route reaches it and is refused; an unserved version's
+/// route never gets that far. An unserved version has no authentication scheme
+/// left to apply, and a client whose credentials expired while it was away
+/// should still be told what actually broke.
+#[tokio::test]
+async fn an_unserved_version_is_answered_before_authentication() {
+    let server = DeployedShape::start().await;
+
+    let served = V3Client::new(server.channel().await)
+        .get_version(V3Request {
+            protocol_version: "v3".to_owned(),
+        })
+        .await
+        .expect_err("the stand-in authentication layer refuses every served route");
+    let unserved = TestClient::new(server.channel().await)
+        .get_version(TestRequest {
+            protocol_version: TEST_VERSION.to_owned(),
+        })
+        .await
+        .expect_err("an unserved version must be refused");
+
+    assert_eq!(served.code(), tonic::Code::Unauthenticated);
+    assert_eq!(unserved.code(), tonic::Code::FailedPrecondition);
+}
+
+/// The distinction the whole design rests on: a retired *version* and a
+/// mistyped *method* are different failures. Collapsing them would make every
+/// typo look like a retirement and every retirement look like a typo.
+#[tokio::test]
+async fn an_unknown_method_on_a_served_version_is_still_unimplemented() {
+    let server = DeployedShape::start_permitting().await;
+    let response = server
+        .grpc_web("/sovereign.config.v3.System/NoSuchMethod")
+        .await;
+
+    let trailers = grpc_web_trailers(response).await;
+
+    // 12 is UNIMPLEMENTED. The route is version-shaped and names a served
+    // version, so the catch-all leaves it alone and the router answers.
+    assert!(
+        trailers.contains("grpc-status: 12"),
+        "an unknown method on a served version must stay UNIMPLEMENTED: {trailers}"
+    );
+    assert!(
+        !trailers.contains(VERSION_NOT_SERVED_KIND),
+        "a mistyped method is not a retirement: {trailers}"
+    );
+}
+
+/// The browser gets the same answer, framed so it can read it.
+///
+/// The catch-all sits inside the gRPC-Web layer for exactly this. Outside it, a
+/// retirement would reach a browser as an undecodable transport failure with no
+/// version in it, and the web UI could never say why it stopped working.
+#[tokio::test]
+async fn the_version_not_served_error_reaches_a_grpc_web_client() {
+    let server = DeployedShape::start().await;
+    let response = server
+        .grpc_web("/sovereign.config.vtest.System/GetVersion")
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let trailers = grpc_web_trailers(response).await;
+
+    // 9 is FAILED_PRECONDITION.
+    assert!(
+        trailers.contains("grpc-status: 9"),
+        "a browser must receive the version-not-served status: {trailers}"
+    );
+    assert!(
+        trailers.contains(ERROR_KIND_METADATA) && trailers.contains(VERSION_NOT_SERVED_KIND),
+        "a browser must receive the error kind, not just a code: {trailers}"
+    );
+    assert!(
+        trailers.contains(TEST_VERSION),
+        "a browser must be told which version is gone: {trailers}"
+    );
+}
+
+/// The 2.15.0 / 2.18.0 class of risk, pinned.
+///
+/// The catch-all changes what a client receives on a route it may one day hit,
+/// and negotiation cannot protect a client that is already deployed. Every
+/// client from 2.25 to 2.27 maps `FAILED_PRECONDITION` and `UNIMPLEMENTED` to
+/// the same `IncompatibleProtocol`, so one of them meets the new answer exactly
+/// as it meets a deleted route today. That mapping is reproduced here verbatim
+/// rather than imported: the point is what a **build that no longer exists in
+/// this tree** does, so importing the current one would prove nothing.
+#[tokio::test]
+async fn a_client_that_predates_the_catch_all_still_reports_incompatible_protocol() {
+    let server = DeployedShape::start().await;
+
+    let refused = TestClient::new(server.channel().await)
+        .get_version(TestRequest {
+            protocol_version: TEST_VERSION.to_owned(),
+        })
+        .await
+        .expect_err("an unserved version must be refused");
+
+    // `map_rpc_status` as every 2.25–2.27 client compiled it.
+    let kind_a_2_27_client_reports = match refused.code() {
+        tonic::Code::FailedPrecondition | tonic::Code::Unimplemented => "IncompatibleProtocol",
+        tonic::Code::Unauthenticated => "Unauthenticated",
+        tonic::Code::Unavailable => "Unavailable",
+        _ => "Internal",
+    };
+
+    assert_eq!(
+        kind_a_2_27_client_reports, "IncompatibleProtocol",
+        "a deployed client must meet the catch-all as a protocol incompatibility, \
+         not as an opaque internal error"
+    );
+}
+
+/// The handshake is unversioned, so it must be reachable on a server that
+/// refuses everything else — it is called before any token exists.
+#[tokio::test]
+async fn the_handshake_answers_without_authentication_or_a_version() {
+    use sovereign_config_proto::sovereign::config::{
+        NegotiateRequest, handshake_client::HandshakeClient,
+    };
+
+    let metrics = Arc::new(ProtocolMetrics::new(SERVED_PROTOCOL_LABELS));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("an ephemeral port must bind");
+    let address = listener.local_addr().expect("the bound address is known");
+    let layer_metrics = Arc::clone(&metrics);
+    tokio::spawn(async move {
+        let _ = Server::builder()
+            .layer(ProtocolVersionLayer::new(
+                layer_metrics,
+                SERVED_PROTOCOL_LABELS,
+            ))
+            .layer(UnservedVersionLayer::new(SERVED_PROTOCOL_LABELS))
+            .add_service(
+                sovereign_config_proto::sovereign::config::handshake_server::HandshakeServer::new(
+                    HandshakeService::new(Arc::new(ProtocolMetrics::new(SERVED_PROTOCOL_LABELS))),
+                ),
+            )
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await;
+    });
+
+    let channel = Endpoint::from_shared(format!("http://{address}"))
+        .expect("the endpoint must parse")
+        .connect_timeout(Duration::from_secs(5))
+        .connect()
+        .await
+        .expect("the server must accept a connection");
+    let served = HandshakeClient::new(channel)
+        .negotiate(NegotiateRequest {
+            client_protocol_versions: vec!["v3".to_owned(), "v9000".to_owned()],
+        })
+        .await
+        .expect("the handshake must answer")
+        .into_inner();
+
+    let versions: Vec<&str> = served
+        .served_protocol_versions
+        .iter()
+        .map(|entry| entry.protocol_version.as_str())
+        .collect();
+    assert_eq!(versions, SERVED_PROTOCOL_LABELS);
+
+    // The handshake belongs to no version, so it must inflate neither the
+    // per-version series nor the unrecognised bucket that exists to surface a
+    // versioned call this build does not know. Otherwise every healthy connect
+    // in the fleet would read as junk traffic.
+    let rendered = metrics.render();
+    assert!(
+        rendered.contains(
+            "sovereign_config_protocol_requests_total{version=\"unrecognised\",outcome=\"attempted\"} 0"
+        ),
+        "a handshake is not an unrecognised version: {rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "sovereign_config_protocol_requests_total{version=\"v3\",outcome=\"attempted\"} 0"
+        ),
+        "a handshake belongs to no version: {rendered}"
+    );
 }

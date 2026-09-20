@@ -1,27 +1,29 @@
 //! Service and authentication status reported to clients.
 //!
-//! Compatibility is a **range**, not an equality. A client speaks the set of
-//! versions in [`ProtocolVersion::ALL`]; a server answers with the set it
-//! serves; the session speaks the highest version in both. Clients are deployed
-//! independently of the server and are expected to lag it, so a server upgrade
-//! that adds a version must leave every already-deployed client negotiating
-//! exactly as before. See `## Protocol versioning` in `README.md`.
+//! Compatibility is a **range**, not an equality, and it is settled on one
+//! unversioned handshake: the client sends every version it speaks, the server
+//! answers with every version it serves — most preferred first — and the client
+//! selects from the server's order. Clients are deployed independently of the
+//! server and are expected to lag it, so a server upgrade that adds a version
+//! must leave every already-deployed client negotiating exactly as before. See
+//! `## Protocol versioning` in `README.md`.
 
 use crate::{ClientError, ErrorKind};
 
 /// A protocol version this build speaks.
 ///
-/// Ordering is **declaration order**, not lexicographic: `"v10" < "v3"` as
-/// strings, so comparing version strings would rank a tenth version below a
-/// third one and negotiate the wrong session. Declare variants oldest-first and
-/// keep [`ProtocolVersion::ALL`] in the same order.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+/// Declaration order is **preference order, most preferred first** — not
+/// lexicographic, and not numeric. Nothing compares two versions: selection
+/// follows the *server's* order, and this enum only answers "do we speak it?".
+/// That is why there is no `Ord`; a derived one would rank `v10` below `v3` as
+/// a string and invite exactly the comparison this design removed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtocolVersion {
     V3,
 }
 
 impl ProtocolVersion {
-    /// Every version this build speaks, oldest first.
+    /// Every version this build speaks, **most preferred first**.
     ///
     /// **A version may only appear here once a transport can actually dial it.**
     /// Negotiation selects from this list and the result is reported to
@@ -39,9 +41,18 @@ impl ProtocolVersion {
     /// build goes green; there is nothing to remember and no test to silence.
     pub const ALL: &'static [Self] = &[Self::V3];
 
-    /// The version a client asks for when it has no reason to ask for an older
-    /// one: the newest it speaks.
+    /// The version a client prefers when the server expresses no preference:
+    /// the first of [`ProtocolVersion::ALL`].
     pub const PREFERRED: Self = Self::V3;
+
+    /// The one version a server that has **no handshake** serves.
+    ///
+    /// Every server up to 2.27 routes `GetVersion` by version and serves
+    /// exactly `v3`, so a client that finds no handshake speaks this and
+    /// nothing else. Naming it once means that retiring `V3` from the
+    /// enumeration fails to compile here, rather than leaving the fallback
+    /// pointing at a version no dialer exists for.
+    pub const LEGACY: Self = Self::V3;
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -69,53 +80,150 @@ impl std::fmt::Display for ProtocolVersion {
     }
 }
 
-/// The highest version both this build and `server_supported` speak.
-///
-/// `echoed` is the server's `protocol_version` field and is used alone when
-/// `server_supported` is empty, which is how a server older than 2.25.0 answers.
-fn select(echoed: &str, server_supported: &[String]) -> Option<ProtocolVersion> {
-    if server_supported.is_empty() {
-        return ProtocolVersion::parse(echoed);
+/// One protocol version a service serves, as the handshake reported it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServedVersion {
+    /// The version's identifier, exactly as the service spelled it. Untrusted:
+    /// it is compared against compiled-in strings and never used as a label.
+    pub version: String,
+    /// An RFC 3339 UTC timestamp before which the service does not expect to
+    /// retire this version, when it named one.
+    ///
+    /// Advisory. A client warns its operator and **never fails** because of it.
+    pub deprecation_date: Option<String>,
+}
+
+impl ServedVersion {
+    /// A version served with no announced retirement date.
+    #[must_use]
+    pub fn new(version: &str) -> Self {
+        Self {
+            version: version.to_owned(),
+            deprecation_date: None,
+        }
     }
-    // `rev()`: `ALL` is oldest-first, so the first match walking backwards is
-    // the highest version both ends speak. A version only the server speaks is
-    // never a candidate, because it is not in `ALL`.
-    ProtocolVersion::ALL.iter().rev().copied().find(|version| {
-        server_supported
-            .iter()
-            .any(|offered| offered == version.as_str())
-    })
+}
+
+/// How many served versions an error message will name, and how long each may
+/// be.
+///
+/// The served list arrives from a public endpoint over the network, and its
+/// only use in an error is to tell an operator what the two ends offered. These
+/// bounds are what stop a hostile or broken service turning that into an
+/// unbounded string in a log, a terminal, or a browser.
+const NAMED_VERSION_LIMIT: usize = 8;
+const NAMED_VERSION_LENGTH: usize = 16;
+
+/// `version` reduced to something safe to put in an operator-facing message.
+///
+/// Anything outside the character set a version identifier may use becomes `?`,
+/// so no control character, quote or newline from the wire can reach a log line
+/// or a terminal, and the result is truncated.
+fn sanitise(version: &str) -> String {
+    version
+        .chars()
+        .take(NAMED_VERSION_LENGTH)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// The served list rendered for an error message: bounded in both directions.
+fn describe_served(served: &[ServedVersion]) -> String {
+    if served.is_empty() {
+        return "none".to_owned();
+    }
+    let named: Vec<String> = served
+        .iter()
+        .take(NAMED_VERSION_LIMIT)
+        .map(|entry| sanitise(&entry.version))
+        .collect();
+    let mut description = named.join(", ");
+    if served.len() > NAMED_VERSION_LIMIT {
+        description.push_str(", …");
+    }
+    description
+}
+
+/// Every version this build speaks, rendered for an error message.
+fn describe_spoken() -> String {
+    ProtocolVersion::ALL
+        .iter()
+        .map(|version| version.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The error raised when this build and a service share no protocol version.
+///
+/// It names **both** lists. A bare "incompatible" tells an operator nothing
+/// they can act on; which versions each end offered tells them whether to
+/// upgrade the client or the server.
+fn incompatible(served: &[ServedVersion]) -> ClientError {
+    ClientError::described(
+        ErrorKind::IncompatibleProtocol,
+        format!(
+            "service protocol is incompatible: this client speaks {}, the service serves {}",
+            describe_spoken(),
+            describe_served(served),
+        ),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceStatus {
-    pub application_version: String,
     /// The version the session speaks, already known to be one this build
     /// supports.
     pub protocol_version: ProtocolVersion,
+    /// Set when the selected version carries an announced retirement date,
+    /// which every client surfaces to its operator as a warning.
+    pub deprecation_date: Option<String>,
 }
 
 impl ServiceStatus {
-    /// Negotiates the session version against the set a server advertises.
+    /// Selects the session's version from the set a service serves.
+    ///
+    /// Follows the **service's** preference order, not this build's: the first
+    /// entry both ends speak wins, except that a version carrying a deprecation
+    /// date is passed over while a version without one is still to come. A
+    /// version only the service speaks is never a candidate — there is no
+    /// dialer for it.
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::IncompatibleProtocol`] when no version is common to
-    /// this build and the server.
-    pub fn negotiate(
-        application_version: String,
-        echoed_protocol_version: &str,
-        server_supported: &[String],
-    ) -> Result<Self, ClientError> {
-        let protocol_version =
-            select(echoed_protocol_version, server_supported).ok_or(ClientError::new(
-                ErrorKind::IncompatibleProtocol,
-                "service protocol is incompatible",
-            ))?;
-        Ok(Self {
-            application_version,
-            protocol_version,
-        })
+    /// Returns [`ErrorKind::IncompatibleProtocol`], naming both lists, when no
+    /// version is common to this build and the service.
+    pub fn select(served: &[ServedVersion]) -> Result<Self, ClientError> {
+        let mut deprecated: Option<&ServedVersion> = None;
+        for entry in served {
+            let Some(version) = ProtocolVersion::parse(&entry.version) else {
+                continue;
+            };
+            if entry.deprecation_date.is_none() {
+                return Ok(Self {
+                    protocol_version: version,
+                    deprecation_date: None,
+                });
+            }
+            // Keep the first deprecated candidate, but keep looking: a
+            // non-deprecated version further down the service's order is the
+            // better choice, even though the service prefers this one.
+            deprecated.get_or_insert(entry);
+        }
+
+        deprecated
+            .and_then(|entry| {
+                ProtocolVersion::parse(&entry.version).map(|version| Self {
+                    protocol_version: version,
+                    deprecation_date: entry.deprecation_date.clone(),
+                })
+            })
+            .ok_or_else(|| incompatible(served))
     }
 }
 

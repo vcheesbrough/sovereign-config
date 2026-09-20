@@ -27,7 +27,7 @@ use tower::{Layer, ServiceExt, service_fn};
 
 use super::{
     AuthenticatedPrincipal, AuthenticationLayer, Authenticator, Grant, IntrospectionResponse,
-    Permission, bearer_token, canonical_prefix, grpc_authentication_layer, is_operational_rpc,
+    Permission, bearer_token, canonical_prefix, grpc_service_layer, is_operational_rpc,
     is_web_asset_request, require_rs256, validate_introspection,
 };
 use crate::{
@@ -405,12 +405,10 @@ fn only_health_and_version_are_operational() {
 #[test]
 fn the_version_handshake_is_unauthenticated_on_every_served_version() {
     for served in SERVED_PROTOCOL_VERSIONS {
+        let version = served.version.as_str();
         assert!(
-            is_operational_rpc(&format!(
-                "/sovereign.config.{}.System/GetVersion",
-                served.as_str()
-            )),
-            "GetVersion must be unauthenticated on served version {served}"
+            is_operational_rpc(&format!("/sovereign.config.{version}.System/GetVersion")),
+            "GetVersion must be unauthenticated on served version {version}"
         );
     }
 }
@@ -526,10 +524,11 @@ async fn grpc_web_authentication_failures_are_framed() {
 }
 
 async fn grpc_web_status(authenticator: Authenticator, headers: HeaderMap) -> u16 {
-    let layer = grpc_authentication_layer(
+    let layer = grpc_service_layer(
         authenticator,
         Arc::new(AuthenticationMetrics::default()),
         Arc::new(ProtocolMetrics::new(&["v3"])),
+        &["v3"],
     );
     let inner = service_fn(|_: Request<BoxBody>| async {
         Ok::<_, Infallible>(Response::new(empty_body()))

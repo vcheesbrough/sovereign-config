@@ -2,6 +2,7 @@ mod auth;
 mod authentik;
 mod config;
 mod encryption;
+mod handshake;
 mod managed;
 mod metrics;
 mod protocol;
@@ -29,16 +30,20 @@ use tonic_health::server::HealthReporter;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use auth::{Authenticator, grpc_authentication_layer};
+use auth::{Authenticator, grpc_service_layer};
 use authentik::AuthentikAdminClient;
 use config::{Config, ManagedConnectionConfig, required_env};
+use handshake::HandshakeService;
 use managed::{ManagedConnectionsService, ManagedSettings, V3ManagedConnections};
 use metrics::{AuthenticationMetrics, ManagedConnectionMetrics, ProtocolMetrics};
 use protocol::ProtocolVersionLayer;
 use sovereign_config_core::Secret;
-use sovereign_config_proto::sovereign::config::v3::{
-    configuration_server::ConfigurationServer,
-    managed_connections_server::ManagedConnectionsServer, system_server::SystemServer,
+use sovereign_config_proto::sovereign::config::{
+    handshake_server::HandshakeServer,
+    v3::{
+        configuration_server::ConfigurationServer,
+        managed_connections_server::ManagedConnectionsServer, system_server::SystemServer,
+    },
 };
 use system::{SERVED_PROTOCOL_LABELS, SystemService};
 use values::{ConfigurationService, V3Configuration, encrypt_stored_secrets};
@@ -149,13 +154,20 @@ async fn main() -> Result<()> {
             Arc::clone(&protocol_metrics),
             SERVED_PROTOCOL_LABELS,
         ))
-        .layer(grpc_authentication_layer(
+        .layer(grpc_service_layer(
             authenticator,
             authentication_metrics,
-            protocol_metrics,
+            Arc::clone(&protocol_metrics),
+            SERVED_PROTOCOL_LABELS,
         ))
         .layer(web_assets)
         .add_service(health_service)
+        // Unversioned, and registered first: it is the operation every
+        // version's clients call before any of them. It has no shim, because
+        // it belongs to no version.
+        .add_service(HandshakeServer::new(HandshakeService::new(
+            protocol_metrics,
+        )))
         .add_service(SystemServer::new(SystemService))
         .add_service(ConfigurationServer::new(V3Configuration::new(Arc::clone(
             &configuration,
@@ -331,7 +343,7 @@ mod tests {
             SERVED_PROTOCOL_VERSIONS
                 .iter()
                 .any(|version| SYSTEM_SERVICE_NAME
-                    == format!("sovereign.config.{}.System", version.as_str())),
+                    == format!("sovereign.config.{}.System", version.version.as_str())),
             "{SYSTEM_SERVICE_NAME} must name a served protocol version"
         );
     }

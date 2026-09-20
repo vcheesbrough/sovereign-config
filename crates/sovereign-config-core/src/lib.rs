@@ -27,7 +27,7 @@ pub use managed::{
 };
 pub use path::{ConfigPath, PathError};
 pub use plain::render_subtree_plain;
-pub use status::{AuthenticationStatus, ProtocolVersion, ServiceStatus};
+pub use status::{AuthenticationStatus, ProtocolVersion, ServedVersion, ServiceStatus};
 pub use value::{
     MaskedSecret, PlainValue, RevealedSecret, Secret, SecretInput, ValueClassification,
     ValueContent,
