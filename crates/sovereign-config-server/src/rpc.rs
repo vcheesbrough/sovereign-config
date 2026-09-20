@@ -6,7 +6,18 @@ use sovereign_config_core::Timestamp;
 use time::OffsetDateTime;
 use tonic::{Extensions, Request, Status};
 
+use crate::audit::Actor;
 use crate::auth::AuthenticatedPrincipal;
+use crate::protocol::NegotiatedProtocolVersion;
+
+/// The protocol version recorded for a call that carries no version extension.
+///
+/// Unreachable in a running server: a handler is only reachable on a served
+/// route, and [`crate::protocol::ProtocolVersionLayer`] attaches the served
+/// label to every one. It exists for a service driven directly, without the
+/// layer stack — and it is a label rather than an error because the version is
+/// data to record, never something a call may succeed or fail on.
+pub(crate) const UNATTRIBUTED_PROTOCOL_LABEL: &str = "unattributed";
 
 /// Who is calling, as a protocol-version-free service implementation sees it.
 ///
@@ -16,6 +27,7 @@ use crate::auth::AuthenticatedPrincipal;
 /// that behaves differently per protocol version is a forked server.
 pub(crate) struct CallContext<'a> {
     principal: Option<&'a AuthenticatedPrincipal>,
+    protocol_version: Option<&'static str>,
 }
 
 impl<'a> CallContext<'a> {
@@ -28,6 +40,13 @@ impl<'a> CallContext<'a> {
     pub(crate) fn from_extensions(extensions: &'a Extensions) -> Self {
         Self {
             principal: extensions.get::<AuthenticatedPrincipal>(),
+            // The label of the route actually dialled, so a shim cannot state
+            // it wrongly: shims are made by copying the previous version's,
+            // and a constant copied and left unchanged would attribute every
+            // call on the new version to the old one.
+            protocol_version: extensions
+                .get::<NegotiatedProtocolVersion>()
+                .and_then(|negotiated| negotiated.0),
         }
     }
 
@@ -47,6 +66,22 @@ impl<'a> CallContext<'a> {
     pub(crate) fn principal(&self) -> Result<&'a AuthenticatedPrincipal, Status> {
         self.principal
             .ok_or_else(|| Status::unauthenticated("authentication required"))
+    }
+
+    /// Who the audit trail attributes this call to, and the protocol version
+    /// they spoke. Reports a missing principal exactly as [`Self::principal`]
+    /// does; every caller has already authorized by the time it records.
+    #[expect(
+        clippy::result_large_err,
+        reason = "tonic::Status is the crate's RPC error type and is returned by value"
+    )]
+    pub(crate) fn actor(&self) -> Result<Actor<'a>, Status> {
+        let principal = self.principal()?;
+        Ok(Actor {
+            subject: &principal.subject,
+            name: principal.name.as_deref(),
+            protocol_version: self.protocol_version.unwrap_or(UNATTRIBUTED_PROTOCOL_LABEL),
+        })
     }
 }
 

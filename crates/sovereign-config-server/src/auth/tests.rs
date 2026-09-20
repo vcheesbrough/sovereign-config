@@ -44,6 +44,7 @@ const TEST_CLIENT_SECRET: &str = "introspection-secret-sentinel";
 fn permissions_are_independent_and_prefixes_stop_at_segment_boundaries() {
     let principal = AuthenticatedPrincipal {
         subject: "principal".into(),
+        name: None,
         grants: vec![
             Grant {
                 prefix: "/apps/api".into(),
@@ -69,6 +70,7 @@ fn permissions_are_independent_and_prefixes_stop_at_segment_boundaries() {
 
     let global = AuthenticatedPrincipal {
         subject: "global-principal".into(),
+        name: None,
         grants: vec![Grant {
             prefix: "/".into(),
             permissions: BTreeSet::from([Permission::Read]),

@@ -25,6 +25,7 @@ use super::wire::{
     ConnectionMetadata, ProvisionedConnection, conflict_error, dependency_error, internal_error,
     invalid_request, metadata,
 };
+use crate::audit::{AuditEvent, AuditRecorder, ConnectionSubject};
 use crate::auth::Permission;
 use crate::authentik::{AdminError, AuthentikAdminClient};
 use crate::metrics::{
@@ -54,6 +55,7 @@ pub(crate) struct ManagedConnectionsService {
     pub(super) admin: AuthentikAdminClient,
     pub(super) settings: ManagedSettings,
     pub(super) metrics: Arc<ManagedConnectionMetrics>,
+    pub(super) audit: AuditRecorder,
 }
 
 /// Maps a selected managed permission onto the server authorization
@@ -117,12 +119,14 @@ impl ManagedConnectionsService {
         admin: AuthentikAdminClient,
         settings: ManagedSettings,
         metrics: Arc<ManagedConnectionMetrics>,
+        audit: AuditRecorder,
     ) -> Self {
         Self {
             database,
             admin,
             settings,
             metrics,
+            audit,
         }
     }
 
@@ -170,6 +174,7 @@ impl ManagedConnectionsService {
         permissions: Option<ManagedPermissions>,
     ) -> Result<ProvisionedConnection, Status> {
         let principal = context.principal()?;
+        let actor = context.actor()?;
         let display_name = DisplayName::parse(display_name).map_err(|_| invalid_request())?;
         let root = ConfigPath::parse_selection(root).map_err(|_| invalid_request())?;
         // Managed connection roots are out of scope for case retention (card
@@ -200,8 +205,23 @@ impl ManagedConnectionsService {
         self.insert_provisioning(&connection_id, &display_name, &root, &permissions)
             .await?;
 
-        self.provision_inserted(&connection_id, &username, &root, &permissions)
-            .await
+        let event = AuditEvent::connection_created(
+            &actor,
+            ConnectionSubject {
+                root: root.as_str(),
+                display_name: display_name.as_str(),
+                connection_id: connection_id.as_str(),
+            },
+            &permissions.as_storage(),
+        );
+        self.provision_inserted(
+            &connection_id,
+            &username,
+            &root,
+            &permissions,
+            (&actor, event),
+        )
+        .await
     }
 
     /// Locks the row, validates it is rotatable, and transitions it to
@@ -255,6 +275,7 @@ impl ManagedConnectionsService {
     ) -> Result<ProvisionedConnection, Status> {
         let connection_id = ConnectionId::parse(connection_id).map_err(|_| invalid_request())?;
         let (row, root) = self.begin_rotation(&connection_id, context).await?;
+        let actor = context.actor()?;
 
         let credential_identifier = row
             .credential_identifier
@@ -297,11 +318,27 @@ impl ManagedConnectionsService {
         // externally, but the row is being torn down; reporting this
         // rotation's URL as current would hand out a credential that is
         // about to be revoked.
+        //
+        // The rotation is recorded with this transition, which is what makes
+        // it complete. Should the record fail, the row stays
+        // `rotation_unknown` and the caller is told the rotation failed —
+        // the same outcome as any other storage fault at this step, and one
+        // a later rotation recovers from once the lease expires.
+        let event = AuditEvent::connection_rotated(
+            &actor,
+            ConnectionSubject {
+                root: root.as_str(),
+                display_name: &row.display_name,
+                connection_id: connection_id.as_str(),
+            },
+        );
         let Some(row) = self
-            .transition_state(
+            .transition_state_recorded(
                 &connection_id,
                 ManagedConnectionState::RotationUnknown,
                 ManagedConnectionState::Active,
+                &actor,
+                event,
             )
             .await?
         else {
@@ -320,12 +357,21 @@ impl ManagedConnectionsService {
     ) -> Result<(), Status> {
         let connection_id = ConnectionId::parse(connection_id).map_err(|_| invalid_request())?;
         let row = self.claim_for_revocation(context, &connection_id).await?;
+        let actor = context.actor()?;
         let username = managed_username(&connection_id, &row.display_name);
         if let Some(user_id) = self.revocation_target(&row, &username).await? {
             self.delete_account_confirmed(user_id, &username).await?;
         }
-        self.delete_connection(&connection_id).await?;
-        Ok(())
+        let event = AuditEvent::connection_revoked(
+            &actor,
+            ConnectionSubject {
+                root: &row.root,
+                display_name: &row.display_name,
+                connection_id: connection_id.as_str(),
+            },
+        );
+        self.delete_connection_recorded(&connection_id, &actor, event)
+            .await
     }
 
     /// Locks a manageable row and marks it `revoking`, so a concurrent

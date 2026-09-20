@@ -16,19 +16,31 @@ use sovereign_config_proto::sovereign::config::v3::{
     ListValuesRequest, PutValueRequest, ReplaceSubTreeRequest,
 };
 
+use crate::protocol::NegotiatedProtocolVersion;
+
+use crate::audit::test_support::{
+    break_audit_writes, clear_trail, kinds, restore_audit_writes, trail,
+};
+
 use super::startup::wrong_key;
 use super::{ConfigurationService, V3Configuration, encrypt_stored_secrets};
+use crate::audit::AuditRecorder;
 use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
 
 /// The `v3` surface these tests drive, over its own shared implementation.
 fn v3_service(pool: PgPool, cipher: Arc<ValueCipher>) -> V3Configuration {
-    V3Configuration::new(Arc::new(ConfigurationService::new(pool, cipher)))
+    V3Configuration::new(Arc::new(ConfigurationService::new(
+        pool,
+        cipher,
+        AuditRecorder::for_tests(),
+    )))
 }
 
 fn request_with_grants<T>(message: T, grants: &[(&str, &[Permission])]) -> Request<T> {
     let mut request = Request::new(message);
     request.extensions_mut().insert(AuthenticatedPrincipal {
         subject: "integration-principal".into(),
+        name: Some("Integration Principal".into()),
         grants: grants
             .iter()
             .map(|(prefix, permissions)| Grant {
@@ -48,6 +60,7 @@ fn request_for_prefix<T>(message: T, prefix: &str, permissions: &[Permission]) -
     let mut request = Request::new(message);
     request.extensions_mut().insert(AuthenticatedPrincipal {
         subject: "integration-principal".into(),
+        name: Some("Integration Principal".into()),
         grants: vec![Grant {
             prefix: prefix.into(),
             permissions: permissions.iter().copied().collect::<BTreeSet<_>>(),
@@ -2179,4 +2192,440 @@ async fn a_malformed_unauthenticated_alias_is_rejected_for_its_missing_principal
         .expect_err("a missing principal must be rejected");
     assert_eq!(status.code(), Code::Unauthenticated);
     assert_eq!(status.message(), "authentication required");
+}
+
+// ---------------------------------------------------------------------------
+// Audit trail (card #373)
+// ---------------------------------------------------------------------------
+
+const AUDIT_ROOT: &str = "/tests/audit";
+
+async fn audit_service(pool: &PgPool) -> V3Configuration {
+    clear_test_paths(pool, &[AUDIT_ROOT]).await;
+    clear_trail(pool, AUDIT_ROOT).await;
+    v3_service(pool.clone(), test_cipher())
+}
+
+macro_rules! pool_or_skip {
+    () => {
+        match env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL") {
+            Ok(url) => {
+                let pool = PgPoolOptions::new().connect(&url).await.unwrap();
+                sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+                pool
+            }
+            Err(_) => return,
+        }
+    };
+}
+
+/// Every write and every read leaves exactly one record of the right kind,
+/// with the value it changed when — and only when — that value is plain.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+#[allow(clippy::too_many_lines)]
+async fn every_change_access_and_read_is_recorded_once() {
+    let pool = pool_or_skip!();
+    let service = audit_service(&pool).await;
+    let path = format!("{AUDIT_ROOT}/key");
+    let grants: &[(&str, &[Permission])] = &[(
+        AUDIT_ROOT,
+        &[Permission::Read, Permission::Write, Permission::Manage],
+    )];
+
+    service
+        .put_value(request_with_grants(plain_put(&path, "first"), grants))
+        .await
+        .expect("create must succeed");
+    service
+        .put_value(request_with_grants(plain_put(&path, "second"), grants))
+        .await
+        .expect("overwrite must succeed");
+    service
+        .get_sub_tree(request_with_grants(
+            GetSubTreeRequest {
+                path: AUDIT_ROOT.into(),
+            },
+            grants,
+        ))
+        .await
+        .expect("read must succeed");
+    service
+        .list_values(request_with_grants(
+            ListValuesRequest {
+                path: AUDIT_ROOT.into(),
+            },
+            grants,
+        ))
+        .await
+        .expect("listing must succeed");
+    service
+        .delete_values(request_with_grants(
+            DeleteValuesRequest {
+                path: path.clone(),
+                recurse: false,
+            },
+            grants,
+        ))
+        .await
+        .expect("delete must succeed");
+
+    let rows = trail(&pool, AUDIT_ROOT).await;
+    assert_eq!(
+        kinds(&rows),
+        [
+            "value.created",
+            "value.updated",
+            "subtree.read",
+            "values.listed",
+            "value.deleted",
+        ]
+    );
+    // The actor is named, and carries the version of the route dialled. These
+    // tests call the shim directly, so no layer attached one.
+    for row in &rows {
+        assert_eq!(row.actor_subject, "integration-principal");
+        assert_eq!(row.actor_name.as_deref(), Some("Integration Principal"));
+        assert_eq!(row.protocol_version, "unattributed");
+        assert_eq!(row.event_count, 1);
+    }
+
+    let created = &rows[0];
+    assert_eq!(created.display_path, path);
+    // `path_fold` is generated by the database, and is what a filter and an
+    // authorization check will match on.
+    assert_eq!(created.path_fold, path.to_lowercase());
+    assert_eq!(created.old_value, None);
+    assert_eq!(created.new_value.as_deref(), Some("first"));
+    let updated = &rows[1];
+    assert_eq!(updated.old_value.as_deref(), Some("first"));
+    assert_eq!(updated.new_value.as_deref(), Some("second"));
+    assert!(
+        updated.narrative.contains("from \"first\" to \"second\""),
+        "{}",
+        updated.narrative
+    );
+    // A read names the path and the count, and carries no value at all.
+    let read = &rows[2];
+    assert_eq!(read.display_path, AUDIT_ROOT);
+    assert_eq!(
+        (read.old_value.as_deref(), read.new_value.as_deref()),
+        (None, None)
+    );
+    assert!(read.narrative.contains("(1 value)"), "{}", read.narrative);
+    assert_eq!(rows[4].old_value.as_deref(), Some("second"));
+
+    clear_test_paths(&pool, &[AUDIT_ROOT]).await;
+    clear_trail(&pool, AUDIT_ROOT).await;
+}
+
+/// The invariant the card turns on, end to end: a secret's value reaches no
+/// column of the trail, through any of the operations that touch one.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn no_operation_on_a_secret_records_its_value() {
+    const SECRET_TEXT: &str = "hunter2-must-never-be-recorded";
+    const REPLACEMENT: &str = "hunter3-must-never-be-recorded";
+    let pool = pool_or_skip!();
+    let service = audit_service(&pool).await;
+    let path = format!("{AUDIT_ROOT}/secret");
+    let grants: &[(&str, &[Permission])] = &[(
+        AUDIT_ROOT,
+        &[Permission::Read, Permission::Write, Permission::Manage],
+    )];
+
+    service
+        .put_value(request_with_grants(secret_put(&path, SECRET_TEXT), grants))
+        .await
+        .expect("secret create must succeed");
+    service
+        .put_value(request_with_grants(secret_put(&path, REPLACEMENT), grants))
+        .await
+        .expect("secret rotation must succeed");
+    service
+        .reveal_secret(request_with_grants(
+            RevealSecretRequest { path: path.clone() },
+            grants,
+        ))
+        .await
+        .expect("reveal must succeed");
+    // A subtree read returns the secret masked; the trail must not copy even
+    // that, nor the ciphertext behind it.
+    service
+        .get_sub_tree(request_with_grants(
+            GetSubTreeRequest {
+                path: AUDIT_ROOT.into(),
+            },
+            grants,
+        ))
+        .await
+        .expect("read must succeed");
+    service
+        .delete_values(request_with_grants(
+            DeleteValuesRequest {
+                path: path.clone(),
+                recurse: false,
+            },
+            grants,
+        ))
+        .await
+        .expect("delete must succeed");
+
+    let rows = trail(&pool, AUDIT_ROOT).await;
+    assert_eq!(
+        kinds(&rows),
+        [
+            "value.created",
+            "value.updated",
+            "secret.revealed",
+            "subtree.read",
+            "value.deleted",
+        ]
+    );
+    for row in &rows {
+        let everything = row.everything();
+        assert!(!everything.contains(SECRET_TEXT), "{everything}");
+        assert!(!everything.contains(REPLACEMENT), "{everything}");
+        assert!(!everything.contains(MASKED_SECRET_TEXT), "{everything}");
+        assert_eq!(
+            (row.old_value.as_deref(), row.new_value.as_deref()),
+            (None, None),
+            "{everything}"
+        );
+    }
+    assert!(rows[2].narrative.contains(&path), "{}", rows[2].narrative);
+
+    clear_test_paths(&pool, &[AUDIT_ROOT]).await;
+    clear_trail(&pool, AUDIT_ROOT).await;
+}
+
+/// Fail closed on a change and on a secret access; best effort on a plain
+/// read, which gains no failure mode it did not already have.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn an_unrecordable_change_fails_while_an_unrecordable_read_is_served() {
+    let pool = pool_or_skip!();
+    let service = audit_service(&pool).await;
+    let path = format!("{AUDIT_ROOT}/key");
+    let secret_path = format!("{AUDIT_ROOT}/secret");
+    let grants: &[(&str, &[Permission])] = &[(
+        AUDIT_ROOT,
+        &[Permission::Read, Permission::Write, Permission::Manage],
+    )];
+    service
+        .put_value(request_with_grants(plain_put(&path, "before"), grants))
+        .await
+        .expect("setup write must succeed");
+    service
+        .put_value(request_with_grants(secret_put(&secret_path, "s"), grants))
+        .await
+        .expect("setup secret must succeed");
+
+    break_audit_writes(&pool, "values", AUDIT_ROOT).await;
+
+    let refused = service
+        .put_value(request_with_grants(plain_put(&path, "after"), grants))
+        .await
+        .expect_err("an unrecordable change must fail");
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert_eq!(refused.message(), "configuration storage is unavailable");
+    // Fail closed means the change did not happen either.
+    assert_eq!(stored_value(&pool, &path).await.1, "before");
+
+    let refused_reveal = service
+        .reveal_secret(request_with_grants(
+            RevealSecretRequest {
+                path: secret_path.clone(),
+            },
+            grants,
+        ))
+        .await
+        .expect_err("an unrecordable secret access must fail");
+    // The same status this RPC already returns when its own read fails, so no
+    // deployed client meets a code it does not handle.
+    assert_eq!(refused_reveal.code(), Code::Unavailable);
+    assert_eq!(
+        refused_reveal.message(),
+        "configuration storage is unavailable"
+    );
+
+    // Reads are served regardless.
+    let subtree = service
+        .get_sub_tree(request_with_grants(
+            GetSubTreeRequest {
+                path: AUDIT_ROOT.into(),
+            },
+            grants,
+        ))
+        .await
+        .expect("an unrecordable read must still be served")
+        .into_inner();
+    assert_eq!(subtree.values.len(), 2);
+    service
+        .list_values(request_with_grants(
+            ListValuesRequest {
+                path: AUDIT_ROOT.into(),
+            },
+            grants,
+        ))
+        .await
+        .expect("an unrecordable listing must still be served");
+
+    restore_audit_writes(&pool, "values").await;
+    clear_test_paths(&pool, &[AUDIT_ROOT]).await;
+    clear_trail(&pool, AUDIT_ROOT).await;
+}
+
+/// Repeated accesses inside one window are one row that counts them and moves
+/// to the latest — and a bulk operation itemizes what it changed under a
+/// summary.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn repeated_accesses_coalesce_and_bulk_changes_are_itemized() {
+    let pool = pool_or_skip!();
+    let service = audit_service(&pool).await;
+    let secret_path = format!("{AUDIT_ROOT}/secret");
+    let grants: &[(&str, &[Permission])] = &[(
+        AUDIT_ROOT,
+        &[Permission::Read, Permission::Write, Permission::Manage],
+    )];
+    service
+        .put_value(request_with_grants(secret_put(&secret_path, "s"), grants))
+        .await
+        .expect("setup secret must succeed");
+    clear_trail(&pool, AUDIT_ROOT).await;
+
+    for _ in 0..3 {
+        service
+            .reveal_secret(request_with_grants(
+                RevealSecretRequest {
+                    path: secret_path.clone(),
+                },
+                grants,
+            ))
+            .await
+            .expect("reveal must succeed");
+    }
+
+    let revealed = trail(&pool, AUDIT_ROOT).await;
+    assert_eq!(kinds(&revealed), ["secret.revealed"]);
+    assert_eq!(revealed[0].event_count, 3);
+    assert!(revealed[0].occurred_at >= revealed[0].first_occurred_at);
+
+    // A replacement: one value created, one changed, one deleted, under a
+    // summary on the root. The secret is preserved and is not a change.
+    service
+        .put_value(request_with_grants(
+            plain_put(&format!("{AUDIT_ROOT}/keep"), "old"),
+            grants,
+        ))
+        .await
+        .expect("setup must succeed");
+    service
+        .put_value(request_with_grants(
+            plain_put(&format!("{AUDIT_ROOT}/gone"), "bye"),
+            grants,
+        ))
+        .await
+        .expect("setup must succeed");
+    clear_trail(&pool, AUDIT_ROOT).await;
+
+    service
+        .replace_sub_tree(request_with_grants(
+            ReplaceSubTreeRequest {
+                path: AUDIT_ROOT.into(),
+                values: vec![
+                    plain_mutation(&format!("{AUDIT_ROOT}/keep"), "new"),
+                    plain_mutation(&format!("{AUDIT_ROOT}/fresh"), "hello"),
+                    preserve_secret(&secret_path),
+                ],
+            },
+            grants,
+        ))
+        .await
+        .expect("replacement must succeed");
+
+    let replaced = trail(&pool, AUDIT_ROOT).await;
+    let summary = replaced.last().expect("a summary must be recorded");
+    assert_eq!(summary.kind, "subtree.replaced");
+    assert_eq!(summary.display_path, AUDIT_ROOT);
+    assert!(
+        summary
+            .narrative
+            .contains("1 created, 1 changed, 1 deleted"),
+        "{}",
+        summary.narrative
+    );
+    let mut itemized: Vec<(&str, &str)> = replaced[..replaced.len() - 1]
+        .iter()
+        .map(|row| (row.kind.as_str(), row.display_path.as_str()))
+        .collect();
+    itemized.sort_unstable();
+    assert_eq!(
+        itemized,
+        [
+            ("value.created", format!("{AUDIT_ROOT}/fresh").as_str()),
+            ("value.deleted", format!("{AUDIT_ROOT}/gone").as_str()),
+            ("value.updated", format!("{AUDIT_ROOT}/keep").as_str()),
+        ]
+    );
+
+    clear_test_paths(&pool, &[AUDIT_ROOT]).await;
+    clear_trail(&pool, AUDIT_ROOT).await;
+}
+
+/// The recorded version is the one on the request, not a constant compiled
+/// into a shim — and two versions inside one window are two rows, not one.
+///
+/// This is what stops a `v4` shim made by copying `v3`'s from attributing all
+/// of its traffic to `v3`, and what keeps a rolling deploy from reporting one
+/// identity's accesses under whichever version happened to write first.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn the_recorded_version_comes_from_the_route_the_call_arrived_on() {
+    let pool = pool_or_skip!();
+    let service = audit_service(&pool).await;
+    let secret_path = format!("{AUDIT_ROOT}/secret");
+    let grants: &[(&str, &[Permission])] = &[(AUDIT_ROOT, &[Permission::Read, Permission::Write])];
+    service
+        .put_value(request_with_grants(secret_put(&secret_path, "s"), grants))
+        .await
+        .expect("setup secret must succeed");
+    clear_trail(&pool, AUDIT_ROOT).await;
+
+    // As the protocol layer attaches it, for each of two served versions.
+    let reveal_on = |version: &'static str| {
+        let mut request = request_with_grants(
+            RevealSecretRequest {
+                path: secret_path.clone(),
+            },
+            grants,
+        );
+        request
+            .extensions_mut()
+            .insert(NegotiatedProtocolVersion(Some(version)));
+        request
+    };
+
+    for _ in 0..2 {
+        service
+            .reveal_secret(reveal_on("v3"))
+            .await
+            .expect("the v3 reveal must succeed");
+    }
+    service
+        .reveal_secret(reveal_on("vtest"))
+        .await
+        .expect("the vtest reveal must succeed");
+
+    let rows = trail(&pool, AUDIT_ROOT).await;
+    let mut seen: Vec<(&str, i32)> = rows
+        .iter()
+        .map(|row| (row.protocol_version.as_str(), row.event_count))
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(seen, [("v3", 2), ("vtest", 1)]);
+
+    clear_test_paths(&pool, &[AUDIT_ROOT]).await;
+    clear_trail(&pool, AUDIT_ROOT).await;
 }
