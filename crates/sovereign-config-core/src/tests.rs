@@ -461,6 +461,35 @@ fn a_deprecated_version_is_passed_over_for_one_that_is_not() {
     );
 }
 
+/// A deprecation date is untrusted wire input from a public endpoint, and the
+/// one piece of handshake text that is *shown* rather than compared — it
+/// reaches a structured log, a terminal, an MCP tool result and the page. It
+/// must be stripped and bounded at this seam, so no consumer has to remember.
+#[test]
+fn a_deprecation_date_is_sanitised_and_bounded_before_any_client_sees_it() {
+    let hostile = vec![ServedVersion {
+        version: "v3".to_owned(),
+        deprecation_date: Some(format!(
+            "2027-01-01T00:00:00Z\r\nx-injected: 1{}",
+            "A".repeat(4096)
+        )),
+    }];
+
+    let date = ServiceStatus::select(&hostile)
+        .expect("a hostile date must not fail the client")
+        .deprecation_date
+        .expect("the date must still be reported");
+
+    assert!(!date.contains('\r') && !date.contains('\n'), "{date}");
+    assert!(
+        date.len() <= 40,
+        "an unbounded date must not reach an operator: {date}"
+    );
+    // The legitimate shape survives intact, so sanitising does not make a real
+    // timestamp unreadable.
+    assert!(date.starts_with("2027-01-01T00:00:00Z"), "{date}");
+}
+
 /// A deprecation date **warns and never fails**. The version still works: the
 /// date is a statement of intent, and a client that refused to use a version
 /// because of one would break on the announcement rather than on the

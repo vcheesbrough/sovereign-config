@@ -158,6 +158,33 @@ fn sanitise(version: &str) -> String {
         .collect()
 }
 
+/// How much of a deprecation date is kept before it is truncated.
+///
+/// An RFC 3339 timestamp with a numeric offset and fractional seconds is
+/// comfortably shorter than this.
+const DEPRECATION_DATE_LENGTH: usize = 40;
+
+/// `date` reduced to something safe to show an operator.
+///
+/// The same reasoning as [`sanitise`], for a timestamp's character set: RFC
+/// 3339 also needs `:` and `+`. This matters because a deprecation date is the
+/// one piece of handshake text that is *shown* rather than compared — it
+/// reaches a structured log, a terminal, an MCP tool result and the page — so
+/// without this a hostile or broken service could put a control character, an
+/// ANSI escape or a megabyte of text into all four.
+fn sanitise_date(date: &str) -> String {
+    date.chars()
+        .take(DEPRECATION_DATE_LENGTH)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, ':' | '+' | '-' | '.') {
+                character
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
 /// The served list rendered for an error message: bounded in both directions.
 fn describe_served(served: &[ServedVersion]) -> String {
     if served.is_empty() {
@@ -245,7 +272,9 @@ impl ServiceStatus {
             .and_then(|entry| {
                 ProtocolVersion::parse(&entry.version).map(|version| Self {
                     protocol_version: version,
-                    deprecation_date: entry.deprecation_date.clone(),
+                    // Sanitised here, at the one seam every client passes
+                    // through, so none of them has to remember to do it.
+                    deprecation_date: entry.deprecation_date.as_deref().map(sanitise_date),
                 })
             })
             .ok_or_else(|| incompatible(served))

@@ -23,6 +23,20 @@ use crate::{APPLICATION_VERSION, auth::AuthenticatedPrincipal};
 /// One protocol version this binary routes, and when it is expected to go.
 pub(crate) struct ServedProtocol {
     pub(crate) version: ProtocolVersion,
+    /// Where this version falls in **age** order: lower is older.
+    ///
+    /// Deliberately its own field rather than inferred from this list's order,
+    /// which is *preference* — a free compile-time choice. A developer will
+    /// usually prefer the newest version, but is not required to: preferring an
+    /// established version while a newer one soaks is a legitimate thing to
+    /// want, and then preference is no longer reverse-age.
+    ///
+    /// `v3`'s advertised set is contractually **oldest first**, and that is
+    /// `v3` behaviour which cannot change without a new protocol version. It is
+    /// therefore derived from this field and never from preference, so that
+    /// reordering preference cannot silently rewrite a released version's
+    /// contract.
+    pub(crate) age: u8,
     /// An RFC 3339 UTC timestamp before which this version is not expected to
     /// be retired, or `None` when no retirement has been announced.
     ///
@@ -52,6 +66,7 @@ pub(crate) struct ServedProtocol {
 /// see the README.
 pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ServedProtocol] = &[ServedProtocol {
     version: ProtocolVersion::V3,
+    age: 3,
     deprecation_date: None,
 }];
 
@@ -85,12 +100,28 @@ pub(crate) fn served(requested: &str) -> bool {
 /// a `v3` client reading it is entitled to that order. The handshake reports
 /// the same versions most-preferred-first; the difference is not an
 /// inconsistency but the point — each contract keeps its own promise.
+///
+/// Sorted by [`ServedProtocol::age`], never by reversing the list. The list's
+/// own order is preference, which is free to be anything, so recovering age
+/// from it would make a preference change silently alter what `v3` advertises.
 fn advertised_to_v3(served: &[ServedProtocol]) -> Vec<String> {
-    served
-        .iter()
-        .rev()
+    oldest_first(served)
+        .into_iter()
         .map(|entry| entry.version.as_str().to_owned())
         .collect()
+}
+
+/// `served` in age order, oldest first.
+///
+/// Split out from [`advertised_to_v3`] so the ordering can be asserted on its
+/// own. `ProtocolVersion` has a single variant today, so every entry of any
+/// test fixture renders to the same string — which would make an assertion on
+/// the advertised names pass no matter what this did. Returning the entries
+/// lets a test check the order that was actually chosen.
+fn oldest_first(served: &[ServedProtocol]) -> Vec<&ServedProtocol> {
+    let mut sorted: Vec<&ServedProtocol> = served.iter().collect();
+    sorted.sort_by_key(|entry| entry.age);
+    sorted
 }
 
 fn v3_supported_protocol_versions() -> Vec<String> {
@@ -149,7 +180,7 @@ impl System for SystemService {
 mod tests {
     use super::{
         SERVED_PROTOCOL_LABELS, SERVED_PROTOCOL_VERSIONS, ServedProtocol, System, SystemService,
-        advertised_to_v3, v3_supported_protocol_versions,
+        advertised_to_v3, oldest_first, v3_supported_protocol_versions,
     };
     use crate::APPLICATION_VERSION;
     use sovereign_config_core::ProtocolVersion;
@@ -198,30 +229,83 @@ mod tests {
     /// With one served version the two orders coincide and nothing could fail,
     /// so this drives a second version through the same function — the same
     /// trick `vtest` plays for concurrent serving.
+    /// `v3` advertises oldest-first; the served list is in **preference**
+    /// order, which is a free compile-time choice.
+    ///
+    /// The two are independent, and this drives the case that proves it: a
+    /// fixture whose preference order is **not** reverse-age, standing for a
+    /// server that deliberately prefers an established version while a newer
+    /// one soaks. Recovering age by reversing preference would emit the wrong
+    /// order here — and would do it in a commit that only touched the served
+    /// list, silently changing a released version's contract.
+    ///
+    /// With one variant in `ProtocolVersion` a synthetic fixture is the only
+    /// way this contract can be tested at all.
     #[test]
-    fn the_v3_advertised_set_reverses_the_served_order() {
-        let two_versions = [
+    fn the_v3_advertised_set_is_oldest_first_whatever_the_preference_order() {
+        // Preference: v9 first, then v3, then v5 — nothing like reverse-age.
+        let preference_is_not_reverse_age = [
             ServedProtocol {
                 version: ProtocolVersion::V3,
+                age: 9,
                 deprecation_date: None,
             },
             ServedProtocol {
                 version: ProtocolVersion::V3,
+                age: 3,
+                deprecation_date: None,
+            },
+            ServedProtocol {
+                version: ProtocolVersion::V3,
+                age: 5,
                 deprecation_date: Some("2027-01-01T00:00:00Z"),
             },
         ];
 
-        // Reversed: the server's least preferred version is advertised first.
+        // Asserted on the ages the ordering actually chose: every entry here
+        // renders to the same name, so an assertion on the advertised strings
+        // would hold whatever this did.
+        let chosen: Vec<u8> = oldest_first(&preference_is_not_reverse_age)
+            .into_iter()
+            .map(|entry| entry.age)
+            .collect();
+
         assert_eq!(
-            advertised_to_v3(&two_versions[..1]),
-            vec!["v3".to_owned()],
-            "one version is its own reverse"
+            chosen,
+            [3, 5, 9],
+            "v3 must be advertised oldest-first regardless of preference order"
         );
-        assert_eq!(advertised_to_v3(&two_versions).len(), 2);
+        assert_ne!(
+            preference_is_not_reverse_age
+                .iter()
+                .map(|entry| entry.age)
+                .collect::<Vec<_>>(),
+            chosen,
+            "the fixture must not already be in age order, or this proves nothing"
+        );
+        assert_eq!(
+            advertised_to_v3(&preference_is_not_reverse_age).len(),
+            preference_is_not_reverse_age.len()
+        );
         assert_eq!(
             v3_supported_protocol_versions(),
             advertised_to_v3(SERVED_PROTOCOL_VERSIONS)
         );
+    }
+
+    /// The served list's ages must be distinct, or "oldest first" is ambiguous
+    /// and the advertised order depends on sort stability rather than on the
+    /// contract.
+    #[test]
+    fn every_served_version_has_a_distinct_age() {
+        let mut ages: Vec<u8> = SERVED_PROTOCOL_VERSIONS
+            .iter()
+            .map(|entry| entry.age)
+            .collect();
+        ages.sort_unstable();
+        let distinct = ages.len();
+        ages.dedup();
+        assert_eq!(ages.len(), distinct, "two served versions share an age");
     }
 
     #[test]

@@ -697,10 +697,14 @@ async fn a_client_that_predates_the_catch_all_still_reports_incompatible_protoco
     );
 }
 
-/// The handshake is unversioned, so it must be reachable on a server that
-/// refuses everything else — it is called before any token exists.
+/// The handshake belongs to no protocol version: it answers without one being
+/// named, and its call is attributed to none.
+///
+/// This stack has **no authentication layer in it**, so it says nothing about
+/// the handshake being exempt from authentication — that is asserted directly
+/// in `auth/tests.rs`, against a real `AuthenticationLayer`.
 #[tokio::test]
-async fn the_handshake_answers_without_authentication_or_a_version() {
+async fn the_handshake_answers_without_a_version_and_is_counted_under_none() {
     use sovereign_config_proto::sovereign::config::{
         NegotiateRequest, handshake_client::HandshakeClient,
     };

@@ -834,6 +834,15 @@ mod tests {
     #[derive(Clone)]
     struct VersionedTransport {
         version: ProtocolVersion,
+        /// Which transport object this is, counting from the session's first.
+        ///
+        /// `ProtocolVersion` has one variant, so a renegotiation can never land
+        /// on a *different* version and no fixture can show the reported
+        /// version changing. What it can show is that a **new** transport was
+        /// obtained rather than the old one rebound — which is the guarantee
+        /// `Connection::speaking` actually documents, and the reason the
+        /// reported version follows a swap at all.
+        generation: usize,
         refusals: Rc<Cell<usize>>,
         calls: Rc<Cell<usize>>,
     }
@@ -860,6 +869,8 @@ mod tests {
         service: ScriptedService,
         refusals: Rc<Cell<usize>>,
         calls: Rc<Cell<usize>>,
+        /// How many transports this connection has handed out.
+        generations: Rc<Cell<usize>>,
     }
 
     impl ScriptedConnection {
@@ -868,6 +879,7 @@ mod tests {
                 service: ScriptedService::serving(versions),
                 refusals: Rc::new(Cell::new(0)),
                 calls: Rc::new(Cell::new(0)),
+                generations: Rc::new(Cell::new(0)),
             }
         }
     }
@@ -890,8 +902,10 @@ mod tests {
         type Transport = VersionedTransport;
 
         fn speaking(&self, version: ProtocolVersion) -> Self::Transport {
+            self.generations.set(self.generations.get() + 1);
             VersionedTransport {
                 version,
+                generation: self.generations.get(),
                 refusals: Rc::clone(&self.refusals),
                 calls: Rc::clone(&self.calls),
             }
@@ -1131,16 +1145,44 @@ mod tests {
         assert!(error.message().contains("v9000"), "{}", error.message());
     }
 
-    /// What an operator is shown follows the swap. A session still reporting
-    /// the retired version would attribute its traffic to a version that is
-    /// gone — and the per-version counters are what gate the next retirement.
+    /// A recovered session holds a **new** transport, not the old one rebound.
+    ///
+    /// This is what makes the reported version follow a swap: the session's
+    /// transport is replaced, so everything read off it afterwards — the
+    /// version an operator is shown, and the routes the traffic travels on —
+    /// describes the version just negotiated rather than the retired one.
+    ///
+    /// **What this cannot cover:** that the *reported version changes*.
+    /// `ProtocolVersion` has one variant, so a renegotiation always lands back
+    /// on `V3` and no fixture can make it land elsewhere. Recorded as an
+    /// uncovered behaviour rather than dressed up: the assertion below is the
+    /// part that is testable today, and it acquires teeth on the version it is
+    /// really about the day a second variant exists.
     #[tokio::test]
-    async fn the_reported_version_follows_a_renegotiation() {
+    async fn a_recovered_session_holds_a_new_transport_not_the_old_one_rebound() {
         let connection = ScriptedConnection::new(&["v3"]);
+        let refusals = Rc::clone(&connection.refusals);
         let session = Session::open(connection).await.unwrap();
 
+        let before = session.transport().generation;
         assert_eq!(session.protocol_version(), ProtocolVersion::V3);
-        assert_eq!(session.transport().version, ProtocolVersion::V3);
+
+        refusals.set(1);
+        session
+            .call(|transport| async move { transport.operate() })
+            .await
+            .expect("the retry must succeed");
+
+        let after = session.transport().generation;
+        assert_ne!(
+            before, after,
+            "the session must hold a transport obtained after the re-handshake"
+        );
+        assert_eq!(
+            session.protocol_version(),
+            ProtocolVersion::V3,
+            "and it must report the version that transport dials"
+        );
     }
 
     /// A deprecation date warns and never fails, and reaches the caller so each
