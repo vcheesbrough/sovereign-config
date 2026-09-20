@@ -35,22 +35,13 @@ use std::{
 };
 
 use http::{Method, Request, Response};
+use sovereign_config_core::{
+    ERROR_KIND_METADATA, REQUESTED_VERSION_METADATA, VERSION_NOT_SERVED_KIND,
+};
 use tonic::{Status, body::BoxBody};
 use tower::{Layer, Service};
 
 use crate::metrics::ProtocolMetrics;
-
-/// The metadata key naming *which* bounded failure a status is.
-///
-/// Fixed forever, like the handshake's message shape: it is returned outside
-/// every protocol version, so no version can ever redefine it.
-pub(crate) const ERROR_KIND_METADATA: &str = "sovereign-config-error-kind";
-
-/// The value of [`ERROR_KIND_METADATA`] on the version-not-served answer.
-pub(crate) const VERSION_NOT_SERVED_KIND: &str = "version-not-served";
-
-/// The metadata key echoing the protocol version a request named.
-pub(crate) const REQUESTED_VERSION_METADATA: &str = "sovereign-config-protocol-version";
 
 /// How much of a request-derived version identifier is echoed back.
 const ECHOED_VERSION_LENGTH: usize = 16;
@@ -268,16 +259,14 @@ where
                     .extensions_mut()
                     .insert(NegotiatedProtocolVersion(None));
             }
-            // The handshake is how a client finds out which versions exist. It
-            // names none, so it belongs to none — and it must not inflate the
-            // unrecognised bucket, which exists to surface a *versioned* call
-            // this build does not know. What clients said they speak is
-            // recorded by the handshake service itself, under compiled-in
-            // labels.
-            Attribution::Unversioned => {}
-            // A web asset, a health probe, a crawler's GET: not protocol
-            // traffic, so it must not inflate any bucket.
-            Attribution::NotProtocolTraffic => {}
+            // Counted nowhere, for two different reasons. The handshake is how
+            // a client finds out which versions exist, so it belongs to none —
+            // and it must not inflate the unrecognised bucket, which exists to
+            // surface a *versioned* call this build does not know; what clients
+            // said they speak is recorded by the handshake service itself,
+            // under compiled-in labels. A web asset, a health probe or a
+            // crawler's GET is not protocol traffic at all.
+            Attribution::Unversioned | Attribution::NotProtocolTraffic => {}
         }
 
         Box::pin(async move { inner.call(request).await })
@@ -339,16 +328,15 @@ where
         let replacement = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, replacement);
 
-        if attribute(request.method(), request.uri().path(), self.recognised)
-            == Attribution::UnservedVersion
+        // One parse, and the version to echo comes straight out of it. Asking
+        // `attribute` and then re-reading the path would be two passes that
+        // could disagree — on the one route in the system where disagreeing
+        // means either answering a served version as retired, or letting a
+        // retired one reach a router that no longer has it.
+        if *request.method() == Method::POST
+            && let Some(Route::Versioned(version)) = classify(request.uri().path())
+            && !self.recognised.contains(&version)
         {
-            // `classify` agreed this is version-shaped, so it has a version
-            // segment to echo. Read through the same function, never a second
-            // parse that could disagree with the one above.
-            let version = match classify(request.uri().path()) {
-                Some(Route::Versioned(version)) => version,
-                _ => unreachable!("an unserved attribution is a versioned route"),
-            };
             let refusal = version_not_served(version, self.recognised).into_http();
             return Box::pin(async move { Ok(refusal) });
         }
@@ -364,10 +352,11 @@ mod serving_tests;
 mod tests {
     use http::Method;
 
-    use super::{
-        Attribution, ERROR_KIND_METADATA, REQUESTED_VERSION_METADATA, Route,
-        VERSION_NOT_SERVED_KIND, attribute, classify, echoed_version, version_not_served,
+    use sovereign_config_core::{
+        ERROR_KIND_METADATA, REQUESTED_VERSION_METADATA, VERSION_NOT_SERVED_KIND,
     };
+
+    use super::{Attribution, Route, attribute, classify, echoed_version, version_not_served};
     use crate::metrics::ProtocolMetrics;
 
     const RECOGNISED: [&str; 2] = ["v3", "vtest"];

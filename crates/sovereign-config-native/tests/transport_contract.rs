@@ -392,12 +392,23 @@ async fn tonic_transport_satisfies_shared_contract() {
         .await
         .unwrap();
 
+    // This fixture registers the versioned services and no handshake, so
+    // negotiating it exercises the legacy fallback as well as the contract.
     let service = negotiate(&channel).await.unwrap();
-    assert_eq!(service.application_version, "contract-version");
     assert_eq!(service.protocol_version, ProtocolVersion::V3);
     // Everything below travels on the version just negotiated, because that is
     // the only thing a value-carrying transport can be built from.
     let transport = channel.speaking(service.protocol_version);
+    // The application version is a versioned call now, not a by-product of
+    // negotiating.
+    assert_eq!(
+        transport
+            .dialer_version()
+            .await
+            .unwrap()
+            .application_version,
+        "contract-version"
+    );
 
     let listing = transport
         .list_values(

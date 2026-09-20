@@ -153,48 +153,51 @@ async fn every_rpc_travels_on_the_routes_of_the_version_the_session_speaks() {
     }
 }
 
-/// The handshake dials the version it is asking about, on that version's own
-/// route. `GetVersion` is routed like any other RPC, so asking a server which
-/// versions it serves is itself a versioned call.
+/// Negotiation dials the **unversioned** handshake first, and only that.
+///
+/// Asserted on the route the server received, because this is the one route in
+/// the system that must never name a version: a handshake inside a version's
+/// namespace would be answered by the catch-all the moment that version was
+/// retired, and no client could ever negotiate its way out again.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_handshake_asks_each_version_on_its_own_route() {
+async fn negotiation_dials_the_unversioned_handshake_first() {
     let recorder = Recorder::default();
     let endpoint = serve(recorder.clone()).await;
     let channel = TonicChannel::connect(endpoint).await.unwrap();
 
-    for version in ProtocolVersion::ALL.iter().copied() {
-        let error = channel.get_version(version).await.unwrap_err();
+    let _ = channel.served_versions(ProtocolVersion::ALL).await;
 
-        assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
-        assert_eq!(
-            recorder.take(),
-            [format!("/sovereign.config.{version}.System/GetVersion")]
-        );
-    }
+    assert_eq!(recorder.take(), ["/sovereign.config.Handshake/Negotiate"]);
 }
 
-/// A service with no route for the newest version this build speaks is asked
-/// about the next older one, newest first, until one answers or the list runs
-/// out. That walk is what lets a newer client reach an older server; without
-/// it, a client would report an incompatible protocol against a server it has
-/// versions in common with.
+/// A service with no handshake is reached on the legacy version's own route.
+///
+/// This server answers `UNIMPLEMENTED` to everything, so negotiation tries the
+/// handshake, finds none, falls back to the legacy route, and fails there. Both
+/// routes, in that order, are what the fallback *is* — and the legacy one must
+/// name the legacy version, because that is the only route a pre-handshake
+/// server exempts from authentication.
 #[tokio::test(flavor = "multi_thread")]
-async fn negotiation_works_down_the_versions_when_a_route_is_missing() {
+async fn a_service_without_a_handshake_is_asked_on_the_legacy_route() {
     let recorder = Recorder::default();
     let endpoint = serve(recorder.clone()).await;
     let channel = TonicChannel::connect(endpoint).await.unwrap();
 
     let error = negotiate(&channel).await.unwrap_err();
 
-    // A version that answers nothing at all is indistinguishable from one the
-    // server has retired, and reads the same way to the caller.
+    // A route that answers nothing at all is indistinguishable from a version
+    // the server has retired, and reads the same way to the caller.
     assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
-    let newest_first: Vec<String> = ProtocolVersion::ALL
-        .iter()
-        .rev()
-        .map(|version| format!("/sovereign.config.{version}.System/GetVersion"))
-        .collect();
-    assert_eq!(recorder.take(), newest_first);
+    assert_eq!(
+        recorder.take(),
+        [
+            "/sovereign.config.Handshake/Negotiate".to_owned(),
+            format!(
+                "/sovereign.config.{}.System/GetVersion",
+                ProtocolVersion::LEGACY
+            ),
+        ]
+    );
 }
 
 /// A transport reports the version its routes name, for every version this

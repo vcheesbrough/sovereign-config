@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 sovereign-config-core = { path = "../sovereign-config-core" }
+tracing.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

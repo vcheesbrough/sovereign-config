@@ -10,9 +10,9 @@
 use async_trait::async_trait;
 use sovereign_config_core::{
     AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata,
-    DisplayName, ManagedConnectionMetadata, ManagedPermissions, PlainValue,
+    DisplayName, ManagedConnectionMetadata, ManagedPermissions, PlainValue, ProtocolVersion,
     ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret, SecretInput,
-    ServiceStatus, SubTreeMutationValue, ValueListing, ValuePaths, ValueSubTree,
+    SubTreeMutationValue, ValueListing, ValuePaths, ValueSubTree,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -25,12 +25,28 @@ pub struct LoginPrompt {
     pub verification_uri_complete: Option<String>,
 }
 
+/// What the `status` tool reports about the service.
+///
+/// Assembled from two calls, not one: the handshake settles the protocol
+/// version and carries nothing else, and the application version is then read
+/// from `System.GetVersion` on the route that negotiation chose. Reporting them
+/// together is what keeps the version shown and the version dialled the same
+/// thing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceReport {
+    pub application_version: String,
+    pub protocol_version: ProtocolVersion,
+    /// Set when the service has announced a retirement date for the version
+    /// this session speaks. Advisory: the session works regardless.
+    pub deprecation_date: Option<String>,
+}
+
 /// The full set of administration operations the server can expose. Each call
 /// is independent: implementations must not cache values or authorization
 /// across calls, matching the client library's no-cache contract.
 #[async_trait(?Send)]
 pub trait Backend {
-    async fn service_status(&self) -> Result<ServiceStatus, ClientError>;
+    async fn service_status(&self) -> Result<ServiceReport, ClientError>;
     async fn authentication_status(&self) -> Result<AuthenticationStatus, ClientError>;
 
     /// Runs an explicit device-authorization login. The implementation sends a

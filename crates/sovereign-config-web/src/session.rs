@@ -5,9 +5,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use js_sys::{Date, Reflect};
 use sha2::{Digest, Sha256};
-use sovereign_config_client::{Client, negotiate};
-use sovereign_config_core::{ClientError, ErrorKind, ProtocolVersion, Secret};
-use std::cell::RefCell;
+use sovereign_config_client::{Client, Session};
+use sovereign_config_core::{ClientError, ErrorKind, Secret};
+use std::{cell::RefCell, rc::Rc};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Response, Url, UrlSearchParams, window};
@@ -23,16 +23,20 @@ use crate::transport::{BrowserHandshake, BrowserTransport, MemoryAuthentication,
 thread_local! {
     pub(crate) static TOKENS: RefCell<Option<MemoryTokens>> = const { RefCell::new(None) };
 
-    /// The protocol version this page negotiated — and therefore the only
-    /// version its requests may travel on — or the error that stopped it.
+    /// The session this page negotiated — and therefore the only version its
+    /// requests may travel on — or the error that stopped it.
     ///
-    /// Held for the life of the page, alongside the session it belongs to: the
-    /// browser negotiates once at load, like every other client, and does not
-    /// renegotiate. The failure is kept, not just the absence of a version,
-    /// because every request made afterwards reports it: an unreachable
-    /// service surfaced as an incompatible protocol would send an operator
-    /// looking at versions rather than at the service.
-    static PROTOCOL: RefCell<Result<ProtocolVersion, ClientError>> =
+    /// Held for the life of the page: the browser negotiates once at load, like
+    /// every other client. It no longer holds a bare version, because the
+    /// session can now re-handshake: a page open across a retirement recovers
+    /// on its next request instead of failing until someone reloads it, and
+    /// what it reports afterwards follows the swap.
+    ///
+    /// The failure is kept, not just the absence of a session, because every
+    /// request made afterwards reports it: an unreachable service surfaced as
+    /// an incompatible protocol would send an operator looking at versions
+    /// rather than at the service.
+    static SESSION: RefCell<Result<Rc<Session<BrowserHandshake>>, ClientError>> =
         const { RefCell::new(Err(NOT_NEGOTIATED)) };
 }
 
@@ -43,13 +47,13 @@ const NOT_NEGOTIATED: ClientError = ClientError::new(
     "service protocol is incompatible",
 );
 
-/// The version negotiated at page load, or why the handshake did not get there.
-pub(crate) fn negotiated_protocol() -> Result<ProtocolVersion, ClientError> {
-    PROTOCOL.with_borrow(Clone::clone)
+/// The session negotiated at page load, or why the handshake did not get there.
+pub(crate) fn negotiated_session() -> Result<Rc<Session<BrowserHandshake>>, ClientError> {
+    SESSION.with_borrow(Clone::clone)
 }
 
-fn set_negotiated_protocol(outcome: Result<ProtocolVersion, ClientError>) {
-    PROTOCOL.with_borrow_mut(|slot| *slot = outcome);
+fn set_negotiated_session(outcome: Result<Rc<Session<BrowserHandshake>>, ClientError>) {
+    SESSION.with_borrow_mut(|slot| *slot = outcome);
 }
 
 const STATE_KEY: &str = "sovereign-config.pkce-state";
@@ -138,13 +142,13 @@ pub(crate) fn logged_in() -> bool {
 
 pub(crate) async fn refresh_status(config: &AppConfig) -> bool {
     clear_error();
-    let status = match negotiate(&BrowserHandshake).await {
-        Ok(status) => status,
+    let session = match Session::open(BrowserHandshake).await {
+        Ok(session) => Rc::new(session),
         Err(error) => {
             // Nothing may be dialled on a version that was never agreed, so the
             // page keeps no stale one from an earlier load — and keeps this
             // failure, which is what every later request reports.
-            set_negotiated_protocol(Err(error.clone()));
+            set_negotiated_session(Err(error.clone()));
             // Unhide before setting the text: a live region only announces a
             // mutation to content already exposed in the accessibility tree,
             // so setting the text first — while still `hidden` — makes the
@@ -171,12 +175,35 @@ pub(crate) async fn refresh_status(config: &AppConfig) -> bool {
     // the standing evidence that it answered. The protocol version it also
     // returns is a client-compatibility concern, not an operator's, so it
     // stays out of the header — it governs the routes below instead.
-    set_negotiated_protocol(Ok(status.protocol_version));
-    set_text("service-value", "");
-    set_hidden("service-value", true);
-    set_text("version-value", &status.application_version);
+    let deprecation_date = session.deprecation_date();
+    set_negotiated_session(Ok(session));
+    // A deprecation date warns and never fails, so it uses the same slot the
+    // page already uses to report trouble with the service rather than an
+    // error banner: the page works, and an operator is being told to plan.
+    if let Some(date) = &deprecation_date {
+        set_hidden("service-value", false);
+        set_text(
+            "service-value",
+            &format!("Protocol retirement announced for {date}"),
+        );
+    } else {
+        set_text("service-value", "");
+        set_hidden("service-value", true);
+    }
+
+    // The application version is no longer a by-product of negotiating: the
+    // handshake carries versions and nothing else, so it is read from
+    // `System.GetVersion` on the route this page just settled on.
+    let transport = BrowserTransport::for_session();
+    match transport.service_version().await {
+        Ok(reply) => set_text("version-value", &reply.application_version),
+        // Not fatal: the header loses a version it cannot confirm, and the
+        // session below is unaffected. The identity check that follows reports
+        // anything genuinely wrong with the service.
+        Err(_) => set_text("version-value", ""),
+    }
     let client = Client::new(
-        BrowserTransport::for_session(),
+        transport,
         MemoryAuthentication {
             client_id: config.client_id.clone(),
         },

@@ -28,13 +28,14 @@ use tonic::{
 };
 use tower::{Layer, Service};
 
+use sovereign_config_core::{
+    ERROR_KIND_METADATA, REQUESTED_VERSION_METADATA, VERSION_NOT_SERVED_KIND,
+};
+
 use crate::{
     handshake::HandshakeService,
     metrics::ProtocolMetrics,
-    protocol::{
-        ERROR_KIND_METADATA, NegotiatedProtocolVersion, ProtocolVersionLayer,
-        REQUESTED_VERSION_METADATA, UnservedVersionLayer, VERSION_NOT_SERVED_KIND,
-    },
+    protocol::{NegotiatedProtocolVersion, ProtocolVersionLayer, UnservedVersionLayer},
     system::{SERVED_PROTOCOL_LABELS, SystemService},
 };
 
@@ -590,7 +591,7 @@ async fn an_unserved_version_gets_the_version_not_served_error() {
 async fn an_unserved_version_is_answered_before_authentication() {
     let server = DeployedShape::start().await;
 
-    let served = V3Client::new(server.channel().await)
+    let answered = V3Client::new(server.channel().await)
         .get_version(V3Request {
             protocol_version: "v3".to_owned(),
         })
@@ -603,7 +604,7 @@ async fn an_unserved_version_is_answered_before_authentication() {
         .await
         .expect_err("an unserved version must be refused");
 
-    assert_eq!(served.code(), tonic::Code::Unauthenticated);
+    assert_eq!(answered.code(), tonic::Code::Unauthenticated);
     assert_eq!(unserved.code(), tonic::Code::FailedPrecondition);
 }
 

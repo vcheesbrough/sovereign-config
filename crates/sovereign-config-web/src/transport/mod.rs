@@ -13,26 +13,30 @@
 
 mod v3;
 
+use std::{future::Future, rc::Rc};
+
 use async_trait::async_trait;
 use js_sys::{Date, Uint8Array};
 use prost::Message;
 use sovereign_config_client::{
-    AccessTokenProvider, Client, Handshake, ManagedConnectionTransport, RpcCode, SessionTransport,
-    Transport, ValueTransport, VersionReply, map_rpc_status,
+    AccessTokenProvider, Client, Connection, Handshake, ManagedConnectionTransport, RpcCode,
+    Session, SessionTransport, Transport, ValueTransport, VersionReply, map_rpc_status,
 };
 use sovereign_config_core::{
     AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata,
-    DisplayName, ErrorKind, ManagedConnectionMetadata, ManagedPermissions, PlainValue,
-    ProtocolVersion, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret,
-    Secret, SecretInput, SubTreeMutationValue, ValueListing, ValuePaths, ValueSubTree,
+    DisplayName, ERROR_KIND_METADATA, ErrorKind, ManagedConnectionMetadata, ManagedPermissions,
+    PlainValue, ProtocolVersion, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata,
+    RevealedSecret, Secret, SecretInput, ServedVersion, SubTreeMutationValue,
+    VERSION_NOT_SERVED_KIND, ValueListing, ValuePaths, ValueSubTree,
 };
+use sovereign_config_proto::sovereign::config::{NegotiateRequest, NegotiateResponse};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Headers, Request, RequestCache, RequestInit, Response, window};
 
 use crate::browser::{AppConfig, browser_error};
 use crate::session::{
-    TOKENS, clear_persisted_refresh_token, negotiated_protocol, persist_refresh_token,
+    TOKENS, clear_persisted_refresh_token, negotiated_session, persist_refresh_token,
     refresh_tokens,
 };
 
@@ -55,14 +59,53 @@ fn routes(version: ProtocolVersion) -> &'static [&'static str] {
     }
 }
 
+/// The route of the unversioned handshake.
+///
+/// Deliberately not in `v3.rs`: it belongs to no version, and putting it there
+/// would tie the browser's ability to negotiate to the lifetime of a version.
+const NEGOTIATE: &str = "/sovereign.config.Handshake/Negotiate";
+
 /// The page before it has agreed a protocol version with the service.
 #[derive(Clone, Copy)]
 pub(crate) struct BrowserHandshake;
 
 #[async_trait(?Send)]
 impl Handshake for BrowserHandshake {
-    async fn get_version(&self, version: ProtocolVersion) -> Result<VersionReply, ClientError> {
-        dialer(version).get_version().await
+    async fn served_versions(
+        &self,
+        client_versions: &[ProtocolVersion],
+    ) -> Result<Vec<ServedVersion>, ClientError> {
+        let request = NegotiateRequest {
+            client_protocol_versions: client_versions
+                .iter()
+                .map(|version| version.as_str().to_owned())
+                .collect(),
+        };
+        let response: NegotiateResponse = grpc_unary(NEGOTIATE, &request, None).await?;
+        Ok(response
+            .served_protocol_versions
+            .into_iter()
+            .map(|entry| ServedVersion {
+                version: entry.protocol_version,
+                deprecation_date: entry.deprecation_date,
+            })
+            .collect())
+    }
+
+    async fn legacy_version(&self) -> Result<VersionReply, ClientError> {
+        dialer(ProtocolVersion::LEGACY).get_version().await
+    }
+}
+
+impl Connection for BrowserHandshake {
+    /// The browser's dialers are stateless unit structs, so "a transport for a
+    /// version" *is* the version: [`dialer`] turns one into the other with
+    /// nothing carried between them. That is what lets the browser reuse the
+    /// one re-handshake implementation instead of growing its own.
+    type Transport = ProtocolVersion;
+
+    fn speaking(&self, version: ProtocolVersion) -> Self::Transport {
+        version
     }
 }
 
@@ -76,33 +119,56 @@ impl Handshake for BrowserHandshake {
 /// it.
 #[derive(Clone)]
 pub(crate) struct BrowserTransport {
-    protocol: Result<ProtocolVersion, ClientError>,
+    session: Result<Rc<Session<BrowserHandshake>>, ClientError>,
 }
 
 impl BrowserTransport {
-    /// The transport for the version this page negotiated at load.
+    /// The transport for the session this page negotiated at load.
     pub(crate) fn for_session() -> Self {
         Self {
-            protocol: negotiated_protocol(),
+            session: negotiated_session(),
         }
     }
 
     #[cfg(test)]
     pub(crate) const fn unnegotiated(failure: ClientError) -> Self {
         Self {
-            protocol: Err(failure),
+            session: Err(failure),
         }
     }
 
-    fn dialer(&self) -> Result<Box<dyn SessionTransport>, ClientError> {
-        self.protocol.clone().map(dialer)
+    /// Runs one operation on the version this page negotiated, re-handshaking
+    /// once if the service has stopped serving it.
+    ///
+    /// The retry is the shared `Session::call`, not a second implementation:
+    /// the browser is a long-lived holder like the provider and the broker, and
+    /// a page open across a retirement should recover rather than break until
+    /// someone reloads it.
+    async fn dial<O, F, R>(&self, operation: O) -> Result<R, ClientError>
+    where
+        O: Fn(Box<dyn SessionTransport>) -> F,
+        F: Future<Output = Result<R, ClientError>>,
+    {
+        let session = self.session.clone()?;
+        session.call(|version| operation(dialer(version))).await
+    }
+
+    /// The service's own release version, read from `System.GetVersion` on the
+    /// negotiated route.
+    ///
+    /// No longer a by-product of negotiating: the handshake carries versions
+    /// and nothing else, so this is an ordinary versioned call like any other.
+    pub(crate) async fn service_version(&self) -> Result<VersionReply, ClientError> {
+        self.dial(|dialer| async move { dialer.get_version().await })
+            .await
     }
 }
 
 #[async_trait(?Send)]
 impl Transport for BrowserTransport {
     async fn get_identity(&self, bearer: &Secret) -> Result<AuthenticationStatus, ClientError> {
-        self.dialer()?.get_identity(bearer).await
+        self.dial(|dialer| async move { dialer.get_identity(bearer).await })
+            .await
     }
 }
 
@@ -113,7 +179,8 @@ impl ValueTransport for BrowserTransport {
         path: &ConfigPath,
         bearer: &Secret,
     ) -> Result<ValueListing, ClientError> {
-        self.dialer()?.list_values(path, bearer).await
+        self.dial(|dialer| async move { dialer.list_values(path, bearer).await })
+            .await
     }
 
     async fn get_subtree(
@@ -121,7 +188,8 @@ impl ValueTransport for BrowserTransport {
         path: &ConfigPath,
         bearer: &Secret,
     ) -> Result<ValueSubTree, ClientError> {
-        self.dialer()?.get_subtree(path, bearer).await
+        self.dial(|dialer| async move { dialer.get_subtree(path, bearer).await })
+            .await
     }
 
     async fn put_value(
@@ -130,7 +198,8 @@ impl ValueTransport for BrowserTransport {
         value: &PlainValue,
         bearer: &Secret,
     ) -> Result<PutMetadata, ClientError> {
-        self.dialer()?.put_value(path, value, bearer).await
+        self.dial(|dialer| async move { dialer.put_value(path, value, bearer).await })
+            .await
     }
 
     async fn put_secret(
@@ -139,7 +208,8 @@ impl ValueTransport for BrowserTransport {
         value: &SecretInput,
         bearer: &Secret,
     ) -> Result<PutMetadata, ClientError> {
-        self.dialer()?.put_secret(path, value, bearer).await
+        self.dial(|dialer| async move { dialer.put_secret(path, value, bearer).await })
+            .await
     }
 
     async fn replace_subtree(
@@ -148,7 +218,8 @@ impl ValueTransport for BrowserTransport {
         values: &[SubTreeMutationValue],
         bearer: &Secret,
     ) -> Result<ReplaceMetadata, ClientError> {
-        self.dialer()?.replace_subtree(path, values, bearer).await
+        self.dial(|dialer| async move { dialer.replace_subtree(path, values, bearer).await })
+            .await
     }
 
     async fn delete_values(
@@ -157,7 +228,8 @@ impl ValueTransport for BrowserTransport {
         recurse: bool,
         bearer: &Secret,
     ) -> Result<DeleteMetadata, ClientError> {
-        self.dialer()?.delete_values(path, recurse, bearer).await
+        self.dial(|dialer| async move { dialer.delete_values(path, recurse, bearer).await })
+            .await
     }
 
     async fn reveal_secret(
@@ -165,7 +237,8 @@ impl ValueTransport for BrowserTransport {
         path: &ConfigPath,
         bearer: &Secret,
     ) -> Result<RevealedSecret, ClientError> {
-        self.dialer()?.reveal_secret(path, bearer).await
+        self.dial(|dialer| async move { dialer.reveal_secret(path, bearer).await })
+            .await
     }
 
     async fn add_value_path(
@@ -174,8 +247,7 @@ impl ValueTransport for BrowserTransport {
         new_path: &ConfigPath,
         bearer: &Secret,
     ) -> Result<AddPathMetadata, ClientError> {
-        self.dialer()?
-            .add_value_path(source, new_path, bearer)
+        self.dial(|dialer| async move { dialer.add_value_path(source, new_path, bearer).await })
             .await
     }
 
@@ -184,7 +256,8 @@ impl ValueTransport for BrowserTransport {
         path: &ConfigPath,
         bearer: &Secret,
     ) -> Result<ValuePaths, ClientError> {
-        self.dialer()?.list_value_paths(path, bearer).await
+        self.dial(|dialer| async move { dialer.list_value_paths(path, bearer).await })
+            .await
     }
 }
 
@@ -194,7 +267,8 @@ impl ManagedConnectionTransport for BrowserTransport {
         &self,
         bearer: &Secret,
     ) -> Result<Vec<ManagedConnectionMetadata>, ClientError> {
-        self.dialer()?.list_managed_connections(bearer).await
+        self.dial(|dialer| async move { dialer.list_managed_connections(bearer).await })
+            .await
     }
 
     async fn create_managed_connection(
@@ -204,9 +278,12 @@ impl ManagedConnectionTransport for BrowserTransport {
         permissions: &ManagedPermissions,
         bearer: &Secret,
     ) -> Result<ProvisionedManagedConnection, ClientError> {
-        self.dialer()?
-            .create_managed_connection(display_name, root, permissions, bearer)
-            .await
+        self.dial(|dialer| async move {
+            dialer
+                .create_managed_connection(display_name, root, permissions, bearer)
+                .await
+        })
+        .await
     }
 
     async fn rotate_managed_connection(
@@ -214,9 +291,12 @@ impl ManagedConnectionTransport for BrowserTransport {
         connection_id: &ConnectionId,
         bearer: &Secret,
     ) -> Result<ProvisionedManagedConnection, ClientError> {
-        self.dialer()?
-            .rotate_managed_connection(connection_id, bearer)
-            .await
+        self.dial(|dialer| async move {
+            dialer
+                .rotate_managed_connection(connection_id, bearer)
+                .await
+        })
+        .await
     }
 
     async fn revoke_managed_connection(
@@ -224,9 +304,12 @@ impl ManagedConnectionTransport for BrowserTransport {
         connection_id: &ConnectionId,
         bearer: &Secret,
     ) -> Result<(), ClientError> {
-        self.dialer()?
-            .revoke_managed_connection(connection_id, bearer)
-            .await
+        self.dial(|dialer| async move {
+            dialer
+                .revoke_managed_connection(connection_id, bearer)
+                .await
+        })
+        .await
     }
 }
 
@@ -313,24 +396,33 @@ where
         .ok()
         .flatten()
         .and_then(|value| value.parse::<u16>().ok());
+    // A trailers-only answer — which is what the version-not-served catch-all
+    // produces — may arrive as headers rather than as a trailer frame.
+    let header_kind = response.headers().get(ERROR_KIND_METADATA).ok().flatten();
     let buffer = JsFuture::from(response.array_buffer().map_err(|_| browser_error())?)
         .await
         .map_err(|_| browser_error())?;
-    decode_grpc_web_response(&Uint8Array::new(&buffer).to_vec(), header_status)
+    decode_grpc_web_response(
+        &Uint8Array::new(&buffer).to_vec(),
+        header_status,
+        header_kind.as_deref(),
+    )
 }
 
 #[cfg(test)]
 pub(crate) fn decode_grpc_web<R: Message + Default>(bytes: &[u8]) -> Result<R, ClientError> {
-    decode_grpc_web_response(bytes, None)
+    decode_grpc_web_response(bytes, None, None)
 }
 
 pub(crate) fn decode_grpc_web_response<R: Message + Default>(
     bytes: &[u8],
     header_status: Option<u16>,
+    header_kind: Option<&str>,
 ) -> Result<R, ClientError> {
     let mut offset = 0;
     let mut payload = None;
     let mut status = None;
+    let mut kind = None;
     while offset + 5 <= bytes.len() {
         let flags = bytes[offset];
         let length = u32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
@@ -346,6 +438,10 @@ pub(crate) fn decode_grpc_web_response<R: Message + Default>(
                 line.strip_prefix("grpc-status:")
                     .and_then(|value| value.trim().parse::<u16>().ok())
             });
+            kind = trailers.lines().find_map(|line| {
+                line.strip_prefix(&format!("{ERROR_KIND_METADATA}:"))
+                    .map(|value| value.trim().to_owned())
+            });
         }
         offset += length;
     }
@@ -353,6 +449,13 @@ pub(crate) fn decode_grpc_web_response<R: Message + Default>(
         .or(header_status)
         .ok_or_else(|| map_rpc_status(RpcCode::Other))?;
     if status != 0 {
+        // The marker, never the code: a retired version is something the
+        // session can recover from by re-handshaking, and nothing else that
+        // shares this status code is.
+        let kind = kind.as_deref().or(header_kind);
+        if kind == Some(VERSION_NOT_SERVED_KIND) {
+            return Err(map_rpc_status(RpcCode::VersionNotServed));
+        }
         return Err(map_rpc_status(grpc_status_code(status)));
     }
     R::decode(payload.ok_or_else(|| map_rpc_status(RpcCode::Other))?)
@@ -469,8 +572,8 @@ mod tests {
     /// the network not at all, and reports **why** the handshake failed —
     /// reporting an unreachable service as an incompatible protocol would send
     /// an operator looking in the wrong place for the life of the page.
-    #[test]
-    fn a_session_that_never_negotiated_dials_nothing_and_says_why() {
+    #[tokio::test]
+    async fn a_session_that_never_negotiated_dials_nothing_and_says_why() {
         for failure in [
             ClientError::new(ErrorKind::Unavailable, "service is unavailable"),
             ClientError::new(
@@ -479,9 +582,9 @@ mod tests {
             ),
         ] {
             let error = BrowserTransport::unnegotiated(failure.clone())
-                .dialer()
-                .err()
-                .expect("an unnegotiated session must not produce a dialer");
+                .dial(|dialer| async move { dialer.get_version().await })
+                .await
+                .expect_err("an unnegotiated session must not dial anything");
 
             assert_eq!(error, failure);
         }

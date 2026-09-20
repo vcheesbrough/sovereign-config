@@ -10,6 +10,31 @@
 
 use crate::{ClientError, ErrorKind};
 
+/// The gRPC metadata key naming *which* bounded failure a status is.
+///
+/// **Frozen, like the handshake's message shape.** It is returned outside every
+/// protocol version — a request for a version the server does not serve has no
+/// version whose rules could apply to it — so no version can ever redefine it,
+/// and every client from 2.28 on reads it.
+///
+/// It lives here, with the version-free protocol vocabulary, rather than in the
+/// generated-types crate: it is a fact about the wire that belongs to no
+/// package, and the server's shared implementation must be able to name it
+/// without naming a protocol version's generated types.
+pub const ERROR_KIND_METADATA: &str = "sovereign-config-error-kind";
+
+/// The [`ERROR_KIND_METADATA`] value marking the version-not-served answer.
+///
+/// A client identifies that answer by this marker, never by the status code
+/// alone: the code is shared with failures that are not about versions at all.
+pub const VERSION_NOT_SERVED_KIND: &str = "version-not-served";
+
+/// The gRPC metadata key echoing the protocol version a refused request named.
+///
+/// Request-derived, so a server bounds and strips it before sending and a
+/// client treats it as untrusted text.
+pub const REQUESTED_VERSION_METADATA: &str = "sovereign-config-protocol-version";
+
 /// A protocol version this build speaks.
 ///
 /// Declaration order is **preference order, most preferred first** — not

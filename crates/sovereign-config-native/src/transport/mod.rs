@@ -18,14 +18,18 @@ use std::{net::IpAddr, time::Duration};
 use async_trait::async_trait;
 use http::Uri;
 use sovereign_config_client::{
-    Handshake, ManagedConnectionTransport, RpcCode, SessionTransport, Transport, ValueTransport,
-    VersionReply, map_rpc_status,
+    Connection, Handshake, ManagedConnectionTransport, RpcCode, SessionTransport, Transport,
+    ValueTransport, VersionReply, map_rpc_status,
 };
 use sovereign_config_core::{
     AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata,
-    DisplayName, ManagedConnectionMetadata, ManagedPermissions, PlainValue, ProtocolVersion,
-    ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret, Secret,
-    SecretInput, SubTreeMutationValue, ValueListing, ValuePaths, ValueSubTree,
+    DisplayName, ERROR_KIND_METADATA, ManagedConnectionMetadata, ManagedPermissions, PlainValue,
+    ProtocolVersion, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret,
+    Secret, SecretInput, ServedVersion, SubTreeMutationValue, VERSION_NOT_SERVED_KIND,
+    ValueListing, ValuePaths, ValueSubTree,
+};
+use sovereign_config_proto::sovereign::config::{
+    NegotiateRequest, handshake_client::HandshakeClient,
 };
 use tonic::{
     Code, Request,
@@ -103,8 +107,43 @@ impl TonicChannel {
 
 #[async_trait(?Send)]
 impl Handshake for TonicChannel {
-    async fn get_version(&self, version: ProtocolVersion) -> Result<VersionReply, ClientError> {
-        dialer(version, self.channel.clone()).get_version().await
+    async fn served_versions(
+        &self,
+        client_versions: &[ProtocolVersion],
+    ) -> Result<Vec<ServedVersion>, ClientError> {
+        let served = HandshakeClient::new(self.channel.clone())
+            .negotiate(Request::new(NegotiateRequest {
+                client_protocol_versions: client_versions
+                    .iter()
+                    .map(|version| version.as_str().to_owned())
+                    .collect(),
+            }))
+            .await
+            .map_err(|status| map_status(&status))?
+            .into_inner();
+
+        Ok(served
+            .served_protocol_versions
+            .into_iter()
+            .map(|entry| ServedVersion {
+                version: entry.protocol_version,
+                deprecation_date: entry.deprecation_date,
+            })
+            .collect())
+    }
+
+    async fn legacy_version(&self) -> Result<VersionReply, ClientError> {
+        dialer(ProtocolVersion::LEGACY, self.channel.clone())
+            .get_version()
+            .await
+    }
+}
+
+impl Connection for TonicChannel {
+    type Transport = TonicTransport;
+
+    fn speaking(&self, version: ProtocolVersion) -> Self::Transport {
+        Self::speaking(self, version)
     }
 }
 
@@ -123,6 +162,21 @@ impl TonicTransport {
     #[must_use]
     pub fn protocol_version(&self) -> ProtocolVersion {
         self.dialer().version()
+    }
+
+    /// The service's own release version, read from `System.GetVersion` on the
+    /// negotiated route.
+    ///
+    /// No longer a by-product of negotiating: the handshake carries versions
+    /// and nothing else, so what an operator is shown as "the service version"
+    /// is an ordinary versioned call, answered by the same routes the session's
+    /// traffic travels on.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded transport error.
+    pub async fn dialer_version(&self) -> Result<VersionReply, ClientError> {
+        self.dialer().get_version().await
     }
 
     fn dialer(&self) -> Box<dyn SessionTransport> {
@@ -287,7 +341,25 @@ fn validate_service_endpoint(endpoint: &str) -> Result<(), ClientError> {
     Ok(())
 }
 
+/// Whether a status is the service's **version-not-served** answer.
+///
+/// Read from the metadata marker, never inferred from the code: this server
+/// returns `FAILED_PRECONDITION` for the retirement case, but the code alone is
+/// not a protocol statement and a future one could use it for something else.
+/// The marker is frozen and returned outside every version, so it is the only
+/// thing safe to key on.
+fn is_version_not_served(status: &tonic::Status) -> bool {
+    status
+        .metadata()
+        .get(ERROR_KIND_METADATA)
+        .and_then(|value| value.to_str().ok())
+        == Some(VERSION_NOT_SERVED_KIND)
+}
+
 fn map_status(status: &tonic::Status) -> ClientError {
+    if is_version_not_served(status) {
+        return map_rpc_status(RpcCode::VersionNotServed);
+    }
     map_rpc_status(match status.code() {
         Code::Unauthenticated => RpcCode::Unauthenticated,
         Code::PermissionDenied => RpcCode::PermissionDenied,
@@ -309,14 +381,35 @@ mod tests {
 
     use sovereign_config_client::{Handshake, Transport};
     use sovereign_config_core::{ErrorKind, ProtocolVersion, Secret};
-    use sovereign_config_proto::sovereign::config::v3::{
-        GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
-        system_server::{System, SystemServer},
+    use sovereign_config_proto::sovereign::config::{
+        NegotiateRequest, NegotiateResponse,
+        handshake_server::{Handshake as HandshakeService, HandshakeServer},
+        v3::{
+            GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
+            system_server::{System, SystemServer},
+        },
     };
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status, transport::Server};
 
     use super::{TonicChannel, validate_service_endpoint};
+
+    /// A handshake that never answers.
+    ///
+    /// Registered wherever the fixture is meant to *stall*: without it the
+    /// handshake route would simply not exist and negotiation would fail fast
+    /// with an incompatibility, which is a different test.
+    struct HangingHandshake;
+
+    #[tonic::async_trait]
+    impl HandshakeService for HangingHandshake {
+        async fn negotiate(
+            &self,
+            _: Request<NegotiateRequest>,
+        ) -> Result<Response<NegotiateResponse>, Status> {
+            pending().await
+        }
+    }
 
     struct HangingSystem;
 
@@ -406,6 +499,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(
             Server::builder()
+                .add_service(HandshakeServer::new(HangingHandshake))
                 .add_service(SystemServer::new(HangingSystem))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
@@ -419,7 +513,7 @@ mod tests {
 
         let version = tokio::time::timeout(
             Duration::from_secs(1),
-            channel.get_version(ProtocolVersion::PREFERRED),
+            channel.served_versions(ProtocolVersion::ALL),
         )
         .await
         .expect("version RPC timeout was not enforced")

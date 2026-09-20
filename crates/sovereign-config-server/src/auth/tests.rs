@@ -487,19 +487,26 @@ async fn dependency_failures_are_unavailable_without_retry() {
         assert_eq!(server.state.calls.load(Ordering::Relaxed), 1);
     }
 
+    // The margins are wide on purpose. This asserts that a timed-out
+    // introspection is not retried, which needs the request to have *arrived*
+    // before the deadline — and on a loaded machine a 25ms deadline can expire
+    // before the listener is even scheduled, leaving the handler never run and
+    // the assertion reading zero for reasons that have nothing to do with
+    // retrying. The client deadline still sits far below the server's delay, so
+    // the timeout under test fires exactly as before.
     let server = fake_server(
         StatusCode::OK,
         valid_response_json().to_string(),
-        Duration::from_millis(200),
+        Duration::from_millis(400),
     )
     .await;
-    let authenticator = authenticator(server.url.clone(), Duration::from_millis(25));
+    let authenticator = authenticator(server.url.clone(), Duration::from_millis(50));
     let failure = authenticator
         .authenticate(&authenticated_headers())
         .await
         .unwrap_err();
     assert_eq!(failure.result.reason(), "dependency_unavailable");
-    sleep(Duration::from_millis(225)).await;
+    sleep(Duration::from_millis(500)).await;
     assert_eq!(server.state.calls.load(Ordering::Relaxed), 1);
 }
 

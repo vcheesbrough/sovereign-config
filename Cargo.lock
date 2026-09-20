@@ -2439,6 +2439,7 @@ dependencies = [
  "async-trait",
  "sovereign-config-core",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2619,6 +2620,7 @@ dependencies = [
  "sovereign-config-client",
  "sovereign-config-core",
  "sovereign-config-proto",
+ "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

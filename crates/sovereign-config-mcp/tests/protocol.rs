@@ -12,12 +12,12 @@ use serde_json::{Value, json};
 use sovereign_config_core::{
     AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, ConnectionUrl,
     DeleteMetadata, DisplayName, ErrorKind, ListedValue, ManagedConnectionMetadata,
-    ManagedConnectionState, ManagedPermissions, MaskedSecret, PlainValue,
+    ManagedConnectionState, ManagedPermissions, MaskedSecret, PlainValue, ProtocolVersion,
     ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedConnectionUrl,
-    RevealedSecret, Secret, SecretInput, ServiceStatus, SubTreeMutationValue, SubTreeValue,
-    Timestamp, ValueContent, ValueListing, ValuePaths, ValueSubTree,
+    RevealedSecret, Secret, SecretInput, SubTreeMutationValue, SubTreeValue, Timestamp,
+    ValueContent, ValueListing, ValuePaths, ValueSubTree,
 };
-use sovereign_config_mcp::backend::{Backend, LoginPrompt};
+use sovereign_config_mcp::backend::{Backend, LoginPrompt, ServiceReport};
 use sovereign_config_mcp::server::Server;
 use tokio::io::BufReader;
 
@@ -113,9 +113,13 @@ fn sample_provisioned() -> ProvisionedManagedConnection {
 
 #[async_trait(?Send)]
 impl Backend for MockBackend {
-    async fn service_status(&self) -> Result<ServiceStatus, ClientError> {
+    async fn service_status(&self) -> Result<ServiceReport, ClientError> {
         self.guard()?;
-        ServiceStatus::negotiate("9.9.9".to_owned(), "v3", &["v3".to_owned()])
+        Ok(ServiceReport {
+            application_version: "9.9.9".to_owned(),
+            protocol_version: ProtocolVersion::V3,
+            deprecation_date: None,
+        })
     }
 
     async fn authentication_status(&self) -> Result<AuthenticationStatus, ClientError> {

@@ -271,10 +271,19 @@ impl<B: Backend> Server<B> {
         let authentication = self.backend.authentication_status().await?;
         // No `compatible` flag: reaching here *is* compatibility, since
         // negotiation fails the call outright when no version is shared.
+        // A deprecation date warns and never fails: the session works, and the
+        // operator is being told to plan a rebuild rather than handed an error.
+        let retirement = service
+            .deprecation_date
+            .as_ref()
+            .map_or_else(String::new, |date| {
+                format!("\nProtocol retirement announced: not before {date}")
+            });
         Ok(format!(
-            "Service {} (protocol {})\nAuthentication: {}",
+            "Service {} (protocol {}){}\nAuthentication: {}",
             service.application_version,
             service.protocol_version,
+            retirement,
             if authentication.authenticated {
                 "logged in"
             } else {

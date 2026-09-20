@@ -11,8 +11,9 @@ mod tests {
     use sovereign_config_core::{
         AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, DeleteMetadata, ErrorKind,
         ListedValue, MaskedSecret, PlainValue, ProtocolVersion, PutMetadata, ReplaceMetadata,
-        RevealedSecret, Secret, SecretInput, SubTreeMutationContent, SubTreeMutationValue,
-        SubTreeValue, Timestamp, ValueContent, ValueListing, ValuePaths, ValueSubTree,
+        RevealedSecret, Secret, SecretInput, ServedVersion, SubTreeMutationContent,
+        SubTreeMutationValue, SubTreeValue, Timestamp, ValueContent, ValueListing, ValuePaths,
+        ValueSubTree,
     };
 
     #[derive(Clone)]
@@ -32,16 +33,25 @@ mod tests {
         values: RefCell<BTreeMap<ConfigPath, StoredValue>>,
     }
 
-    /// A consumer's own transport negotiates like any other: it is asked for
-    /// one version, on that version's routes, and answers with the set it
-    /// serves.
+    /// A consumer's own transport negotiates like any other: one unversioned
+    /// handshake, answered with the whole set it serves, most preferred first.
     #[async_trait(?Send)]
     impl Handshake for ConsumerTransport {
-        async fn get_version(&self, version: ProtocolVersion) -> Result<VersionReply, ClientError> {
+        async fn served_versions(
+            &self,
+            _: &[ProtocolVersion],
+        ) -> Result<Vec<ServedVersion>, ClientError> {
+            Ok(ProtocolVersion::ALL
+                .iter()
+                .map(|version| ServedVersion::new(version.as_str()))
+                .collect())
+        }
+
+        async fn legacy_version(&self) -> Result<VersionReply, ClientError> {
             Ok(VersionReply {
                 application_version: "consumer-fixture".into(),
-                protocol_version: version.as_str().into(),
-                supported_protocol_versions: vec![version.as_str().into()],
+                protocol_version: ProtocolVersion::LEGACY.as_str().into(),
+                supported_protocol_versions: vec![ProtocolVersion::LEGACY.as_str().into()],
             })
         }
     }

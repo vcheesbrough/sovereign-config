@@ -28,6 +28,21 @@ pub trait InvalidatableToken: AccessTokenProvider {
     fn invalidate(&self);
 }
 
+/// A shared token provider is still one provider.
+///
+/// A [`LayerReader`] owns its provider, so a holder that has to rebuild a
+/// reader — which is what obtaining a transport for a newly negotiated protocol
+/// version amounts to — would otherwise have to duplicate the provider and with
+/// it the token cache, turning one cached credential into several and one
+/// acquisition per reader. Sharing it keeps a rebuilt reader reading the same
+/// cache the old one filled. The matching `AccessTokenProvider` forwarding
+/// lives in `sovereign-config-client`, which owns that trait.
+impl<P: InvalidatableToken> InvalidatableToken for std::rc::Rc<P> {
+    fn invalidate(&self) {
+        (**self).invalidate();
+    }
+}
+
 /// What an *unreadable* or concurrently deleted path means to the caller.
 ///
 /// The two consumers genuinely differ here, so the policy is theirs to choose

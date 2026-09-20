@@ -54,7 +54,13 @@ impl From<ClientError> for ProviderError {
         match error.kind {
             ErrorKind::Unauthenticated => Self::AuthenticationFailed,
             ErrorKind::PermissionDenied => Self::PermissionDenied,
-            ErrorKind::IncompatibleProtocol => Self::IncompatibleProtocol,
+            // A version going away and no version in common are different
+            // events, but they reach a consuming application the same way:
+            // there is nothing it can do about either but rebuild. The session
+            // has already re-handshaked once by the time this is reached.
+            ErrorKind::IncompatibleProtocol | ErrorKind::VersionNotServed => {
+                Self::IncompatibleProtocol
+            }
             // The provider only reads configuration, so it never targets an
             // occupied path; a conflict would still be a rejected request.
             ErrorKind::InvalidRequest | ErrorKind::Conflict => Self::InvalidRequest,
