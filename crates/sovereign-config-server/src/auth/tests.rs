@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     convert::Infallible,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -26,9 +26,9 @@ use tonic::body::{BoxBody, empty_body};
 use tower::{Layer, ServiceExt, service_fn};
 
 use super::{
-    AuthenticatedPrincipal, AuthenticationLayer, Authenticator, Grant, IntrospectionResponse,
-    Permission, bearer_token, canonical_prefix, grpc_authentication_layer, is_operational_rpc,
-    is_web_asset_request, require_rs256, validate_introspection,
+    AuthenticatedPrincipal, AuthenticationLayer, Authenticator, Grant, HANDSHAKE_RPC,
+    IntrospectionResponse, Permission, bearer_token, canonical_prefix, grpc_service_layer,
+    is_operational_rpc, is_web_asset_request, require_rs256, validate_introspection,
 };
 use crate::{
     config::AuthenticationConfig,
@@ -157,6 +157,22 @@ async fn fake_server(
         state,
         task,
     }
+}
+
+/// Waits until the fixture has recorded at least `expected` arrivals.
+///
+/// The counter is bumped at the top of the handler, before any configured
+/// delay, so this observes arrival rather than completion — which is what lets
+/// a test about retries stop guessing at scheduling latency.
+async fn arrived(server: &FakeIntrospectionServer, expected: usize, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        if server.state.calls.load(Ordering::Relaxed) >= expected {
+            return true;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    false
 }
 
 fn authenticator(url: Url, timeout: Duration) -> Authenticator {
@@ -384,14 +400,24 @@ fn grants_require_canonical_prefixes_and_known_permissions() {
 }
 
 #[test]
-fn only_health_and_version_are_operational() {
+fn only_health_the_handshake_and_version_are_operational() {
     assert!(is_operational_rpc("/grpc.health.v1.Health/Check"));
     assert!(is_operational_rpc("/grpc.health.v1.Health/Watch"));
     assert!(is_operational_rpc("/sovereign.config.v3.System/GetVersion"));
+    // The unversioned handshake. A client calls it before it holds any token,
+    // so losing this exemption breaks negotiation for the whole fleet — and
+    // breaks it *silently*, because a client reads `UNAUTHENTICATED` here as
+    // "this server predates the handshake" and falls back to the legacy route
+    // forever. Nothing else would go red: handshake calls are counted under no
+    // version.
+    assert!(is_operational_rpc(HANDSHAKE_RPC));
+    assert!(is_operational_rpc("/sovereign.config.Handshake/Negotiate"));
     assert!(!is_operational_rpc("/grpc.health.v1.Health/Unknown"));
     assert!(!is_operational_rpc(
         "/sovereign.config.v3.Configuration/GetSubTree"
     ));
+    // Only the handshake's own method, not the whole unversioned package.
+    assert!(!is_operational_rpc("/sovereign.config.Handshake/Other"));
 }
 
 /// `GetVersion` must stay unauthenticated on **every** served version, not just
@@ -405,12 +431,10 @@ fn only_health_and_version_are_operational() {
 #[test]
 fn the_version_handshake_is_unauthenticated_on_every_served_version() {
     for served in SERVED_PROTOCOL_VERSIONS {
+        let version = served.version.as_str();
         assert!(
-            is_operational_rpc(&format!(
-                "/sovereign.config.{}.System/GetVersion",
-                served.as_str()
-            )),
-            "GetVersion must be unauthenticated on served version {served}"
+            is_operational_rpc(&format!("/sovereign.config.{version}.System/GetVersion")),
+            "GetVersion must be unauthenticated on served version {version}"
         );
     }
 }
@@ -489,19 +513,41 @@ async fn dependency_failures_are_unavailable_without_retry() {
         assert_eq!(server.state.calls.load(Ordering::Relaxed), 1);
     }
 
+    // This asserts that a timed-out introspection is **not retried**, which
+    // needs the request to have *arrived* before the deadline — otherwise the
+    // counter reads zero because nothing ever happened, not because nothing was
+    // retried, and the test passes for the wrong reason.
+    //
+    // The original 25ms deadline could not establish that. It covers connection
+    // setup as well as the request, so on a busy machine it expires while the
+    // connection is still being made and the fixture never sees anything at
+    // all — confirmed by watching this very assertion time out against a
+    // ten-second poll. The deadline is therefore generous enough for the
+    // request to land, while the server's delay stays far above it so the
+    // timeout under test still fires. Arrival is then waited for directly,
+    // using the count the fixture takes at the top of its handler before it
+    // sleeps, rather than guessed at with a sleep.
     let server = fake_server(
         StatusCode::OK,
         valid_response_json().to_string(),
-        Duration::from_millis(200),
+        Duration::from_secs(5),
     )
     .await;
-    let authenticator = authenticator(server.url.clone(), Duration::from_millis(25));
+    let authenticator = authenticator(server.url.clone(), Duration::from_millis(250));
     let failure = authenticator
         .authenticate(&authenticated_headers())
         .await
         .unwrap_err();
     assert_eq!(failure.result.reason(), "dependency_unavailable");
-    sleep(Duration::from_millis(225)).await;
+
+    assert!(
+        arrived(&server, 1, Duration::from_secs(10)).await,
+        "the introspection request never reached the fixture, so this test \
+         could not have observed a retry either way"
+    );
+    // `authenticate` has already returned, so a retry would have been issued by
+    // now; a brief settle is enough to catch one in flight.
+    sleep(Duration::from_millis(50)).await;
     assert_eq!(server.state.calls.load(Ordering::Relaxed), 1);
 }
 
@@ -526,10 +572,11 @@ async fn grpc_web_authentication_failures_are_framed() {
 }
 
 async fn grpc_web_status(authenticator: Authenticator, headers: HeaderMap) -> u16 {
-    let layer = grpc_authentication_layer(
+    let layer = grpc_service_layer(
         authenticator,
         Arc::new(AuthenticationMetrics::default()),
         Arc::new(ProtocolMetrics::new(&["v3"])),
+        &["v3"],
     );
     let inner = service_fn(|_: Request<BoxBody>| async {
         Ok::<_, Infallible>(Response::new(empty_body()))
@@ -573,24 +620,70 @@ async fn middleware_bypasses_only_operational_rpcs_and_propagates_principal() {
         Arc::new(AuthenticationMetrics::default()),
         Arc::new(ProtocolMetrics::new(&["v3"])),
     );
-    let inner = service_fn(|request: Request<()>| async move {
-        if request.uri().path() == "/protected.Service/Call" {
-            let principal = request
-                .extensions()
-                .get::<AuthenticatedPrincipal>()
-                .expect("protected request must contain its principal");
-            assert_eq!(principal.subject, "principal-id");
+    // Every path the inner service is actually reached on. A refusal by the
+    // authentication layer is an HTTP 200 carrying a gRPC status in trailers,
+    // so the response status alone cannot tell "passed through" from "refused"
+    // — only whether the inner service ran can.
+    let reached: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&reached);
+    let inner = service_fn(move |request: Request<()>| {
+        let seen = Arc::clone(&seen);
+        async move {
+            seen.lock()
+                .expect("the reached-path log is not poisoned")
+                .push(request.uri().path().to_owned());
+            if request.uri().path() == "/protected.Service/Call" {
+                let principal = request
+                    .extensions()
+                    .get::<AuthenticatedPrincipal>()
+                    .expect("protected request must contain its principal");
+                assert_eq!(principal.subject, "principal-id");
+            }
+            Ok::<_, Infallible>(Response::new(empty_body()))
         }
-        Ok::<_, Infallible>(Response::new(empty_body()))
     });
 
     let version = Request::builder()
         .uri("/sovereign.config.v3.System/GetVersion")
         .body(())
         .unwrap();
-    let response = layer.clone().layer(inner).oneshot(version).await.unwrap();
+    let response = layer
+        .clone()
+        .layer(inner.clone())
+        .oneshot(version)
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(server.state.calls.load(Ordering::Relaxed), 0);
+
+    // The unversioned handshake, carrying no bearer token at all — which is how
+    // every client calls it, because it runs before a token exists. It must
+    // reach the service beneath, not merely come back 200.
+    let handshake = Request::builder()
+        .method(Method::POST)
+        .uri(HANDSHAKE_RPC)
+        .body(())
+        .unwrap();
+    let response = layer
+        .clone()
+        .layer(inner.clone())
+        .oneshot(handshake)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        reached
+            .lock()
+            .expect("the reached-path log is not poisoned")
+            .iter()
+            .any(|path| path == HANDSHAKE_RPC),
+        "an unauthenticated handshake must pass through to the service beneath"
+    );
+    assert_eq!(
+        server.state.calls.load(Ordering::Relaxed),
+        0,
+        "the handshake must not reach the introspection endpoint"
+    );
 
     let mut protected = Request::builder()
         .method(Method::POST)
@@ -598,7 +691,12 @@ async fn middleware_bypasses_only_operational_rpcs_and_propagates_principal() {
         .body(())
         .unwrap();
     *protected.headers_mut() = authenticated_headers();
-    let response = layer.clone().layer(inner).oneshot(protected).await.unwrap();
+    let response = layer
+        .clone()
+        .layer(inner.clone())
+        .oneshot(protected)
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(server.state.calls.load(Ordering::Relaxed), 1);
 
@@ -607,7 +705,7 @@ async fn middleware_bypasses_only_operational_rpcs_and_propagates_principal() {
         .uri("/grpc.health.v1.Health/Unknown")
         .body(())
         .unwrap();
-    let response = layer.layer(inner).oneshot(unknown).await.unwrap();
+    let response = layer.layer(inner.clone()).oneshot(unknown).await.unwrap();
     let collected = response.into_body().collect().await.unwrap();
     assert_eq!(
         collected.trailers().unwrap().get("grpc-status").unwrap(),

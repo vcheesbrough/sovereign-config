@@ -8,7 +8,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .build_transport(false)
         .compile_protos(
-            &["../../proto/sovereign/config/v3/service.proto"],
+            &[
+                // The unversioned handshake, and then one file per protocol
+                // version. The handshake is listed first because it is the
+                // operation every version's clients call before any of them.
+                "../../proto/sovereign/config/handshake.proto",
+                "../../proto/sovereign/config/v3/service.proto",
+            ],
             &["../../proto"],
         )?;
     Ok(())

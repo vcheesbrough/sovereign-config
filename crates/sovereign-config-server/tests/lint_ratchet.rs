@@ -25,11 +25,17 @@ const SILENCERS: [&str; 2] = [
 /// `sovereign_config_protocol_requests_total` metric name.
 const PROTO_CRATE: &str = "sovereign_config_proto::";
 
-/// Server sources, relative to `src/`, that may name a protocol version's
-/// generated types besides the `vN.rs` shims: the entry point registers each
-/// version's servers, and `System` is per-version by nature because
-/// `GetVersion` echoes the version it was asked for.
-const VERSION_AWARE: [&str; 2] = ["main.rs", "system.rs"];
+/// Server sources, relative to `src/`, that may name the generated protobuf
+/// types besides the `vN.rs` shims.
+///
+/// - `main.rs` registers each version's servers;
+/// - `system.rs` is `v3`'s `System` service, per-version by nature because
+///   `GetVersion` echoes the version it was asked for;
+/// - `handshake.rs` names the **unversioned** `sovereign.config` package. It is
+///   the one service that belongs to no version, which is exactly why it needs
+///   naming here: the scan sees the proto crate, not which package of it, so
+///   the module that is furthest from a version still has to be listed.
+const VERSION_AWARE: [&str; 3] = ["main.rs", "system.rs", "handshake.rs"];
 
 /// The server modules split at the protocol seam. Each holds one shared
 /// implementation, `<module>/service.rs`, and a `<module>/vN.rs` shim per

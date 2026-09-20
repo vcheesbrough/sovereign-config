@@ -9,6 +9,11 @@ repository.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Test-only, and never part of a wasm build: the unit tests below run natively
+# and a few of them drive `async` transport code.
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true

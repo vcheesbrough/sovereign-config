@@ -111,12 +111,12 @@ pub(crate) fn spawn(
                 return;
             };
             LocalSet::new().block_on(&runtime, async move {
-                let reader = match connect::connect(&connection_url, token_ttl).await {
+                let connected = match connect::connect(&connection_url, token_ttl).await {
                     Ok(connected) => {
-                        if ready.send(Ok(connected.root)).is_err() {
+                        if ready.send(Ok(connected.root.clone())).is_err() {
                             return;
                         }
-                        connected.reader
+                        connected
                     }
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -126,9 +126,24 @@ pub(crate) fn spawn(
                 while let Some(command) = inbox.recv().await {
                     match command {
                         Command::Fetch { layers, reply } => {
+                            // One fetch is one operation: if the service has
+                            // retired the version this connection negotiated,
+                            // the session re-handshakes once and the whole
+                            // fetch is retried on the new version's routes,
+                            // over a reader built for them. A layer read is a
+                            // read, so repeating it is safe — and the call that
+                            // triggered the retry never executed.
+                            let outcome = connected
+                                .session
+                                .call(|transport| {
+                                    let reader = connected.reader(transport);
+                                    let layers = layers.clone();
+                                    async move { reader.fetch(&layers).await }
+                                })
+                                .await;
                             // A caller that gave up is not an error; the next
                             // command is served regardless.
-                            let _ = reply.send(reader.fetch(&layers).await.map_err(Into::into));
+                            let _ = reply.send(outcome.map_err(Into::into));
                         }
                     }
                 }

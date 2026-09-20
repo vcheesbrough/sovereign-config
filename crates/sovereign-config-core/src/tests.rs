@@ -1,15 +1,16 @@
 use super::{
     ConfigPath, ErrorKind, MASKED_SECRET_TEXT, MaskedSecret, PlainValue, ProtocolVersion,
-    RevealedSecret, Secret, SecretInput, ServiceStatus, SubTreeMutationContent,
+    RevealedSecret, Secret, SecretInput, ServedVersion, ServiceStatus, SubTreeMutationContent,
     SubTreeMutationValue, SubTreeValue, ValueContent, parse_subtree_json, render_subtree_json,
     render_subtree_plain,
 };
 
-/// The versions a server advertises, as `GetVersionResponse` carries them.
-fn advertised(versions: &[&str]) -> Vec<String> {
+/// The versions a service advertises, as the handshake carries them: none of
+/// them carrying a deprecation date.
+fn advertised(versions: &[&str]) -> Vec<ServedVersion> {
     versions
         .iter()
-        .map(|version| (*version).to_owned())
+        .map(|version| ServedVersion::new(version))
         .collect()
 }
 
@@ -333,17 +334,19 @@ fn secret_types_and_json_masks_are_safe_by_construction() {
 
 #[test]
 fn protocol_negotiation_selects_a_version_inside_the_advertised_range() {
-    let status = ServiceStatus::negotiate("1.5.0".into(), "v3", &advertised(&["v3"]))
-        .expect("a server serving v3 must negotiate");
+    let status =
+        ServiceStatus::select(&advertised(&["v3"])).expect("a server serving v3 must negotiate");
     assert_eq!(status.protocol_version, ProtocolVersion::V3);
-    assert_eq!(status.application_version, "1.5.0");
+    assert_eq!(status.deprecation_date, None);
 }
 
 #[test]
 fn protocol_negotiation_accepts_a_server_newer_than_this_client() {
     // The outage this mechanism exists to prevent: the server has gained a
     // version this build has never heard of and still serves the one it speaks.
-    let status = ServiceStatus::negotiate("9.0.0".into(), "v3", &advertised(&["v3", "v4"]))
+    // The server prefers `v4`, but it is not a candidate — there is no dialer
+    // for a version this build does not declare.
+    let status = ServiceStatus::select(&advertised(&["v4", "v3"]))
         .expect("a newer server still serving v3 must negotiate");
     assert_eq!(status.protocol_version, ProtocolVersion::V3);
 }
@@ -351,44 +354,175 @@ fn protocol_negotiation_accepts_a_server_newer_than_this_client() {
 #[test]
 fn protocol_negotiation_rejects_a_server_outside_the_range() {
     // Both boundaries: a server too new (v3 retired) and one too old.
-    for offered in [advertised(&["v4", "v5"]), advertised(&["v1", "v2"])] {
-        let error = ServiceStatus::negotiate("9.0.0".into(), "v4", &offered)
+    for offered in [advertised(&["v5", "v4"]), advertised(&["v2", "v1"]), vec![]] {
+        let error = ServiceStatus::select(&offered)
             .expect_err("a server with no version in common must be rejected");
         assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
     }
 }
 
+/// The incompatible-version error names **both** lists.
+///
+/// "The protocol is incompatible" tells an operator nothing they can act on.
+/// Which versions each end offered tells them whether the client or the server
+/// is the one to move.
 #[test]
-fn protocol_negotiation_falls_back_to_the_echo_when_no_set_is_advertised() {
-    // A server older than 2.25.0 sends no `supported_protocol_versions`.
-    let status = ServiceStatus::negotiate("2.24.0".into(), "v3", &[])
-        .expect("a pre-2.25.0 server must still negotiate on its echo alone");
-    assert_eq!(status.protocol_version, ProtocolVersion::V3);
+fn an_incompatible_service_names_what_each_end_speaks() {
+    let error = ServiceStatus::select(&advertised(&["v9", "v8"]))
+        .expect_err("no version in common must be rejected");
 
-    let error = ServiceStatus::negotiate("2.24.0".into(), "v1", &[])
-        .expect_err("an echo this build does not speak must be rejected");
-    assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
+    let message = error.message();
+    assert!(
+        message.contains("v3"),
+        "the client's list is missing: {message}"
+    );
+    assert!(
+        message.contains("v9") && message.contains("v8"),
+        "the service's list is missing: {message}"
+    );
+}
+
+/// The service's list arrives over the network from a public endpoint, and its
+/// only use is to be shown to an operator. A hostile or broken service must not
+/// be able to put an unbounded string, a control character or a quote into a
+/// log line, a terminal or a browser through it.
+#[test]
+fn a_services_version_list_is_bounded_and_stripped_before_it_is_shown() {
+    let hostile = vec![
+        ServedVersion::new("v\r\ninjected: 1"),
+        ServedVersion::new(&"v".repeat(4096)),
+    ];
+
+    let message = ServiceStatus::select(&hostile)
+        .expect_err("none of these is a version this build speaks")
+        .message()
+        .to_owned();
+
+    assert!(
+        !message.contains('\n') && !message.contains('\r'),
+        "{message}"
+    );
+    assert!(
+        message.len() < 300,
+        "an unbounded list must not reach an operator: {message}"
+    );
+
+    // Numbered well clear of anything this build speaks, so the list really has
+    // nothing in common with it.
+    let flood: Vec<ServedVersion> = (1000..1100)
+        .map(|index| ServedVersion::new(&format!("v{index}")))
+        .collect();
+    let message = ServiceStatus::select(&flood)
+        .expect_err("none is spoken")
+        .message()
+        .to_owned();
+    assert!(
+        message.contains('…'),
+        "a truncated list must say so: {message}"
+    );
+    assert!(message.len() < 300, "{message}");
+}
+
+/// §1.4: selection follows the **service's** preference order, not this
+/// build's. The service is what knows which of its versions it wants traffic
+/// on; a client that imposed its own order would quietly defeat a migration the
+/// service is trying to run.
+#[test]
+fn selection_follows_the_services_preference_order() {
+    let status =
+        ServiceStatus::select(&advertised(&["v3", "v4"])).expect("v3 is spoken and listed first");
+    assert_eq!(status.protocol_version, ProtocolVersion::V3);
+}
+
+/// §1.4: a deprecated version is passed over while a non-deprecated one is
+/// still to come, even though the service prefers the deprecated one. A client
+/// that took the service's first choice blindly would keep selecting a version
+/// that is on its way out, and the retirement it is being warned about would
+/// arrive with no traffic having moved.
+#[test]
+fn a_deprecated_version_is_passed_over_for_one_that_is_not() {
+    let served = vec![
+        ServedVersion {
+            version: "v3".to_owned(),
+            deprecation_date: Some("2027-01-01T00:00:00Z".to_owned()),
+        },
+        // A second entry this build does not speak: there is nothing better to
+        // move to, so the deprecated version must still be selected.
+        ServedVersion::new("v4"),
+    ];
+
+    let status = ServiceStatus::select(&served).expect("a deprecated version still works");
+
+    assert_eq!(status.protocol_version, ProtocolVersion::V3);
+    assert_eq!(
+        status.deprecation_date.as_deref(),
+        Some("2027-01-01T00:00:00Z"),
+        "the date must reach the caller, which is what warns the operator"
+    );
+}
+
+/// A deprecation date is untrusted wire input from a public endpoint, and the
+/// one piece of handshake text that is *shown* rather than compared — it
+/// reaches a structured log, a terminal, an MCP tool result and the page. It
+/// must be stripped and bounded at this seam, so no consumer has to remember.
+#[test]
+fn a_deprecation_date_is_sanitised_and_bounded_before_any_client_sees_it() {
+    let hostile = vec![ServedVersion {
+        version: "v3".to_owned(),
+        deprecation_date: Some(format!(
+            "2027-01-01T00:00:00Z\r\nx-injected: 1{}",
+            "A".repeat(4096)
+        )),
+    }];
+
+    let date = ServiceStatus::select(&hostile)
+        .expect("a hostile date must not fail the client")
+        .deprecation_date
+        .expect("the date must still be reported");
+
+    assert!(!date.contains('\r') && !date.contains('\n'), "{date}");
+    assert!(
+        date.len() <= 40,
+        "an unbounded date must not reach an operator: {date}"
+    );
+    // The legitimate shape survives intact, so sanitising does not make a real
+    // timestamp unreadable.
+    assert!(date.starts_with("2027-01-01T00:00:00Z"), "{date}");
+}
+
+/// A deprecation date **warns and never fails**. The version still works: the
+/// date is a statement of intent, and a client that refused to use a version
+/// because of one would break on the announcement rather than on the
+/// retirement.
+#[test]
+fn a_deprecated_version_is_still_selected_when_it_is_the_only_one() {
+    let served = vec![ServedVersion {
+        version: "v3".to_owned(),
+        deprecation_date: Some("2027-01-01T00:00:00Z".to_owned()),
+    }];
+
+    let status = ServiceStatus::select(&served).expect("a deprecation date never fails a client");
+
+    assert_eq!(status.protocol_version, ProtocolVersion::V3);
+    assert!(status.deprecation_date.is_some());
 }
 
 #[test]
-fn protocol_version_ordering_is_declaration_order_not_lexicographic() {
-    // The hazard this ordering exists to avoid: a tenth version sorts *below* a
-    // third one as a string, so comparing version strings would negotiate the
-    // older session.
+fn the_declared_version_order_is_preference_order_most_preferred_first() {
+    // The hazard the removal of `Ord` closes off: a tenth version sorts *below*
+    // a third one as a string, so any comparison of versions — derived or by
+    // hand — would rank them wrongly. Nothing compares them any more; selection
+    // follows the service's order and this enum only answers "is it spoken?".
     assert!("v10" < "v3");
 
-    // `ALL` is oldest-first and strictly ascending, which is what makes
-    // selecting the highest mutual version a reverse scan.
-    assert!(
-        ProtocolVersion::ALL
-            .windows(2)
-            .all(|pair| pair[0] < pair[1]),
-        "ProtocolVersion::ALL must be declared oldest-first"
-    );
     assert_eq!(
-        ProtocolVersion::ALL.last().copied(),
+        ProtocolVersion::ALL.first().copied(),
         Some(ProtocolVersion::PREFERRED),
-        "PREFERRED must be the newest version in ALL"
+        "PREFERRED must be the first, most preferred, version in ALL"
+    );
+    assert!(
+        ProtocolVersion::ALL.contains(&ProtocolVersion::LEGACY),
+        "the legacy fallback must name a version this build can dial"
     );
 }
 

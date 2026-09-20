@@ -5,19 +5,44 @@
 //! device flow, and a refresh credential on disk is not what a CI extension
 //! should be carrying.
 
-use std::time::Duration;
+use std::{rc::Rc, time::Duration};
 
-use sovereign_config_client::negotiate;
+use sovereign_config_client::Session;
 use sovereign_config_core::{ConfigPath, ConnectionUrl, ErrorKind, Secret};
 use sovereign_config_layers::{CachedTokenProvider, LayerReader, Naming, OnMissing};
 use sovereign_config_native::{TonicChannel, TonicTransport};
 
-pub(crate) type BrokerReader = LayerReader<TonicTransport, CachedTokenProvider>;
+pub(crate) type BrokerReader = LayerReader<TonicTransport, Rc<CachedTokenProvider>>;
 
+/// The broker's one long-lived connection.
+///
+/// It keeps the negotiated [`Session`] rather than a bare transport, so a
+/// version retired under it is recovered: the session re-handshakes once and
+/// the read is retried on the new version. The token provider is shared rather
+/// than owned by a reader, because a reader is rebuilt whenever that happens
+/// and duplicating the provider would duplicate its token cache.
 pub(crate) struct Connected {
-    pub(crate) reader: BrokerReader,
+    pub(crate) session: Session<TonicChannel>,
+    pub(crate) tokens: Rc<CachedTokenProvider>,
     /// The configuration root this connection is confined to. Not secret.
     pub(crate) root: ConfigPath,
+}
+
+impl Connected {
+    /// A reader for one fetch, over `transport`.
+    ///
+    /// `Skip`: an absent or unreadable layer is ordinary here — a repository
+    /// simply may have no per-repo layer — and matches the Go broker's
+    /// treatment of `OpenBao` 404 and 403. `Folded`: Woodpecker matches a
+    /// `from_secret:` reference by exact lowercase string.
+    pub(crate) fn reader(&self, transport: TonicTransport) -> BrokerReader {
+        LayerReader::new(
+            transport,
+            Rc::clone(&self.tokens),
+            OnMissing::Skip,
+            Naming::Folded,
+        )
+    }
 }
 
 /// Parses the connection URL, opens the channel, and negotiates protocol
@@ -37,27 +62,24 @@ pub(crate) async fn connect(url: &Secret, token_ttl: Duration) -> Result<Connect
     let channel = TonicChannel::connect(connection.endpoint().to_owned())
         .await
         .map_err(|_| ConnectError::Unavailable)?;
-    let status = negotiate(&channel)
+    // Every layer read the broker serves travels on the version negotiated
+    // here, and is counted under it — until the service retires that version,
+    // at which point the session negotiates again and the reads follow.
+    let session = Session::open(channel)
         .await
         .map_err(|error| match error.kind {
             ErrorKind::IncompatibleProtocol => ConnectError::IncompatibleProtocol,
             _ => ConnectError::Unavailable,
         })?;
-    // Every layer read the broker serves for the life of this connection
-    // travels on the version negotiated here, and is counted under it.
-    let transport = channel.speaking(status.protocol_version);
-    let tokens = CachedTokenProvider::new(
+    let tokens = Rc::new(CachedTokenProvider::new(
         connection.issuer().to_owned(),
         connection.client_id().to_owned(),
         authentication,
         token_ttl,
-    );
+    ));
     Ok(Connected {
-        // `Skip`: an absent or unreadable layer is ordinary here — a repository
-        // simply may have no per-repo layer — and matches the Go broker's
-        // treatment of `OpenBao` 404 and 403. `Folded`: Woodpecker matches a
-        // `from_secret:` reference by exact lowercase string.
-        reader: LayerReader::new(transport, tokens, OnMissing::Skip, Naming::Folded),
+        session,
+        tokens,
         root: connection.root().clone(),
     })
 }

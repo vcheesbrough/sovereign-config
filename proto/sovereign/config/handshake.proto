@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+// The unversioned handshake.
+//
+// This is the one service that is **not** routed by protocol version. Its route
+// is `/sovereign.config.Handshake/Negotiate` — one dotted segment fewer than a
+// versioned route, which is what keeps it out of every version's namespace and
+// out of the catch-all that answers unserved version-shaped routes.
+//
+// **This file's shape is fixed, forever.** A versioned message can be replaced
+// by a new `sovereign.config.vN` package; this one cannot, because it is the
+// operation a client calls *before* it knows which versions exist. It therefore
+// never gains, loses, retypes or repurposes a member. Anything a client needs
+// beyond the list of served versions belongs in a versioned operation — the
+// application version is read from `System.GetVersion` on the negotiated route,
+// not from here.
+//
+// The contract:
+//
+//   - the request carries the versions the client speaks. It exists for the
+//     server's usage records only. The server must never filter or reorder its
+//     answer by it, must never reject on it, and must treat it as untrusted
+//     input on a public endpoint;
+//   - the response carries every version the server serves, **most preferred
+//     first**, whatever the client asked for. It never rejects.
+//
+// The endpoint is **unauthenticated**. `System.GetVersion` already exposes the
+// same list publicly, a client has no token before it has negotiated, and
+// leaving it unauthenticated keeps each version free to change its own
+// authentication scheme. See `## Protocol versioning` in `README.md`.
+
+package sovereign.config;
+
+service Handshake {
+  // Reports every protocol version this server serves.
+  //
+  // Never rejects: an empty, unknown or oversized client list gets the same
+  // answer as a well-formed one.
+  rpc Negotiate(NegotiateRequest) returns (NegotiateResponse);
+}
+
+message NegotiateRequest {
+  // Every protocol version the client speaks, most preferred first.
+  //
+  // Recorded, never acted on. Entries the server does not recognise are
+  // counted under a fixed label rather than one taken from the request.
+  repeated string client_protocol_versions = 1;
+}
+
+message NegotiateResponse {
+  // Every protocol version this server serves, most preferred first.
+  //
+  // Always the server's whole set, independent of the request.
+  repeated ServedProtocolVersion served_protocol_versions = 1;
+}
+
+message ServedProtocolVersion {
+  // The version's identifier, as it appears in that version's route prefix:
+  // `v3` is served at `/sovereign.config.v3.<Service>/<Method>`.
+  string protocol_version = 1;
+
+  // When set, an RFC 3339 timestamp in UTC before which the server does not
+  // expect to retire this version.
+  //
+  // A statement of intent, not a guarantee: a version may be served well past
+  // it, and a security flaw may retire one before it. A client that selects a
+  // version carrying this warns its operator and **never fails** because of it.
+  optional string deprecation_date = 2;
+}

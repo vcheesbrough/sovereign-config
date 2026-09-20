@@ -357,7 +357,7 @@ fn grpc_web_decoder_rejects_responses_without_a_status_trailer() {
 
 #[test]
 fn grpc_web_decoder_accepts_trailers_only_status_headers() {
-    let error = decode_grpc_web_response::<GetIdentityResponse>(&[], Some(7)).unwrap_err();
+    let error = decode_grpc_web_response::<GetIdentityResponse>(&[], Some(7), None).unwrap_err();
     assert_eq!(error.kind, ErrorKind::PermissionDenied);
     assert_eq!(error.message(), "permission denied");
 }
@@ -367,6 +367,6 @@ fn grpc_web_decoder_accepts_trailers_only_status_headers() {
 /// incompatibility, not as the opaque failure every unmapped status becomes.
 #[test]
 fn grpc_web_decoder_reports_an_unimplemented_route_as_an_incompatible_protocol() {
-    let error = decode_grpc_web_response::<GetIdentityResponse>(&[], Some(12)).unwrap_err();
+    let error = decode_grpc_web_response::<GetIdentityResponse>(&[], Some(12), None).unwrap_err();
     assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
 }

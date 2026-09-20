@@ -609,10 +609,13 @@ pub(crate) fn validate_path_field() -> bool {
     let Some(input) = element::<HtmlInputElement>("selected-path") else {
         return false;
     };
+    // Owned: a bounded error's message is no longer always a `'static` string,
+    // because the ones that name both ends' version lists are assembled at run
+    // time.
     let message = parse_absolute_path(&input.value())
         .err()
-        .map(|error| error.message());
-    set_validation("selected-path", "path-error", message);
+        .map(|error| error.message().to_owned());
+    set_validation("selected-path", "path-error", message.as_deref());
     message.is_none()
 }
 

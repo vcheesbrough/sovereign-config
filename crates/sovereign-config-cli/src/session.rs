@@ -157,11 +157,23 @@ pub async fn status(connection: &ConnectionUrl) -> Result<()> {
     // The transport is built from the version just reported, so the protocol
     // printed here is the one the identity check below travels on.
     let transport = channel.speaking(service.protocol_version);
+    // The application version is no longer a by-product of negotiating — the
+    // handshake carries versions and nothing else — so it is an ordinary
+    // versioned call on the route just settled on.
+    let application_version = transport.dialer_version().await?.application_version;
     println!(
         "Service {} (protocol {})",
-        service.application_version,
+        application_version,
         transport.protocol_version()
     );
+    // A deprecation date warns and never fails. stderr, so it cannot be
+    // mistaken for part of the status a script is parsing.
+    if let Some(date) = &service.deprecation_date {
+        eprintln!(
+            "warning: the service has announced that protocol {} may be retired after {date}",
+            transport.protocol_version()
+        );
+    }
 
     let Some(access_token) = maybe_access_token(connection).await? else {
         println!("Authentication: logged out");

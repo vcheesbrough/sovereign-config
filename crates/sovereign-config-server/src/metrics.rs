@@ -42,12 +42,15 @@ pub(crate) const UNRECOGNISED_PROTOCOL_LABEL: &str = "unrecognised";
 pub(crate) struct ProtocolMetrics {
     versions: Vec<VersionCounters>,
     unrecognised: AtomicU64,
+    offered_unrecognised: AtomicU64,
 }
 
 struct VersionCounters {
     label: &'static str,
     attempted: AtomicU64,
     authenticated: AtomicU64,
+    /// How many times a handshake named this version in its client list.
+    offered: AtomicU64,
 }
 
 impl ProtocolMetrics {
@@ -60,9 +63,11 @@ impl ProtocolMetrics {
                     label,
                     attempted: AtomicU64::new(0),
                     authenticated: AtomicU64::new(0),
+                    offered: AtomicU64::new(0),
                 })
                 .collect(),
             unrecognised: AtomicU64::new(0),
+            offered_unrecognised: AtomicU64::new(0),
         }
     }
 
@@ -91,6 +96,24 @@ impl ProtocolMetrics {
         }
     }
 
+    /// Counts one version a handshake's client list named.
+    ///
+    /// This is the record of **what clients in the field can speak**, which the
+    /// per-request series cannot show: a client that speaks `v3` and `v4` sends
+    /// both, but its traffic only ever names the one it selected. Retirement
+    /// reads the request series; this one is how an operator sees a fleet
+    /// becoming ready for a retirement before making it.
+    ///
+    /// The list is untrusted input on a public endpoint, so a version outside
+    /// the compiled-in label domain lands in the unrecognised bucket. Nothing
+    /// from the request can ever become a label.
+    pub(crate) fn record_offered(&self, version: &str) {
+        match self.counters(version) {
+            Some(counters) => counters.offered.fetch_add(1, Ordering::Relaxed),
+            None => self.offered_unrecognised.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
     pub(crate) fn render(&self) -> String {
         let mut output = String::from(
             "# HELP sovereign_config_protocol_requests_total gRPC requests by protocol version and outcome.\n\
@@ -114,6 +137,26 @@ impl ProtocolMetrics {
         writeln!(
             output,
             "sovereign_config_protocol_requests_total{{version=\"{UNRECOGNISED_PROTOCOL_LABEL}\",outcome=\"attempted\"}} {value}",
+        )
+        .expect("writing metrics to a String cannot fail");
+
+        output.push_str(
+            "# HELP sovereign_config_protocol_client_versions_total Protocol versions named in handshake client lists.\n\
+             # TYPE sovereign_config_protocol_client_versions_total counter\n",
+        );
+        for counters in &self.versions {
+            let value = counters.offered.load(Ordering::Relaxed);
+            writeln!(
+                output,
+                "sovereign_config_protocol_client_versions_total{{version=\"{}\"}} {value}",
+                counters.label,
+            )
+            .expect("writing metrics to a String cannot fail");
+        }
+        let value = self.offered_unrecognised.load(Ordering::Relaxed);
+        writeln!(
+            output,
+            "sovereign_config_protocol_client_versions_total{{version=\"{UNRECOGNISED_PROTOCOL_LABEL}\"}} {value}",
         )
         .expect("writing metrics to a String cannot fail");
         output

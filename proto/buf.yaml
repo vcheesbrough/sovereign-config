@@ -5,3 +5,11 @@ lint:
     - STANDARD
   except:
     - SERVICE_SUFFIX
+  ignore_only:
+    # `sovereign.config` is deliberately unversioned: the handshake is the one
+    # operation a client calls before it knows which versions exist, so it can
+    # never live in a `vN` package. A version suffix here would make its route
+    # version-shaped and put it inside the namespace it exists to negotiate.
+    # See the header of the file itself.
+    PACKAGE_VERSION_SUFFIX:
+      - sovereign/config/handshake.proto

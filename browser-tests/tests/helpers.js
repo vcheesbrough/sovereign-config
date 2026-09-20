@@ -436,6 +436,22 @@ async function mockApplication(page) {
     contentType: 'text/javascript',
     body: configScript
   }));
+  // The unversioned handshake, which every page load now calls *before* any
+  // versioned route. Without it the client finds no handshake, falls back to
+  // the legacy `v3` GetVersion route, and — since Playwright would answer that
+  // too — the suite would pass while never exercising the path the real client
+  // takes. Mocking both is what keeps the fallback a fallback.
+  await page.route('**/sovereign.config.Handshake/Negotiate', route => {
+    const protocol = Buffer.from('v3');
+    // NegotiateResponse { served_protocol_versions: [ { protocol_version } ] }
+    const served = Buffer.concat([Buffer.from([0x0a, protocol.length]), protocol]);
+    const message = Buffer.concat([Buffer.from([0x0a, served.length]), served]);
+    return route.fulfill({
+      status: 200,
+      headers: { 'content-type': 'application/grpc-web+proto' },
+      body: grpcFrame(message)
+    });
+  });
   await page.route('**/sovereign.config.v3.System/GetVersion', route => {
     const application = Buffer.from('1.5.0');
     const protocol = Buffer.from('v3');

@@ -59,16 +59,24 @@
 //! This crate is distributed as tagged workspace source and targets the
 //! workspace `rust-version`. It does **not** have to be built from the same tag
 //! as the server it talks to: it speaks a set of protocol versions, and
-//! [`Provider::connect`] negotiates the highest version both ends serve. A
-//! server upgraded ahead of this build keeps working, so a server deploy does
-//! not require redeploying the applications that consume it.
+//! [`Provider::connect`] settles on one in a single handshake, following the
+//! server's own preference order. A server upgraded ahead of this build keeps
+//! working, so a server deploy does not require redeploying the applications
+//! that consume it.
+//!
+//! A version retired *under* a connected provider is not fatal either: the next
+//! [`Provider::load`] re-negotiates once, obtains a transport for whatever the
+//! server now serves, and retries the read — which never executed, so repeating
+//! it is safe. The change of version is logged, and the server's per-version
+//! counters follow it, so a retirement stays observable.
 //!
 //! A build fails only once the server has *retired* every version this crate
 //! speaks — an announced, observable event rather than a side effect of an
-//! upgrade. Either way it surfaces as [`ProviderError::IncompatibleProtocol`]:
-//! from [`Provider::connect`] when no version is shared, and from
-//! [`Provider::load`] for a provider that connected *before* the retirement,
-//! whose next call reaches a route the server no longer has. See
+//! upgrade. It surfaces as [`ProviderError::IncompatibleProtocol`], from
+//! [`Provider::connect`] or from the re-negotiation inside [`Provider::load`],
+//! and the error names both what this build speaks and what the server serves.
+//! The server announces a retirement ahead of time with a deprecation date,
+//! which the provider logs as a warning while continuing to work. See
 //! `## Protocol versioning` in the repository `README.md` for the deprecation
 //! procedure and the metric that gates it.
 //!
@@ -100,9 +108,9 @@ mod token;
 use std::collections::BTreeMap;
 
 use serde::de::DeserializeOwned;
-use sovereign_config_client::{AccessTokenProvider, ValueTransport, negotiate};
+use sovereign_config_client::{AccessTokenProvider, Session, ValueTransport};
 use sovereign_config_core::{ConfigPath, ConnectionUrl, ValueContent};
-use sovereign_config_native::{TonicChannel, TonicTransport};
+use sovereign_config_native::TonicChannel;
 
 #[cfg(feature = "config")]
 pub use config_source::SovereignConfigSource;
@@ -112,7 +120,12 @@ use token::ManagedTokenProvider;
 
 /// A read-only handle to one managed configuration subtree.
 pub struct Provider {
-    transport: TonicTransport,
+    /// The negotiated session, not a bare transport: if the service retires the
+    /// version this connection settled on, the session re-handshakes once and
+    /// the load is retried on the new one. What [`Provider::protocol_version`]
+    /// reports follows that swap, so a long-lived application never reports a
+    /// version its traffic is no longer travelling on.
+    session: Session<TonicChannel>,
     token: ManagedTokenProvider,
     root: ConfigPath,
 }
@@ -142,16 +155,16 @@ impl Provider {
             .clone();
         let channel = TonicChannel::connect(connection.endpoint().to_owned()).await?;
         // The version negotiated here is the version every later `load` travels
-        // on: `speaking` is the only way to a transport that can read values,
-        // so the handshake's answer cannot be dropped on the floor.
-        let transport = channel.speaking(negotiate(&channel).await?.protocol_version);
+        // on: a transport can only be obtained by naming a version, so the
+        // handshake's answer cannot be dropped on the floor.
+        let session = Session::open(channel).await?;
         let token = ManagedTokenProvider::new(
             connection.issuer().to_owned(),
             connection.client_id().to_owned(),
             authentication,
         );
         Ok(Self {
-            transport,
+            session,
             token,
             root: connection.root().clone(),
         })
@@ -223,14 +236,27 @@ impl Provider {
             .access_token()
             .await?
             .ok_or(ProviderError::AuthenticationFailed)?;
-        let subtree = self.transport.get_subtree(&self.root, &token).await?;
-        let mut revealed = BTreeMap::new();
-        for value in &subtree.values {
-            if matches!(value.value, ValueContent::Secret(_)) {
-                let secret = self.transport.reveal_secret(&value.path, &token).await?;
-                revealed.insert(value.path.clone(), secret);
-            }
-        }
+        // The whole read is one operation, so a version retired part-way
+        // through it is retried from the start rather than stitched together
+        // from two versions' answers. It is all reads, so repeating it is safe
+        // — and the call that triggered the retry never executed at all.
+        let (subtree, revealed) = self
+            .session
+            .call(|transport| {
+                let token = token.clone();
+                async move {
+                    let subtree = transport.get_subtree(&self.root, &token).await?;
+                    let mut revealed = BTreeMap::new();
+                    for value in &subtree.values {
+                        if matches!(value.value, ValueContent::Secret(_)) {
+                            let secret = transport.reveal_secret(&value.path, &token).await?;
+                            revealed.insert(value.path.clone(), secret);
+                        }
+                    }
+                    Ok((subtree, revealed))
+                }
+            })
+            .await?;
         build_tree(&self.root, &subtree.values, &revealed)
     }
 
@@ -252,7 +278,7 @@ impl Provider {
     /// attribute this application to.
     #[must_use]
     pub fn protocol_version(&self) -> &'static str {
-        self.transport.protocol_version().as_str()
+        self.session.protocol_version().as_str()
     }
 }
 

@@ -21,7 +21,7 @@ use sovereign_config_native::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::backend::{Backend, LoginPrompt};
+use crate::backend::{Backend, LoginPrompt, ServiceReport};
 
 /// A live administration backend bound to one profile name (or the default).
 pub struct NativeBackend {
@@ -115,15 +115,17 @@ impl NativeBackend {
 
 #[async_trait(?Send)]
 impl Backend for NativeBackend {
-    async fn service_status(&self) -> Result<ServiceStatus, ClientError> {
+    async fn service_status(&self) -> Result<ServiceReport, ClientError> {
         let (status, transport) = Self::negotiated(&self.connection()?).await?;
         // The version the `status` tool prints is read back off the transport
         // that would carry this session's traffic, rather than reported
         // alongside it — so an operator is never told a version the client is
-        // not the one dialling.
-        Ok(ServiceStatus {
+        // not the one dialling. The application version comes from a versioned
+        // call on that same transport: the handshake carries versions only.
+        Ok(ServiceReport {
+            application_version: transport.dialer_version().await?.application_version,
             protocol_version: transport.protocol_version(),
-            ..status
+            deprecation_date: status.deprecation_date,
         })
     }
 
