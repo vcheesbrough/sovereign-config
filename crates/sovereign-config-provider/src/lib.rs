@@ -59,16 +59,24 @@
 //! This crate is distributed as tagged workspace source and targets the
 //! workspace `rust-version`. It does **not** have to be built from the same tag
 //! as the server it talks to: it speaks a set of protocol versions, and
-//! [`Provider::connect`] negotiates the highest version both ends serve. A
-//! server upgraded ahead of this build keeps working, so a server deploy does
-//! not require redeploying the applications that consume it.
+//! [`Provider::connect`] settles on one in a single handshake, following the
+//! server's own preference order. A server upgraded ahead of this build keeps
+//! working, so a server deploy does not require redeploying the applications
+//! that consume it.
+//!
+//! A version retired *under* a connected provider is not fatal either: the next
+//! [`Provider::load`] re-negotiates once, obtains a transport for whatever the
+//! server now serves, and retries the read — which never executed, so repeating
+//! it is safe. The change of version is logged, and the server's per-version
+//! counters follow it, so a retirement stays observable.
 //!
 //! A build fails only once the server has *retired* every version this crate
 //! speaks — an announced, observable event rather than a side effect of an
-//! upgrade. Either way it surfaces as [`ProviderError::IncompatibleProtocol`]:
-//! from [`Provider::connect`] when no version is shared, and from
-//! [`Provider::load`] for a provider that connected *before* the retirement,
-//! whose next call reaches a route the server no longer has. See
+//! upgrade. It surfaces as [`ProviderError::IncompatibleProtocol`], from
+//! [`Provider::connect`] or from the re-negotiation inside [`Provider::load`],
+//! and the error names both what this build speaks and what the server serves.
+//! The server announces a retirement ahead of time with a deprecation date,
+//! which the provider logs as a warning while continuing to work. See
 //! `## Protocol versioning` in the repository `README.md` for the deprecation
 //! procedure and the metric that gates it.
 //!

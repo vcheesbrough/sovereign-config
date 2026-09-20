@@ -419,6 +419,25 @@ It is, however, **source-breaking for code that builds against these crates**, w
 
 `sovereign-config-provider`'s own API is unchanged, and it gains `Provider::protocol_version()` — worth logging at startup, since it is the version the service's per-version counters attribute the application to.
 
+### 2.28.0 adopts the unversioned handshake
+
+Release 2.28.0 moves negotiation onto a **new unversioned service**, `sovereign.config.Handshake`, and gives a request for a version the server does not serve a **distinct error** instead of tonic's generic `UNIMPLEMENTED`. Both are protocol changes, approved before implementation as `AGENTS.md` §3 requires. Neither touches `proto/sovereign/config/v3/`: no `v3` signature, and no `v3` behaviour, changed.
+
+**For deployed clients, nothing changes at connect.** A 2.25–2.27 client negotiates by calling `GetVersion` on `v3`'s own route, which is still served, still unauthenticated, and still echoes the version it was asked for. Upgrading the server alone remains safe, as always.
+
+**The catch-all is the 2.15.0 / 2.18.0 class of change**, and is called out for it: it alters what an already-deployed client receives on a route it may one day hit, and negotiation cannot protect a client that is already in the field. The blast radius is nil in practice, because every client from 2.25 on maps `FAILED_PRECONDITION` and `UNIMPLEMENTED` to the same incompatible-protocol error, so one of them meets the new answer exactly as it meets a deleted route today. That is asserted, not assumed, by `a_client_that_predates_the_catch_all_still_reports_incompatible_protocol`.
+
+It is **source-breaking for code that builds against the client crates**, the same class as 2.26.0. Nothing breaks until a consumer rebuilds against tag 2.28.0 or later:
+
+- `Handshake` is now two methods: `served_versions(&[ProtocolVersion])`, which calls the unversioned handshake, and `legacy_version()`, which calls `GetVersion` on `ProtocolVersion::LEGACY`'s route for a server that has no handshake. `Handshake::get_version(version)` is gone.
+- `negotiate` returns a `ServiceStatus` carrying `protocol_version` and an optional `deprecation_date`. It no longer carries `application_version`: the handshake carries versions and nothing else, so the service's release version is read from `System.GetVersion` on the negotiated route — `TonicTransport::dialer_version()` natively, `SessionTransport::get_version()` through a dialer.
+- `ProtocolVersion` is declared **most preferred first** and no longer derives `Ord`. Nothing compares versions: selection follows the server's order.
+- `ClientError::message()` returns `&str` rather than `&'static str`, because the incompatible-version error now names the version lists both ends offered, which cannot be known at compile time. It is bounded and stripped before it is built.
+- `ErrorKind` gains `VersionNotServed`, distinct from `IncompatibleProtocol`. Exhaustive matches on `ErrorKind` must handle it.
+- `sovereign-config-mcp`'s `Backend::service_status` returns a `ServiceReport` rather than a `ServiceStatus`, and `ToolFailure::message` is a `String`.
+
+`sovereign-config-provider`'s own API is unchanged. Its documented **fail-fast-on-retirement contract is reversed**, however: a provider whose negotiated version is retired under it now re-handshakes once and retries the load, rather than failing. The retry is safe because the rejected call never executed, and the retirement stays observable through the logged version change and the per-version counters. See [How negotiation works](#how-negotiation-works).
+
 Configuration values are stored in PostgreSQL as content rows holding a `plain` or `secret` classification, the value itself — sealed as an `enc:v1:` AEAD envelope when the classification is `secret`, verbatim when it is `plain` — and service-generated UTC creation/update timestamps, plus one or more path rows that each expose that content at a canonical absolute path beginning with `/`. Existing values migrate to exactly one path each. Each path row stores the exact case it was written with in `path`, and Postgres computes and stores its lowercase fold key in the generated `lowercase_path` column, which carries the primary key; `lowercase_path` can never drift from `path` because it cannot be written to directly. The fold key is what every comparison, lookup, and collision check uses — a path's stored case is a display concern only, never resolved or rewritten a segment at a time, so two path rows sharing a fold-equal ancestor may each keep their own case for it (see 2.18.0 above). Writing through any path updates the shared content, so every path to that value observes the change; classification cannot be changed while more than one path resolves to the value. Deleting a path removes only that path, and the value is deleted permanently once its last path is removed, in the same transaction and with no background reconciliation. There is no history or duplicate secret copy. Updates are last-write-wins and preserve the original creation timestamp. Deletion is a hard delete with no tombstone, rollback record, or retained value history. Application-level encryption covers secret-classified values only, so PostgreSQL volume and backup encryption remain operator responsibilities for everything else the database holds.
 
 Exposing one value at several paths is a deliberate administrative act that requires `write` on both the existing and the new path and `read` on the existing one. It widens who can reach that value: a secret aliased into a namespace where more principals hold `read` becomes revealable by them. Listings and path queries only ever return the paths a caller may read, so a value may have paths that a given principal can neither see nor operate on.
@@ -431,102 +450,133 @@ Applications embedding `sovereign-config-provider` are deployed independently of
 
 ### How negotiation works
 
-1. The client sends `GetVersion` with the newest protocol version *it* speaks, **on that version's own route** — `GetVersion` is routed by version like every other RPC.
-2. The server answers with `supported_protocol_versions` — every version it serves, oldest first — and never rejects the request, whatever was asked for.
-3. `GetVersionResponse.protocol_version` **echoes the version the session will speak**: the version the client asked for, whenever the server serves it.
-4. The client selects the highest version present in both sets, and fails with a bounded incompatible-protocol error only when there is no overlap.
+1. The client calls the **handshake** — `/sovereign.config.Handshake/Negotiate` — sending every protocol version it speaks. The handshake is the one operation that is **not versioned and not routed by version**, and the only one a client may call before a version is agreed.
+2. The client's list exists for the server's **usage records only**. The server never filters or reorders its answer by it, never rejects on it, and treats it as untrusted input: it is counted under compiled-in labels, bounded in how much is examined, and can never mint a metric label of its own.
+3. The server answers with **every version it serves, most preferred first**, whatever the client asked for, and **never rejects**. Each version may carry a `deprecation_date` — an RFC 3339 UTC timestamp before which the server does not expect to retire it. That is a statement of intent, not a guarantee: a version may be served well past it, and a security flaw may retire one before it.
+4. The client selects the first version in the **server's** order that it also speaks, passing over a version carrying a deprecation date while one without is still to come. A selected deprecation date **warns and never fails** — the CLI to stderr, the MCP `status` tool in its output, the provider and broker through `tracing`, the browser in the header slot it already uses to report trouble with the service. With no version in common the client aborts with a bounded incompatible-protocol error that **names both lists**, so an operator can tell which end has to move.
 5. **Every RPC that follows travels on the negotiated version's routes.** A client is opened as a connection that can do nothing but negotiate; naming the negotiated version is the only way to obtain one that can carry configuration traffic. What an operator is shown is read back off that transport, so a reported version and a dialled route cannot disagree.
+6. If a later call fails with the **version-not-served** error, the client repeats the handshake **once**, selects again, obtains a *new* transport, and retries that call. The rejected call never executed, so the retry is safe. It logs the change of version. If nothing is in common, or the retry fails the same way, it aborts.
 
-A server older than 2.25.0 sends no `supported_protocol_versions`. Clients treat an empty set as "this server serves exactly the version it echoed", so negotiation still succeeds against one.
+**The handshake's shape is fixed, forever.** It can never be versioned, because it is the operation that tells a client which versions exist. It never gains, loses, retypes or repurposes a member. Anything a client needs beyond the list of served versions belongs in a versioned operation — which is why the service's release version is read from `System.GetVersion` on the negotiated route rather than from the handshake.
 
-Step 1 has a consequence worth naming: a server that does not serve the newest version a client speaks has no route to answer that client's `GetVersion` on, and replies `UNIMPLEMENTED` rather than a version list. The client therefore works **down** the versions it speaks, newest first, until one answers or the list runs out. That is what lets a **newer client reach an older server** — the mirror of the older-client case — and it is also how a pre-2.25.0 server, which rejects an unserved version outright, is reached.
+The handshake is **unauthenticated**, and this is the recorded reason: a client has no token before it has negotiated, `System.GetVersion` already publishes the same list to anyone, and leaving the handshake outside authentication keeps each protocol version free to change its own authentication scheme. The cost is that the served list and the client lists sent to it are public, which is what the untrusted-input handling in step 2 exists for.
 
-Negotiation happens **once**, at connect. A version retired under an already-connected client is deliberately not renegotiated: its next call fails with a bounded incompatible-protocol error. That is the provider's documented fail-fast contract, and it keeps a retirement an observable event rather than something a retry papers over. It is also why the observation window below is a full deployment cycle of every consuming application.
+#### Reaching a server that has no handshake
+
+Every server up to 2.27 authenticates **before** it routes, and exempts only the health probes and `<served>.System/GetVersion`. A handshake call carries no token, so such a server refuses it `UNAUTHENTICATED` — the request never reaches the router that would have said `UNIMPLEMENTED`. **Detecting a pre-handshake server is therefore not "`UNIMPLEMENTED`"**, and the obvious test fixture lies about this: a bare router with no authentication in front of it answers `UNIMPLEMENTED`, while a real deployed server answers `UNAUTHENTICATED`.
+
+On either answer the client falls back to `GetVersion` on `ProtocolVersion::LEGACY`'s own route, which those servers do exempt. If it answers, the server serves exactly that version. A handshake failure of any other kind — `UNAVAILABLE`, say — is reported as itself, and a fallback that also fails reports the fallback's failure. A server that *has* the handshake never answers it `UNAUTHENTICATED`, so the fallback cannot mask a genuine authentication problem.
 
 ### The rule that makes this work
 
 **Adding a protocol version must never change what an existing version's clients see.**
 
-The echo in step 3 is why. Clients compiled before `supported_protocol_versions` existed ignore that field entirely and compare the echoed `protocol_version` against the single version they were built with. If the server ever echoed *its own newest* version instead of the requested one, every one of those clients would fail on the day a newer version shipped — and they are already deployed, so they cannot be fixed retroactively. That is the fleet-wide outage this mechanism exists to prevent.
+`GetVersionResponse.protocol_version` is why. Clients compiled before `supported_protocol_versions` existed ignore that field entirely and compare the echoed `protocol_version` against the single version they were built with. If the server ever echoed *its own preferred* version instead of the requested one, every one of those clients would fail on the day a newer version shipped — and they are already deployed, so they cannot be fixed retroactively. That is the fleet-wide outage this mechanism exists to prevent. **Never change the echo semantics.**
 
-The echo falls back to the server's newest version only when the requested version is not served at all. A client asking for a version it speaks can never observe that fallback; a client whose version has been *retired* does, and hard-fails, which is intended.
+The echo falls back to the server's preferred version only when the requested version is not served at all. A client asking for a version it speaks can never observe that fallback.
 
-The regression tests that protect this are `a_server_newer_than_this_build_still_connects` and `a_client_compiled_without_the_supported_set_still_decodes_and_negotiates`. Do not weaken them.
+`v3` also advertises its `supported_protocol_versions` **oldest first**, while the handshake reports **most preferred first**. The two orders are opposite on purpose: `v3` has advertised oldest-first since the field was added and a `v3` client is entitled to that order, so changing it would be a `v3` behaviour change and therefore a new version.
+
+The regression tests that protect this are `a_server_newer_than_this_build_still_connects`, `a_client_compiled_without_the_supported_set_still_decodes_and_negotiates`, and the echo tests in `system.rs`. Do not weaken them.
+
+### The version-not-served error
+
+A request on a **version-shaped route naming a version this server does not serve** — retired, or never existed — is answered by a catch-all with `FAILED_PRECONDITION` plus two fixed metadata keys: one naming the kind (`version-not-served`), one echoing the version asked for. A client identifies it by the **marker, never by the status code**, which is shared with failures that are not about versions.
+
+A mistyped service or method on a *served* version stays `UNIMPLEMENTED`. Keeping those two apart is the point: a retired version is something a session can recover from by re-handshaking, and a typo is not.
+
+Two placement decisions are load-bearing, and `auth::grpc_service_layer` is what pins them:
+
+- the catch-all sits **inside** the gRPC-Web layer, so a browser receives an answer it can decode. Outside it, a retirement would reach the browser as an undecodable transport failure with no version in it;
+- it sits **outside** authentication, because an unserved version has no authentication scheme left to apply, and a client whose credentials also expired while it was away should still be told what actually broke.
+
+Both are asserted in `crates/sovereign-config-server/src/protocol/serving_tests.rs`.
 
 ### What forces a new version, and what does not
-
-A new version is **not** needed for:
-
-- adding a field with an unused number;
-- adding a message;
-- adding an RPC to an existing service.
-
-Existing clients skip unknown fields and never call new RPCs.
 
 A new version **is** required for:
 
 - renaming, renumbering, retyping, removing or repurposing an existing field;
-- changing what an existing RPC does — the behaviour of a call is part of the contract, not just its signature.
+- changing what an existing RPC does — the behaviour of a call is part of the contract, not just its signature;
+- **adding any field or RPC, even an optional one**;
+- **changing the set of values an existing field may carry** — a wider or narrower grammar, letter case, range, or a new enumeration member.
 
-There has been exactly one deliberate exception to that last rule: release 2.25.0 widened `GetVersion` itself in place, because the negotiation mechanism could not otherwise be introduced without the flag day it exists to remove. It is recorded, with who it can affect, under [2.25.0 widens `GetVersion`](#2250-widens-getversion). Treat it as the bootstrap of this mechanism, not as precedent.
+The last two were relaxed until 2.28.0, which is what releases 2.15.0 (path grammar) and 2.18.0 (path letter case) are this repository's own evidence against: both were additive to the `v3` contract, both shipped without a version bump, and both broke older clients, because a client validates what it was built to expect and one unexpected value fails the whole response carrying it.
 
-Note the converse, because it has bitten this project twice: a change can break clients *without* being a protocol change. Releases 2.15.0 (path grammar) and 2.18.0 (path letter case) were both additive to the `v3` contract and still broke older clients, because those clients validated responses more strictly than the contract required. Version negotiation does not protect against that class; see [Upgrade](#upgrade) for how those were sequenced.
+A new version is **not** required for bug fixes or performance improvements that change no API shape and no substantive behaviour.
+
+**Exceptions are approved before implementation and recorded**, with the reason and who they can affect — a rule with an unrecorded exception reads as a rule that is negotiable. There has been exactly one: release 2.25.0 widened `GetVersion` itself in place, because the negotiation mechanism could not otherwise be introduced without the flag day it exists to remove. It is recorded under [2.25.0 widens `GetVersion`](#2250-widens-getversion). Treat it as the bootstrap of this mechanism, not as precedent.
+
+Note the converse: a change can break clients *without* being a protocol change. 2.26.0 and 2.28.0 both changed the client crates' API without touching any wire contract. Version negotiation does not protect against that class; see [Upgrade](#upgrade) for how those were sequenced.
+
+### Recorded deviations
+
+Where this repository knowingly differs from the general contract, with the reason:
+
+- **A `v3` shim validates nothing.** Input it cannot translate, such as an unset oneof, goes down as `None` for the shared implementation to reject. The general rule is that a version's shim performs that version's own basic validation, but moving it into `v3`'s shim would reorder `v3`'s errors — `PutValue` authorizes before it validates content — and changing the order in which an existing RPC fails is a behaviour change, and so a new version. **A new version's shim does its own basic validation**; `v3`'s does not, and will not.
+- **Shims do not yet share adapter code.** The rule is that adapter code for an operation whose wire shape is identical across versions lives once and is referenced by each shim, never copied and never chained. Generated types differ per package, so sharing needs a macro or a generic; whoever adds `v4` chooses, with a second real version to test against. Until then there is one shim per service and nothing to share.
 
 ### Introducing a new version
 
 Each version is its own protobuf package, because the gRPC route path embeds the package name — `/sovereign.config.v3.System/GetVersion`. Distinct packages mean distinct routes, so two versions serve concurrently on one router with no dispatch ambiguity. This is proven end to end by `test-consumers/sovereign-config-proto-testversion`, a dev-only package registered alongside `v3` in the server's own tests; read those tests if you want to see the mechanism working before you rely on it.
 
+The handshake is **not** part of this. It lives outside every version in `proto/sovereign/config/handshake.proto` and `crates/sovereign-config-server/src/handshake.rs`, has no shim, and is never copied or edited when a version is added.
+
 To add `vN`:
 
-1. Copy `proto/sovereign/config/v3/service.proto` to `proto/sovereign/config/vN/service.proto` and change its `package` line to `sovereign.config.vN`. Make the breaking change there, and only there.
+1. Add `proto/sovereign/config/vN/service.proto` with `package sovereign.config.vN`, starting from the previous version's file. Make the breaking change there, and only there.
 2. Compile it in `crates/sovereign-config-proto/build.rs` and expose it as a `vN` module in that crate's `lib.rs`, alongside `v3`.
-3. Write the `vN` ↔ core mapping shims: copy `crates/sovereign-config-server/src/values/v3.rs` and `managed/v3.rs` to `vN.rs` beside them, point each at the `vN` generated types, and add its `mod` line and re-export in `values.rs` / `managed.rs`. **This layer must be only the proto↔core translation.** Domain types in `sovereign-config-core` stay version-free, so a second version is a translation shim over one implementation rather than a forked server. If you find yourself duplicating logic rather than mapping types, the change belongs in the shared implementation (`service.rs`) or in core, not in the shim.
+3. Write the `vN` ↔ core mapping shims beside `crates/sovereign-config-server/src/values/v3.rs` and `managed/v3.rs`, point each at the `vN` generated types, and add its `mod` line and re-export in `values.rs` / `managed.rs`. **This layer must be only the proto↔core translation, plus that version's own basic validation.** Domain types in `sovereign-config-core` stay version-free, so a second version is a translation shim over one implementation rather than a forked server. If you find yourself duplicating logic rather than mapping types, the change belongs in the shared implementation (`service.rs`) or in core, not in the shim.
 
-   Two rules keep a shim honest. It **validates nothing**: input it cannot translate, such as an unset oneof, goes down as `None` for the shared implementation to reject, so every version fails a bad request with the same error in the same order. And the shared implementation **never branches on the version**: the `CallContext` it receives may come to record which version a call arrived on, but an implementation that behaves differently per version is a forked server with extra steps. `System` is the exception that stays per-version (`system.rs`), because `GetVersion`'s echo is version-specific by nature.
+   **Share adapter code, do not copy it and never chain it.** Because every added field or RPC is now a new version, most of a new version is unchanged from the one before — so an operation whose wire shape is identical in both should have one adapter referenced by both shims. A shim must never call another version's shim, or retiring a version would mean untangling the ones built on it. See [Recorded deviations](#recorded-deviations) for where this stands today.
+
+   And the shared implementation **never branches on the version**: the `CallContext` it receives may record which version a call arrived on, but an implementation that behaves differently per version is a forked server with extra steps. `System` stays per-version (`system.rs`), because `GetVersion`'s echo is version-specific by nature.
 4. Register the `vN` services on the router in `crates/sovereign-config-server/src/main.rs`, **leaving every existing `add_service` line in place.** Construct each `vN` shim over the same `Arc` of the shared implementation the `v3` line uses — one implementation, however many versions.
 5. Teach the **clients** to dial `vN`:
-   - Add `VN` to `ProtocolVersion` in `crates/sovereign-config-core/src/status.rs`, declared *after* the existing variants — ordering is declaration order, because `"v10"` sorts below `"v3"` as a string. This says only that clients in this workspace can *speak* `vN`; it advertises nothing.
+   - Add `VN` to `ProtocolVersion` in `crates/sovereign-config-core/src/status.rs`, declared **before** the existing variants — the list is preference order, most preferred first. This says only that clients in this workspace can *speak* `vN`; it advertises nothing.
    - **The workspace now fails to compile**, in `crates/sovereign-config-native/src/transport/mod.rs` and `crates/sovereign-config-web/src/transport/mod.rs`. Each selects its routes with an exhaustive `match` on `ProtocolVersion`, so a version with no dialer is a non-exhaustive-patterns error naming the transport that cannot speak it.
-   - Fix it by writing the dialers: copy `transport/v3.rs` to `transport/vN.rs` in each crate, point it at the `vN` stubs (native) or the `/sovereign.config.vN.…` paths (browser), and add the `ProtocolVersion::VN` arm. **These modules must be only the proto↔core translation**, for the same reason step 3 gives on the server side.
+   - Fix it by writing the dialers: add `transport/vN.rs` in each crate pointing at the `vN` stubs (native) or the `/sovereign.config.vN.…` paths (browser), and add the `ProtocolVersion::VN` arm. **These modules must be only the proto↔core translation**, and share adapter code for the same reason step 3 gives on the server side.
 
    The order is deliberate: declaring the version first is what produces the compile error, and the compile error is what stops the version being declared without dispatch. Do not work around it by returning an older version's dialer — a version negotiated and reported while its traffic travels on an older version's routes makes `sovereign_config_protocol_requests_total` read backwards, showing the version actually carrying the traffic as idle and the unused one as busy. Since that counter is the retirement gate below, the result is a gate that says it is safe to delete the version everything is using.
 
    `crates/sovereign-config-native/tests/protocol_dispatch.rs` then checks, for every version in `ProtocolVersion::ALL`, that each RPC reaches a route naming that version — asserted on what the server received. It covers `vN` the moment `vN` is declared; there is no list in it to extend. The browser's equivalent is `every_route_the_browser_dials_names_the_version_it_speaks`.
-6. Add `vN` to `SERVED_PROTOCOL_VERSIONS` and `SERVED_PROTOCOL_LABELS` in `crates/sovereign-config-server/src/system.rs`. Do this **last**: it advertises the version to clients, so the services implementing it must already be registered.
+6. Add `vN` to `SERVED_PROTOCOL_VERSIONS` and `SERVED_PROTOCOL_LABELS` in `crates/sovereign-config-server/src/system.rs`, `vN` **first** — that list is the server's preference order, and the handshake reports it verbatim. Do this **last**: it advertises the version to clients, so the services implementing it must already be registered.
 
 Two things you do *not* have to edit, because they derive from `SERVED_PROTOCOL_VERSIONS` and would be easy to miss:
 
-- **The unauthenticated-RPC allowlist.** `GetVersion` is called before any token exists, so it must stay unauthenticated on every served version. `is_operational_rpc` in `crates/sovereign-config-server/src/auth.rs` matches `/sovereign.config.<served>.System/GetVersion` against the served set rather than listing paths, so step 6 exempts `vN` automatically. Were it a hardcoded list, forgetting it would refuse every `vN` client at connect with an authentication error — before it could discover that the older version is still served.
+- **The unauthenticated-RPC allowlist.** `GetVersion` is called before any token exists by every client that predates the handshake, so it must stay unauthenticated on every served version. `is_operational_rpc` in `crates/sovereign-config-server/src/auth.rs` matches `/sovereign.config.<served>.System/GetVersion` against the served set rather than listing paths, so step 6 exempts `vN` automatically. The handshake route is exempt by name, and is not version-derived because it names no version.
 - **The per-version metric label**, which comes from `SERVED_PROTOCOL_LABELS` in the same step.
 
 Deploy the server before any client change. Clients now negotiate `vN` automatically; clients that have not been rebuilt continue on `v3`.
 
 ### Retiring a version
 
-**Confirm no real consumer still speaks the version before removing it.** The gate is the **authenticated** series:
+**Announce it first.** Set a `deprecation_date` on the version in `SERVED_PROTOCOL_VERSIONS` and ship that, so clients selecting it warn their operators and clients that can move to a non-deprecated version do so on their own. The date is a statement of intent, not a commitment: it binds nothing, and a security flaw may retire a version before it.
+
+**Then confirm no real consumer still speaks the version.** The gate is the **authenticated** series:
 
 ```
 sovereign_config_protocol_requests_total{version="v3",outcome="authenticated"}
 ```
 
-A version may be retired only once that series has been flat at zero across an observation window long enough to cover the slowest-moving consumer — at minimum a full deployment cycle of every application that embeds the provider.
+A version may be retired only once that series has been flat at zero across an observation window long enough to cover the slowest-moving consumer — at minimum a full deployment cycle of every application that embeds the provider. `sovereign_config_protocol_client_versions_total` is the companion view: it counts the versions clients *say* they speak in their handshake lists, so it shows a fleet becoming ready for a retirement before the request series goes quiet.
 
 Gate on `authenticated`, **not** on `attempted`. The gRPC endpoint is public, so `outcome="attempted"` counts everything whose route names the version before authentication runs — including an internet scanner, or a decommissioned application whose credentials were revoked months ago but whose process still retries. None of those breaks when the version is retired, yet any of them can hold `attempted` above zero indefinitely; gating on it would mean never retiring anything, or learning to ignore the counter. Nothing unauthenticated can move `authenticated`. A non-zero `attempted` with `authenticated` at zero is worth a look in the logs, but it is not a reason to keep the version.
 
-This is a precondition, not a courtesy. The provider does not cache: it holds no last-known-good configuration, by deliberate design, because retaining one would keep revealed secrets in process memory for the application's lifetime. An application still speaking a version you delete therefore fails on its **next configuration load**, with no fallback and no degraded mode.
+This is a precondition, not a courtesy. The provider does not cache: it holds no last-known-good configuration, by deliberate design, because retaining one would keep revealed secrets in process memory for the application's lifetime. An application still speaking a version you delete therefore fails on its next configuration load — it re-handshakes once, and if nothing is left in common, that is the end of it.
 
 Once the authenticated series reads zero:
 
 1. Delete `proto/sovereign/config/v3/` and its entry in `crates/sovereign-config-proto/build.rs` and `lib.rs`.
 2. Delete the `v3` mapping shims — `crates/sovereign-config-server/src/values/v3.rs` and `crates/sovereign-config-server/src/managed/v3.rs` — with their `mod` lines and re-exports. The shared implementations beside them (`service.rs`) are untouched: they never knew `v3` existed.
 3. Delete the `v3` client dialers — `crates/sovereign-config-native/src/transport/v3.rs` and `crates/sovereign-config-web/src/transport/v3.rs` — with their `mod` lines and their arm of each `dialer` match.
-4. Delete the `v3` `add_service` lines in `crates/sovereign-config-server/src/main.rs`.
-5. Remove `V3` from `ProtocolVersion`, `SERVED_PROTOCOL_VERSIONS` and `SERVED_PROTOCOL_LABELS`.
+4. Delete the `v3` `add_service` lines in `crates/sovereign-config-server/src/main.rs`. **Its routes now fall to the catch-all**, which answers them version-not-served; there is nothing else to remove for dispatch.
+5. Remove `V3` from `ProtocolVersion`, `SERVED_PROTOCOL_VERSIONS` and `SERVED_PROTOCOL_LABELS`, and repoint `ProtocolVersion::LEGACY` if it named `V3`.
 6. Update `SYSTEM_SERVICE_NAME` in `main.rs`, which the container health probe asks for by name.
 
-Steps 3 and 5 hold each other honest: removing the variant while a dialer still names it is a compile error in that dialer, and removing the dialer while the variant remains is a non-exhaustive `match`. A retired version leaves no orphan in either direction.
+Steps 3 and 5 hold each other honest: removing the variant while a dialer still names it is a compile error in that dialer, and removing the dialer while the variant remains is a non-exhaustive `match`. `LEGACY` is checked the same way. A retired version leaves no orphan in either direction.
 
-Announce the retirement to every consuming repository before it ships. A client outside the supported range fails with `IncompatibleProtocol` at connect, which is a clear error but not a recoverable one.
+Announce the retirement to every consuming repository before it ships. A client outside the supported range fails with a bounded incompatible-protocol error naming both lists at connect, which is a clear error but not a recoverable one.
 
 ## Observability
 
