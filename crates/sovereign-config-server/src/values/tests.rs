@@ -2139,3 +2139,44 @@ fn a_key_that_opens_nothing_is_reported_as_the_wrong_key() {
     // serving a secret the server cannot read.
     assert!(wrong_key(1, 1));
 }
+
+/// A service over a pool that never connects, for requests rejected before
+/// any query runs. Needs no database, so these run in a plain `cargo test`.
+fn v3_service_without_storage() -> V3Configuration {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgresql://unused@127.0.0.1:1/unused")
+        .expect("a lazy pool must build without connecting");
+    v3_service(pool, test_cipher())
+}
+
+// The two RPCs below disagree on whether they parse their input or ask who is
+// calling first, so a request that is both malformed and unauthenticated tells
+// them apart. The authentication layer never lets such a request reach a
+// handler, so no deployed client can see this; it is pinned because
+// `CallContext::principal` reports a missing principal lazily precisely to keep
+// each order as it was, and an eager check would otherwise pass every test.
+
+#[tokio::test]
+async fn a_malformed_unauthenticated_subtree_read_is_rejected_for_its_path() {
+    let status = v3_service_without_storage()
+        .get_sub_tree(Request::new(GetSubTreeRequest {
+            path: "not-rooted".into(),
+        }))
+        .await
+        .expect_err("a malformed path must be rejected");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.message(), "configuration path is invalid");
+}
+
+#[tokio::test]
+async fn a_malformed_unauthenticated_alias_is_rejected_for_its_missing_principal() {
+    let status = v3_service_without_storage()
+        .add_value_path(Request::new(AddValuePathRequest {
+            source_path: "not-rooted".into(),
+            new_path: "/tests/alias".into(),
+        }))
+        .await
+        .expect_err("a missing principal must be rejected");
+    assert_eq!(status.code(), Code::Unauthenticated);
+    assert_eq!(status.message(), "authentication required");
+}

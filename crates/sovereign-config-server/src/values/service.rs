@@ -43,6 +43,18 @@ pub(super) enum PutContent<'a> {
     Secret(&'a str),
 }
 
+/// The two paths of an `add_value_path` call, before either is validated.
+///
+/// Named rather than positional because they share a type and mean opposite
+/// things: two bare strings transposed in a shim would compile and alias
+/// backwards. Building this makes a shim say which is which.
+pub(super) struct AliasPaths<'a> {
+    /// The existing path whose value is being exposed elsewhere.
+    pub(super) source: &'a str,
+    /// The additional path that value becomes reachable at.
+    pub(super) new_path: &'a str,
+}
+
 /// A subtree's plain writes resolved against what is stored: content ids that
 /// already exist mapped to their single new value, and paths with no stored
 /// value yet.
@@ -378,13 +390,12 @@ impl ConfigurationService {
     pub(super) async fn add_value_path(
         &self,
         context: &CallContext<'_>,
-        source_path: &str,
-        new_path: &str,
+        paths: AliasPaths<'_>,
     ) -> Result<AddPathMetadata, Status> {
         let principal = context.principal()?;
-        let source = ConfigPath::parse_operation(source_path)
+        let source = ConfigPath::parse_operation(paths.source)
             .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
-        let new_path = ConfigPath::parse_operation(new_path)
+        let new_path = ConfigPath::parse_operation(paths.new_path)
             .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
         // Resolving the value and exposing it elsewhere is a write on both
         // paths; reading the source is required to name the value at all.

@@ -31,16 +31,37 @@ const PROTO_CRATE: &str = "sovereign_config_proto::";
 /// `GetVersion` echoes the version it was asked for.
 const VERSION_AWARE: [&str; 2] = ["main.rs", "system.rs"];
 
-/// The shared implementations the shims translate for. Named so the guard
-/// fails, rather than passing vacuously, if they move out from under it.
-const SHARED_IMPLEMENTATIONS: [&str; 2] = ["values/service.rs", "managed/service.rs"];
+/// The server modules split at the protocol seam. Each holds one shared
+/// implementation, `<module>/service.rs`, and a `<module>/vN.rs` shim per
+/// protocol version served.
+const SEAM_MODULES: [&str; 2] = ["values", "managed"];
 
-/// Whether `path` is a protocol version's shim: a file named `v<digits>.rs`.
-fn is_version_shim(path: &Path) -> bool {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .and_then(|stem| stem.strip_prefix('v'))
-        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+/// The `vN` in `<module>/vN.rs` when `relative` is a protocol version's shim.
+///
+/// The name alone is not enough: a shim is exempt from the scan below, so the
+/// exemption is confined to the modules that are actually split at the seam.
+/// Anywhere else a file called `v2.rs` is an ordinary source.
+fn version_shim(relative: &str) -> Option<&str> {
+    let (module, file) = relative.split_once('/')?;
+    let stem = file.strip_suffix(".rs")?;
+    let digits = stem.strip_prefix('v')?;
+    (SEAM_MODULES.contains(&module)
+        && !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit()))
+    .then_some(stem)
+}
+
+/// Whether `source` uses `module` as a path segment: `module::…` or `…::module`.
+fn uses_module(source: &str, module: &str) -> bool {
+    let is_identifier = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    source.match_indices(module).any(|(start, _)| {
+        let end = start + module.len();
+        let before = &source.as_bytes()[..start];
+        let after = &source.as_bytes()[end..];
+        let whole_word = !before.last().is_some_and(|byte| is_identifier(*byte))
+            && !after.first().is_some_and(|byte| is_identifier(*byte));
+        whole_word && (before.ends_with(b"::") || after.starts_with(b"::"))
+    })
 }
 
 fn workspace_root() -> PathBuf {
@@ -118,54 +139,88 @@ fn no_product_source_silences_the_line_count_lint() {
 #[test]
 fn only_version_shims_name_a_protocol_version() {
     let server = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut sources = Vec::new();
-    product_sources(&server, &mut sources);
-    let relative = |path: &Path| {
-        path.strip_prefix(&server)
-            .expect("source should be under src/")
-            .to_string_lossy()
-            .replace('\\', "/")
-    };
-    let names_a_version = |path: &Path| {
-        fs::read_to_string(path)
-            .expect("source should be readable")
-            .contains(PROTO_CRATE)
-    };
+    let mut paths = Vec::new();
+    product_sources(&server, &mut paths);
+    let sources: Vec<(String, String)> = paths
+        .iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(&server)
+                .expect("source should be under src/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let contents = fs::read_to_string(path).expect("source should be readable");
+            (relative, contents)
+        })
+        .collect();
 
-    for shared in SHARED_IMPLEMENTATIONS {
+    for module in SEAM_MODULES {
+        let shared = format!("{module}/service.rs");
         assert!(
-            sources.iter().any(|path| relative(path) == shared),
+            sources.iter().any(|(relative, _)| *relative == shared),
             "{shared} is gone; point this guard at the shared implementation's new home"
         );
-    }
-    // A shim that names no version would mean the needle no longer matches
-    // how the proto crate is imported, and the scan below proves nothing.
-    let shims: Vec<&PathBuf> = sources
-        .iter()
-        .filter(|path| is_version_shim(path))
-        .collect();
-    assert!(
-        shims.len() >= SHARED_IMPLEMENTATIONS.len(),
-        "expected a shim per shared implementation, found {shims:?}"
-    );
-    for shim in &shims {
+        let shims: Vec<&(String, String)> = sources
+            .iter()
+            .filter(|(relative, _)| {
+                version_shim(relative).is_some() && relative.starts_with(&format!("{module}/"))
+            })
+            .collect();
         assert!(
-            names_a_version(shim),
-            "{} imports no protocol version; is `{PROTO_CRATE}` still how it is spelled?",
-            shim.display()
+            !shims.is_empty(),
+            "{shared} has no vN.rs shim beside it, so nothing serves it and this guard is \
+             checking a seam that no longer exists"
         );
+        for (shim, contents) in shims {
+            // A shim that names no version would mean the needle no longer
+            // matches how the proto crate is imported, and the scan below
+            // proves nothing.
+            assert!(
+                contents.contains(PROTO_CRATE),
+                "{shim} imports no protocol version; is `{PROTO_CRATE}` still how it is spelled?"
+            );
+        }
     }
 
-    let offenders: Vec<String> = sources
+    let offenders: Vec<&str> = sources
         .iter()
-        .filter(|path| !is_version_shim(path))
-        .filter(|path| !VERSION_AWARE.contains(&relative(path).as_str()))
-        .filter(|path| names_a_version(path))
-        .map(|path| relative(path))
+        .filter(|(relative, _)| version_shim(relative).is_none())
+        .filter(|(relative, _)| !VERSION_AWARE.contains(&relative.as_str()))
+        .filter(|(_, contents)| contents.contains(PROTO_CRATE))
+        .map(|(relative, _)| relative.as_str())
         .collect();
     assert!(
         offenders.is_empty(),
         "these are shared by every protocol version and must not name one; \
          translate in a vN.rs shim instead: {offenders:?}"
+    );
+
+    // The scan above only sees the proto crate named directly. A shared file
+    // could still reach a version's types through its shim, were the shim to
+    // re-export them; nothing on the shared side of the seam has any business
+    // depending on a shim, so that direction is refused outright.
+    let shim_modules: Vec<(&str, &str)> = sources
+        .iter()
+        .filter_map(|(relative, _)| {
+            let module = relative.split_once('/')?.0;
+            version_shim(relative).map(|stem| (module, stem))
+        })
+        .collect();
+    let dependants: Vec<String> = sources
+        .iter()
+        .filter(|(relative, _)| version_shim(relative).is_none())
+        .flat_map(|(relative, contents)| {
+            shim_modules
+                .iter()
+                .filter(|(module, stem)| {
+                    relative.starts_with(&format!("{module}/")) && uses_module(contents, stem)
+                })
+                .map(|(_, stem)| format!("{relative} uses {stem}"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        dependants.is_empty(),
+        "a shared implementation must not depend on a protocol version's shim: {dependants:?}"
     );
 }

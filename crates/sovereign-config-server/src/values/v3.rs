@@ -22,7 +22,7 @@ use sovereign_config_proto::sovereign::config::v3::{
 use tonic::{Request, Response, Status};
 
 use super::ConfigurationService;
-use super::service::PutContent;
+use super::service::{AliasPaths, PutContent};
 use super::subtree::{SubTreeEntry, SubTreeEntryContent};
 use crate::rpc::{CallContext, to_proto_timestamp};
 
@@ -207,7 +207,13 @@ impl Configuration for V3Configuration {
         let message = request.get_ref();
         let metadata = self
             .shared
-            .add_value_path(&context, &message.source_path, &message.new_path)
+            .add_value_path(
+                &context,
+                AliasPaths {
+                    source: &message.source_path,
+                    new_path: &message.new_path,
+                },
+            )
             .await?;
         Ok(Response::new(AddValuePathResponse {
             created_at: Some(to_proto_timestamp(metadata.created_at)),

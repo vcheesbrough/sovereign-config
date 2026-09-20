@@ -1,5 +1,6 @@
 use std::{borrow::Cow, env, time::Duration};
 
+use sovereign_config_core::ConfigPath;
 use sqlx::{PgPool, migrate::Migrator, postgres::PgPoolOptions};
 use tokio::time::{Instant, sleep};
 
@@ -82,6 +83,97 @@ async fn rooted_path_constraint_accepts_only_rooted_values(pool: &PgPool) {
     assert!(underscored_path.is_ok());
     assert!(dotted_path.is_err());
     assert_eq!(retained_values, 2);
+}
+
+/// Paths that probe every edge of the grammar: each character class at a
+/// segment boundary, every way of being unrooted or empty, the separators and
+/// encodings a caller might try, and the two places a regex and a byte scan
+/// most often part ways — a trailing newline and a non-ASCII letter.
+const PATH_GRAMMAR_CORPUS: [&str; 34] = [
+    "/a",
+    "/a/b",
+    "/A/b",
+    "/Mixed/Case_and-dash",
+    "/0",
+    "/a_b",
+    "/a-b",
+    "/-",
+    "/_",
+    "/a/B/c9",
+    "",
+    "/",
+    "a",
+    "a/b",
+    "/a/",
+    "//a",
+    "/a//b",
+    "/a b",
+    " /a",
+    "/a ",
+    "/a\tb",
+    "/a.b",
+    "/a:b",
+    "/a@b",
+    "/a+b",
+    "/a~b",
+    "/a\\b",
+    "/a%2fb",
+    "/a\n",
+    "\n/a",
+    "/a/b\n",
+    "/\u{e9}",
+    "/\u{ff41}",
+    "/a/\u{c5}",
+];
+
+/// The `configuration_paths.path` constraint and `ConfigPath::parse_operation`
+/// must admit exactly the same strings.
+///
+/// The server relies on it: reads hand each stored path to `parse_operation`
+/// to carry it as a `ConfigPath`, and fail the whole response if that parse
+/// fails. That is only safe while no row the database accepts can fail it. The
+/// two live in different files and different languages, and migration 0008 is
+/// precedent for the constraint being widened — so whoever next widens either
+/// one alone finds out here, not from a listing that answers `UNAVAILABLE`.
+async fn path_constraint_and_parser_admit_the_same_grammar(pool: &PgPool) {
+    let content_id = seed_content(pool, "plain").await;
+    for path in PATH_GRAMMAR_CORPUS {
+        let mut transaction = pool.begin().await.expect("transaction must begin");
+        let inserted = sqlx::query(
+            "INSERT INTO configuration_paths (path, content_id, created_at, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(path)
+        .bind(content_id)
+        .execute(&mut *transaction)
+        .await;
+        transaction
+            .rollback()
+            .await
+            .expect("probe must leave no row behind");
+
+        // Only the grammar constraint may refuse a probe: any other failure
+        // would otherwise pass for a rejection and prove nothing.
+        let database_accepts = match inserted {
+            Ok(_) => true,
+            Err(error) => {
+                let refused_by = error
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::constraint)
+                    .map(str::to_owned);
+                assert_eq!(
+                    refused_by.as_deref(),
+                    Some("configuration_paths_path_check"),
+                    "{path:?} was refused by something other than the grammar: {error}"
+                );
+                false
+            }
+        };
+        assert_eq!(
+            database_accepts,
+            ConfigPath::parse_operation(path).is_ok(),
+            "the path constraint and ConfigPath::parse_operation disagree on {path:?}"
+        );
+    }
 }
 
 async fn classification_is_explicit_and_constrained(pool: &PgPool) {
@@ -410,6 +502,7 @@ async fn migrations_are_repeatable_against_postgresql() {
     assert_eq!(path_columns, 4);
     assert_eq!(credential_columns, 0);
     rooted_path_constraint_accepts_only_rooted_values(&pool).await;
+    path_constraint_and_parser_admit_the_same_grammar(&pool).await;
     classification_is_explicit_and_constrained(&pool).await;
     managed_connection_constraints_are_enforced(&pool).await;
 }

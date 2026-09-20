@@ -34,9 +34,12 @@ impl<'a> CallContext<'a> {
     /// The principal the authentication layer attached to the request.
     ///
     /// A missing principal is reported here, when it is first needed, rather
-    /// than when the context is built. Each RPC has always validated some of
-    /// its input before asking who is calling, and which error a doubly-wrong
-    /// request receives is part of the behaviour a protocol version promises.
+    /// than when the context is built. RPCs differ in whether they validate
+    /// their input or ask who is calling first, and reporting it lazily keeps
+    /// each one's order as it was. This is a fail-closed backstop rather than a
+    /// client-visible contract: the authentication layer never lets a request
+    /// without a principal reach a handler. The order is kept because keeping
+    /// it is free, and `values/tests.rs` pins it against an eager rewrite.
     #[expect(
         clippy::result_large_err,
         reason = "tonic::Status is the crate's RPC error type and is returned by value"
