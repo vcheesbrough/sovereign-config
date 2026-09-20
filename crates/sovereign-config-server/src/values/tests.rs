@@ -6,7 +6,7 @@ use sovereign_config_proto::sovereign::config::v3::{
     configuration_server::Configuration, listed_value, put_value_request, sub_tree_mutation_value,
     sub_tree_value,
 };
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::time::{sleep, timeout};
 use tonic::{Code, Request};
 
@@ -17,8 +17,13 @@ use sovereign_config_proto::sovereign::config::v3::{
 };
 
 use super::startup::wrong_key;
-use super::{ConfigurationService, encrypt_stored_secrets};
+use super::{ConfigurationService, V3Configuration, encrypt_stored_secrets};
 use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
+
+/// The `v3` surface these tests drive, over its own shared implementation.
+fn v3_service(pool: PgPool, cipher: Arc<ValueCipher>) -> V3Configuration {
+    V3Configuration::new(Arc::new(ConfigurationService::new(pool, cipher)))
+}
 
 fn request_with_grants<T>(message: T, grants: &[(&str, &[Permission])]) -> Request<T> {
     let mut request = Request::new(message);
@@ -191,7 +196,7 @@ async fn postgres_service_enforces_atomic_v3_value_lifecycle() {
     let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     clear_test_paths(&pool, &["/tests/exact", "/tests/exactly"]).await;
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
 
     let invalid_list = service
         .list_values(request(
@@ -561,7 +566,7 @@ async fn postgres_retains_established_display_case_across_writes_and_folds_uniqu
     let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     clear_test_paths(&pool, &["/tests/case"]).await;
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
     let read_write = [Permission::Read, Permission::Write];
 
     // The first write of a fold key establishes its display form.
@@ -683,7 +688,7 @@ async fn postgres_masks_rotates_reveals_and_preserves_secrets() {
     let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     clear_test_paths(&pool, &["/tests/secrets"]).await;
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
 
     for sentinel in ["secret-sentinel-one", "secret-sentinel-two"] {
         service
@@ -1014,7 +1019,7 @@ async fn postgres_serializes_overlapping_subtree_replacements() {
     .await
     .unwrap();
 
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
     let first_service = service.clone();
     let first = tokio::spawn(async move {
         first_service
@@ -1110,7 +1115,7 @@ async fn postgres_service_exposes_one_value_at_multiple_paths() {
     let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     clear_test_paths(&pool, &["/tests/alias"]).await;
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
     let read_write = [Permission::Read, Permission::Write];
 
     service
@@ -1241,7 +1246,7 @@ async fn postgres_refuses_to_reclassify_a_value_with_multiple_paths() {
     let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     clear_test_paths(&pool, &["/tests/aliasclass"]).await;
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
     let read_write = [Permission::Read, Permission::Write];
 
     service
@@ -1352,7 +1357,7 @@ async fn postgres_replaces_cross_aliased_subtrees_without_deadlock() {
         .await
         .unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
     let read_write = [Permission::Read, Permission::Write];
     let replace = [Permission::Write, Permission::Manage];
 
@@ -1444,7 +1449,7 @@ async fn postgres_prunes_content_when_last_aliases_are_deleted_concurrently() {
         .await
         .unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
     let read_write = [Permission::Read, Permission::Write];
 
     // The two aliases sit under unrelated hierarchies, so the path locks
@@ -1537,7 +1542,7 @@ async fn postgres_subtree_replacement_writes_a_shared_value_once() {
     let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     clear_test_paths(&pool, &["/tests/aliasreplace"]).await;
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
     let read_write = [Permission::Read, Permission::Write];
     let replace = [Permission::Write, Permission::Manage];
 
@@ -1644,7 +1649,7 @@ async fn postgres_service_scopes_alias_permissions() {
     let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     clear_test_paths(&pool, &["/tests/aliasauth"]).await;
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
     let read_write = [Permission::Read, Permission::Write];
 
     service
@@ -1736,7 +1741,7 @@ async fn postgres_stores_secrets_as_ciphertext_and_reveals_them() {
     let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     clear_test_paths(&pool, &["/tests/encryption"]).await;
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
     let permissions = [Permission::Read, Permission::Write];
 
     service
@@ -1802,7 +1807,7 @@ async fn postgres_leaves_plain_values_readable() {
     let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     clear_test_paths(&pool, &["/tests/encryptionplain"]).await;
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
     let permissions = [Permission::Read, Permission::Write];
 
     service
@@ -1834,7 +1839,7 @@ async fn postgres_treats_underscore_as_a_literal_not_a_wildcard() {
     let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     clear_test_paths(&pool, &["/tests/underscore"]).await;
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
     let permissions = [Permission::Read, Permission::Write, Permission::Manage];
 
     // `a_b` and `axb` are distinct subtrees that `LIKE '/…/a_b/%'` conflates.
@@ -1909,7 +1914,7 @@ async fn postgres_rejects_ciphertext_moved_between_values() {
     let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     clear_test_paths(&pool, &["/tests/encryptionswap"]).await;
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
     let permissions = [Permission::Read, Permission::Write];
 
     for (path, value) in [("first", "alpha-secret"), ("second", "beta-secret")] {
@@ -1961,7 +1966,7 @@ async fn postgres_reclassification_switches_the_stored_representation() {
     let pool = PgPoolOptions::new().connect(&database_url).await.unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     clear_test_paths(&pool, &["/tests/encryptionclass"]).await;
-    let service = ConfigurationService::new(pool.clone(), test_cipher());
+    let service = v3_service(pool.clone(), test_cipher());
     let permissions = [Permission::Read, Permission::Write];
     let path = "/tests/encryptionclass/value";
 
@@ -2051,7 +2056,7 @@ async fn postgres_encrypts_legacy_plaintext_secrets_once() {
     assert!(sealed.starts_with("enc:v1:"));
     assert!(!sealed.contains("legacy-secret"));
 
-    let service = ConfigurationService::new(pool.clone(), Arc::clone(&cipher));
+    let service = v3_service(pool.clone(), Arc::clone(&cipher));
     let permissions = [Permission::Read, Permission::Write];
     let revealed = service
         .reveal_secret(request_for_prefix(

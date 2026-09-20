@@ -29,7 +29,7 @@ use super::identity::{
     managed_username, username_slug,
 };
 use super::store::ConnectionRow;
-use super::{ManagedConnectionsService, ManagedSettings};
+use super::{ManagedConnectionsService, ManagedSettings, V3ManagedConnections};
 use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
 use crate::authentik::AuthentikAdminClient;
 use crate::metrics::ManagedConnectionMetrics;
@@ -424,14 +424,14 @@ fn request<T>(message: T, principal: &AuthenticatedPrincipal) -> Request<T> {
     request
 }
 
-async fn service(mock: &MockAuthentik) -> Option<ManagedConnectionsService> {
+async fn service(mock: &MockAuthentik) -> Option<V3ManagedConnections> {
     service_with_metrics(mock, Arc::new(ManagedConnectionMetrics::default())).await
 }
 
 async fn service_with_metrics(
     mock: &MockAuthentik,
     metrics: Arc<ManagedConnectionMetrics>,
-) -> Option<ManagedConnectionsService> {
+) -> Option<V3ManagedConnections> {
     let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL").ok()?;
     let database = PgPoolOptions::new()
         .acquire_timeout(Duration::from_secs(5))
@@ -452,22 +452,24 @@ async fn service_with_metrics(
         Duration::from_millis(400),
     )
     .expect("mock admin client must build");
-    Some(ManagedConnectionsService::new(
-        database,
-        admin,
-        ManagedSettings {
-            public_origin: PUBLIC_ORIGIN.to_owned(),
-            issuer: ISSUER.to_owned(),
-            client_id: "sovereign-config".to_owned(),
-            grants_attribute: GRANTS_ATTRIBUTE.to_owned(),
-            managed_group: MANAGED_GROUP.to_owned(),
-            rotation_lease: ROTATION_LEASE,
-        },
-        metrics,
-    ))
+    Some(V3ManagedConnections::new(Arc::new(
+        ManagedConnectionsService::new(
+            database,
+            admin,
+            ManagedSettings {
+                public_origin: PUBLIC_ORIGIN.to_owned(),
+                issuer: ISSUER.to_owned(),
+                client_id: "sovereign-config".to_owned(),
+                grants_attribute: GRANTS_ATTRIBUTE.to_owned(),
+                managed_group: MANAGED_GROUP.to_owned(),
+                rotation_lease: ROTATION_LEASE,
+            },
+            metrics,
+        ),
+    )))
 }
 
-async fn rows(service: &ManagedConnectionsService) -> Vec<ConnectionRow> {
+async fn rows(service: &V3ManagedConnections) -> Vec<ConnectionRow> {
     sqlx::query_as::<_, ConnectionRow>(
         r"
         SELECT connection_id, display_name, root, provider_user_id,
@@ -476,13 +478,13 @@ async fn rows(service: &ManagedConnectionsService) -> Vec<ConnectionRow> {
         ORDER BY created_at, connection_id
         ",
     )
-    .fetch_all(&service.database)
+    .fetch_all(&service.shared.database)
     .await
     .expect("managed connection rows must be readable")
 }
 
 async fn create(
-    service: &ManagedConnectionsService,
+    service: &V3ManagedConnections,
     name: &str,
     root: &str,
     principal: &AuthenticatedPrincipal,
@@ -491,7 +493,7 @@ async fn create(
 }
 
 async fn create_with(
-    service: &ManagedConnectionsService,
+    service: &V3ManagedConnections,
     name: &str,
     root: &str,
     permissions: &[ManagedPermission],

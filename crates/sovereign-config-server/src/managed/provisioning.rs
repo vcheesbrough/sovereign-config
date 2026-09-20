@@ -7,13 +7,12 @@ use std::time::Duration;
 use sovereign_config_core::{
     ConfigPath, ConnectionId, ConnectionUrl, ManagedConnectionState, ManagedPermissions,
 };
-use sovereign_config_proto::sovereign::config::v3::CreateManagedConnectionResponse;
 use tokio::time::sleep;
 use tonic::Status;
 
 use super::ManagedConnectionsService;
 use super::store::ConnectionRow;
-use super::wire::{dependency_error, internal_error, proto_metadata};
+use super::wire::{ProvisionedConnection, dependency_error, internal_error, metadata};
 use crate::authentik::{AdminError, CreatedServiceAccount};
 use crate::metrics::{ManagedDependencyCall, ManagedDependencyOutcome};
 
@@ -38,7 +37,7 @@ impl ManagedConnectionsService {
         username: &str,
         root: &ConfigPath,
         permissions: &ManagedPermissions,
-    ) -> Result<CreateManagedConnectionResponse, Status> {
+    ) -> Result<ProvisionedConnection, Status> {
         let account = match self.admin.create_service_account(username).await {
             Ok(account) => {
                 self.metrics.record_dependency(
@@ -70,9 +69,9 @@ impl ManagedConnectionsService {
             }
         };
 
-        Ok(CreateManagedConnectionResponse {
-            metadata: Some(proto_metadata(&row)?),
-            connection_url: connection_url.canonical().expose().to_owned(),
+        Ok(ProvisionedConnection {
+            metadata: metadata(&row)?,
+            connection_url,
         })
     }
 

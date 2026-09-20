@@ -1,40 +1,46 @@
-//! The tonic `Configuration` impl. Each RPC authorizes, then composes named
-//! validation (`authz`, `subtree`, `paths`), storage (`store`) and wire
-//! mapping (`content`) steps; no SQL is written here.
+//! The `Configuration` service, in no protocol version's terms. Each operation
+//! authorizes, then composes named validation (`authz`, `subtree`, `paths`),
+//! storage (`store`) and masking (`content`) steps; no SQL is written here.
+//!
+//! Inputs arrive unvalidated — a raw path string, an absent content as `None`
+//! — because validating them is this layer's job, in an order that is part of
+//! the behaviour every protocol version promises. Nothing here may import the
+//! proto crate: a version is a shim over this file (`v3`), never a branch in it.
 
 use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 
-use sovereign_config_core::ConfigPath;
-use sovereign_config_proto::sovereign::config::v3::{
-    AddValuePathRequest, AddValuePathResponse, DeleteValuesRequest, DeleteValuesResponse,
-    GetSubTreeRequest, GetSubTreeResponse, ListValuePathsRequest, ListValuePathsResponse,
-    ListValuesRequest, ListValuesResponse, ListedValue, PutValueRequest, PutValueResponse,
-    ReplaceSubTreeRequest, ReplaceSubTreeResponse, RevealSecretRequest, RevealSecretResponse,
-    SubTreeMutationValue, SubTreeValue, configuration_server::Configuration, put_value_request,
-    sub_tree_mutation_value,
+use sovereign_config_core::{
+    AddPathMetadata, ConfigPath, DeleteMetadata, ListedValue, PutMetadata, ReplaceMetadata,
+    RevealedSecret, SubTreeValue, ValueListing, ValuePaths, ValueSubTree,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
-use tonic::{Request, Response, Status};
+use tonic::Status;
 use tracing::error;
 
 use super::authz::authorize;
-use super::content::{listed_content, subtree_content};
+use super::content::masked_content;
 use super::paths::{add_parent_paths, parent_path};
 use super::store::{
     self, MutationRow, content_ids, insert_content, insert_path, lock_mutation_path, path_collides,
     prune_orphan_contents, reserve_content_id,
 };
-use super::subtree::{self, NormalizedSubtree};
+use super::subtree::{self, NormalizedSubtree, SubTreeEntry, SubTreeEntryContent};
 use super::{PLAIN, SECRET};
 use crate::auth::Permission;
 use crate::encryption::{DecryptError, ValueCipher};
-use crate::rpc::{principal, storage_unavailable, to_proto_timestamp};
+use crate::rpc::{CallContext, storage_unavailable, to_timestamp};
 
 #[derive(Clone)]
 pub(crate) struct ConfigurationService {
     database: PgPool,
     cipher: Arc<ValueCipher>,
+}
+
+/// What a caller asked `put_value` to store, before any of it is validated.
+pub(super) enum PutContent<'a> {
+    Plain(&'a str),
+    Secret(&'a str),
 }
 
 /// A subtree's plain writes resolved against what is stored: content ids that
@@ -140,15 +146,15 @@ impl ConfigurationService {
     }
 }
 
-#[tonic::async_trait]
-impl Configuration for ConfigurationService {
-    async fn list_values(
+impl ConfigurationService {
+    pub(super) async fn list_values(
         &self,
-        request: Request<ListValuesRequest>,
-    ) -> Result<Response<ListValuesResponse>, Status> {
-        let selected = ConfigPath::parse_selection(&request.get_ref().path)
+        context: &CallContext<'_>,
+        path: &str,
+    ) -> Result<ValueListing, Status> {
+        let selected = ConfigPath::parse_selection(path)
             .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
-        let principal = principal(&request)?;
+        let principal = context.principal()?;
         let candidates = store::path_candidates(&self.database).await?;
 
         // Group every readable path by the content it resolves to so a listed
@@ -182,62 +188,66 @@ impl Configuration for ConfigurationService {
         let mut values = Vec::new();
         if !direct.is_empty() {
             for row in store::listed_values(&self.database, &direct).await? {
-                let (classification, content) = listed_content(row.value, &row.classification)
+                let value = masked_content(row.value, &row.classification)
                     .ok_or_else(storage_unavailable)?;
-                let alias_paths = content_paths
-                    .get(&row.content_id)
-                    .map(|siblings| {
-                        siblings
-                            .iter()
-                            .filter(|(fold, _)| fold != &row.lowercase_path)
-                            .map(|(_, display)| display.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let mut alias_paths = Vec::new();
+                for (fold, display) in content_paths.get(&row.content_id).into_iter().flatten() {
+                    if fold != &row.lowercase_path {
+                        alias_paths.push(stored_path(display)?);
+                    }
+                }
                 values.push(ListedValue {
-                    path: row.path,
-                    created_at: Some(to_proto_timestamp(row.created_at)?),
-                    updated_at: Some(to_proto_timestamp(row.updated_at)?),
-                    classification,
-                    content: Some(content),
+                    path: stored_path(&row.path)?,
+                    value,
+                    created_at: to_timestamp(row.created_at)?,
+                    updated_at: to_timestamp(row.updated_at)?,
                     alias_paths,
                 });
             }
         }
 
-        Ok(Response::new(ListValuesResponse {
+        let mut namespaces = Vec::with_capacity(paths.len());
+        for (_, display) in paths.into_values() {
+            // Ancestors include the tree root, which is a selection rather
+            // than an operation path.
+            namespaces
+                .push(ConfigPath::parse_selection(display).map_err(|_| storage_unavailable())?);
+        }
+        Ok(ValueListing {
             values,
-            paths: paths.into_values().map(|(_, display)| display).collect(),
-        }))
+            paths: namespaces,
+        })
     }
 
-    async fn get_sub_tree(
+    pub(super) async fn get_sub_tree(
         &self,
-        request: Request<GetSubTreeRequest>,
-    ) -> Result<Response<GetSubTreeResponse>, Status> {
-        let path = authorize(&request, &[Permission::Read], true)?;
+        context: &CallContext<'_>,
+        path: &str,
+    ) -> Result<ValueSubTree, Status> {
+        let path = authorize(context, path, &[Permission::Read], true)?;
         let rows = store::sub_tree_rows(&self.database, &path.fold()).await?;
         let mut values = Vec::with_capacity(rows.len());
         for row in rows {
-            let (classification, content) =
-                subtree_content(row.value, &row.classification).ok_or_else(storage_unavailable)?;
+            let value =
+                masked_content(row.value, &row.classification).ok_or_else(storage_unavailable)?;
             values.push(SubTreeValue {
-                path: row.path,
-                classification,
-                content: Some(content),
+                path: stored_path(&row.path)?,
+                value,
             });
         }
-        Ok(Response::new(GetSubTreeResponse { values }))
+        Ok(ValueSubTree { values })
     }
 
-    async fn put_value(
+    pub(super) async fn put_value(
         &self,
-        request: Request<PutValueRequest>,
-    ) -> Result<Response<PutValueResponse>, Status> {
-        let path = authorize(&request, &[Permission::Write], false)?;
-        let (value, classification) = match request.get_ref().content.as_ref() {
-            Some(put_value_request::Content::PlainValue(value)) => (value, PLAIN),
-            Some(put_value_request::Content::SecretValue(value)) => (value, SECRET),
+        context: &CallContext<'_>,
+        path: &str,
+        written: Option<PutContent<'_>>,
+    ) -> Result<PutMetadata, Status> {
+        let path = authorize(context, path, &[Permission::Write], false)?;
+        let (value, classification) = match written {
+            Some(PutContent::Plain(value)) => (value, PLAIN),
+            Some(PutContent::Secret(value)) => (value, SECRET),
             None => return Err(Status::invalid_argument("configuration value is invalid")),
         };
         if value.contains('\0') {
@@ -260,21 +270,28 @@ impl Configuration for ConfigurationService {
         };
         store::commit(transaction).await?;
 
-        Ok(Response::new(PutValueResponse {
-            created_at: Some(to_proto_timestamp(row.created_at)?),
-            updated_at: Some(to_proto_timestamp(row.updated_at)?),
-        }))
+        Ok(PutMetadata {
+            created_at: to_timestamp(row.created_at)?,
+            updated_at: to_timestamp(row.updated_at)?,
+        })
     }
 
-    async fn replace_sub_tree(
+    pub(super) async fn replace_sub_tree(
         &self,
-        request: Request<ReplaceSubTreeRequest>,
-    ) -> Result<Response<ReplaceSubTreeResponse>, Status> {
-        let path = authorize(&request, &[Permission::Write, Permission::Manage], true)?;
+        context: &CallContext<'_>,
+        path: &str,
+        values: Vec<SubTreeEntry>,
+    ) -> Result<ReplaceMetadata, Status> {
+        let path = authorize(
+            context,
+            path,
+            &[Permission::Write, Permission::Manage],
+            true,
+        )?;
         let NormalizedSubtree {
             mut values,
             displays,
-        } = subtree::normalize(&path, request.get_ref().values.clone())?;
+        } = subtree::normalize(&path, values)?;
 
         let mut transaction = store::begin(&self.database).await?;
         lock_mutation_path(&mut transaction, &path).await?;
@@ -302,18 +319,19 @@ impl Configuration for ConfigurationService {
             insert_path(&mut transaction, display, inserted.id, now).await?;
         }
         store::commit(transaction).await?;
-        Ok(Response::new(ReplaceSubTreeResponse {
-            updated_at: Some(to_proto_timestamp(now)?),
+        Ok(ReplaceMetadata {
+            updated_at: to_timestamp(now)?,
             value_count: u64::try_from(values.len()).map_err(|_| storage_unavailable())?,
-        }))
+        })
     }
 
-    async fn delete_values(
+    pub(super) async fn delete_values(
         &self,
-        request: Request<DeleteValuesRequest>,
-    ) -> Result<Response<DeleteValuesResponse>, Status> {
-        let recurse = request.get_ref().recurse;
-        let path = authorize(&request, &[Permission::Write], recurse)?;
+        context: &CallContext<'_>,
+        path: &str,
+        recurse: bool,
+    ) -> Result<DeleteMetadata, Status> {
+        let path = authorize(context, path, &[Permission::Write], recurse)?;
         let mut transaction = store::begin(&self.database).await?;
         lock_mutation_path(&mut transaction, &path).await?;
         let deleted = store::delete_paths(&mut transaction, &path.fold(), recurse).await?;
@@ -326,17 +344,18 @@ impl Configuration for ConfigurationService {
         prune_orphan_contents(&mut transaction, &content_ids(&deleted)).await?;
         store::commit(transaction).await?;
         let deleted_at = OffsetDateTime::from(SystemTime::now());
-        Ok(Response::new(DeleteValuesResponse {
-            deleted_at: Some(to_proto_timestamp(deleted_at)?),
+        Ok(DeleteMetadata {
+            deleted_at: to_timestamp(deleted_at)?,
             deleted_count: u64::try_from(deleted.len()).map_err(|_| storage_unavailable())?,
-        }))
+        })
     }
 
-    async fn reveal_secret(
+    pub(super) async fn reveal_secret(
         &self,
-        request: Request<RevealSecretRequest>,
-    ) -> Result<Response<RevealSecretResponse>, Status> {
-        let path = authorize(&request, &[Permission::Read], false)?;
+        context: &CallContext<'_>,
+        path: &str,
+    ) -> Result<RevealedSecret, Status> {
+        let path = authorize(context, path, &[Permission::Read], false)?;
         let row = store::revealed_row(&self.database, &path.fold())
             .await?
             .ok_or_else(|| Status::not_found("configuration value not found"))?;
@@ -353,17 +372,19 @@ impl Configuration for ConfigurationService {
             .cipher
             .decrypt(row.content_id, &row.classification, &row.value)
             .map_err(|error| decryption_failed(row.content_id, &error))?;
-        Ok(Response::new(RevealSecretResponse { value }))
+        Ok(RevealedSecret::new(value))
     }
 
-    async fn add_value_path(
+    pub(super) async fn add_value_path(
         &self,
-        request: Request<AddValuePathRequest>,
-    ) -> Result<Response<AddValuePathResponse>, Status> {
-        let principal = principal(&request)?;
-        let source = ConfigPath::parse_operation(&request.get_ref().source_path)
+        context: &CallContext<'_>,
+        source_path: &str,
+        new_path: &str,
+    ) -> Result<AddPathMetadata, Status> {
+        let principal = context.principal()?;
+        let source = ConfigPath::parse_operation(source_path)
             .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
-        let new_path = ConfigPath::parse_operation(&request.get_ref().new_path)
+        let new_path = ConfigPath::parse_operation(new_path)
             .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
         // Resolving the value and exposing it elsewhere is a write on both
         // paths; reading the source is required to name the value at all.
@@ -410,17 +431,18 @@ impl Configuration for ConfigurationService {
         // The path exactly as written establishes this alias's display case.
         insert_path(&mut transaction, new_path.as_str(), content_id, now).await?;
         store::commit(transaction).await?;
-        Ok(Response::new(AddValuePathResponse {
-            created_at: Some(to_proto_timestamp(now)?),
-        }))
+        Ok(AddPathMetadata {
+            created_at: to_timestamp(now)?,
+        })
     }
 
-    async fn list_value_paths(
+    pub(super) async fn list_value_paths(
         &self,
-        request: Request<ListValuePathsRequest>,
-    ) -> Result<Response<ListValuePathsResponse>, Status> {
-        let path = authorize(&request, &[Permission::Read], false)?;
-        let principal = principal(&request)?;
+        context: &CallContext<'_>,
+        path: &str,
+    ) -> Result<ValuePaths, Status> {
+        let path = authorize(context, path, &[Permission::Read], false)?;
+        let principal = context.principal()?;
         let content_id = store::content_id_at(&self.database, &path.fold())
             .await?
             .ok_or_else(|| Status::not_found("configuration value not found"))?;
@@ -431,11 +453,25 @@ impl Configuration for ConfigurationService {
             let candidate =
                 ConfigPath::parse(&row.lowercase_path).map_err(|_| storage_unavailable())?;
             if principal.allows(&candidate, Permission::Read) {
-                paths.push(row.path);
+                paths.push(stored_path(&row.path)?);
             }
         }
-        Ok(Response::new(ListValuePathsResponse { paths }))
+        Ok(ValuePaths { paths })
     }
+}
+
+/// A stored display path as the version-free type every response carries.
+///
+/// The `configuration_paths_path_check` constraint admits exactly the grammar
+/// [`ConfigPath::parse_operation`] accepts, so this cannot fail for a row the
+/// database holds: it satisfies the type, it does not validate. `as_str()`
+/// gives back the stored bytes unchanged, which is what a shim emits.
+#[expect(
+    clippy::result_large_err,
+    reason = "tonic::Status is the crate's RPC error type and is returned by value"
+)]
+fn stored_path(path: &str) -> Result<ConfigPath, Status> {
+    ConfigPath::parse_operation(path).map_err(|_| storage_unavailable())
 }
 
 /// Resolves each plain write to the content it lands on, so a value shared by
@@ -444,15 +480,14 @@ impl Configuration for ConfigurationService {
 /// silently discarding an edit while still reporting success.
 async fn resolve_plain_writes<'a>(
     transaction: &mut Transaction<'_, Postgres>,
-    values: &'a [SubTreeMutationValue],
+    values: &'a [SubTreeEntry],
 ) -> Result<ResolvedWrites<'a>, Status> {
     let mut writes = ResolvedWrites {
         shared: BTreeMap::new(),
         fresh: Vec::new(),
     };
     for value in values {
-        let Some(sub_tree_mutation_value::Content::PlainValue(content)) = value.content.as_ref()
-        else {
+        let Some(SubTreeEntryContent::PlainValue(content)) = value.content.as_ref() else {
             continue;
         };
         match store::content_id_at(&mut **transaction, &value.path).await? {

@@ -1,5 +1,12 @@
-//! The tonic `ManagedConnections` impl: request validation, authorization,
-//! outcome metrics, and the create / rotate / revoke flows.
+//! The `ManagedConnections` service, in no protocol version's terms: request
+//! validation, authorization, outcome metrics, and the create / rotate /
+//! revoke flows.
+//!
+//! Inputs arrive unvalidated — raw strings, and a permission selection that is
+//! `None` when it had no version-free form — because validating them is this
+//! layer's job, in an order that is part of the behaviour every protocol
+//! version promises. Nothing here may import the proto crate: a version is a
+//! shim over this file (`v3`), never a branch in it.
 
 use std::{sync::Arc, time::Duration};
 
@@ -7,21 +14,16 @@ use sovereign_config_core::{
     ConfigPath, ConnectionId, ConnectionUrl, DisplayName, ManagedConnectionState,
     ManagedPermission, ManagedPermissions,
 };
-use sovereign_config_proto::sovereign::config::v3::{
-    CreateManagedConnectionRequest, CreateManagedConnectionResponse, ListManagedConnectionsRequest,
-    ListManagedConnectionsResponse, RevokeManagedConnectionRequest,
-    RevokeManagedConnectionResponse, RotateManagedConnectionRequest,
-    RotateManagedConnectionResponse, managed_connections_server::ManagedConnections,
-};
 use sqlx::PgPool;
 use time::OffsetDateTime;
-use tonic::{Request, Response, Status};
+use tonic::Status;
 
 use super::identity::{generate_app_password, generate_connection_id, managed_username};
 use super::provisioning::{CLEANUP_MESSAGE, dependency_outcome};
 use super::store::{ConnectionRow, commit, mark_revoking, mark_rotation_unknown};
 use super::wire::{
-    conflict_error, dependency_error, internal_error, invalid_request, proto_metadata,
+    ConnectionMetadata, ProvisionedConnection, conflict_error, dependency_error, internal_error,
+    invalid_request, metadata,
 };
 use crate::auth::Permission;
 use crate::authentik::{AdminError, AuthentikAdminClient};
@@ -29,7 +31,7 @@ use crate::metrics::{
     ManagedConnectionMetrics, ManagedDependencyCall, ManagedDependencyOutcome, ManagedOperation,
     ManagedOperationResult,
 };
-use crate::rpc::{STORAGE_UNAVAILABLE_MESSAGE, principal};
+use crate::rpc::{CallContext, STORAGE_UNAVAILABLE_MESSAGE};
 
 /// Non-secret settings used to build canonical connection URLs and grants.
 pub(crate) struct ManagedSettings {
@@ -64,42 +66,48 @@ const fn required_permission(permission: ManagedPermission) -> Permission {
     }
 }
 
-#[tonic::async_trait]
-impl ManagedConnections for ManagedConnectionsService {
-    async fn list_managed_connections(
+/// The operations a protocol shim calls. Each records its outcome here, so a
+/// version can neither forget the metric nor count a call twice.
+impl ManagedConnectionsService {
+    pub(super) async fn list_managed_connections(
         &self,
-        request: Request<ListManagedConnectionsRequest>,
-    ) -> Result<Response<ListManagedConnectionsResponse>, Status> {
-        let result = self.list(&request).await;
+        context: &CallContext<'_>,
+    ) -> Result<Vec<ConnectionMetadata>, Status> {
+        let result = self.list(context).await;
         self.record(ManagedOperation::List, &result);
-        result.map(Response::new)
+        result
     }
 
-    async fn create_managed_connection(
+    pub(super) async fn create_managed_connection(
         &self,
-        request: Request<CreateManagedConnectionRequest>,
-    ) -> Result<Response<CreateManagedConnectionResponse>, Status> {
-        let result = self.create(&request).await;
+        context: &CallContext<'_>,
+        display_name: &str,
+        root: &str,
+        permissions: Option<ManagedPermissions>,
+    ) -> Result<ProvisionedConnection, Status> {
+        let result = self.create(context, display_name, root, permissions).await;
         self.record(ManagedOperation::Create, &result);
-        result.map(Response::new)
+        result
     }
 
-    async fn rotate_managed_connection(
+    pub(super) async fn rotate_managed_connection(
         &self,
-        request: Request<RotateManagedConnectionRequest>,
-    ) -> Result<Response<RotateManagedConnectionResponse>, Status> {
-        let result = self.rotate(&request).await;
+        context: &CallContext<'_>,
+        connection_id: &str,
+    ) -> Result<ProvisionedConnection, Status> {
+        let result = self.rotate(context, connection_id).await;
         self.record(ManagedOperation::Rotate, &result);
-        result.map(Response::new)
+        result
     }
 
-    async fn revoke_managed_connection(
+    pub(super) async fn revoke_managed_connection(
         &self,
-        request: Request<RevokeManagedConnectionRequest>,
-    ) -> Result<Response<RevokeManagedConnectionResponse>, Status> {
-        let result = self.revoke(&request).await;
+        context: &CallContext<'_>,
+        connection_id: &str,
+    ) -> Result<(), Status> {
+        let result = self.revoke(context, connection_id).await;
         self.record(ManagedOperation::Revoke, &result);
-        result.map(Response::new)
+        result
     }
 }
 
@@ -140,29 +148,30 @@ impl ManagedConnectionsService {
 
     pub(super) async fn list(
         &self,
-        request: &Request<ListManagedConnectionsRequest>,
-    ) -> Result<ListManagedConnectionsResponse, Status> {
-        let principal = principal(request)?;
+        context: &CallContext<'_>,
+    ) -> Result<Vec<ConnectionMetadata>, Status> {
+        let principal = context.principal()?;
         let rows = self.list_rows().await?;
         let mut connections = Vec::new();
         for row in rows {
             let root = ConfigPath::parse(&row.root).map_err(|_| internal_error())?;
             if principal.allows(&root, Permission::Manage) {
-                connections.push(proto_metadata(&row)?);
+                connections.push(metadata(&row)?);
             }
         }
-        Ok(ListManagedConnectionsResponse { connections })
+        Ok(connections)
     }
 
     pub(super) async fn create(
         &self,
-        request: &Request<CreateManagedConnectionRequest>,
-    ) -> Result<CreateManagedConnectionResponse, Status> {
-        let principal = principal(request)?;
-        let display_name = DisplayName::parse(request.get_ref().display_name.clone())
-            .map_err(|_| invalid_request())?;
-        let root =
-            ConfigPath::parse_selection(&request.get_ref().root).map_err(|_| invalid_request())?;
+        context: &CallContext<'_>,
+        display_name: &str,
+        root: &str,
+        permissions: Option<ManagedPermissions>,
+    ) -> Result<ProvisionedConnection, Status> {
+        let principal = context.principal()?;
+        let display_name = DisplayName::parse(display_name).map_err(|_| invalid_request())?;
+        let root = ConfigPath::parse_selection(root).map_err(|_| invalid_request())?;
         // Managed connection roots are out of scope for case retention (card
         // #294): `managed_connections.root` has no display column, and
         // `ConnectionUrl` requires an exactly-lowercase root to round-trip.
@@ -172,8 +181,7 @@ impl ManagedConnectionsService {
         let root = ConfigPath::parse(root.fold()).expect("a fold of a valid path is valid");
         // A non-empty selection is required; an empty or malformed set is a
         // client error, never a silent default.
-        let permissions = ManagedPermissions::from_proto(&request.get_ref().permissions)
-            .map_err(|_| invalid_request())?;
+        let permissions = permissions.ok_or_else(invalid_request)?;
         // Using the feature at all requires Manage on the root, and no access
         // URL may be granted a permission the caller does not itself hold on
         // that root — a manage-only principal cannot mint a write-capable URL.
@@ -202,9 +210,9 @@ impl ManagedConnectionsService {
     pub(super) async fn begin_rotation(
         &self,
         connection_id: &ConnectionId,
-        request: &Request<RotateManagedConnectionRequest>,
+        context: &CallContext<'_>,
     ) -> Result<(ConnectionRow, ConfigPath), Status> {
-        let principal = principal(request)?;
+        let principal = context.principal()?;
         let mut transaction = self.begin().await?;
         let row = self
             .lock_manageable(&mut transaction, connection_id, principal)
@@ -242,11 +250,11 @@ impl ManagedConnectionsService {
 
     pub(super) async fn rotate(
         &self,
-        request: &Request<RotateManagedConnectionRequest>,
-    ) -> Result<RotateManagedConnectionResponse, Status> {
-        let connection_id = ConnectionId::parse(request.get_ref().connection_id.clone())
-            .map_err(|_| invalid_request())?;
-        let (row, root) = self.begin_rotation(&connection_id, request).await?;
+        context: &CallContext<'_>,
+        connection_id: &str,
+    ) -> Result<ProvisionedConnection, Status> {
+        let connection_id = ConnectionId::parse(connection_id).map_err(|_| invalid_request())?;
+        let (row, root) = self.begin_rotation(&connection_id, context).await?;
 
         let credential_identifier = row
             .credential_identifier
@@ -299,35 +307,35 @@ impl ManagedConnectionsService {
         else {
             return Err(dependency_error());
         };
-        Ok(RotateManagedConnectionResponse {
-            metadata: Some(proto_metadata(&row)?),
-            connection_url: connection_url.canonical().expose().to_owned(),
+        Ok(ProvisionedConnection {
+            metadata: metadata(&row)?,
+            connection_url,
         })
     }
 
     pub(super) async fn revoke(
         &self,
-        request: &Request<RevokeManagedConnectionRequest>,
-    ) -> Result<RevokeManagedConnectionResponse, Status> {
-        let connection_id = ConnectionId::parse(request.get_ref().connection_id.clone())
-            .map_err(|_| invalid_request())?;
-        let row = self.claim_for_revocation(request, &connection_id).await?;
+        context: &CallContext<'_>,
+        connection_id: &str,
+    ) -> Result<(), Status> {
+        let connection_id = ConnectionId::parse(connection_id).map_err(|_| invalid_request())?;
+        let row = self.claim_for_revocation(context, &connection_id).await?;
         let username = managed_username(&connection_id, &row.display_name);
         if let Some(user_id) = self.revocation_target(&row, &username).await? {
             self.delete_account_confirmed(user_id, &username).await?;
         }
         self.delete_connection(&connection_id).await?;
-        Ok(RevokeManagedConnectionResponse {})
+        Ok(())
     }
 
     /// Locks a manageable row and marks it `revoking`, so a concurrent
     /// rotation cannot report its URL as current.
     async fn claim_for_revocation(
         &self,
-        request: &Request<RevokeManagedConnectionRequest>,
+        context: &CallContext<'_>,
         connection_id: &ConnectionId,
     ) -> Result<ConnectionRow, Status> {
-        let principal = principal(request)?;
+        let principal = context.principal()?;
         let mut transaction = self.begin().await?;
         let row = self
             .lock_manageable(&mut transaction, connection_id, principal)

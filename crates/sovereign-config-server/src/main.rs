@@ -32,7 +32,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use auth::{Authenticator, grpc_authentication_layer};
 use authentik::AuthentikAdminClient;
 use config::{Config, ManagedConnectionConfig, required_env};
-use managed::{ManagedConnectionsService, ManagedSettings};
+use managed::{ManagedConnectionsService, ManagedSettings, V3ManagedConnections};
 use metrics::{AuthenticationMetrics, ManagedConnectionMetrics, ProtocolMetrics};
 use protocol::ProtocolVersionLayer;
 use sovereign_config_core::Secret;
@@ -41,7 +41,7 @@ use sovereign_config_proto::sovereign::config::v3::{
     managed_connections_server::ManagedConnectionsServer, system_server::SystemServer,
 };
 use system::{SERVED_PROTOCOL_LABELS, SystemService};
-use values::{ConfigurationService, encrypt_stored_secrets};
+use values::{ConfigurationService, V3Configuration, encrypt_stored_secrets};
 use web::WebAssetsLayer;
 
 const SYSTEM_SERVICE_NAME: &str = "sovereign.config.v3.System";
@@ -119,6 +119,18 @@ async fn main() -> Result<()> {
     };
     spawn_metrics_server(config.metrics_addr, state.clone()).await?;
     let (_health_reporter, health_service) = serving_health_service().await;
+    // One implementation of each service, whatever the number of protocol
+    // versions served: every version registered below is a shim over these.
+    let configuration = Arc::new(ConfigurationService::new(
+        state.database.clone(),
+        Arc::clone(&value_cipher),
+    ));
+    let managed_connections = Arc::new(ManagedConnectionsService::new(
+        state.database.clone(),
+        managed_admin,
+        managed_settings,
+        managed_metrics,
+    ));
 
     info!(
         grpc_addr = %config.grpc_addr,
@@ -145,18 +157,12 @@ async fn main() -> Result<()> {
         .layer(web_assets)
         .add_service(health_service)
         .add_service(SystemServer::new(SystemService))
-        .add_service(ConfigurationServer::new(ConfigurationService::new(
-            state.database.clone(),
-            Arc::clone(&value_cipher),
+        .add_service(ConfigurationServer::new(V3Configuration::new(Arc::clone(
+            &configuration,
+        ))))
+        .add_service(ManagedConnectionsServer::new(V3ManagedConnections::new(
+            Arc::clone(&managed_connections),
         )))
-        .add_service(ManagedConnectionsServer::new(
-            ManagedConnectionsService::new(
-                state.database.clone(),
-                managed_admin,
-                managed_settings,
-                managed_metrics,
-            ),
-        ))
         .serve_with_shutdown(config.grpc_addr, shutdown_signal())
         .await
         .context("gRPC server terminated")
