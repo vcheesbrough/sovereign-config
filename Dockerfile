@@ -94,7 +94,7 @@ ENTRYPOINT ["/usr/local/bin/sovereign-config-server"]
 # already use, plus the same static musl `sovereign-config` binary the served
 # installer carries, so a step can `sovereign-config render -- docker compose …`
 # with no install. Published under the same semver as the server. It keeps the
-# base image's root user and no entrypoint, because pipeline steps drive the
+# base image's root user and entrypoint, because pipeline steps drive the
 # host Docker socket through `commands:`. The build gates on the binary running
 # on this base and, when a release is given, reporting exactly that release.
 FROM docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c AS cli-runtime

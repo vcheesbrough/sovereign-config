@@ -188,7 +188,7 @@ deploy:
     - sovereign-config render /apps/api /apps/api/prod -- docker compose up -d --wait
 ```
 
-The connection URL arrives through `SOVEREIGN_CONFIG_URL` from a Woodpecker secret — never inline in the pipeline file — and `render` strips it before the command runs (see [Credential inputs](#credential-inputs)). Use a read-only managed connection rooted at the step's own subtree.
+The connection URL arrives through `SOVEREIGN_CONFIG_URL` from a Woodpecker secret — never inline in the pipeline file — and `render` strips it before the command runs (see [Credential inputs](#credential-inputs)). Use a read-only managed connection rooted at the step's own subtree. The image pulls anonymously from `registry.desync.link`, so the step needs no registry credentials; if the registry is ever made to require authentication for pulls, the consuming repository needs a Woodpecker registry entry for `registry.desync.link`.
 
 #### Self-hosting exception
 

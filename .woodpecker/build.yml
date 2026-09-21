@@ -3,7 +3,7 @@
 # only after checks has passed.
 #
 # Three images, one semver — every docker build MUST pass --target, see the
-# Dockerfile. Both are tagged locally as <name>-ci:<commit> and labelled with the
+# Dockerfile. Each is tagged locally as <name>-ci:<commit> and labelled with the
 # release tag and commit, which deploy-dev checks before it publishes.
 # See checks.yml for how the workflows fit together.
 
