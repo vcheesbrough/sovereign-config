@@ -149,7 +149,8 @@ test.describe('audit trail', () => {
     expect(audit.requests.at(-1)).toMatchObject({
       protocolVersion: '',
       from: 1699920000,
-      until: 1700006340
+      // Through the end of the minute picked, not its first instant.
+      until: 1700006399
     });
     await page.getByLabel('From').fill('');
     await page.getByLabel('Until').fill('');
@@ -185,6 +186,30 @@ test.describe('audit trail', () => {
     await page.getByLabel('Access URL changes').uncheck();
     await expect(page.locator('#audit-kinds-error')).toHaveText('choose at least one kind of event');
     expect(audit.requests).toHaveLength(beforeLast);
+  });
+
+  test('an applied filter the service would refuse clears the list rather than paging the old one', async ({ page }) => {
+    const audit = await signIn(page, MANY, { pageSize: 25 });
+    await page.goto('/audit/');
+    await expect(rows(page)).toHaveCount(25);
+    const asked = audit.requests.length;
+
+    await page.getByLabel('Protocol version').fill('V4');
+    await page.getByRole('button', { name: 'Filter' }).click();
+    await expect(page.locator('#audit-protocol-error')).toBeVisible();
+    await expect(rows(page)).toHaveCount(0);
+    await expect(page.locator('#audit-state')).toHaveText('Check the filters');
+
+    await scrollToEnd(page);
+    await page.waitForTimeout(300);
+    expect(audit.requests).toHaveLength(asked);
+    await expect(page.locator('#audit-state')).toHaveText('Check the filters');
+
+    // Correcting it asks afresh, from the first page.
+    await page.getByLabel('Protocol version').fill('v4');
+    await page.getByRole('button', { name: 'Filter' }).click();
+    await expect(rows(page)).toHaveCount(25);
+    expect(audit.requests.at(-1)).toMatchObject({ protocolVersion: 'v4', cursor: '' });
   });
 
   test('loads further pages as it scrolls, once each, and stops at the end', async ({ page }) => {

@@ -224,6 +224,16 @@ pub(crate) fn timestamp_from_millis(milliseconds: f64) -> Option<Timestamp> {
     })
 }
 
+/// The last instant of the minute `at` starts. A `datetime-local` field names
+/// a whole minute, and an operator who picks "until 14:05" means through the
+/// end of it, not its first instant.
+pub(crate) const fn end_of_minute(at: Timestamp) -> Timestamp {
+    Timestamp {
+        seconds: at.seconds - at.seconds.rem_euclid(60) + 59,
+        nanos: 999_999_999,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum FeedState {
     /// Nothing in flight; the next page, if any, may be fetched.
@@ -320,6 +330,11 @@ impl AuditFeed {
             PageOutcome::Failed => self.state = FeedState::Failed,
         }
         true
+    }
+
+    /// Whether a reply for `generation` is still awaited, and so may be drawn.
+    pub(crate) fn is_current(&self, generation: u64) -> bool {
+        self.active && generation == self.generation && self.state == FeedState::Loading
     }
 
     /// Abandons the current query: leaving the view or logging out. Whatever
@@ -517,7 +532,8 @@ fn apply_filters() {
     spawn_local(fetch_page(start_feed(query)));
 }
 
-/// Forgets the list: on leaving the view and on logging out.
+/// Forgets the list: on leaving the view, on logging out, and when an applied
+/// filter is one the service would refuse.
 pub(crate) fn reset_audit() {
     FEED.with_borrow_mut(AuditFeed::invalidate);
     disarm_observer();
@@ -540,6 +556,9 @@ fn form_query(element_path: Option<&ConfigPath>) -> Option<AuditQuery> {
         Ok(query) => Some(query),
         Err(errors) => {
             show_filter_errors(errors);
+            // The rows on show answer filters the form no longer holds, and
+            // left armed they would keep loading more of that old answer.
+            reset_audit();
             set_text("audit-state", "Check the filters");
             None
         }
@@ -586,7 +605,7 @@ fn read_form() -> FilterInput {
         path: text("audit-path-filter"),
         text: text("audit-text-filter"),
         from: instant("audit-from"),
-        until: instant("audit-until"),
+        until: instant("audit-until").map(end_of_minute),
         protocol_version: text("audit-protocol"),
         groups: KindGroup::ALL
             .into_iter()
@@ -615,21 +634,22 @@ async fn fetch_page(request: PageRequest) {
             .await
     }
     .await;
+    // Refused before anything is drawn when it belongs to a superseded query,
+    // but settled only once drawn: a page that could not be drawn is a failed
+    // page, so Retry fetches it again rather than the cursor moving past it.
+    if !FEED.with_borrow(|feed| feed.is_current(request.generation)) {
+        return;
+    }
+    let result = result.and_then(|page| append_events(&page.events).map(|()| page.next_cursor));
     let outcome = match &result {
-        Ok(page) => PageOutcome::Loaded {
-            next_cursor: page.next_cursor.clone(),
+        Ok(next_cursor) => PageOutcome::Loaded {
+            next_cursor: next_cursor.clone(),
         },
         Err(_) => PageOutcome::Failed,
     };
-    if !FEED.with_borrow_mut(|feed| feed.settle(request.generation, outcome)) {
-        return;
-    }
+    FEED.with_borrow_mut(|feed| feed.settle(request.generation, outcome));
     match result {
-        Ok(page) => {
-            if let Err(error) = append_events(&page.events) {
-                show_page_error(&error);
-                return;
-            }
+        Ok(_) => {
             let count = audit_row_count();
             set_hidden("empty-audit", count != 0);
             let ended = FEED.with_borrow(AuditFeed::state) == FeedState::Ended;
@@ -689,8 +709,14 @@ fn append_events(events: &[AuditEntry]) -> Result<(), ClientError> {
         .and_then(|window| window.document())
         .ok_or_else(browser_error)?;
     let body = audit_body().ok_or_else(browser_error)?;
-    for event in events {
-        append(&body, &render_event(&document, event)?)?;
+    // Every row is built before any is attached, so a row that cannot be
+    // built leaves the list as it was for the retry to fill.
+    let rows = events
+        .iter()
+        .map(|event| render_event(&document, event))
+        .collect::<Result<Vec<_>, _>>()?;
+    for row in &rows {
+        append(&body, row)?;
     }
     Ok(())
 }
@@ -739,7 +765,7 @@ mod tests {
     use sovereign_config_core::{AuditEventKind, AuditQuery, ConfigPath, Timestamp};
 
     use super::{
-        AuditFeed, FeedState, FilterInput, KindGroup, PageOutcome, build_query,
+        AuditFeed, FeedState, FilterInput, KindGroup, PageOutcome, build_query, end_of_minute,
         timestamp_from_millis,
     };
 
@@ -844,6 +870,31 @@ mod tests {
             feed.advance().unwrap().query.cursor.as_deref(),
             Some("new-cursor")
         );
+    }
+
+    #[test]
+    fn only_the_awaited_reply_is_current() {
+        let mut feed = AuditFeed::default();
+        let stale = feed.restart(query("old"));
+        let current = feed.restart(query("new"));
+        assert!(!feed.is_current(stale.generation));
+        assert!(feed.is_current(current.generation));
+        // A page that arrived but could not be drawn settles as failed, and a
+        // retry asks for that same page again.
+        assert!(feed.settle(current.generation, loaded(Some("page-2"))));
+        let second = feed.advance().unwrap();
+        assert!(feed.is_current(second.generation));
+        assert!(feed.settle(second.generation, PageOutcome::Failed));
+        assert!(
+            !feed.is_current(second.generation),
+            "nothing is awaited now"
+        );
+        assert_eq!(
+            feed.retry().unwrap().query.cursor.as_deref(),
+            Some("page-2")
+        );
+        feed.invalidate();
+        assert!(!feed.is_current(second.generation));
     }
 
     #[test]
@@ -962,6 +1013,31 @@ mod tests {
                 "audit-until",
                 "audit-kinds"
             ]
+        );
+    }
+
+    #[test]
+    fn until_covers_the_whole_minute_it_names() {
+        let minute = Timestamp {
+            seconds: 1_700_006_340,
+            nanos: 0,
+        };
+        let end = end_of_minute(minute);
+        assert_eq!((end.seconds, end.nanos), (1_700_006_399, 999_999_999));
+        // Already inside the minute, and before the epoch, it still lands on
+        // that minute's last instant.
+        let inside = end_of_minute(Timestamp {
+            seconds: 1_700_006_345,
+            nanos: 5,
+        });
+        assert_eq!(inside.seconds, 1_700_006_399);
+        assert_eq!(
+            end_of_minute(Timestamp {
+                seconds: -60,
+                nanos: 0
+            })
+            .seconds,
+            -1
         );
     }
 
