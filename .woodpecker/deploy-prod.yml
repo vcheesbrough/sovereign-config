@@ -99,12 +99,14 @@ steps:
       - |
         RELEASE_TAG=$$(cat .release-tag)
         echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
-        # Fail closed if either image is missing: a promotion that shipped the
+        # Fail closed if any image is missing: a promotion that shipped the
         # server without its matching broker would leave CI resolving secrets
-        # against a stale extension.
+        # against a stale extension, and a tag without its CLI image is not a
+        # whole release for the pipelines that pin it.
         for IMAGE in \
           registry.desync.link/sovereign-config:$$RELEASE_TAG \
-          registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG; do
+          registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG \
+          registry.desync.link/sovereign-config-cli:$$RELEASE_TAG; do
           if ! docker pull "$$IMAGE"; then
             echo "ERROR: $$IMAGE not found in the registry." >&2
             echo "The push pipeline (build + publish) must succeed for this commit before it can be promoted." >&2

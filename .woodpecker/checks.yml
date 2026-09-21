@@ -7,7 +7,8 @@
 #   deployment:  deploy-prod   (prod target, from main only)
 #
 #   checks       script-validation, unit-test, client-playwright   (+ postgres-test)
-#   build        compute-version ∥ prune-build-cache → build-server ∥ build-broker
+#   build        compute-version ∥ prune-build-cache
+#                → build-server ∥ build-broker ∥ build-cli
 #   deploy-dev   compute-version ∥ validate-authentik-version → publish-dev-image
 #                → apply-authentik-blueprint-auto-dev → validate-authentik-manager-live
 #                → auto-deploy-dev → tag-release-auto-dev

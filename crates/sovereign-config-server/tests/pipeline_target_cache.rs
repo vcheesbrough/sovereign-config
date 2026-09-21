@@ -147,7 +147,7 @@ fn the_buildkit_cache_is_pruned_before_the_image_builds() {
         ["sh scripts/ci-prune-buildkit-cache.sh"],
         "prune-build-cache must run the BuildKit cache prune script"
     );
-    for build in ["build-server", "build-broker"] {
+    for build in ["build-server", "build-broker", "build-cli"] {
         let dependencies: Vec<&str> = pipeline
             .step_in("build", build)
             .get("depends_on")
