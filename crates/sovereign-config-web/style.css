@@ -340,10 +340,11 @@ input[aria-invalid="true"], textarea[aria-invalid="true"] { border-color: var(--
 table { width: 100%; min-width: 760px; border-collapse: collapse; table-layout: fixed; background: var(--surface); }
 th, td { padding: 10px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border-soft); }
 thead th { color: var(--text-muted); background: var(--surface-2); font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
-thead th:nth-child(1) { width: 26%; }
-thead th:nth-child(2) { width: 44%; }
+/* The actions column holds a value row's four icons on one line. */
+thead th:nth-child(1) { width: 24%; }
+thead th:nth-child(2) { width: 38%; }
 thead th:nth-child(3) { width: 16%; }
-thead th:nth-child(4) { width: 14%; }
+thead th:nth-child(4) { width: 22%; }
 /* The connections table has a fifth (Actions) column; give it an explicit
    share so the actions column does not collapse and overflow the row. */
 .connections-table thead th:nth-child(1) { width: 24%; }
@@ -404,6 +405,21 @@ dialog .actions { justify-content: flex-end; }
 .download-command-actions { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
 .download-copy-status { color: var(--text-muted); font-size: 12px; }
 .downloads-list .download-card:first-child { border-top: 0; }
+/* ── Audit trail ────────────────────────────────── */
+.audit-element { margin: 0 0 16px; color: var(--text-muted); font-size: 13px; }
+.audit-element code { color: var(--text); font-family: var(--mono); overflow-wrap: anywhere; }
+.audit-filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px 16px; }
+.audit-table-scroll { margin-top: 16px; }
+.audit-table thead th:nth-child(1) { width: 18%; }
+.audit-table thead th:nth-child(2) { width: 18%; }
+.audit-table thead th:nth-child(3) { width: 54%; }
+.audit-table thead th:nth-child(4) { width: 10%; }
+.audit-actor { overflow-wrap: anywhere; }
+.audit-narrative { display: block; overflow-wrap: anywhere; }
+.audit-feed-status { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+.audit-feed-status .field-error { margin: 0; }
+/* Height enough to intersect reliably; it draws nothing. */
+.audit-sentinel { height: 1px; }
 [hidden] { display: none !important; }
 
 @media (max-width: 760px) {
@@ -426,12 +442,21 @@ dialog .actions { justify-content: flex-end; }
   thead th:nth-child(3), tbody td:nth-child(3) { display: none; }
   thead th:nth-child(4) { width: 30%; }
   th, td { padding: 8px; }
-  /* Three icons have to sit on one line in a column this narrow; wrapping them
-     doubles every row's height for no gain. */
+  /* Four icons cannot share one line in a column this narrow, and wrapping
+     them freely leaves one hanging and doubles the row's height. Two by two is
+     about as tall as the value editor beside them, so the row does not grow. */
+  .row-actions { display: grid; grid-template-columns: repeat(2, 26px); justify-content: end; }
   .row-actions .icon-button { width: 26px; min-height: 26px; }
   .row-actions .icon { width: 14px; height: 14px; }
   .full-path { display: none; }
   .alias-path .full-path { display: block; }
+  /* The audit table's third column is the event itself, not a timestamp that
+     can go; it drops the actor instead, which the description already names. */
+  .audit-table thead th:nth-child(3), .audit-table tbody td:nth-child(3) { display: table-cell; }
+  .audit-table thead th:nth-child(2), .audit-table tbody td:nth-child(2) { display: none; }
+  .audit-table thead th:nth-child(1) { width: 28%; }
+  .audit-table thead th:nth-child(3) { width: 48%; }
+  .audit-table thead th:nth-child(4) { width: 24%; }
   .identity-name { max-width: 12ch; }
   .watermark { display: none; }
 }

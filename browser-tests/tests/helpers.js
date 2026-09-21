@@ -88,6 +88,11 @@ function scalarField(number, value) {
   return Buffer.concat([varint(number << 3), varint(value)]);
 }
 
+// `v4` is `v3` plus the Audit service, with every shared message identical on
+// the wire, so the shared mocks answer on both and a test picks the version its
+// session negotiates (see `negotiate`).
+const SHARED_VERSIONS = '{v3,v4}';
+
 function storedValue(value) {
   return typeof value === 'string' ? { value, secret: false } : value;
 }
@@ -257,7 +262,7 @@ async function mockValues(page, initial = {}) {
   let delayedSubtree;
   let delayedReveal;
   let delayedAddPath;
-  await page.route('**/sovereign.config.v3.Configuration/*', async route => {
+  await page.route(`**/sovereign.config.${SHARED_VERSIONS}.Configuration/*`, async route => {
     const method = route.request().url().split('/').pop();
     const body = route.request().postDataBuffer();
     const fields = stringFields(body);
@@ -426,7 +431,7 @@ async function mockApplication(page) {
   // empty replies keep those reads off the network; Playwright matches routes in
   // reverse registration order, so mockValues/mockConnections still win.
   for (const service of ['Configuration', 'ManagedConnections']) {
-    await page.route(`**/sovereign.config.v3.${service}/*`, route => route.fulfill({
+    await page.route(`**/sovereign.config.${SHARED_VERSIONS}.${service}/*`, route => route.fulfill({
       status: 200,
       headers: { 'content-type': 'application/grpc-web+proto' },
       body: grpcFrame(Buffer.alloc(0))
@@ -452,9 +457,9 @@ async function mockApplication(page) {
       body: grpcFrame(message)
     });
   });
-  await page.route('**/sovereign.config.v3.System/GetVersion', route => {
+  await page.route(`**/sovereign.config.${SHARED_VERSIONS}.System/GetVersion`, route => {
     const application = Buffer.from('1.5.0');
-    const protocol = Buffer.from('v3');
+    const protocol = Buffer.from(route.request().url().includes('.v4.') ? 'v4' : 'v3');
     const message = Buffer.concat([
       Buffer.from([0x0a, application.length]), application,
       Buffer.from([0x12, protocol.length]), protocol
@@ -470,6 +475,10 @@ async function mockApplication(page) {
     return route.fulfill({ contentType: 'text/html', path: path.join(staticDir, 'index.html') });
   });
   await page.route('**/connections/**', route => {
+    if (route.request().resourceType() !== 'document') return route.continue();
+    return route.fulfill({ contentType: 'text/html', path: path.join(staticDir, 'index.html') });
+  });
+  await page.route('**/audit/**', route => {
     if (route.request().resourceType() !== 'document') return route.continue();
     return route.fulfill({ contentType: 'text/html', path: path.join(staticDir, 'index.html') });
   });
@@ -524,7 +533,7 @@ async function mockConnections(page, options = {}) {
     rotations: 0
   };
   let delayedList;
-  await page.route('**/sovereign.config.v3.ManagedConnections/*', async route => {
+  await page.route(`**/sovereign.config.${SHARED_VERSIONS}.ManagedConnections/*`, async route => {
     const method = route.request().url().split('/').pop();
     const body = route.request().postDataBuffer();
     const fields = stringFields(body);
@@ -575,6 +584,143 @@ async function mockConnections(page, options = {}) {
     let release;
     const promise = new Promise(resolve => { release = resolve; });
     delayedList = { promise };
+    return release;
+  };
+  return state;
+}
+
+// Makes the handshake serve `version` instead of mockApplication's `v3`.
+// Playwright matches the newest route first, so this must follow
+// mockApplication.
+async function negotiate(page, version) {
+  await page.route('**/sovereign.config.Handshake/Negotiate', route => {
+    const protocol = Buffer.from(version);
+    const served = field(1, protocol);
+    return route.fulfill({
+      status: 200,
+      headers: { 'content-type': 'application/grpc-web+proto' },
+      body: grpcFrame(field(1, served))
+    });
+  });
+}
+
+// `v4.AuditEventKind` numbers, by the trail's labels.
+const AUDIT_KINDS = {
+  'value.created': 1,
+  'value.updated': 2,
+  'value.deleted': 3,
+  'value.path_added': 4,
+  'subtree.replaced': 5,
+  'subtree.deleted': 6,
+  'secret.revealed': 7,
+  'subtree.read': 8,
+  'values.listed': 9,
+  'connection.created': 10,
+  'connection.rotated': 11,
+  'connection.revoked': 12
+};
+
+function auditEvent({ id, kind, path: eventPath, at, firstAt = at, count = 1, subject = 'operator-subject', name, protocol = 'v4', narrative }) {
+  return Buffer.concat([
+    scalarField(1, id),
+    scalarField(2, AUDIT_KINDS[kind]),
+    field(3, Buffer.from(eventPath)),
+    field(4, timestamp(at)),
+    field(5, timestamp(firstAt)),
+    scalarField(6, count),
+    field(7, Buffer.from(subject)),
+    ...(name ? [field(8, Buffer.from(name))] : []),
+    field(9, Buffer.from(protocol)),
+    field(12, Buffer.from(narrative))
+  ]);
+}
+
+function timestampSeconds(message) {
+  return message ? (messageFields(message).get(1) || [0])[0] : undefined;
+}
+
+// A QueryAuditTrailRequest, decoded into the filters it carries.
+function auditRequest(body) {
+  const fields = messageFields(body, 5);
+  const text = number => (fields.get(number) || []).map(value => value.toString())[0] || '';
+  const kindNumbers = decodeRepeatedVarints(fields.get(7) || []);
+  const labels = Object.fromEntries(Object.entries(AUDIT_KINDS).map(([label, number]) => [number, label]));
+  return {
+    pathFilter: text(1),
+    elementPath: text(2),
+    textFilter: text(3),
+    from: timestampSeconds((fields.get(4) || [])[0]),
+    until: timestampSeconds((fields.get(5) || [])[0]),
+    protocolVersion: text(6),
+    kinds: kindNumbers.map(number => labels[number]),
+    pageSize: (fields.get(8) || [0])[0],
+    cursor: text(9)
+  };
+}
+
+// The service's filters, as README "Reading the trail" states them.
+function auditMatches(event, query) {
+  const firstAt = event.firstAt ?? event.at;
+  if (query.pathFilter && !event.path.toLowerCase().includes(query.pathFilter.toLowerCase())) return false;
+  if (query.elementPath) {
+    const element = query.elementPath.toLowerCase();
+    const eventPath = event.path.toLowerCase();
+    const own = eventPath === element;
+    const ancestorRead = event.kind === 'subtree.read'
+      && (eventPath === '/' || element.startsWith(`${eventPath}/`));
+    const parentListing = event.kind === 'values.listed' && eventPath === parentPath(element).toLowerCase();
+    if (!own && !ancestorRead && !parentListing) return false;
+  }
+  if (query.textFilter && !event.narrative.toLowerCase().includes(query.textFilter.toLowerCase())) return false;
+  if (query.protocolVersion && (event.protocol || 'v4') !== query.protocolVersion) return false;
+  if (query.kinds.length && !query.kinds.includes(event.kind)) return false;
+  if (query.from !== undefined && event.at < query.from) return false;
+  if (query.until !== undefined && firstAt > query.until) return false;
+  return true;
+}
+
+/**
+ * Mocks `v4.Audit/QueryAuditTrail` over `events`, which are given newest
+ * first. Pages hold `pageSize` events and the cursor is the offset of the next
+ * one — opaque to the client, which is all the contract promises.
+ */
+async function mockAudit(page, { events = [], pageSize = 3 } = {}) {
+  const state = { requests: [], failures: 0 };
+  let delayed;
+  await page.route('**/sovereign.config.v4.Audit/QueryAuditTrail', async route => {
+    const query = auditRequest(route.request().postDataBuffer());
+    state.requests.push(query);
+    const reply = (body, status = 0) => route.fulfill({
+      status: 200,
+      headers: { 'content-type': 'application/grpc-web+proto' },
+      body: grpcFrame(body, status)
+    });
+    if (route.request().headers().authorization !== 'Bearer access-token-two') {
+      return reply(Buffer.alloc(0), 16);
+    }
+    if (delayed) {
+      const delay = delayed;
+      delayed = undefined;
+      await delay.promise;
+    }
+    if (state.failures > 0) {
+      state.failures -= 1;
+      return reply(Buffer.alloc(0), 14);
+    }
+    const matching = events.filter(event => auditMatches(event, query));
+    const start = query.cursor ? Number(query.cursor) : 0;
+    const slice = matching.slice(start, start + pageSize);
+    const next = start + pageSize < matching.length ? String(start + pageSize) : '';
+    return reply(Buffer.concat([
+      ...slice.map(event => field(1, auditEvent(event))),
+      ...(next ? [field(2, Buffer.from(next))] : [])
+    ]));
+  });
+  state.failNext = (count = 1) => { state.failures = count; };
+  state.delayNext = () => {
+    let release;
+    const promise = new Promise(resolve => { release = resolve; });
+    delayed = { promise };
     return release;
   };
   return state;
@@ -675,7 +821,7 @@ async function openCallback(
       })
     });
   });
-  await page.route('**/sovereign.config.v3.System/GetIdentity', route => {
+  await page.route(`**/sovereign.config.${SHARED_VERSIONS}.System/GetIdentity`, route => {
     const authorized = route.request().headers().authorization === 'Bearer access-token-two';
     const status = authorized ? identityStatus : 16;
     return route.fulfill({
@@ -744,6 +890,8 @@ module.exports = {
   listConnectionsReply,
   provisionedReply,
   mockConnections,
+  negotiate,
+  mockAudit,
   mockDiscovery,
   idToken,
   openCallback,

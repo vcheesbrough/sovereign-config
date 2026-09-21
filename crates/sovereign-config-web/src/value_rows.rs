@@ -16,6 +16,7 @@ use crate::dom::{
 };
 use crate::icons::{Icon, create_icon_button, set_icon_button_icon};
 use crate::path_selector::render_path_options;
+use crate::route::{Route, guarded_navigate};
 
 fn secret_field_revealed(input_id: &str) -> bool {
     element::<HtmlInputElement>(input_id).is_some_and(|input| {
@@ -317,6 +318,13 @@ fn render_row_actions(
         Icon::AddPath,
         None,
     )?;
+    let history = create_icon_button(
+        document,
+        &format!("audit-listed-value-{index}"),
+        &format!("Show the audit trail for {name}"),
+        Icon::History,
+        None,
+    )?;
     let remove_id = format!("delete-listed-value-{index}");
     let remove = create_icon_button(
         document,
@@ -327,6 +335,7 @@ fn render_row_actions(
     )?;
     append(&actions, &save)?;
     append(&actions, &add_path)?;
+    append(&actions, &history)?;
     append(&actions, &remove)?;
     append(&actions_cell, &actions)?;
 
@@ -334,6 +343,13 @@ fn render_row_actions(
     let add_path_focus = add_path_id;
     listen(&add_path, "click", move |_: Event| {
         open_add_path(add_path_source.clone(), add_path_focus.clone());
+    })?;
+
+    // Guarded like any other navigation: an edit on this very row is exactly
+    // the kind of thing an operator might leave to go and look at its history.
+    let history_path = value.path.clone();
+    listen(&history, "click", move |_: Event| {
+        guarded_navigate(Route::Audit(Some(history_path.clone())));
     })?;
 
     let delete_path = value.path.clone();

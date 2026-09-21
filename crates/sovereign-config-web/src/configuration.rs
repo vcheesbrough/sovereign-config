@@ -388,7 +388,7 @@ pub(crate) async fn reveal_existing_secret(path: ConfigPath, input_id: String, b
     let generation = CONFIGURATION_LOAD_GENERATION.get();
     let route_path = match route_from_location() {
         Route::Configuration(path) => path,
-        Route::Connections | Route::Downloads => return,
+        Route::Connections | Route::Downloads | Route::Audit(_) => return,
     };
     clear_error();
     lock_secret_field(&input_id, &button_id);
@@ -399,7 +399,7 @@ pub(crate) async fn reveal_existing_secret(path: ConfigPath, input_id: String, b
     .await;
     let current_path = match route_from_location() {
         Route::Configuration(path) => path,
-        Route::Connections | Route::Downloads => return,
+        Route::Connections | Route::Downloads | Route::Audit(_) => return,
     };
     if generation != CONFIGURATION_LOAD_GENERATION.get() || current_path != route_path {
         return;

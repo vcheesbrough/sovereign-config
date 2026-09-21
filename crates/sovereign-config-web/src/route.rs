@@ -7,6 +7,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{HtmlDialogElement, HtmlElement, HtmlInputElement, HtmlTextAreaElement, window};
 
+use crate::audit::{load_audit, render_audit_route};
 use crate::configuration::{absolute_path, load_current_configuration, validate_path_field};
 use crate::connections::{
     discard_connection_url, load_current_connections, render_path_connections,
@@ -30,6 +31,8 @@ pub(crate) enum Route {
     Configuration(ConfigPath),
     Connections,
     Downloads,
+    /// The audit trail: the whole of it, or one value's history.
+    Audit(Option<ConfigPath>),
 }
 
 /// Every in-app route change runs through here so an unsaved value edit can
@@ -140,6 +143,7 @@ pub(crate) async fn refresh_views() {
     load_current_configuration().await;
     load_current_connections().await;
     load_downloads().await;
+    load_audit().await;
     load_tree().await;
 }
 
@@ -204,13 +208,16 @@ pub(crate) fn render_route(route: &Route) {
     let configuration = matches!(route, Route::Configuration(_));
     let connections = matches!(route, Route::Connections);
     let downloads = matches!(route, Route::Downloads);
+    let audit = matches!(route, Route::Audit(_));
     set_hidden("configuration-page", !configuration);
     set_hidden("connections-page", !connections);
     set_hidden("downloads-page", !downloads);
+    set_hidden("audit-page", !audit);
     set_active("configuration-values-link", configuration);
     set_active("managed-connections-link", connections);
     set_active("downloads-link", downloads);
-    if let Route::Configuration(path) = route {
+    set_active("audit-trail-link", audit);
+    if configuration || audit {
         let canonical_url = route_url(route);
         if let Some(window) = window()
             && window.location().pathname().ok().as_deref() != Some(canonical_url.as_str())
@@ -227,6 +234,11 @@ pub(crate) fn render_route(route: &Route) {
                 Some(&format!("{canonical_url}{search}")),
             );
         }
+    }
+    if let Route::Audit(path) = route {
+        render_audit_route(path.as_ref());
+    }
+    if let Route::Configuration(path) = route {
         if let Some(input) = element::<HtmlInputElement>("selected-path") {
             input.set_value(&absolute_path(path));
         }
@@ -265,6 +277,14 @@ pub(crate) fn route_from_path(path: &str) -> Route {
     if path == "/downloads" || path == "/downloads/" {
         return Route::Downloads;
     }
+    if path == "/audit" || path == "/audit/" {
+        return Route::Audit(None);
+    }
+    if let Some(relative) = path.strip_prefix("/audit/") {
+        // A suffix that names no value is not a value's history; it falls back
+        // to the whole trail, and `render_route` rewrites the address to say so.
+        return Route::Audit(ConfigPath::parse_operation(format!("/{relative}")).ok());
+    }
     if let Some(relative) = path.strip_prefix("/configuration/")
         && let Ok(path) = ConfigPath::parse_operation(format!("/{relative}"))
     {
@@ -282,5 +302,7 @@ pub(crate) fn route_url(route: &Route) -> String {
         Route::Configuration(path) => format!("/configuration{}", path.as_str()),
         Route::Connections => "/connections/".into(),
         Route::Downloads => "/downloads".into(),
+        Route::Audit(None) => "/audit/".into(),
+        Route::Audit(Some(path)) => format!("/audit{}", path.as_str()),
     }
 }

@@ -162,7 +162,7 @@ pub(crate) fn build_tree(
 pub(crate) fn selected_tree_path() -> Option<ConfigPath> {
     match route_from_location() {
         Route::Configuration(path) => Some(path),
-        Route::Connections | Route::Downloads => None,
+        Route::Connections | Route::Downloads | Route::Audit(_) => None,
     }
 }
 

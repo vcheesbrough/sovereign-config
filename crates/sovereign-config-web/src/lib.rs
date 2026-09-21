@@ -5,6 +5,7 @@
 //! and renders the route in the current URL; each view and concern lives in
 //! its own module.
 
+mod audit;
 mod browser;
 mod configuration;
 mod connections;
@@ -26,6 +27,7 @@ use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{Event, window};
 
+use crate::audit::{install_audit_actions, load_audit, reset_audit};
 use crate::browser::{app_config, location_search};
 use crate::configuration::{
     CONFIGURATION_LOAD_GENERATION, hide_new_value_row, install_configuration_actions,
@@ -79,6 +81,7 @@ pub fn start() {
                 } else if authenticated {
                     load_current_configuration().await;
                     load_current_connections().await;
+                    load_audit().await;
                     load_tree().await;
                 } else {
                     // Renders the sidebar's logged-out hint in place of a tree.
@@ -102,6 +105,7 @@ pub(crate) fn install_actions() {
     );
     install_route_link(&document, "managed-connections-link", Route::Connections);
     install_route_link(&document, "downloads-link", Route::Downloads);
+    install_route_link(&document, "audit-trail-link", Route::Audit(None));
     if let Some(browser_window) = window() {
         let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
             // Every other route change closes the menu before anything else —
@@ -161,11 +165,14 @@ pub(crate) fn install_actions() {
         let _ = render_tree(&[]);
         set_text("config-tree-state", "Log in to browse");
         set_text("connection-state", "Log in to view connections");
+        reset_audit();
+        set_text("audit-state", "Log in to view the audit trail");
         close_brand_menu();
         focus("login");
     });
     install_configuration_actions(&document);
     install_connections_actions(&document);
+    install_audit_actions(&document);
     install_tree_actions(&document);
     install_unsaved_guard(&document);
     install_sidebar_resizer(&document);
