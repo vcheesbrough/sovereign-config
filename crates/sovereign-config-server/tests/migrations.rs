@@ -523,7 +523,7 @@ async fn migrations_are_repeatable_against_postgresql() {
     .fetch_all(&pool)
     .await
     .expect("audit index inventory must be readable");
-    assert_eq!(applied_migrations, 11);
+    assert_eq!(applied_migrations, 12);
     assert_eq!(
         audit_indexes,
         [

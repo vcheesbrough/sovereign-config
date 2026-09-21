@@ -662,7 +662,7 @@ Every filter is optional and every one that is set must match: a fragment of the
 
 Paging is keyset, never offset, on each event's first occurrence and its id — both fixed for the event's life, and the order events are returned in, so a coalesced event keeps the place of its first occurrence however recently it was bumped. A new event lands above the cursor and a coalesced window bumped mid-scroll keeps its place, so a scroll returns each event exactly once. Paging on the most recent occurrence would not: a bump moves it, and a row that moves past the cursor is skipped. A coalesced event is served with its count and period rendered onto its narrative.
 
-The path and narrative filters are served by trigram indexes (`pg_trgm`, migration `0011`), and the paging order by its own index. The same migration gives each alias event a column naming its other path, backfilled from the narrative for events recorded before it.
+The path and narrative filters are served by trigram indexes (`pg_trgm`, migration `0011`), and the paging order by its own index. Migration `0012` gives each alias event a column naming its other path, backfilled from the narrative for events recorded before it.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
