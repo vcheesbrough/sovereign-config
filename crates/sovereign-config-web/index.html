@@ -22,10 +22,11 @@
         </button>
         <!-- A plain disclosure rather than an ARIA menu: these are ordinary
              links, and a real `role="menu"` would owe a roving tab stop and
-             arrow-key traversal that buy a three-item list nothing. -->
+             arrow-key traversal that buy a short list of four links nothing. -->
         <nav id="brand-menu" class="brand-menu-panel" aria-label="Views" hidden>
           <a id="configuration-values-link" href="/configuration/">Configuration values</a>
           <a id="managed-connections-link" href="/connections/">Access URLs</a>
+          <a id="audit-trail-link" href="/audit/">Audit trail</a>
           <a id="downloads-link" href="/downloads">Downloads</a>
         </nav>
       </div>
@@ -270,6 +271,93 @@
           <p class="downloads-intro">Install the command-line client for this server. The binary is built from this server's release, so it stays protocol-compatible. Download the installer, then run it &mdash; the command below downloads to a temporary directory that is removed afterwards.</p>
           <div id="downloads-list" class="downloads-list"></div>
           <p id="empty-downloads" class="empty-state" hidden>No installers are published by this server.</p>
+        </div>
+
+        <div id="audit-page" class="page" hidden>
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Configuration</p>
+              <h1>Audit trail</h1>
+            </div>
+            <p id="audit-state" class="status-text" aria-live="polite">Log in to view the audit trail</p>
+          </div>
+          <p id="audit-element" class="audit-element" hidden>History of <code id="audit-element-path"></code>, including reads of the namespaces above it. <a id="audit-whole-trail" href="/audit/">Show the whole trail</a></p>
+
+          <form id="audit-filters" class="path-form" novalidate>
+            <div class="audit-filter-grid">
+              <div>
+                <label for="audit-path-filter">Path contains</label>
+                <input id="audit-path-filter" type="text" autocomplete="off" spellcheck="false" maxlength="512" aria-describedby="audit-path-filter-error">
+                <p id="audit-path-filter-error" class="field-error" aria-live="polite" hidden></p>
+              </div>
+              <div>
+                <label for="audit-text-filter">Description contains</label>
+                <input id="audit-text-filter" type="text" autocomplete="off" maxlength="256" aria-describedby="audit-text-filter-error">
+                <p id="audit-text-filter-error" class="field-error" aria-live="polite" hidden></p>
+              </div>
+              <div>
+                <label for="audit-from">From</label>
+                <input id="audit-from" type="datetime-local">
+              </div>
+              <div>
+                <label for="audit-until">Until</label>
+                <input id="audit-until" type="datetime-local" aria-describedby="audit-until-error">
+                <p id="audit-until-error" class="field-error" aria-live="polite" hidden></p>
+              </div>
+              <div>
+                <label for="audit-protocol">Protocol version</label>
+                <!-- Free text with suggestions rather than a fixed list: a year
+                     of history can name versions this build no longer speaks. -->
+                <input id="audit-protocol" type="text" list="audit-protocol-versions" autocomplete="off" spellcheck="false" maxlength="32" placeholder="Any" aria-describedby="audit-protocol-error">
+                <datalist id="audit-protocol-versions"></datalist>
+                <p id="audit-protocol-error" class="field-error" aria-live="polite" hidden></p>
+              </div>
+            </div>
+            <fieldset id="audit-kinds" class="permission-choices" aria-describedby="audit-kinds-error">
+              <legend>Events</legend>
+              <label class="permission-choice" for="audit-kind-changes">
+                <input id="audit-kind-changes" type="checkbox" checked>
+                Changes
+              </label>
+              <label class="permission-choice" for="audit-kind-secrets">
+                <input id="audit-kind-secrets" type="checkbox" checked>
+                Secret reveals
+              </label>
+              <label class="permission-choice" for="audit-kind-connections">
+                <input id="audit-kind-connections" type="checkbox" checked>
+                Access URL changes
+              </label>
+              <label class="permission-choice" for="audit-kind-reads">
+                <input id="audit-kind-reads" type="checkbox">
+                Reads
+              </label>
+            </fieldset>
+            <p id="audit-kinds-error" class="field-error" aria-live="polite" hidden></p>
+            <div class="json-actions">
+              <button id="apply-audit-filters" type="submit">Filter</button>
+            </div>
+          </form>
+
+          <div class="table-scroll audit-table-scroll">
+            <table class="audit-table" aria-label="Audit events">
+              <thead>
+                <tr>
+                  <th scope="col">When</th>
+                  <th scope="col">Actor</th>
+                  <th scope="col">Event</th>
+                  <th scope="col">Protocol</th>
+                </tr>
+              </thead>
+              <tbody id="audit-body"></tbody>
+            </table>
+          </div>
+          <p id="empty-audit" class="empty-state" hidden>No events match these filters.</p>
+          <div class="audit-feed-status">
+            <p id="audit-page-error" class="field-error" role="alert" hidden></p>
+            <button id="retry-audit" class="secondary" type="button" hidden>Retry</button>
+          </div>
+          <!-- Observed from Rust: reaching it loads the next page. -->
+          <div id="audit-sentinel" class="audit-sentinel" aria-hidden="true"></div>
         </div>
       </main>
     </div>

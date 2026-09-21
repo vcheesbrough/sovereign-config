@@ -20,6 +20,7 @@ pub(crate) enum Icon {
     LockClosed,
     LockOpen,
     Key,
+    History,
 }
 
 const fn icon_paths(icon: Icon) -> &'static [&'static str] {
@@ -42,6 +43,13 @@ const fn icon_paths(icon: Icon) -> &'static [&'static str] {
         Icon::Key => &[
             "M5 4.8a3.2 3.2 0 1 0 0 6.4 3.2 3.2 0 0 0 0-6.4",
             "M8.2 8h6.3M12.5 8v2.4",
+        ],
+        // A clock face with a counter-clockwise arrow at its start: time, run
+        // backwards.
+        Icon::History => &[
+            "M2.8 8a5.2 5.2 0 1 0 1.5-3.7",
+            "M4.3 1.8v2.5H1.8",
+            "M8 5.2V8l2 1.3",
         ],
     }
 }

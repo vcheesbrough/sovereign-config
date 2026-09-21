@@ -162,6 +162,25 @@ fn connection_routes_are_canonical() {
     );
 }
 
+#[test]
+fn audit_routes_are_canonical_and_keep_a_values_case() {
+    for path in ["/audit", "/audit/"] {
+        assert!(matches!(route_from_path(path), Route::Audit(None)));
+    }
+    assert_eq!(route_url(&Route::Audit(None)), "/audit/");
+    let Route::Audit(Some(element)) = route_from_path("/audit/Apps/API/Key") else {
+        panic!("a value path should open that value's history");
+    };
+    assert_eq!(element.as_str(), "/Apps/API/Key");
+    assert_eq!(
+        route_url(&route_from_path("/audit/Apps/API/Key")),
+        "/audit/Apps/API/Key"
+    );
+    // A suffix that names no value falls back to the whole trail rather than
+    // leaving the audit view.
+    assert_eq!(route_url(&route_from_path("/audit/bad.name")), "/audit/");
+}
+
 fn node(path: &str, depth: usize) -> TreeNode {
     TreeNode {
         path: ConfigPath::parse(path).unwrap(),
