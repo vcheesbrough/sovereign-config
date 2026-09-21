@@ -51,7 +51,7 @@ Production is deployed with Woodpecker's **Deploy feature — a `deployment` eve
 
 Before the first promotion the operator provides the production Woodpecker secrets `sovereign_config_prod_postgres_password`, `sovereign_config_prod_oidc_introspection_client_secret`, `sovereign_config_prod_manager_api_token`, and `sovereign_config_prod_value_encryption_key` (the server refuses to start without it), the pre-created encrypted `sovereign-config-production-db` volume, and DNS/Traefik for the production host. The shared secrets the deployment path reuses — `github_token` (tag resolution), `zot_ci_user` and `zot_ci_password` (registry pull), and `authentik_api_token` (blueprint) — must permit the `deployment` event in their Woodpecker event allowlists.
 
-Build release images only for linux/amd64 with `docker build --platform linux/amd64 --target server-runtime --tag sovereign-config:local .`. `--target` is mandatory: the Dockerfile has a second final stage, `broker-runtime`, for the Woodpecker secrets broker (`docker build --platform linux/amd64 --target broker-runtime --tag sovereign-config-woodpecker-broker:local .`), and an untargeted build tags whichever stage is last in the file.
+Build release images only for linux/amd64 with `docker build --platform linux/amd64 --target server-runtime --tag sovereign-config:local .`. `--target` is mandatory: the Dockerfile has two further final stages — `broker-runtime` for the Woodpecker secrets broker (`docker build --platform linux/amd64 --target broker-runtime --tag sovereign-config-woodpecker-broker:local .`) and `cli-runtime` for the [CLI image](#the-cli-image-for-woodpecker-pipelines) (`docker build --platform linux/amd64 --target cli-runtime --tag sovereign-config-cli:local .`) — and an untargeted build tags whichever stage is last in the file.
 Woodpecker keeps two separate Cargo caches, and neither reuses the other. The `unit-test` step builds debug and test artifacts into the `sovereign-config-contract-target` volume. The image builds compile release artifacts into the `sovereign-config-cargo-target` BuildKit cache mount. Each cache is bounded at 20 GiB by its own prune script, `scripts/ci-prune-cargo-target.sh` and `scripts/ci-prune-buildkit-cache.sh`.
 
 The server embeds the fingerprinted Rust WASM administration application and serves it with gRPC-Web on the native gRPC listener. Browser assets, runtime OIDC configuration, and gRPC-Web use the service origin; the server sends no cross-origin API permission. Browser access tokens remain only in WASM memory, while rotating refresh tokens remain in tab-scoped session storage. Access expiry refreshes transparently and reload restores the tab's session; logout, absolute refresh expiry, or definitive refresh rejection require a new PKCE authorization.
@@ -171,6 +171,24 @@ The hosts `render` exists for — a CI container, a Compose deploy step — have
 **A connection URL is never a process argument**, here as everywhere else: it carries the credential, and process arguments are world-readable on a typical host. `--url-file` names a file and `SOVEREIGN_CONFIG_URL` names a variable; neither is the URL itself.
 
 `render` removes `SOVEREIGN_CONFIG_URL` from the environment it hands the command, whether or not this invocation used it — the credential that read the configuration stops at `render`. It is removed before rendered values are applied, so configuration that legitimately holds a connection URL for the executed application's own use still reaches it; only the *inherited* credential is stripped.
+
+#### The CLI image for Woodpecker pipelines
+
+Each release also publishes `registry.desync.link/sovereign-config-cli:<version>`: the digest-pinned `docker:27-cli` image this repository's own deploy steps run, with the same static `sovereign-config` binary the installer carries at `/usr/local/bin/sovereign-config`. A Woodpecker step that already runs `docker` can swap its image for this one and gain the CLI with no install step and no download at run time. The image keeps the base image's root user and entrypoint, so the step's `commands:` drive the mounted Docker socket exactly as before. It is published under the server's semver, so pin the tag of the server you talk to; the image build fails unless the binary reports exactly that release.
+
+```yaml
+deploy:
+  image: registry.desync.link/sovereign-config-cli:<version>
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+  environment:
+    SOVEREIGN_CONFIG_URL:
+      from_secret: sovereign_config_url
+  commands:
+    - sovereign-config render /apps/api /apps/api/prod -- docker compose up -d --wait
+```
+
+The connection URL arrives through `SOVEREIGN_CONFIG_URL` from a Woodpecker secret — never inline in the pipeline file — and `render` strips it before the command runs (see [Credential inputs](#credential-inputs)). Use a read-only managed connection rooted at the step's own subtree.
 
 #### Self-hosting exception
 
@@ -637,4 +655,4 @@ Both answer a question `GetVersion` alone cannot — negotiation happens once at
 
 ## Release Gate
 
-Publish an image tag only after `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `shellcheck` and unit tests of the repository's shell scripts, native and WASM checks, unit and integration checks, PostgreSQL migration checks, gRPC/gRPC-Web checks, and Chromium/Firefox UI checks pass. Each release publishes **two** images from the same source tag and the same semver — `sovereign-config` and `sovereign-config-woodpecker-broker` — so the pair is protocol-matched by construction; a production promotion fails closed if either is missing from the registry. Both image builds must pass `--target` (`server-runtime` / `broker-runtime`), because the Dockerfile has more than one final stage. The release image bundles static musl CLI and MCP-server installers built from the same tag and served unauthenticated under `/dist`; the image build gates on each installer extracting to a binary whose reported version equals the release tag. The tagged source also supplies the protocol-matched CLI and MCP server through `cargo install --locked`. SBOM generation is out of scope for the MVP.
+Publish an image tag only after `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `shellcheck` and unit tests of the repository's shell scripts, native and WASM checks, unit and integration checks, PostgreSQL migration checks, gRPC/gRPC-Web checks, and Chromium/Firefox UI checks pass. Each release publishes **three** images from the same source tag and the same semver — `sovereign-config`, `sovereign-config-woodpecker-broker` and `sovereign-config-cli` — so they are protocol-matched by construction; a production promotion fails closed if any is missing from the registry. Every image build must pass `--target` (`server-runtime` / `broker-runtime` / `cli-runtime`), because the Dockerfile has more than one final stage. The release image bundles static musl CLI and MCP-server installers built from the same tag and served unauthenticated under `/dist`; the image build gates on each installer extracting to a binary whose reported version equals the release tag. The tagged source also supplies the protocol-matched CLI and MCP server through `cargo install --locked`. SBOM generation is out of scope for the MVP.

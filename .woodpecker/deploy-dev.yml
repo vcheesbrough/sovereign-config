@@ -1,4 +1,4 @@
-# Deploy-dev workflow: publish the two images the build workflow made, apply the
+# Deploy-dev workflow: publish the three images the build workflow made, apply the
 # dev Authentik blueprint, prove the connection manager against live Authentik,
 # deploy dev, then push the git tag.
 #
@@ -11,8 +11,8 @@
 when:
   - event: [push, manual]
 
-# Nothing here starts until every check has passed and both images are built.
-# All three run on push and manual alike, so neither dependency is optional.
+# Nothing here starts until every check has passed and all three images are built.
+# All three workflows run on push and manual alike, so neither dependency is optional.
 depends_on:
   - checks
   - build
@@ -81,11 +81,12 @@ steps:
         RELEASE_TAG=$$(cat .release-tag)
         IMAGE=registry.desync.link/sovereign-config:$$RELEASE_TAG
         BROKER_IMAGE=registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG
-        # The build workflow made both images on this Docker host and computed its
+        CLI_IMAGE=registry.desync.link/sovereign-config-cli:$$RELEASE_TAG
+        # The build workflow made all three images on this Docker host and computed its
         # own release tag. Publish only images built from this commit for exactly
         # this tag: if another pipeline tagged a release in between, the two tags
         # differ and a binary would ship under another version's name.
-        for LOCAL in sovereign-config-ci:$$CI_COMMIT_SHA sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA; do
+        for LOCAL in sovereign-config-ci:$$CI_COMMIT_SHA sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA sovereign-config-cli-ci:$$CI_COMMIT_SHA; do
           LABELS=$$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }} {{ index .Config.Labels "org.opencontainers.image.revision" }}' "$$LOCAL") || {
             echo "ERROR: $$LOCAL was not built on this host" >&2
             exit 1
@@ -98,10 +99,12 @@ steps:
         echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
         docker tag sovereign-config-ci:$$CI_COMMIT_SHA "$$IMAGE"
         docker push "$$IMAGE"
-        # Both images carry the same semver, so server and broker are always
-        # protocol-matched by construction.
+        # All three images carry the same semver, so server, broker and CLI are
+        # always protocol-matched by construction.
         docker tag sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA "$$BROKER_IMAGE"
         docker push "$$BROKER_IMAGE"
+        docker tag sovereign-config-cli-ci:$$CI_COMMIT_SHA "$$CLI_IMAGE"
+        docker push "$$CLI_IMAGE"
 
   apply-authentik-blueprint-auto-dev:
     depends_on:

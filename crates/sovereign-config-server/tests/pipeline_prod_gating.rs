@@ -124,6 +124,7 @@ fn build_and_dev_deploy_steps_never_run_on_a_deployment() {
         "prune-build-cache",
         "build-server",
         "build-broker",
+        "build-cli",
         "publish-dev-image",
         "apply-authentik-blueprint-auto-dev",
         "validate-authentik-manager-live",
@@ -141,7 +142,7 @@ fn build_and_dev_deploy_steps_never_run_on_a_deployment() {
     }
 }
 
-/// The Dockerfile has two final stages, so an untargeted `docker build .`
+/// The Dockerfile has three final stages, so an untargeted `docker build .`
 /// silently tags the *last* one. Without `--target`, `build-server` would
 /// publish the broker binary under the server's image name — a failure that
 /// would only surface at deploy time.
@@ -151,6 +152,7 @@ fn each_image_build_names_its_dockerfile_target() {
     for (name, target) in [
         ("build-server", "--target server-runtime"),
         ("build-broker", "--target broker-runtime"),
+        ("build-cli", "--target cli-runtime"),
     ] {
         let commands = commands_text(step(&pipeline, name));
         assert!(
@@ -160,16 +162,86 @@ fn each_image_build_names_its_dockerfile_target() {
     }
 }
 
-/// Server and broker ship as one release: the same commit, the same semver, the
-/// same publish step. A tag that carries only one of them is not a release.
+/// The CLI image is the exact docker CLI image the pipeline's own docker steps
+/// run, plus the static CLI binary on `PATH` — so another repository's step can
+/// swap its image for it and gain `sovereign-config` without losing `docker`.
 #[test]
-fn the_release_publishes_both_images_under_one_semver() {
-    let publish = commands_text(step(&pipeline(), "publish-dev-image"));
+fn the_cli_image_is_the_pipeline_docker_image_plus_the_cli() {
+    let dockerfile = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Dockerfile"),
+    )
+    .expect("Dockerfile should be readable");
+    let stage = dockerfile
+        .split("\nFROM ")
+        .find(|stage| {
+            stage
+                .lines()
+                .next()
+                .is_some_and(|from| from.ends_with(" AS cli-runtime"))
+        })
+        .expect("the Dockerfile must define a cli-runtime stage");
+    let base = stage
+        .split_whitespace()
+        .next()
+        .expect("cli-runtime needs a base image");
+    let pipeline = pipeline();
+    let build_image = step(&pipeline, "build-cli")
+        .get("image")
+        .and_then(Value::as_str)
+        .expect("build-cli needs an image");
     assert!(
-        publish.contains("registry.desync.link/sovereign-config:$$RELEASE_TAG")
-            && publish
-                .contains("registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG"),
-        "publish-dev-image must push both images at the allocated release tag"
+        base.starts_with("docker:27-cli@sha256:") && base == build_image,
+        "cli-runtime must be based on the digest-pinned docker CLI image the pipeline uses, got {base}"
+    );
+    assert!(
+        stage.contains(
+            "COPY --from=installer-builder /tmp/bin/sovereign-config /usr/local/bin/sovereign-config"
+        ),
+        "cli-runtime must carry the static musl CLI the installer is built from"
+    );
+    assert!(
+        !stage.contains("ENTRYPOINT") && !stage.contains("\nUSER "),
+        "cli-runtime keeps the base image's entrypoint and user so pipeline commands can drive Docker"
+    );
+    assert!(
+        stage.contains("sovereign-config --version") && stage.contains("$RELEASE_VERSION"),
+        "cli-runtime must gate on the binary reporting the release it was built for"
+    );
+}
+
+/// Server, broker and CLI ship as one release: the same commit, the same
+/// semver, the same publish step. A tag that carries only some of them is not a
+/// release.
+#[test]
+fn the_release_publishes_every_image_under_one_semver() {
+    let publish = commands_text(step(&pipeline(), "publish-dev-image"));
+    for (local, published) in [
+        (
+            "sovereign-config-ci:$$CI_COMMIT_SHA",
+            "registry.desync.link/sovereign-config:$$RELEASE_TAG",
+        ),
+        (
+            "sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA",
+            "registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG",
+        ),
+        (
+            "sovereign-config-cli-ci:$$CI_COMMIT_SHA",
+            "registry.desync.link/sovereign-config-cli:$$RELEASE_TAG",
+        ),
+    ] {
+        assert!(
+            publish.contains(published),
+            "publish-dev-image must push {published} at the allocated release tag"
+        );
+        assert!(
+            publish.contains(&format!("docker tag {local} ")),
+            "publish-dev-image must publish {published} from the local build {local}"
+        );
+    }
+    assert_eq!(
+        publish.matches("docker push").count(),
+        3,
+        "publish-dev-image must push exactly the three release images"
     );
 }
 
@@ -230,6 +302,10 @@ fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
     assert!(
         verify_cmd.contains("registry.desync.link/sovereign-config-woodpecker-broker:"),
         "verify-image must also prove the broker image was published for this tag"
+    );
+    assert!(
+        verify_cmd.contains("registry.desync.link/sovereign-config-cli:"),
+        "verify-image must also prove the CLI image was published for this tag"
     );
 }
 
@@ -307,6 +383,7 @@ fn every_step_sits_in_its_workflow() {
                 "prune-build-cache",
                 "build-server",
                 "build-broker",
+                "build-cli",
             ],
         ),
         (
@@ -490,6 +567,7 @@ fn publish_only_ships_images_built_for_this_commit_and_tag() {
             "build-broker",
             "sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA",
         ),
+        ("build-cli", "sovereign-config-cli-ci:$$CI_COMMIT_SHA"),
     ] {
         let commands = commands_text(pipeline.step_in("build", build));
         assert!(
@@ -516,6 +594,7 @@ fn publish_only_ships_images_built_for_this_commit_and_tag() {
     for expected in [
         "sovereign-config-ci:$$CI_COMMIT_SHA",
         "sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA",
+        "sovereign-config-cli-ci:$$CI_COMMIT_SHA",
         "org.opencontainers.image.version",
         "org.opencontainers.image.revision",
         "\"$$RELEASE_TAG $$CI_COMMIT_SHA\"",
