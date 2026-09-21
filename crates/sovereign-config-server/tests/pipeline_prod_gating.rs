@@ -238,13 +238,24 @@ fn every_dockerfile_pins_the_same_base_images() {
             1,
             "{name} must build from the pinned rust image"
         );
-        let from_lines = text.lines().filter(|line| line.starts_with("FROM "));
-        for from in from_lines {
-            let base = from.split_whitespace().nth(1).unwrap_or_default();
+        let mut stages: Vec<&str> = Vec::new();
+        for from in text.lines().filter(|line| line.starts_with("FROM ")) {
+            let words: Vec<&str> = from
+                .split_whitespace()
+                .filter(|word| !word.starts_with("--"))
+                .collect();
+            let base = words.get(1).copied().unwrap_or_default();
             assert!(
-                base == "scratch" || base.contains("@sha256:") || !base.contains(['/', ':']),
-                "{name}: {from} must pin its base image by digest"
+                base == "scratch" || base.contains("@sha256:") || stages.contains(&base),
+                "{name}: {from} must pin its base image by digest or build on an earlier stage"
             );
+            if let Some(stage) = words
+                .iter()
+                .position(|word| word.eq_ignore_ascii_case("AS"))
+                .and_then(|index| words.get(index + 1))
+            {
+                stages.push(stage);
+            }
         }
     }
 }
@@ -313,6 +324,15 @@ fn the_cli_image_is_the_pipeline_docker_image_plus_the_cli() {
     assert!(
         dockerfile.contains("--target x86_64-unknown-linux-musl"),
         "the CLI must be built as a static musl binary"
+    );
+    // build-server strips and packages the same musl path in the shared target
+    // cache, possibly at the same time, so the CLI image builds elsewhere.
+    assert!(
+        dockerfile.contains("--target-dir /src/target/cli-image")
+            && dockerfile.contains(
+                "/src/target/cli-image/x86_64-unknown-linux-musl/release/sovereign-config"
+            ),
+        "the CLI image must build into its own target directory, not the server's musl output"
     );
     assert!(
         !stage.contains("ENTRYPOINT") && !stage.contains("\nUSER "),

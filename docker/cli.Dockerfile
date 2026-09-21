@@ -15,17 +15,20 @@ COPY crates ./crates
 COPY test-consumers ./test-consumers
 COPY proto ./proto
 # Fully static x86_64 musl (ring, no OpenSSL, so musl links cleanly), stripped
-# like the served installer's binary, and kept outside the cache mount.
+# like the served installer's binary, and kept outside the cache mount. It
+# builds into its own directory of the shared target cache: server.Dockerfile
+# builds and strips the same musl binary in place, possibly concurrently, and
+# must not be able to overwrite this one (or this one it) mid-packaging.
 RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=sovereign-config-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=sovereign-config-cargo-target,target=/src/target \
     apt-get update && apt-get install -y --no-install-recommends musl-tools \
     && rustup target add x86_64-unknown-linux-musl \
     && SOVEREIGN_CONFIG_RELEASE="$RELEASE_VERSION" cargo build --release --locked \
-        --target x86_64-unknown-linux-musl \
+        --target x86_64-unknown-linux-musl --target-dir /src/target/cli-image \
         --package sovereign-config-cli \
-    && strip /src/target/x86_64-unknown-linux-musl/release/sovereign-config \
-    && cp /src/target/x86_64-unknown-linux-musl/release/sovereign-config /tmp/sovereign-config
+    && strip /src/target/cli-image/x86_64-unknown-linux-musl/release/sovereign-config \
+    && cp /src/target/cli-image/x86_64-unknown-linux-musl/release/sovereign-config /tmp/sovereign-config
 
 # It keeps the base image's root user and entrypoint, because pipeline steps
 # drive the host Docker socket through `commands:`. The build gates on the
