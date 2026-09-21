@@ -59,14 +59,6 @@ impl AuditEventKind {
     pub fn parse(label: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.as_str() == label)
     }
-
-    /// Whether this kind is a plain read of configuration — the events a view
-    /// of changes and secret accesses leaves out by default, because they
-    /// outnumber everything else.
-    #[must_use]
-    pub const fn is_plain_read(self) -> bool {
-        matches!(self, Self::SubtreeRead | Self::ValuesListed)
-    }
 }
 
 /// One page's worth of filters. Every filter that is set must match; an unset

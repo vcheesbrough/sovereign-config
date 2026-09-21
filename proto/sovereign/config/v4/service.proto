@@ -267,9 +267,15 @@ enum AuditEventKind {
   AUDIT_EVENT_KIND_CONNECTION_REVOKED = 12;
 }
 
-// One page of the audit trail, newest first. Every filter that is set must
-// match; an unset filter matches everything. Only events on paths the caller
-// holds `read` on are ever returned.
+// One page of the audit trail, newest first by `first_occurred_at` then `id`:
+// a coalesced event keeps the place of its first occurrence however often it
+// is bumped, so `occurred_at` is not the order. Every filter that is set must
+// match; an unset filter matches everything.
+//
+// Only events the caller may see are ever returned: those on a path they hold
+// `read` on; for a `value.path_added` event, only when they may also read the
+// other path its narrative names; and for a `connection.*` event, only when
+// they hold `manage` on the connection's root instead.
 message QueryAuditTrailRequest {
   // A case-insensitive fragment of the event's path, matched anywhere in it.
   // Path characters only (`A-Z a-z 0-9 _ - /`), at most 512 of them.

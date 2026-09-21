@@ -159,6 +159,9 @@ impl Actor<'_> {
 pub(crate) struct AuditEvent<'a> {
     kind: EventKind,
     path: &'a str,
+    /// The other path of an alias event, which its narrative names. Stored so
+    /// the query can require `read` on it too.
+    counterpart: Option<&'a str>,
     old_value: Option<&'a str>,
     new_value: Option<&'a str>,
     narrative: String,
@@ -178,6 +181,7 @@ impl<'a> AuditEvent<'a> {
         Self {
             kind: EventKind::ValueCreated,
             path,
+            counterpart: None,
             old_value: None,
             new_value: new.plain(),
             narrative: narrative::value_created(actor.shown(), path, new),
@@ -193,6 +197,7 @@ impl<'a> AuditEvent<'a> {
         Self {
             kind: EventKind::ValueUpdated,
             path,
+            counterpart: None,
             old_value: old.plain(),
             new_value: new.plain(),
             narrative: narrative::value_updated(actor.shown(), path, old, new),
@@ -203,6 +208,7 @@ impl<'a> AuditEvent<'a> {
         Self {
             kind: EventKind::ValueDeleted,
             path,
+            counterpart: None,
             old_value: old.plain(),
             new_value: None,
             narrative: narrative::value_deleted(actor.shown(), path, old),
@@ -218,16 +224,22 @@ impl<'a> AuditEvent<'a> {
         new_path: &'a ConfigPath,
     ) -> [Self; 2] {
         [
-            Self::bare(
-                EventKind::ValuePathAdded,
-                new_path.as_str(),
-                narrative::path_added(actor.shown(), new_path.as_str(), source.as_str()),
-            ),
-            Self::bare(
-                EventKind::ValuePathAdded,
-                source.as_str(),
-                narrative::path_exposed(actor.shown(), source.as_str(), new_path.as_str()),
-            ),
+            Self {
+                counterpart: Some(source.as_str()),
+                ..Self::bare(
+                    EventKind::ValuePathAdded,
+                    new_path.as_str(),
+                    narrative::path_added(actor.shown(), new_path.as_str(), source.as_str()),
+                )
+            },
+            Self {
+                counterpart: Some(new_path.as_str()),
+                ..Self::bare(
+                    EventKind::ValuePathAdded,
+                    source.as_str(),
+                    narrative::path_exposed(actor.shown(), source.as_str(), new_path.as_str()),
+                )
+            },
         ]
     }
 
@@ -337,6 +349,7 @@ impl<'a> AuditEvent<'a> {
         Self {
             kind,
             path,
+            counterpart: None,
             old_value: None,
             new_value: None,
             narrative,
@@ -436,6 +449,7 @@ impl AuditRecorder {
             .map(|event| store::EventRow {
                 kind: event.kind.as_str(),
                 display_path: event.path,
+                counterpart_display_path: event.counterpart,
                 old_value: event.old_value,
                 new_value: event.new_value,
                 narrative: &event.narrative,

@@ -325,6 +325,12 @@ async fn serving_health_service() -> (HealthReporter, HealthServer<impl Health>)
         .set_serving::<v4::system_server::SystemServer<V4System>>()
         .await;
     health_reporter
+        .set_serving::<v4::configuration_server::ConfigurationServer<V4Configuration>>()
+        .await;
+    health_reporter
+        .set_serving::<v4::managed_connections_server::ManagedConnectionsServer<V4ManagedConnections>>()
+        .await;
+    health_reporter
         .set_serving::<v4::audit_server::AuditServer<V4Audit>>()
         .await;
     (health_reporter, health_service)

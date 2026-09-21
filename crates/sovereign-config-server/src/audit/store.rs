@@ -10,13 +10,14 @@ use std::borrow::Cow;
 use sqlx::{FromRow, PgExecutor, PgPool, Postgres, QueryBuilder};
 use time::OffsetDateTime;
 
-use super::Actor;
+use super::{Actor, EventKind};
 
 /// One event's columns. The actor and the time are shared by every event of a
 /// call, so they are bound once rather than repeated per row.
 pub(super) struct EventRow<'a> {
     pub(super) kind: &'static str,
     pub(super) display_path: &'a str,
+    pub(super) counterpart_display_path: Option<&'a str>,
     pub(super) old_value: Option<&'a str>,
     pub(super) new_value: Option<&'a str>,
     pub(super) narrative: &'a str,
@@ -59,6 +60,10 @@ where
     }
     let kinds: Vec<&str> = rows.iter().map(|row| row.kind).collect();
     let paths: Vec<&str> = rows.iter().map(|row| row.display_path).collect();
+    let counterparts: Vec<Option<&str>> = rows
+        .iter()
+        .map(|row| row.counterpart_display_path)
+        .collect();
     let old_values: Vec<Option<&str>> = rows.iter().map(|row| row.old_value).collect();
     let new_values: Vec<Option<&str>> = rows.iter().map(|row| row.new_value).collect();
     let narratives: Vec<Cow<'_, str>> = rows.iter().map(|row| storable(row.narrative)).collect();
@@ -70,13 +75,19 @@ where
     sqlx::query(
         r"
         INSERT INTO audit_events (
-            occurred_at, first_occurred_at, kind, display_path, actor_subject, actor_name,
-            protocol_version, old_value, new_value, narrative, coalesce_digest
+            occurred_at, first_occurred_at, kind, display_path, counterpart_display_path,
+            actor_subject, actor_name, protocol_version, old_value, new_value, narrative,
+            coalesce_digest
         )
-        SELECT $1, $1, event.kind, event.display_path, $2, $3, $4,
-               event.old_value, event.new_value, event.narrative, event.coalesce_digest
-        FROM UNNEST($5::TEXT[], $6::TEXT[], $7::TEXT[], $8::TEXT[], $9::TEXT[], $10::TEXT[])
-            AS event(kind, display_path, old_value, new_value, narrative, coalesce_digest)
+        SELECT $1, $1, event.kind, event.display_path, event.counterpart_display_path,
+               $2, $3, $4, event.old_value, event.new_value, event.narrative,
+               event.coalesce_digest
+        FROM UNNEST(
+            $5::TEXT[], $6::TEXT[], $7::TEXT[], $8::TEXT[], $9::TEXT[], $10::TEXT[], $11::TEXT[]
+        ) AS event(
+            kind, display_path, counterpart_display_path, old_value, new_value, narrative,
+            coalesce_digest
+        )
         ON CONFLICT (coalesce_digest) DO UPDATE
         SET event_count = audit_events.event_count + 1,
             occurred_at = GREATEST(audit_events.occurred_at, EXCLUDED.occurred_at),
@@ -91,6 +102,7 @@ where
     .bind(actor.protocol_version)
     .bind(kinds)
     .bind(paths)
+    .bind(counterparts)
     .bind(old_values)
     .bind(new_values)
     .bind(narratives)
@@ -146,6 +158,10 @@ pub(super) struct EventFilter<'a> {
     /// Applied in the query rather than to the page, so a page is never
     /// short because rows the caller may not see were dropped from it.
     pub(super) readable_prefixes: &'a [String],
+    /// The fold keys the caller holds `manage` under, which is what a
+    /// managed-connection event needs — the same grant that lists the
+    /// connection at all.
+    pub(super) manageable_prefixes: &'a [String],
     pub(super) path_fragment: Option<&'a str>,
     pub(super) element: Option<&'a ElementScope>,
     pub(super) text_fragment: Option<&'a str>,
@@ -174,6 +190,37 @@ fn contains_pattern(fragment: &str) -> String {
     pattern
 }
 
+/// The managed-connection kinds, as a SQL list. Compiled-in labels only.
+fn push_connection_kinds(query: &mut QueryBuilder<'_, Postgres>) {
+    let mut kinds = query.separated(", ");
+    for kind in CONNECTION_KINDS {
+        kinds.push_bind(kind);
+    }
+}
+
+const CONNECTION_KINDS: [&str; 3] = [
+    EventKind::ConnectionCreated.as_str(),
+    EventKind::ConnectionRotated.as_str(),
+    EventKind::ConnectionRevoked.as_str(),
+];
+
+/// `column` is at or below one of `prefixes` — the grant check
+/// `AuthenticatedPrincipal::allows` makes, as SQL over fold keys.
+fn push_covered<'a>(
+    query: &mut QueryBuilder<'a, Postgres>,
+    column: &'static str,
+    prefixes: &'a [String],
+) {
+    query
+        .push("EXISTS (SELECT 1 FROM UNNEST(")
+        .push_bind(prefixes)
+        .push(format!(
+            "::TEXT[]) AS granted(prefix) WHERE granted.prefix = '/' \
+             OR {column} = granted.prefix \
+             OR starts_with({column}, granted.prefix || '/'))"
+        ));
+}
+
 /// One page of events matching `filter`, newest first.
 ///
 /// Built clause by clause so each filter that is unset costs nothing and each
@@ -186,13 +233,21 @@ pub(super) async fn query_events(
     let mut query = QueryBuilder::<Postgres>::new(
         "SELECT id, kind, display_path, occurred_at, first_occurred_at, event_count, \
          actor_subject, actor_name, protocol_version, old_value, new_value, narrative \
-         FROM audit_events WHERE EXISTS (SELECT 1 FROM UNNEST(",
+         FROM audit_events WHERE ((kind NOT IN (",
     );
-    query.push_bind(filter.readable_prefixes).push(
-        "::TEXT[]) AS readable(prefix) WHERE readable.prefix = '/' \
-             OR path_fold = readable.prefix \
-             OR starts_with(path_fold, readable.prefix || '/'))",
-    );
+    push_connection_kinds(&mut query);
+    query.push(") AND ");
+    push_covered(&mut query, "path_fold", filter.readable_prefixes);
+    query.push(") OR (kind IN (");
+    push_connection_kinds(&mut query);
+    query.push(") AND ");
+    push_covered(&mut query, "path_fold", filter.manageable_prefixes);
+    // An alias event names its other path, so it needs `read` there too. One
+    // with no counterpart recorded is hidden rather than shown: failing closed
+    // costs a row, failing open discloses a path.
+    query.push(")) AND (kind <> 'value.path_added' OR ");
+    push_covered(&mut query, "counterpart_fold", filter.readable_prefixes);
+    query.push(")");
     if let Some(fragment) = filter.path_fragment {
         query
             .push(" AND path_fold LIKE ")

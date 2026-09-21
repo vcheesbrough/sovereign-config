@@ -656,13 +656,13 @@ Recording lives in the version-free service implementations, never in a protocol
 
 ### Reading the trail
 
-`QueryAuditTrail` returns one page of events, newest first, and a cursor for the next. **An event is returned only where the caller holds `read` on its path** — the same grant check every listing applies — and the check is part of the query rather than applied to its result, so a page is never short because someone else's events were filtered out of it. A query is not itself recorded.
+`QueryAuditTrail` returns one page of events, newest first by first occurrence, and a cursor for the next. **An event is returned only where the caller holds `read` on its path** — the same grant check every listing applies. An alias event (`value.path_added`) names the alias's other path in its narrative, so it also needs `read` on that path: `ListValuePaths` hides an alias the caller cannot read, and the trail must not name it instead. A managed-connection event needs `manage` on the connection's root rather than `read`, the grant that lists the connection at all. Every condition is part of the query rather than applied to its result, so a page is never short because someone else's events were filtered out of it. A query is not itself recorded.
 
 Every filter is optional and every one that is set must match: a fragment of the path, matched case-insensitively anywhere in it; a fragment of the narrative; a time range, which matches an event whose period overlaps it; the protocol version it arrived on; and a set of event kinds. An **element query** names one value's path exactly and returns its own events plus subtree reads of any of its ancestors and listings of its parent — the only ways a plain value is ever read, since nothing reads one plain value alone. Fragments are matched as text, never as patterns: `_` is a path character and matches only itself.
 
-Paging is keyset, never offset, on each event's first occurrence and its id — both fixed for the event's life. A new event lands above the cursor and a coalesced window bumped mid-scroll keeps its place, so a scroll returns each event exactly once. Paging on the most recent occurrence would not: a bump moves it, and a row that moves past the cursor is skipped. A coalesced event is served with its count and period rendered onto its narrative.
+Paging is keyset, never offset, on each event's first occurrence and its id — both fixed for the event's life, and the order events are returned in, so a coalesced event keeps the place of its first occurrence however recently it was bumped. A new event lands above the cursor and a coalesced window bumped mid-scroll keeps its place, so a scroll returns each event exactly once. Paging on the most recent occurrence would not: a bump moves it, and a row that moves past the cursor is skipped. A coalesced event is served with its count and period rendered onto its narrative.
 
-The path and narrative filters are served by trigram indexes (`pg_trgm`, migration `0011`), and the paging order by its own index.
+The path and narrative filters are served by trigram indexes (`pg_trgm`, migration `0011`), and the paging order by its own index. The same migration gives each alias event a column naming its other path, backfilled from the narrative for events recorded before it.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |

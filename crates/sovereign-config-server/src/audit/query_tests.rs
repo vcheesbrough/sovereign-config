@@ -504,3 +504,100 @@ async fn a_malformed_query_is_invalid_before_it_is_authorized() {
         .expect_err("a well-formed query still needs a caller");
     assert_eq!(status.code(), Code::Unauthenticated);
 }
+
+/// An alias event names its other path, so it is visible only to a caller who
+/// may read both — `ListValuePaths` hides an unreadable alias, and the trail
+/// must not name it instead, in a result or through the narrative filter.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn an_alias_event_is_hidden_from_a_caller_who_cannot_read_both_paths() {
+    let pool = pool().await;
+    let service = audit(&pool, 100);
+    let source = sovereign_config_core::ConfigPath::parse(format!("{ROOT}/open/src")).unwrap();
+    let alias = sovereign_config_core::ConfigPath::parse(format!("{ROOT}/closed/alias")).unwrap();
+    let [on_alias, on_source] = AuditEvent::path_added(&actor("v4"), &source, &alias);
+    record(&pool, 1, on_alias).await;
+    record(&pool, 2, on_source).await;
+    record(&pool, 3, created(source.as_str())).await;
+
+    let open_only = reader_of(&format!("{ROOT}/open"));
+    let seen = query(&service, &open_only, QueryAuditTrailRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(paths(&seen), [source.as_str()], "only the plain creation");
+    let probed = query(
+        &service,
+        &open_only,
+        QueryAuditTrailRequest {
+            text_filter: "closed".into(),
+            ..QueryAuditTrailRequest::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        probed.events.is_empty(),
+        "the hidden path cannot be probed for"
+    );
+
+    let both = query(
+        &service,
+        &reader_of(ROOT),
+        QueryAuditTrailRequest::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        paths(&both),
+        [source.as_str(), source.as_str(), alias.as_str()]
+    );
+
+    clear_trail(&pool, ROOT).await;
+}
+
+/// A managed connection's events need `manage` on its root — the grant that
+/// lists the connection at all — and `read` alone does not show them.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn connection_events_need_manage_and_value_events_need_read() {
+    let pool = pool().await;
+    let service = audit(&pool, 100);
+    let root = format!("{ROOT}/conn");
+    let value = format!("{root}/key");
+    record(
+        &pool,
+        1,
+        AuditEvent::connection_created(
+            &actor("v4"),
+            super::ConnectionSubject {
+                root: &root,
+                display_name: "Shown to managers",
+                connection_id: "a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8",
+            },
+            "read",
+        ),
+    )
+    .await;
+    record(&pool, 2, created(&value)).await;
+
+    let reader = query(
+        &service,
+        &reader_of(ROOT),
+        QueryAuditTrailRequest::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(paths(&reader), [value.as_str()]);
+
+    let manager = caller(&[(ROOT, &[Permission::Manage])]);
+    let as_manager = query(&service, &manager, QueryAuditTrailRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(paths(&as_manager), [root.as_str()]);
+    assert_eq!(
+        as_manager.events[0].kind,
+        v4::AuditEventKind::ConnectionCreated as i32
+    );
+
+    clear_trail(&pool, ROOT).await;
+}

@@ -6,8 +6,11 @@
 //! in it.
 //!
 //! **Visibility is the existing grant check.** An event is returned only where
-//! the caller holds `read` on its path, exactly as `list_value_paths` filters,
-//! and that condition is part of the query rather than applied to its result:
+//! the caller holds `read` on its path, exactly as `list_value_paths` filters —
+//! and, for an alias event, on the other path its narrative names too, which is
+//! what `list_value_paths` hides. A managed-connection event needs `manage` on
+//! its root instead, the grant that lists the connection at all. Every
+//! condition is part of the query rather than applied to its result:
 //! filtering a page after reading it would return short pages, or empty ones,
 //! for as long as the newest events belonged to someone else's namespace.
 //!
@@ -82,8 +85,9 @@ impl AuditTrailService {
     ) -> Result<AuditPage, Status> {
         let valid = validate(&query)?;
         let principal = context.principal()?;
-        let readable_prefixes = readable_prefixes(principal);
-        if readable_prefixes.is_empty() {
+        let readable_prefixes = granted_prefixes(principal, Permission::Read);
+        let manageable_prefixes = granted_prefixes(principal, Permission::Manage);
+        if readable_prefixes.is_empty() && manageable_prefixes.is_empty() {
             return Ok(AuditPage::default());
         }
         let page_size = match query.page_size {
@@ -94,6 +98,7 @@ impl AuditTrailService {
             &self.database,
             &EventFilter {
                 readable_prefixes: &readable_prefixes,
+                manageable_prefixes: &manageable_prefixes,
                 path_fragment: valid.path_fragment.as_deref(),
                 element: valid.element.as_ref(),
                 text_fragment: valid.text_fragment,
@@ -113,13 +118,13 @@ impl AuditTrailService {
     }
 }
 
-/// The fold keys `principal` holds `read` under. Grant prefixes are already
-/// fold keys, which is what `path_fold` is matched against.
-fn readable_prefixes(principal: &AuthenticatedPrincipal) -> Vec<String> {
+/// The fold keys `principal` holds `permission` under. Grant prefixes are
+/// already fold keys, which is what `path_fold` is matched against.
+fn granted_prefixes(principal: &AuthenticatedPrincipal, permission: Permission) -> Vec<String> {
     principal
         .grants
         .iter()
-        .filter(|grant| grant.permissions.contains(&Permission::Read))
+        .filter(|grant| grant.permissions.contains(&permission))
         .map(|grant| grant.prefix.clone())
         .collect()
 }
