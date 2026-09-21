@@ -44,6 +44,7 @@ pub const REQUESTED_VERSION_METADATA: &str = "sovereign-config-protocol-version"
 /// a string and invite exactly the comparison this design removed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtocolVersion {
+    V4,
     V3,
 }
 
@@ -64,11 +65,11 @@ impl ProtocolVersion {
     /// until each has a dialer for it: both select their route set with an
     /// exhaustive `match` over [`ProtocolVersion`]. Write the dialer, and the
     /// build goes green; there is nothing to remember and no test to silence.
-    pub const ALL: &'static [Self] = &[Self::V3];
+    pub const ALL: &'static [Self] = &[Self::V4, Self::V3];
 
     /// The version a client prefers when the server expresses no preference:
     /// the first of [`ProtocolVersion::ALL`].
-    pub const PREFERRED: Self = Self::V3;
+    pub const PREFERRED: Self = Self::V4;
 
     /// The one version a server that has **no handshake** serves.
     ///
@@ -82,6 +83,7 @@ impl ProtocolVersion {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::V4 => "v4",
             Self::V3 => "v3",
         }
     }

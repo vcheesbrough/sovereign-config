@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod audit;
 mod connection;
 mod error;
 mod json;
@@ -12,6 +13,7 @@ mod value;
 
 pub const MASKED_SECRET_TEXT: &str = "********";
 
+pub use audit::{AuditEntry, AuditEventKind, AuditPage, AuditQuery};
 pub use connection::{ConnectionUrl, ConnectionUrlError};
 pub use error::{ClientError, ErrorKind};
 pub use json::{parse_subtree_json, render_subtree_json};

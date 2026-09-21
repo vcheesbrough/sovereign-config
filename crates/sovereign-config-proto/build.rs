@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // operation every version's clients call before any of them.
                 "../../proto/sovereign/config/handshake.proto",
                 "../../proto/sovereign/config/v3/service.proto",
+                "../../proto/sovereign/config/v4/service.proto",
             ],
             &["../../proto"],
         )?;

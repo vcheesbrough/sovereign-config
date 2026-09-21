@@ -32,6 +32,26 @@ pub(crate) struct AuditConfig {
     pub(crate) retention: Duration,
     /// The window inside which repeated accesses collapse into one event.
     pub(crate) coalesce_window: Duration,
+    /// How many events one audit query returns, at most and by default.
+    pub(crate) page_size: u32,
+}
+
+const AUDIT_PAGE_SIZE: &str = "SOVEREIGN_CONFIG_AUDIT_PAGE_SIZE";
+/// A screenful and then some: enough that a scrolling view fetches rarely,
+/// small enough that one page is a quick indexed read.
+const AUDIT_PAGE_SIZE_DEFAULT: u32 = 100;
+/// Each event carries up to two plain values in full, so a page is bounded in
+/// rows to keep a response comfortably inside a gRPC message.
+const AUDIT_PAGE_SIZE_MAXIMUM: u32 = 1000;
+
+/// The audit page size named by `value`, the setting's raw text.
+fn audit_page_size(value: Option<&str>) -> Result<u32> {
+    bounded_setting(
+        AUDIT_PAGE_SIZE,
+        value,
+        AUDIT_PAGE_SIZE_DEFAULT,
+        AUDIT_PAGE_SIZE_MAXIMUM,
+    )
 }
 
 pub(crate) struct ManagedConnectionConfig {
@@ -122,6 +142,7 @@ impl Config {
                     168,
                 )?) * SECONDS_PER_HOUR,
             ),
+            page_size: audit_page_size(env::var(AUDIT_PAGE_SIZE).ok().as_deref())?,
         };
 
         Ok(Self {
@@ -334,8 +355,9 @@ pub(crate) fn required_secret(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_setting, issuer_api_origin, required_env, validate_introspection_url,
-        validate_issuer_url, validated_group_name, validated_public_origin,
+        audit_page_size, bounded_setting, issuer_api_origin, required_env,
+        validate_introspection_url, validate_issuer_url, validated_group_name,
+        validated_public_origin,
     };
 
     #[test]
@@ -471,6 +493,23 @@ mod tests {
             // Names the variable, so the operator knows which one to fix.
             assert!(error.contains(SETTING), "{unusable:?}: {error}");
             assert!(error.contains("1 to 3650"), "{unusable:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_audit_page_size_defaults_and_is_bounded() {
+        assert_eq!(audit_page_size(None).unwrap(), 100);
+        assert_eq!(audit_page_size(Some(" ")).unwrap(), 100);
+        assert_eq!(audit_page_size(Some("1")).unwrap(), 1);
+        assert_eq!(audit_page_size(Some("1000")).unwrap(), 1000);
+        for unusable in ["0", "1001", "-5", "fifty"] {
+            let error = audit_page_size(Some(unusable))
+                .expect_err(unusable)
+                .to_string();
+            assert!(
+                error.contains("SOVEREIGN_CONFIG_AUDIT_PAGE_SIZE") && error.contains("1 to 1000"),
+                "{unusable:?}: {error}"
+            );
         }
     }
 

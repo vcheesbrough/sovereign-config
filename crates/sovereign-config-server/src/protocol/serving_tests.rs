@@ -241,7 +241,9 @@ async fn both_protocol_packages_answer_on_their_own_routes() {
     // Neither shadows the other: each route reached its own implementation,
     // which the distinct application versions prove.
     assert_eq!(v3.protocol_version, "v3");
-    assert_eq!(v3.supported_protocol_versions, SERVED_PROTOCOL_LABELS);
+    // `v3` advertises the served set oldest first, whatever the preference
+    // order of `SERVED_PROTOCOL_LABELS`.
+    assert_eq!(v3.supported_protocol_versions, ["v3", "v4"]);
     assert_eq!(test.application_version, "testversion-service");
     assert_eq!(test.protocol_version, TEST_VERSION);
     assert_ne!(v3.application_version, test.application_version);
@@ -769,4 +771,85 @@ async fn the_handshake_answers_without_a_version_and_is_counted_under_none() {
         ),
         "a handshake belongs to no version: {rendered}"
     );
+}
+
+/// `v4` served beside `v3` the way `main.rs` registers them, behind the
+/// shipped labels: each version's `GetVersion` keeps its own contract, each is
+/// counted under its own label, and `v4`'s `Audit` route is registered — it
+/// answers for itself rather than falling through as `UNIMPLEMENTED`.
+#[tokio::test]
+async fn v4_serves_beside_v3_with_each_contract_and_label_its_own() {
+    use sovereign_config_proto::sovereign::config::v4;
+
+    let metrics = Arc::new(ProtocolMetrics::new(SERVED_PROTOCOL_LABELS));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("an ephemeral port must bind");
+    let address = listener.local_addr().expect("the bound address is known");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgresql://unused@127.0.0.1:1/unused")
+        .expect("a lazy pool must build without connecting");
+    let router = Server::builder()
+        .layer(ProtocolVersionLayer::new(
+            Arc::clone(&metrics),
+            SERVED_PROTOCOL_LABELS,
+        ))
+        .add_service(V3Server::new(SystemService))
+        .add_service(v4::system_server::SystemServer::new(
+            crate::system::V4System,
+        ))
+        .add_service(v4::audit_server::AuditServer::new(
+            crate::audit::v4::V4Audit::new(Arc::new(crate::audit::AuditTrailService::new(
+                pool, 10,
+            ))),
+        ));
+    let server = tokio::spawn(
+        router.serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let channel = Endpoint::from_shared(format!("http://{address}"))
+        .expect("the endpoint must parse")
+        .connect()
+        .await
+        .expect("the server must accept a connection");
+
+    let on_v3 = V3Client::new(channel.clone())
+        .get_version(V3Request {
+            protocol_version: "v3".to_owned(),
+        })
+        .await
+        .expect("the v3 route must answer")
+        .into_inner();
+    let on_v4 = v4::system_client::SystemClient::new(channel.clone())
+        .get_version(v4::GetVersionRequest {
+            protocol_version: "v4".to_owned(),
+        })
+        .await
+        .expect("the v4 route must answer")
+        .into_inner();
+    assert_eq!(on_v3.protocol_version, "v3");
+    assert_eq!(on_v3.supported_protocol_versions, ["v3", "v4"]);
+    assert_eq!(on_v4.protocol_version, "v4");
+    assert_eq!(on_v4.supported_protocol_versions, ["v4", "v3"]);
+
+    let audit = v4::audit_client::AuditClient::new(channel)
+        .query_audit_trail(v4::QueryAuditTrailRequest::default())
+        .await
+        .expect_err("no principal is attached");
+    assert_eq!(
+        audit.code(),
+        tonic::Code::Unauthenticated,
+        "the audit route must reach its own service"
+    );
+
+    let rendered = metrics.render();
+    for (version, count) in [("v3", 1), ("v4", 2)] {
+        let series = format!(
+            "sovereign_config_protocol_requests_total{{version=\"{version}\",outcome=\"attempted\"}} {count}"
+        );
+        assert!(
+            rendered.contains(&series),
+            "{series} missing from:\n{rendered}"
+        );
+    }
+    server.abort();
 }

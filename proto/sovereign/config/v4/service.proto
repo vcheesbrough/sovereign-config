@@ -1,0 +1,364 @@
+syntax = "proto3";
+
+// Protocol version 4.
+//
+// `v4` is `v3`'s whole surface — every service, RPC and message, unchanged in
+// shape and in behaviour except where noted below — plus the `Audit` service,
+// which reads the audit trail back.
+//
+// What differs from `v3`:
+//
+//   - the `Audit` service and its messages, which `v3` does not have;
+//   - input validation happens before authorization. A request `v3` would
+//     refuse `PERMISSION_DENIED` for a caller without the grant, but which is
+//     malformed — a `PutValue` with no content or with a NUL in it, a
+//     `ReplaceSubTree` entry with no content, a managed connection with an
+//     unknown or empty permission set — is refused `INVALID_ARGUMENT` by `v4`
+//     whoever sends it;
+//   - `GetVersionResponse.supported_protocol_versions` lists the served
+//     versions most preferred first, the order the handshake reports. `v3`
+//     lists them oldest first, and keeps doing so.
+//
+// Canonical configuration paths.
+//
+// Every `path`, `source_path`, `new_path`, `element_path` and managed-connection
+// `root` in this file is a canonical absolute path matching
+// `^/[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$`, or the bare tree root `/` where a
+// request selects rather than operates. Paths are ASCII-case-insensitive: the
+// service resolves, compares and authorizes on the lowercase fold, and returns
+// each path in the case it was stored with.
+//
+// Changing this file: never, once released.
+//
+// This package is frozen from the release that first advertises it. Adding any
+// field or RPC — even an optional one — changing what an RPC does, and
+// changing the set of values a field may carry all require a new
+// `sovereign.config.vN` package alongside this one. See `## Protocol
+// versioning` in `README.md`.
+
+package sovereign.config.v4;
+
+import "google/protobuf/timestamp.proto";
+
+service System {
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+  rpc GetIdentity(GetIdentityRequest) returns (GetIdentityResponse);
+}
+
+service Configuration {
+  rpc ListValues(ListValuesRequest) returns (ListValuesResponse);
+  rpc GetSubTree(GetSubTreeRequest) returns (GetSubTreeResponse);
+  rpc PutValue(PutValueRequest) returns (PutValueResponse);
+  rpc ReplaceSubTree(ReplaceSubTreeRequest) returns (ReplaceSubTreeResponse);
+  rpc DeleteValues(DeleteValuesRequest) returns (DeleteValuesResponse);
+  rpc RevealSecret(RevealSecretRequest) returns (RevealSecretResponse);
+  rpc AddValuePath(AddValuePathRequest) returns (AddValuePathResponse);
+  rpc ListValuePaths(ListValuePathsRequest) returns (ListValuePathsResponse);
+}
+
+service ManagedConnections {
+  rpc ListManagedConnections(ListManagedConnectionsRequest) returns (ListManagedConnectionsResponse);
+  rpc CreateManagedConnection(CreateManagedConnectionRequest) returns (CreateManagedConnectionResponse);
+  rpc RotateManagedConnection(RotateManagedConnectionRequest) returns (RotateManagedConnectionResponse);
+  rpc RevokeManagedConnection(RevokeManagedConnectionRequest) returns (RevokeManagedConnectionResponse);
+}
+
+// Reads the audit trail. Its own service rather than more RPCs on
+// `Configuration`, so the audit surface can be authorized and retired on its
+// own.
+service Audit {
+  rpc QueryAuditTrail(QueryAuditTrailRequest) returns (QueryAuditTrailResponse);
+}
+
+enum ValueClassification {
+  VALUE_CLASSIFICATION_UNSPECIFIED = 0;
+  VALUE_CLASSIFICATION_PLAIN = 1;
+  VALUE_CLASSIFICATION_SECRET = 2;
+}
+
+message MaskedSecret {}
+message PreserveSecret {}
+
+message ListValuesRequest {
+  string path = 1;
+}
+
+message ListedValue {
+  string path = 1;
+  oneof content {
+    string plain_value = 2;
+    MaskedSecret masked_secret = 5;
+  }
+  google.protobuf.Timestamp created_at = 3;
+  google.protobuf.Timestamp updated_at = 4;
+  ValueClassification classification = 6;
+  // Other canonical paths that resolve to the same stored value, restricted to
+  // those the caller is authorized to read. Excludes this value's own path.
+  repeated string alias_paths = 7;
+}
+
+message ListValuesResponse {
+  repeated ListedValue values = 1;
+  repeated string paths = 2;
+}
+
+message GetSubTreeRequest {
+  string path = 1;
+}
+
+message SubTreeValue {
+  string path = 1;
+  oneof content {
+    string plain_value = 2;
+    MaskedSecret masked_secret = 3;
+  }
+  ValueClassification classification = 4;
+}
+
+message GetSubTreeResponse {
+  repeated SubTreeValue values = 1;
+}
+
+message PutValueRequest {
+  string path = 1;
+  // Required, and may not contain NUL: anything else is `INVALID_ARGUMENT`.
+  oneof content {
+    string plain_value = 2;
+    string secret_value = 3;
+  }
+}
+
+message PutValueResponse {
+  google.protobuf.Timestamp created_at = 1;
+  google.protobuf.Timestamp updated_at = 2;
+}
+
+message SubTreeMutationValue {
+  string path = 1;
+  // Required: an entry with neither arm set is `INVALID_ARGUMENT`.
+  oneof content {
+    string plain_value = 2;
+    PreserveSecret preserve_secret = 3;
+  }
+}
+
+message ReplaceSubTreeRequest {
+  string path = 1;
+  repeated SubTreeMutationValue values = 2;
+}
+
+message ReplaceSubTreeResponse {
+  google.protobuf.Timestamp updated_at = 1;
+  uint64 value_count = 2;
+}
+
+message DeleteValuesRequest {
+  string path = 1;
+  bool recurse = 2;
+}
+
+message DeleteValuesResponse {
+  google.protobuf.Timestamp deleted_at = 1;
+  uint64 deleted_count = 2;
+}
+
+message RevealSecretRequest {
+  string path = 1;
+}
+
+message RevealSecretResponse {
+  string value = 1;
+}
+
+message AddValuePathRequest {
+  // Existing path identifying the stored value to alias.
+  string source_path = 1;
+  // New canonical path to expose that same value at.
+  string new_path = 2;
+}
+
+message AddValuePathResponse {
+  google.protobuf.Timestamp created_at = 1;
+}
+
+message ListValuePathsRequest {
+  string path = 1;
+}
+
+message ListValuePathsResponse {
+  // Every path resolving to the same value that the caller may read, sorted.
+  repeated string paths = 1;
+}
+
+enum ManagedConnectionState {
+  MANAGED_CONNECTION_STATE_UNSPECIFIED = 0;
+  MANAGED_CONNECTION_STATE_PROVISIONING = 1;
+  MANAGED_CONNECTION_STATE_ACTIVE = 2;
+  MANAGED_CONNECTION_STATE_ROTATION_UNKNOWN = 3;
+  MANAGED_CONNECTION_STATE_REVOKING = 4;
+  MANAGED_CONNECTION_STATE_CLEANUP_REQUIRED = 5;
+}
+
+enum ManagedPermission {
+  MANAGED_PERMISSION_UNSPECIFIED = 0;
+  MANAGED_PERMISSION_READ = 1;
+  MANAGED_PERMISSION_WRITE = 2;
+  MANAGED_PERMISSION_MANAGE = 3;
+}
+
+message ManagedConnectionMetadata {
+  string connection_id = 1;
+  string display_name = 2;
+  string root = 3;
+  ManagedConnectionState state = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  repeated ManagedPermission permissions = 7;
+}
+
+message ListManagedConnectionsRequest {}
+
+message ListManagedConnectionsResponse {
+  repeated ManagedConnectionMetadata connections = 1;
+}
+
+message CreateManagedConnectionRequest {
+  string display_name = 1;
+  string root = 2;
+  // Required and non-empty, with no unknown or unspecified member; anything
+  // else is `INVALID_ARGUMENT`.
+  repeated ManagedPermission permissions = 3;
+}
+
+message CreateManagedConnectionResponse {
+  ManagedConnectionMetadata metadata = 1;
+  string connection_url = 2;
+}
+
+message RotateManagedConnectionRequest {
+  string connection_id = 1;
+}
+
+message RotateManagedConnectionResponse {
+  ManagedConnectionMetadata metadata = 1;
+  string connection_url = 2;
+}
+
+message RevokeManagedConnectionRequest {
+  string connection_id = 1;
+}
+
+message RevokeManagedConnectionResponse {}
+
+// What happened, as the audit trail records it.
+enum AuditEventKind {
+  AUDIT_EVENT_KIND_UNSPECIFIED = 0;
+  AUDIT_EVENT_KIND_VALUE_CREATED = 1;
+  AUDIT_EVENT_KIND_VALUE_UPDATED = 2;
+  AUDIT_EVENT_KIND_VALUE_DELETED = 3;
+  AUDIT_EVENT_KIND_VALUE_PATH_ADDED = 4;
+  AUDIT_EVENT_KIND_SUBTREE_REPLACED = 5;
+  AUDIT_EVENT_KIND_SUBTREE_DELETED = 6;
+  AUDIT_EVENT_KIND_SECRET_REVEALED = 7;
+  AUDIT_EVENT_KIND_SUBTREE_READ = 8;
+  AUDIT_EVENT_KIND_VALUES_LISTED = 9;
+  AUDIT_EVENT_KIND_CONNECTION_CREATED = 10;
+  AUDIT_EVENT_KIND_CONNECTION_ROTATED = 11;
+  AUDIT_EVENT_KIND_CONNECTION_REVOKED = 12;
+}
+
+// One page of the audit trail, newest first. Every filter that is set must
+// match; an unset filter matches everything. Only events on paths the caller
+// holds `read` on are ever returned.
+message QueryAuditTrailRequest {
+  // A case-insensitive fragment of the event's path, matched anywhere in it.
+  // Path characters only (`A-Z a-z 0-9 _ - /`), at most 512 of them.
+  string path_filter = 1;
+
+  // One value's canonical path, matched exactly. Returns the events on that
+  // path, plus `subtree.read` events on any of its ancestors and
+  // `values.listed` events on its direct parent — plain values are only ever
+  // read that way. Cannot be combined with `path_filter`.
+  string element_path = 2;
+
+  // A case-insensitive fragment of the event's narrative. At most 256
+  // characters.
+  string text_filter = 3;
+
+  // Events whose period overlaps [`from`, `until`]. Either may be unset.
+  google.protobuf.Timestamp from = 4;
+  google.protobuf.Timestamp until = 5;
+
+  // The served-version label an event arrived on, matched exactly.
+  string protocol_version = 6;
+
+  // The kinds to return. Empty returns every kind. `UNSPECIFIED` or an unknown
+  // value is `INVALID_ARGUMENT`.
+  repeated AuditEventKind kinds = 7;
+
+  // How many events to return. Zero asks for the service's page size; a larger
+  // value is capped at it.
+  uint32 page_size = 8;
+
+  // The `next_cursor` of the previous page, verbatim, or empty for the first
+  // page. Opaque: its content is not part of this contract. A cursor is only
+  // meaningful with the filters of the query that produced it.
+  string cursor = 9;
+}
+
+message AuditEvent {
+  // Stable for the life of the event.
+  uint64 id = 1;
+  AuditEventKind kind = 2;
+  // The path as it was written when the event happened.
+  string path = 3;
+  // The most recent occurrence. For a coalesced event, the latest access in
+  // its window; otherwise the same as `first_occurred_at`.
+  google.protobuf.Timestamp occurred_at = 4;
+  google.protobuf.Timestamp first_occurred_at = 5;
+  // How many accesses this event stands for: 1 unless repeated accesses were
+  // coalesced into it.
+  uint32 event_count = 6;
+  string actor_subject = 7;
+  // What the identity provider called the actor at the time, when it said.
+  optional string actor_name = 8;
+  // The served-version label of the route the call arrived on.
+  string protocol_version = 9;
+  // The previous and new text of a plain value, for a single value's
+  // creation, change or deletion. Never set for a secret.
+  optional string old_value = 10;
+  optional string new_value = 11;
+  // One sentence describing the event. A coalesced event's count and period
+  // are part of it.
+  string narrative = 12;
+}
+
+message QueryAuditTrailResponse {
+  repeated AuditEvent events = 1;
+  // Pass as `cursor` to fetch the next page. Empty when there are no more
+  // events.
+  string next_cursor = 2;
+}
+
+message GetIdentityRequest {}
+
+message GetIdentityResponse {
+  bool authenticated = 1;
+}
+
+message GetVersionRequest {
+  string protocol_version = 1;
+}
+
+message GetVersionResponse {
+  string application_version = 1;
+
+  // The version the client asked for, whenever the server serves it; the
+  // server's most preferred version otherwise. Never the server's preferred
+  // version when the requested one is served — see `v3`'s field of the same
+  // name for why that must hold for every version.
+  string protocol_version = 2;
+
+  // Every protocol version this server serves, most preferred first.
+  repeated string supported_protocol_versions = 3;
+}

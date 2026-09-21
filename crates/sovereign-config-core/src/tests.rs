@@ -344,17 +344,17 @@ fn protocol_negotiation_selects_a_version_inside_the_advertised_range() {
 fn protocol_negotiation_accepts_a_server_newer_than_this_client() {
     // The outage this mechanism exists to prevent: the server has gained a
     // version this build has never heard of and still serves the one it speaks.
-    // The server prefers `v4`, but it is not a candidate — there is no dialer
+    // The server prefers `v5`, but it is not a candidate — there is no dialer
     // for a version this build does not declare.
-    let status = ServiceStatus::select(&advertised(&["v4", "v3"]))
+    let status = ServiceStatus::select(&advertised(&["v5", "v3"]))
         .expect("a newer server still serving v3 must negotiate");
     assert_eq!(status.protocol_version, ProtocolVersion::V3);
 }
 
 #[test]
 fn protocol_negotiation_rejects_a_server_outside_the_range() {
-    // Both boundaries: a server too new (v3 retired) and one too old.
-    for offered in [advertised(&["v5", "v4"]), advertised(&["v2", "v1"]), vec![]] {
+    // Both boundaries: a server too new (v3 and v4 retired) and one too old.
+    for offered in [advertised(&["v6", "v5"]), advertised(&["v2", "v1"]), vec![]] {
         let error = ServiceStatus::select(&offered)
             .expect_err("a server with no version in common must be rejected");
         assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
@@ -448,7 +448,7 @@ fn a_deprecated_version_is_passed_over_for_one_that_is_not() {
         },
         // A second entry this build does not speak: there is nothing better to
         // move to, so the deprecated version must still be selected.
-        ServedVersion::new("v4"),
+        ServedVersion::new("v5"),
     ];
 
     let status = ServiceStatus::select(&served).expect("a deprecated version still works");
@@ -529,7 +529,8 @@ fn the_declared_version_order_is_preference_order_most_preferred_first() {
 #[test]
 fn protocol_version_parsing_ignores_versions_this_build_does_not_speak() {
     assert_eq!(ProtocolVersion::parse("v3"), Some(ProtocolVersion::V3));
-    for unknown in ["v1", "v4", "v10", "V3", "3", ""] {
+    assert_eq!(ProtocolVersion::parse("v4"), Some(ProtocolVersion::V4));
+    for unknown in ["v1", "v5", "v10", "V3", "V4", "3", ""] {
         assert_eq!(ProtocolVersion::parse(unknown), None, "{unknown:?}");
     }
 }

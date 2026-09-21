@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 
-use sqlx::{PgExecutor, PgPool};
+use sqlx::{FromRow, PgExecutor, PgPool, Postgres, QueryBuilder};
 use time::OffsetDateTime;
 
 use super::Actor;
@@ -111,4 +111,148 @@ pub(super) async fn delete_before(
         .execute(database)
         .await?;
     Ok(swept.rows_affected())
+}
+
+/// One stored event, as the audit query reads it back.
+#[derive(Debug, FromRow)]
+pub(super) struct StoredEvent {
+    pub(super) id: i64,
+    pub(super) kind: String,
+    pub(super) display_path: String,
+    pub(super) occurred_at: OffsetDateTime,
+    pub(super) first_occurred_at: OffsetDateTime,
+    pub(super) event_count: i32,
+    pub(super) actor_subject: String,
+    pub(super) actor_name: Option<String>,
+    pub(super) protocol_version: String,
+    pub(super) old_value: Option<String>,
+    pub(super) new_value: Option<String>,
+    pub(super) narrative: String,
+}
+
+/// The events one value's history is made of: its own, subtree reads of any
+/// ancestor, and listings of its parent. All three are fold keys.
+pub(super) struct ElementScope {
+    pub(super) path: String,
+    pub(super) ancestors: Vec<String>,
+    pub(super) parent: String,
+}
+
+/// Every filter of one audit query, already validated and folded. Nothing in
+/// here is raw request text: fragments are matched literally, never as
+/// patterns, whatever they contain.
+pub(super) struct EventFilter<'a> {
+    /// The fold keys the caller holds `read` under; `/` covers everything.
+    /// Applied in the query rather than to the page, so a page is never
+    /// short because rows the caller may not see were dropped from it.
+    pub(super) readable_prefixes: &'a [String],
+    pub(super) path_fragment: Option<&'a str>,
+    pub(super) element: Option<&'a ElementScope>,
+    pub(super) text_fragment: Option<&'a str>,
+    pub(super) from: Option<OffsetDateTime>,
+    pub(super) until: Option<OffsetDateTime>,
+    pub(super) protocol_version: Option<&'a str>,
+    pub(super) kinds: &'a [&'static str],
+    /// The last row of the previous page, as `(first_occurred_at, id)`.
+    pub(super) after: Option<(OffsetDateTime, i64)>,
+    pub(super) limit: i64,
+}
+
+/// A `LIKE` pattern matching `fragment` anywhere, with every wildcard in the
+/// fragment itself escaped: `_` is a legal path character and must match only
+/// an underscore.
+fn contains_pattern(fragment: &str) -> String {
+    let mut pattern = String::with_capacity(fragment.len() + 2);
+    pattern.push('%');
+    for character in fragment.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern.push('%');
+    pattern
+}
+
+/// One page of events matching `filter`, newest first.
+///
+/// Built clause by clause so each filter that is unset costs nothing and each
+/// that is set can use its index: a fixed statement of `$n IS NULL OR …`
+/// clauses would leave the planner a generic plan that uses none of them.
+pub(super) async fn query_events(
+    database: &PgPool,
+    filter: &EventFilter<'_>,
+) -> Result<Vec<StoredEvent>, sqlx::Error> {
+    let mut query = QueryBuilder::<Postgres>::new(
+        "SELECT id, kind, display_path, occurred_at, first_occurred_at, event_count, \
+         actor_subject, actor_name, protocol_version, old_value, new_value, narrative \
+         FROM audit_events WHERE EXISTS (SELECT 1 FROM UNNEST(",
+    );
+    query.push_bind(filter.readable_prefixes).push(
+        "::TEXT[]) AS readable(prefix) WHERE readable.prefix = '/' \
+             OR path_fold = readable.prefix \
+             OR starts_with(path_fold, readable.prefix || '/'))",
+    );
+    if let Some(fragment) = filter.path_fragment {
+        query
+            .push(" AND path_fold LIKE ")
+            .push_bind(contains_pattern(fragment))
+            .push(" ESCAPE '\\'");
+    }
+    if let Some(element) = filter.element {
+        query
+            .push(" AND (path_fold = ")
+            .push_bind(&element.path)
+            .push(" OR (kind = 'subtree.read' AND path_fold = ANY(")
+            .push_bind(&element.ancestors)
+            .push(")) OR (kind = 'values.listed' AND path_fold = ")
+            .push_bind(&element.parent)
+            .push("))");
+    }
+    if let Some(fragment) = filter.text_fragment {
+        query
+            .push(" AND narrative ILIKE ")
+            .push_bind(contains_pattern(fragment))
+            .push(" ESCAPE '\\'");
+    }
+    if let Some(from) = filter.from {
+        query.push(" AND occurred_at >= ").push_bind(from);
+    }
+    if let Some(until) = filter.until {
+        query.push(" AND first_occurred_at <= ").push_bind(until);
+    }
+    if let Some(version) = filter.protocol_version {
+        query.push(" AND protocol_version = ").push_bind(version);
+    }
+    if !filter.kinds.is_empty() {
+        query
+            .push(" AND kind = ANY(")
+            .push_bind(filter.kinds)
+            .push(")");
+    }
+    if let Some((first_occurred_at, id)) = filter.after {
+        query
+            .push(" AND (first_occurred_at, id) < (")
+            .push_bind(first_occurred_at)
+            .push(", ")
+            .push_bind(id)
+            .push(")");
+    }
+    query
+        .push(" ORDER BY first_occurred_at DESC, id DESC LIMIT ")
+        .push_bind(filter.limit);
+    query.build_query_as().fetch_all(database).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_pattern;
+
+    #[test]
+    fn a_fragment_matches_literally_whatever_it_contains() {
+        assert_eq!(contains_pattern("api"), "%api%");
+        assert_eq!(contains_pattern("db_url"), "%db\\_url%");
+        assert_eq!(contains_pattern("100%"), "%100\\%%");
+        assert_eq!(contains_pattern("a\\b"), "%a\\\\b%");
+    }
 }

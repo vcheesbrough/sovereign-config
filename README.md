@@ -194,7 +194,7 @@ The connection URL arrives through `SOVEREIGN_CONFIG_URL` from a Woodpecker secr
 
 Sovereign Config's own deploy steps deliberately do **not** consume their configuration through `render`, and keep their Woodpecker secrets. Reading `/sovereign-config/prod/...` in order to deploy Sovereign Config would create a circular availability dependency: a broken production deployment could not be redeployed through a path that requires production to be readable. Other repositories and the homelab stacks are the intended consumers.
 
-The native and gRPC-Web APIs use the `sovereign.config.v3` protobuf package. A client is not required to match the server's release: each connection negotiates a protocol version from the set the server advertises, so a client that speaks an older version than the server's newest keeps working and mixed-version operation is supported. Upgrading the server alone is therefore safe. See [Protocol versioning](#protocol-versioning) for how a version is introduced and retired, and note that protocol compatibility is a separate question from the client-visible behaviour changes described under [Upgrade](#upgrade) — 2.15.0 and 2.18.0 each broke older clients without any protocol version change.
+The native and gRPC-Web APIs serve two protobuf packages, `sovereign.config.v4` and `sovereign.config.v3`; `v4` is `v3` plus a read-only audit trail query. A client is not required to match the server's release: each connection negotiates a protocol version from the set the server advertises, so a client that speaks an older version than the server's newest keeps working and mixed-version operation is supported. Upgrading the server alone is therefore safe. See [Protocol versioning](#protocol-versioning) for how a version is introduced and retired, and note that protocol compatibility is a separate question from the client-visible behaviour changes described under [Upgrade](#upgrade) — 2.15.0 and 2.18.0 each broke older clients without any protocol version change.
 
 The version-1 URL origin is the native gRPC endpoint, its path is the canonical configuration root, and its fragment contains the OIDC issuer and client ID. Without `client_secret`, login uses device flow. With `client_secret`, the value is unpadded Base64URL-encoded `service-account-username:app-password`; the CLI obtains a fresh client-credentials access token for each operation and does not support login or logout for that profile. The entire managed URL is a secret even though its credential is encoded.
 
@@ -347,10 +347,10 @@ Each crate has one consumer, target, or artifact. Dependencies only point down t
 
 | Crate | Role | Depends on |
 | --- | --- | --- |
-| `sovereign-config-proto` | Generated `sovereign.config.v3` gRPC types. | — |
+| `sovereign-config-proto` | Generated gRPC types: one module per protocol version (`v3`, `v4`) plus the unversioned handshake. | — |
 | `sovereign-config-core` | The shared contract: paths, value and secret newtypes, listing shapes, the JSON subtree codec, connection URLs, and `ClientError`. No I/O and no async. | — |
 | `sovereign-config-server` | The service binary: gRPC, gRPC-Web, PostgreSQL, Authentik. | proto, core |
-| `sovereign-config-client` | The transport-agnostic client: the `Handshake` trait and the `negotiate` function that settles a session's protocol version, the `Transport`, `ValueTransport` and `ManagedConnectionTransport` traits a transport bound to that version implements, `SessionTransport` for one version's whole surface, `AccessTokenProvider`, and the `Client` facade. | core |
+| `sovereign-config-client` | The transport-agnostic client: the `Handshake` trait and the `negotiate` function that settles a session's protocol version, the `Transport`, `ValueTransport`, `ManagedConnectionTransport` and `AuditTransport` traits a transport bound to that version implements, `SessionTransport` for one version's whole surface, `AccessTokenProvider`, and the `Client` facade. | core |
 | `sovereign-config-native` | The native tonic transport, split into a `TonicChannel` that can only negotiate and the `TonicTransport` its `speaking` returns, with one dialer module per protocol version; plus OIDC device and refresh flows and the profile store. | proto, core, client |
 | `sovereign-config-web` | The browser UI, compiled to WebAssembly, with its own gRPC-Web transport and dialer module per protocol version. | proto, core, client |
 | `sovereign-config-layers` | Ordered configuration-layer reading and merging: per-layer `GetSubTree`, per-secret `RevealSecret`, direct-children-only naming, later-wins merge, and a caching client-credentials token provider. | core, client, native |
@@ -371,7 +371,7 @@ The two consumers differ on two policies, which is why each is a parameter rathe
 
 A module holds one concern. When a file starts mixing concerns, add a sibling module rather than growing it. `clippy.toml` holds functions to clippy's default of 100 lines, and `crates/sovereign-config-server/tests/lint_ratchet.rs` fails if product code silences that lint.
 
-- **Server services** (`values/`, `managed/`): each is split at the protocol seam. `service.rs` is the **shared implementation** — authorization, validation, the control flow and every `Status` — written in no protocol version's terms: it takes a `CallContext` and unvalidated inputs, returns `sovereign-config-core` types, and holds no SQL. `v3.rs` is the **`v3` shim**: the tonic impl, which only restates a `v3` message as those inputs and encodes the result. Nothing but a `vN.rs` shim may import the proto crate, and `tests/lint_ratchet.rs` fails if anything else does. `store.rs` holds every row type and query. Authorization, pure validation such as `values/subtree.rs`, secret masking (`content.rs`) and version-free connection metadata (`wire.rs`) each get their own module. Authentik orchestration lives in `managed/provisioning.rs`. `rpc.rs` holds what every service shares, including the `CallContext`.
+- **Server services** (`values/`, `managed/`, `audit/`): each is split at the protocol seam. `service.rs` is the **shared implementation** — authorization, validation, the control flow and every `Status` — written in no protocol version's terms: it takes a `CallContext` and unvalidated inputs, returns `sovereign-config-core` types, and holds no SQL. `shim.rs` is the **one adapter** every version's shim instantiates — a macro, because each version's generated types are distinct types — plus the validation policies a version chooses between. `vN.rs` is **`vN`'s shim**: one invocation of that adapter naming `vN`'s generated package, plus anything only `vN` has. Nothing but a `vN.rs` shim may import the proto crate, and `tests/lint_ratchet.rs` fails if anything else does. `store.rs` holds every row type and query. Authorization, pure validation such as `values/subtree.rs`, secret masking (`content.rs`) and version-free connection metadata (`wire.rs`) each get their own module. Authentik orchestration lives in `managed/provisioning.rs`. `rpc.rs` holds what every service shares, including the `CallContext`.
 - **Server root**: `main.rs` is the startup sequence, one named step per concern. Authentication, Authentik, configuration, encryption, metrics and static assets each keep their own module.
 - **Core**: one module per concept (`path`, `value`, `listing`, `json`, `status`, `error`, `connection`, `managed`). Every public item is re-exported from the crate root, and dependants import it from there.
 - **Web**: one module per view (`configuration`, `value_rows`, `path_selector`, `tree`, `connections`, `downloads`) plus shared plumbing (`transport`, `session`, `route`, `shell`, `dom`, `browser`, `icons`). A thread-local static lives beside the code that owns it. Event handlers are registered through `dom::on_element_id` or `dom::listen`.
@@ -474,6 +474,21 @@ It was made in place rather than as `v4` because it cannot be confined to a vers
 
 Changes (`PutValue`, `ReplaceSubTree`, `DeleteValues`, `AddValuePath`) also record inside their transactions and fail closed, but they are not part of this exception: they already wrote, and already failed when the database refused a write. `GetSubTree` and `ListValues` record best effort, and gain no failure mode at all.
 
+### 2.31.0 introduces protocol `v4`
+
+Release 2.31.0 serves `sovereign.config.v4` beside `v3`, the first time two protocol versions have been served at once. It was approved explicitly before implementation, as `AGENTS.md` §3 requires. `v3` is untouched: no `v3` signature and no `v3` behaviour changed, and a `v3` client negotiates, dials and fails exactly as before. `v4` is described under [Served versions](#served-versions).
+
+**Deploying the server needs no client change.** Clients built from 2.31.0 negotiate `v4` automatically; everything older continues on `v3`. The browser UI is served by the same release, so it moves to `v4` with the server.
+
+Migration `0011` creates the `pg_trgm` extension for the audit query's filter indexes. It is a trusted extension, so it needs `CREATE` on the database rather than superuser, and the deployed role — the image's bootstrap role — owns the database in every environment. A deployment that connects as a role without `CREATE` must have an administrator run `CREATE EXTENSION pg_trgm` first, or the server stops at startup.
+
+It is **source-breaking for code that builds against the client crates**, the same class as 2.26.0 and 2.28.0. Nothing breaks until a consumer rebuilds against tag 2.31.0 or later:
+
+- `ProtocolVersion` gains `V4`, declared first, and `ProtocolVersion::PREFERRED` is now `V4`. An exhaustive `match` on `ProtocolVersion` must handle it.
+- `SessionTransport` now also requires `AuditTransport`. Only code implementing a dialer by hand is affected; the dialers in this workspace implement it, and a `v3` one answers an audit query with a bounded incompatible-protocol error without dialling.
+
+`sovereign-config-provider`'s own API is unchanged.
+
 ## Protocol versioning
 
 Applications embedding `sovereign-config-provider` are deployed independently of the server and are expected to lag it. A server upgrade must therefore never break them. This section is the whole procedure for introducing and retiring a protocol version; it is self-contained and needs no reading of source.
@@ -505,7 +520,7 @@ On either answer the client falls back to `GetVersion` on `ProtocolVersion::LEGA
 
 The echo falls back to the server's preferred version only when the requested version is not served at all. A client asking for a version it speaks can never observe that fallback.
 
-`v3` also advertises its `supported_protocol_versions` **oldest first**, while the handshake reports **most preferred first**. The two orders are opposite on purpose: `v3` has advertised oldest-first since the field was added and a `v3` client is entitled to that order, so changing it would be a `v3` behaviour change and therefore a new version.
+`v3` also advertises its `supported_protocol_versions` **oldest first**, while the handshake reports **most preferred first**. The two orders are opposite on purpose: `v3` has advertised oldest-first since the field was added and a `v3` client is entitled to that order, so changing it would be a `v3` behaviour change and therefore a new version. `v4`, a new contract, reports most preferred first, as the handshake does. Both keep the echo.
 
 The regression tests that protect this are `a_server_newer_than_this_build_still_connects`, `a_client_compiled_without_the_supported_set_still_decodes_and_negotiates`, and the echo tests in `system.rs`. Do not weaken them.
 
@@ -542,12 +557,18 @@ A new version is **not** required for bug fixes or performance improvements that
 
 Note the converse: a change can break clients *without* being a protocol change. 2.26.0 and 2.28.0 both changed the client crates' API without touching any wire contract. Version negotiation does not protect against that class; see [Upgrade](#upgrade) for how those were sequenced.
 
-### Recorded deviations
+### Served versions
 
-Where this repository knowingly differs from the general contract, with the reason:
+| Version | Preference | What it is |
+| --- | --- | --- |
+| `v4` | first | `v3`'s whole surface plus the `Audit` service. Validates a request's shape before authorizing it. |
+| `v3` | second | The original surface. No announced retirement. |
 
-- **A `v3` shim validates nothing.** Input it cannot translate, such as an unset oneof, goes down as `None` for the shared implementation to reject. The general rule is that a version's shim performs that version's own basic validation, but moving it into `v3`'s shim would reorder `v3`'s errors — `PutValue` authorizes before it validates content — and changing the order in which an existing RPC fails is a behaviour change, and so a new version. **A new version's shim does its own basic validation**; `v3`'s does not, and will not.
-- **Shims do not yet share adapter code.** The rule is that adapter code for an operation whose wire shape is identical across versions lives once and is referenced by each shim, never copied and never chained. Generated types differ per package, so sharing needs a macro or a generic; whoever adds `v4` chooses, with a second real version to test against. Until then there is one shim per service and nothing to share.
+`v4` differs from `v3` in exactly three ways, each recorded in `proto/sovereign/config/v4/service.proto`:
+
+- **`Audit.QueryAuditTrail`** reads the [audit trail](#audit-trail) back. `v3` has no such service.
+- **A malformed request is refused before it is authorized.** A `PutValue` with no content or with a NUL in it, a `ReplaceSubTree` entry with no content, and a managed connection with an empty, unknown or unspecified permission are `INVALID_ARGUMENT` on `v4` whoever sends them. `v3` authorizes first and reports the caller's missing grant instead — `v3`'s order, which cannot change. The wording of each refusal is the same on both.
+- **`GetVersion` lists the served versions most preferred first**, where `v3` lists them oldest first.
 
 ### Introducing a new version
 
@@ -561,14 +582,16 @@ To add `vN`:
 2. Compile it in `crates/sovereign-config-proto/build.rs` and expose it as a `vN` module in that crate's `lib.rs`, alongside `v3`.
 3. Write the `vN` ↔ core mapping shims beside `crates/sovereign-config-server/src/values/v3.rs` and `managed/v3.rs`, point each at the `vN` generated types, and add its `mod` line and re-export in `values.rs` / `managed.rs`. **This layer must be only the proto↔core translation, plus that version's own basic validation.** Domain types in `sovereign-config-core` stay version-free, so a second version is a translation shim over one implementation rather than a forked server. If you find yourself duplicating logic rather than mapping types, the change belongs in the shared implementation (`service.rs`) or in core, not in the shim.
 
-   **Share adapter code, do not copy it and never chain it.** Because every added field or RPC is now a new version, most of a new version is unchanged from the one before — so an operation whose wire shape is identical in both should have one adapter referenced by both shims. A shim must never call another version's shim, or retiring a version would mean untangling the ones built on it. See [Recorded deviations](#recorded-deviations) for where this stands today.
+   **Share adapter code, do not copy it and never chain it.** Because every added field or RPC is now a new version, most of a new version is unchanged from the one before — so an operation whose wire shape is identical in both has one adapter referenced by both shims. Generated types differ per package, so the adapter is a macro in each module's `shim.rs`: a version's `vN.rs` imports its generated package as `proto` and invokes it, and adds only what that version alone has, as `audit/v4.rs` does. An operation whose shape *does* change gets its own adapter for that operation rather than a branch in the shared one. A shim must never call another version's shim, or retiring a version would mean untangling the ones built on it.
+
+   **Each version chooses its own basic validation**, as a policy passed to that macro. `v3` passes `Deferred`: input it cannot translate, such as an unset oneof, goes down as `None` for the shared implementation to reject after it authorizes, which is the order `v3` has always failed in and so the order it keeps. From `v4` on the policy is `Upfront`: the shim refuses a malformed request before the shared implementation is called, with the shared implementation's own wording. A managed-connection refusal is counted through the shared implementation, so the operation metric sees it like any other.
 
    And the shared implementation **never branches on the version**: the `CallContext` it receives may record which version a call arrived on, but an implementation that behaves differently per version is a forked server with extra steps. `System` stays per-version (`system.rs`), because `GetVersion`'s echo is version-specific by nature.
 4. Register the `vN` services on the router in `crates/sovereign-config-server/src/main.rs`, **leaving every existing `add_service` line in place.** Construct each `vN` shim over the same `Arc` of the shared implementation the `v3` line uses — one implementation, however many versions.
 5. Teach the **clients** to dial `vN`:
    - Add `VN` to `ProtocolVersion` in `crates/sovereign-config-core/src/status.rs`, declared **before** the existing variants — the list is preference order, most preferred first. This says only that clients in this workspace can *speak* `vN`; it advertises nothing.
    - **The workspace now fails to compile**, in `crates/sovereign-config-native/src/transport/mod.rs` and `crates/sovereign-config-web/src/transport/mod.rs`. Each selects its routes with an exhaustive `match` on `ProtocolVersion`, so a version with no dialer is a non-exhaustive-patterns error naming the transport that cannot speak it.
-   - Fix it by writing the dialers: add `transport/vN.rs` in each crate pointing at the `vN` stubs (native) or the `/sovereign.config.vN.…` paths (browser), and add the `ProtocolVersion::VN` arm. **These modules must be only the proto↔core translation**, and share adapter code for the same reason step 3 gives on the server side.
+   - Fix it by writing the dialers: add `transport/vN.rs` in each crate invoking that crate's `transport/adapter.rs` macro over the `vN` stubs (native) or messages and route label (browser), and add the `ProtocolVersion::VN` arm. **These modules must be only the proto↔core translation**, and share adapter code for the same reason step 3 gives on the server side. A version without an operation another has still implements its client trait, answering with a bounded error and dialling nothing, as `v3`'s `AuditTransport` does.
 
    The order is deliberate: declaring the version first is what produces the compile error, and the compile error is what stops the version being declared without dispatch. Do not work around it by returning an older version's dialer — a version negotiated and reported while its traffic travels on an older version's routes makes `sovereign_config_protocol_requests_total` read backwards, showing the version actually carrying the traffic as idle and the unused one as busy. Since that counter is the retirement gate below, the result is a gate that says it is safe to delete the version everything is using.
 
@@ -580,7 +603,7 @@ Two things you do *not* have to edit, because they derive from `SERVED_PROTOCOL_
 - **The unauthenticated-RPC allowlist.** `GetVersion` is called before any token exists by every client that predates the handshake, so it must stay unauthenticated on every served version. `is_operational_rpc` in `crates/sovereign-config-server/src/auth.rs` matches `/sovereign.config.<served>.System/GetVersion` against the served set rather than listing paths, so step 6 exempts `vN` automatically. The handshake route is exempt by name, and is not version-derived because it names no version.
 - **The per-version metric label**, which comes from `SERVED_PROTOCOL_LABELS` in the same step.
 
-Deploy the server before any client change. Clients now negotiate `vN` automatically; clients that have not been rebuilt continue on `v3`.
+Deploy the server before any client change. Clients now negotiate `vN` automatically; clients that have not been rebuilt continue on the version they were built for.
 
 ### Retiring a version
 
@@ -605,11 +628,13 @@ This is a precondition, not a courtesy. The provider does not cache: it holds no
 Once the authenticated series reads zero:
 
 1. Delete `proto/sovereign/config/v3/` and its entry in `crates/sovereign-config-proto/build.rs` and `lib.rs`.
-2. Delete the `v3` mapping shims — `crates/sovereign-config-server/src/values/v3.rs` and `crates/sovereign-config-server/src/managed/v3.rs` — with their `mod` lines and re-exports. The shared implementations beside them (`service.rs`) are untouched: they never knew `v3` existed.
-3. Delete the `v3` client dialers — `crates/sovereign-config-native/src/transport/v3.rs` and `crates/sovereign-config-web/src/transport/v3.rs` — with their `mod` lines and their arm of each `dialer` match.
+2. Delete the `v3` mapping shims — `crates/sovereign-config-server/src/values/v3.rs` and `crates/sovereign-config-server/src/managed/v3.rs` — with their `mod` lines and re-exports, and `SystemService` in `system.rs`. The shared implementations and adapters beside them (`service.rs`, `shim.rs`) are untouched: they never knew `v3` existed. Once no version uses the `Deferred` validation policy, delete it too.
+3. Delete the `v3` client dialers — `crates/sovereign-config-native/src/transport/v3.rs` and `crates/sovereign-config-web/src/transport/v3.rs` — with their `mod` lines and their arm of each `dialer` and `routes` match.
 4. Delete the `v3` `add_service` lines in `crates/sovereign-config-server/src/main.rs`. **Its routes now fall to the catch-all**, which answers them version-not-served; there is nothing else to remove for dispatch.
 5. Remove `V3` from `ProtocolVersion`, `SERVED_PROTOCOL_VERSIONS` and `SERVED_PROTOCOL_LABELS`, and repoint `ProtocolVersion::LEGACY` if it named `V3`.
-6. Update `SYSTEM_SERVICE_NAME` in `main.rs`, which the container health probe asks for by name.
+6. Update `SYSTEM_SERVICE_NAME` in `main.rs`, which the container health probe asks for by name, and drop `v3`'s `System` from `serving_health_service`.
+
+With `v4` served, `v3` is the first version that *can* be retired: every client built from 2.31.0 on already speaks `v4`, so its authenticated series falls as consumers are rebuilt. It has no announced date.
 
 Steps 3 and 5 hold each other honest: removing the variant while a dialer still names it is a compile error in that dialer, and removing the dialer while the variant remains is a non-exhaustive `match`. `LEGACY` is checked the same way. A retired version leaves no orphan in either direction.
 
@@ -617,7 +642,7 @@ Announce the retirement to every consuming repository before it ships. A client 
 
 ## Audit trail
 
-Every change to a configuration value, every reveal of a secret, every read of configuration, and every managed-connection create, rotate and revoke is recorded in the `audit_events` table, attributed to the identity that caused it and the protocol version its call arrived on. Nothing reads the trail back over the protocol yet — that needs a protocol version of its own — so it is queried directly in PostgreSQL for now.
+Every change to a configuration value, every reveal of a secret, every read of configuration, and every managed-connection create, rotate and revoke is recorded in the `audit_events` table, attributed to the identity that caused it and the protocol version its call arrived on. It is read back through `v4`'s `Audit.QueryAuditTrail`; `v3` has no way to read it.
 
 **No secret value is ever recorded.** A value reaches the trail only as plain content: `old_value` and `new_value` are populated for a plain value changing and are `NULL` for everything else, and a narrative naming a secret names its path, actor and action and nothing more. A read records the path it was asked for and how many values came back, never the values themselves — a subtree can hold secrets, masked or not, and the trail has no business copying content it was only asked to witness. The rule is enforced three times over: values reach an event only through a constructor that discards anything not classified plain, a table constraint confines them to the three single-value change kinds, and tests assert directly that no secret text reaches any column.
 
@@ -629,10 +654,21 @@ Recording lives in the version-free service implementations, never in a protocol
 
 `sovereign_config_audit_events_total{kind="…",outcome="…"}` counts every write by event kind. **`outcome="failed"` is the series to alert on:** a failed write either failed the operation it belonged to or, for a plain read, was dropped while the read was served — either way the trail and reality have parted, and this counter is the only place that shows. `sovereign_config_audit_retention_swept_total` and `sovereign_config_audit_retention_sweep_failures_total` cover the retention sweep, which runs hourly in the background, deletes events last seen before the retention cutoff, and never takes the server down on failure.
 
+### Reading the trail
+
+`QueryAuditTrail` returns one page of events, newest first, and a cursor for the next. **An event is returned only where the caller holds `read` on its path** — the same grant check every listing applies — and the check is part of the query rather than applied to its result, so a page is never short because someone else's events were filtered out of it. A query is not itself recorded.
+
+Every filter is optional and every one that is set must match: a fragment of the path, matched case-insensitively anywhere in it; a fragment of the narrative; a time range, which matches an event whose period overlaps it; the protocol version it arrived on; and a set of event kinds. An **element query** names one value's path exactly and returns its own events plus subtree reads of any of its ancestors and listings of its parent — the only ways a plain value is ever read, since nothing reads one plain value alone. Fragments are matched as text, never as patterns: `_` is a path character and matches only itself.
+
+Paging is keyset, never offset, on each event's first occurrence and its id — both fixed for the event's life. A new event lands above the cursor and a coalesced window bumped mid-scroll keeps its place, so a scroll returns each event exactly once. Paging on the most recent occurrence would not: a bump moves it, and a row that moves past the cursor is skipped. A coalesced event is served with its count and period rendered onto its narrative.
+
+The path and narrative filters are served by trigram indexes (`pg_trgm`, migration `0011`), and the paging order by its own index.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SOVEREIGN_CONFIG_AUDIT_RETENTION_DAYS` | `365` | How long an event is kept after it was last seen. Maximum `3650`. |
 | `SOVEREIGN_CONFIG_AUDIT_COALESCE_WINDOW_HOURS` | `24` | The window inside which repeated accesses collapse into one event. Maximum `168`. |
+| `SOVEREIGN_CONFIG_AUDIT_PAGE_SIZE` | `100` | How many events one audit query returns: what a query that names no page size gets, and the most any query gets. Maximum `1000`. |
 
 Each is optional, because the defaults are the intended configuration. One that is set but unusable fails startup rather than falling back, so a mistyped retention cannot silently become a year.
 

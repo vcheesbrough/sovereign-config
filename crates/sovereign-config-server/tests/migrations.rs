@@ -510,7 +510,31 @@ async fn migrations_are_repeatable_against_postgresql() {
     .fetch_one(&pool)
     .await
     .expect("credential column inventory must be readable");
-    assert_eq!(applied_migrations, 10);
+    // The audit query's filters are served by indexes, not by scanning a
+    // year of history (card #407).
+    let audit_indexes: Vec<String> = sqlx::query_scalar(
+        r"
+        SELECT indexname::text
+        FROM pg_indexes
+        WHERE schemaname = current_schema() AND tablename = 'audit_events'
+        ORDER BY indexname
+        ",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit index inventory must be readable");
+    assert_eq!(applied_migrations, 11);
+    assert_eq!(
+        audit_indexes,
+        [
+            "audit_events_coalesce_digest_key",
+            "audit_events_first_occurred_idx",
+            "audit_events_narrative_trgm_idx",
+            "audit_events_occurred_idx",
+            "audit_events_path_fold_trgm_idx",
+            "audit_events_pkey",
+        ]
+    );
     assert_eq!(metadata_rows, 1);
     assert_eq!(authorization_tables, 0);
     assert_eq!(audit_tables, ["audit_events"]);

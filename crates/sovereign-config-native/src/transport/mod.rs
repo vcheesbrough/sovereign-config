@@ -11,22 +11,24 @@
 //! [`dialer`]. That match is exhaustive over [`ProtocolVersion`], so declaring
 //! a version this transport cannot dial does not compile.
 
+mod adapter;
 mod v3;
+mod v4;
 
 use std::{net::IpAddr, time::Duration};
 
 use async_trait::async_trait;
 use http::Uri;
 use sovereign_config_client::{
-    Connection, Handshake, ManagedConnectionTransport, RpcCode, SessionTransport, Transport,
-    ValueTransport, VersionReply, map_rpc_status,
+    AuditTransport, Connection, Handshake, ManagedConnectionTransport, RpcCode, SessionTransport,
+    Transport, ValueTransport, VersionReply, map_rpc_status,
 };
 use sovereign_config_core::{
-    AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata,
-    DisplayName, ERROR_KIND_METADATA, ManagedConnectionMetadata, ManagedPermissions, PlainValue,
-    ProtocolVersion, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret,
-    Secret, SecretInput, ServedVersion, SubTreeMutationValue, VERSION_NOT_SERVED_KIND,
-    ValueListing, ValuePaths, ValueSubTree,
+    AddPathMetadata, AuditPage, AuditQuery, AuthenticationStatus, ClientError, ConfigPath,
+    ConnectionId, DeleteMetadata, DisplayName, ERROR_KIND_METADATA, ManagedConnectionMetadata,
+    ManagedPermissions, PlainValue, ProtocolVersion, ProvisionedManagedConnection, PutMetadata,
+    ReplaceMetadata, RevealedSecret, Secret, SecretInput, ServedVersion, SubTreeMutationValue,
+    VERSION_NOT_SERVED_KIND, ValueListing, ValuePaths, ValueSubTree,
 };
 use sovereign_config_proto::sovereign::config::{
     NegotiateRequest, handshake_client::HandshakeClient,
@@ -52,6 +54,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// from the same module that owns the routes it dials.
 fn dialer(version: ProtocolVersion, channel: Channel) -> Box<dyn SessionTransport> {
     match version {
+        ProtocolVersion::V4 => Box::new(v4::Dialer::new(channel)),
         ProtocolVersion::V3 => Box::new(v3::Dialer::new(channel)),
     }
 }
@@ -313,6 +316,17 @@ impl ManagedConnectionTransport for TonicTransport {
     }
 }
 
+#[async_trait(?Send)]
+impl AuditTransport for TonicTransport {
+    async fn query_audit_trail(
+        &self,
+        query: &AuditQuery,
+        bearer: &Secret,
+    ) -> Result<AuditPage, ClientError> {
+        self.dialer().query_audit_trail(query, bearer).await
+    }
+}
+
 fn authenticated_request<T>(message: T, bearer: &Secret) -> Result<Request<T>, ClientError> {
     let mut request = Request::new(message);
     let authorization = MetadataValue::try_from(format!("Bearer {}", bearer.expose()))
@@ -521,7 +535,8 @@ mod tests {
         let identity = tokio::time::timeout(
             Duration::from_secs(1),
             channel
-                .speaking(ProtocolVersion::PREFERRED)
+                // The hanging fixture is `v3`'s `System`.
+                .speaking(ProtocolVersion::V3)
                 .get_identity(&Secret::new("token-sentinel")),
         )
         .await

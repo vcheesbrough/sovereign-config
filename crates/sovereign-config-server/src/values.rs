@@ -2,7 +2,10 @@
 //! their stored representation.
 //!
 //! - `service` — the shared implementation, in no protocol version's terms.
-//! - `v3` — the `v3` tonic impl: a translation shim over `service`.
+//! - `shim` — the one adapter every version's shim instantiates, and the
+//!   validation policies a version chooses between.
+//! - `v3`, `v4` — each version's tonic impl: `shim` pointed at that version's
+//!   generated types.
 //! - `authz` — per-request path parsing and permission checks.
 //! - `store` — every `PostgreSQL` row type and query.
 //! - `paths` — pure fold-path arithmetic (collision, parents, ancestors).
@@ -14,14 +17,17 @@ mod authz;
 mod content;
 mod paths;
 mod service;
+mod shim;
 mod startup;
 mod store;
 mod subtree;
 mod v3;
+mod v4;
 
 pub(crate) use service::ConfigurationService;
 pub(crate) use startup::encrypt_stored_secrets;
 pub(crate) use v3::V3Configuration;
+pub(crate) use v4::V4Configuration;
 
 /// Classification of a value the caller may read back in the clear — and the
 /// only classification whose values the audit trail will hold.
@@ -29,5 +35,7 @@ pub(crate) const PLAIN: &str = "plain";
 /// Classification of a value stored as ciphertext and masked on read.
 const SECRET: &str = "secret";
 
+#[cfg(test)]
+mod shim_tests;
 #[cfg(test)]
 mod tests;

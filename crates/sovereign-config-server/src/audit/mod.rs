@@ -2,11 +2,12 @@
 //! configuration read, attributed to who caused it and the protocol version it
 //! arrived on.
 //!
-//! - `narrative` — the sentence each event is stored with. Pure.
+//! - `narrative` — the sentence each event is stored with, and how it is
+//!   served. Pure.
 //! - `store` — every `PostgreSQL` statement behind the trail.
-//!
-//! This module records and exposes nothing: reading the trail over the
-//! protocol is a later card, because it needs a protocol version of its own.
+//! - `service` — reading the trail back, in no protocol version's terms.
+//! - `v4` — the `v4` tonic impl of the `Audit` service: a translation shim
+//!   over `service`. `v3` has no `Audit` service.
 //!
 //! **No secret value is ever recorded.** A value reaches an event only as a
 //! [`Recorded`], whose constructor discards anything not classified plain, so
@@ -18,7 +19,9 @@
 //! would be a way around the trail.
 
 mod narrative;
+mod service;
 mod store;
+pub(crate) mod v4;
 
 use std::{sync::Arc, time::Duration};
 
@@ -32,6 +35,8 @@ use tracing::error;
 use crate::metrics::{AuditMetrics, AuditWriteOutcome};
 use crate::rpc::storage_unavailable;
 use crate::values::PLAIN;
+
+pub(crate) use service::AuditTrailService;
 
 /// How many individual value events one bulk operation records. A recursive
 /// delete or a subtree replacement can touch an unbounded number of values
@@ -525,6 +530,9 @@ impl AuditRecorder {
 
 #[cfg(test)]
 pub(crate) mod test_support;
+
+#[cfg(test)]
+mod query_tests;
 
 #[cfg(test)]
 mod tests;

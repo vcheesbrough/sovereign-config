@@ -1,4 +1,8 @@
-//! The `System` service: protocol negotiation and authenticated identity.
+//! The `System` service: protocol negotiation and authenticated identity, once
+//! per protocol version — [`SystemService`] for `v3` and [`V4System`] for `v4`.
+//! It stays per-version, unlike every other service, because `GetVersion` is
+//! version-specific by nature: each version answers on its own route, in its
+//! own message, with its own promised ordering.
 //!
 //! `GetVersion` is **`v3`'s** view of the served set, not the handshake. The
 //! handshake ([`crate::handshake`]) is unversioned and is what a current client
@@ -12,11 +16,14 @@
 //! See `## Protocol versioning` in `README.md`.
 
 use sovereign_config_core::ProtocolVersion;
-use sovereign_config_proto::sovereign::config::v3::{
-    GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
-    system_server::System,
+use sovereign_config_proto::sovereign::config::{
+    v3::{
+        GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
+        system_server::System,
+    },
+    v4,
 };
-use tonic::{Request, Response, Status};
+use tonic::{Extensions, Request, Response, Status};
 
 use crate::{APPLICATION_VERSION, auth::AuthenticatedPrincipal};
 
@@ -64,11 +71,18 @@ pub(crate) struct ServedProtocol {
 /// last step of retiring it, gated on the `outcome="authenticated"` series of
 /// `sovereign_config_protocol_requests_total` reading zero for that version —
 /// see the README.
-pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ServedProtocol] = &[ServedProtocol {
-    version: ProtocolVersion::V3,
-    age: 3,
-    deprecation_date: None,
-}];
+pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ServedProtocol] = &[
+    ServedProtocol {
+        version: ProtocolVersion::V4,
+        age: 4,
+        deprecation_date: None,
+    },
+    ServedProtocol {
+        version: ProtocolVersion::V3,
+        age: 3,
+        deprecation_date: None,
+    },
+];
 
 /// The metric label for every version in [`SERVED_PROTOCOL_VERSIONS`], in the
 /// same order.
@@ -76,7 +90,8 @@ pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ServedProtocol] = &[ServedProtocol 
 /// Spelled out rather than derived, because a `const` cannot map a slice; the
 /// test below is what keeps the two in step. Compiled-in labels are what keep
 /// `sovereign_config_protocol_requests_total` bounded.
-pub(crate) const SERVED_PROTOCOL_LABELS: &[&str] = &[ProtocolVersion::V3.as_str()];
+pub(crate) const SERVED_PROTOCOL_LABELS: &[&str] =
+    &[ProtocolVersion::V4.as_str(), ProtocolVersion::V3.as_str()];
 
 /// The version a request that names no version this server serves is told about:
 /// the most preferred served version.
@@ -128,6 +143,38 @@ fn v3_supported_protocol_versions() -> Vec<String> {
     advertised_to_v3(SERVED_PROTOCOL_VERSIONS)
 }
 
+/// The served set as **`v4`** reports it: most preferred first, the order the
+/// handshake reports. `v4` is free to choose, because it is a new contract;
+/// `v3` is not, and keeps its own order.
+fn v4_supported_protocol_versions() -> Vec<String> {
+    SERVED_PROTOCOL_VERSIONS
+        .iter()
+        .map(|entry| entry.version.as_str().to_owned())
+        .collect()
+}
+
+/// The version a session is told it will speak: the one it asked for whenever
+/// that is served. Shared by every version's `GetVersion`, because the echo is
+/// the one rule no version may change — see [`SystemService::get_version`].
+fn echoed(requested: String) -> String {
+    if served(&requested) {
+        requested
+    } else {
+        preferred_served().to_owned()
+    }
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "tonic::Status is the crate's RPC error type and is returned by value"
+)]
+fn require_principal(extensions: &Extensions) -> Result<(), Status> {
+    if extensions.get::<AuthenticatedPrincipal>().is_none() {
+        return Err(Status::unauthenticated("authentication required"));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SystemService;
 
@@ -146,15 +193,9 @@ impl System for SystemService {
         // newer version ships. Only a request for a version this server does
         // not serve at all falls back — a client that asks for a version it
         // speaks can never see that, so the guarantee holds.
-        let protocol_version = if served(&requested) {
-            requested
-        } else {
-            preferred_served().to_owned()
-        };
-
         Ok(Response::new(GetVersionResponse {
             application_version: APPLICATION_VERSION.to_owned(),
-            protocol_version,
+            protocol_version: echoed(requested),
             supported_protocol_versions: v3_supported_protocol_versions(),
         }))
     }
@@ -163,14 +204,37 @@ impl System for SystemService {
         &self,
         request: Request<GetIdentityRequest>,
     ) -> Result<Response<GetIdentityResponse>, Status> {
-        if request
-            .extensions()
-            .get::<AuthenticatedPrincipal>()
-            .is_none()
-        {
-            return Err(Status::unauthenticated("authentication required"));
-        }
+        require_principal(request.extensions())?;
         Ok(Response::new(GetIdentityResponse {
+            authenticated: true,
+        }))
+    }
+}
+
+/// `v4`'s `System`: the same echo as `v3`, and the served set most preferred
+/// first.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct V4System;
+
+#[tonic::async_trait]
+impl v4::system_server::System for V4System {
+    async fn get_version(
+        &self,
+        request: Request<v4::GetVersionRequest>,
+    ) -> Result<Response<v4::GetVersionResponse>, Status> {
+        Ok(Response::new(v4::GetVersionResponse {
+            application_version: APPLICATION_VERSION.to_owned(),
+            protocol_version: echoed(request.into_inner().protocol_version),
+            supported_protocol_versions: v4_supported_protocol_versions(),
+        }))
+    }
+
+    async fn get_identity(
+        &self,
+        request: Request<v4::GetIdentityRequest>,
+    ) -> Result<Response<v4::GetIdentityResponse>, Status> {
+        require_principal(request.extensions())?;
+        Ok(Response::new(v4::GetIdentityResponse {
             authenticated: true,
         }))
     }
@@ -180,11 +244,11 @@ impl System for SystemService {
 mod tests {
     use super::{
         SERVED_PROTOCOL_LABELS, SERVED_PROTOCOL_VERSIONS, ServedProtocol, System, SystemService,
-        advertised_to_v3, oldest_first, v3_supported_protocol_versions,
+        V4System, advertised_to_v3, oldest_first, v3_supported_protocol_versions,
     };
     use crate::APPLICATION_VERSION;
     use sovereign_config_core::ProtocolVersion;
-    use sovereign_config_proto::sovereign::config::v3::GetVersionRequest;
+    use sovereign_config_proto::sovereign::config::{v3::GetVersionRequest, v4};
     use tonic::Request;
 
     async fn get_version(
@@ -205,7 +269,7 @@ mod tests {
 
         assert_eq!(response.protocol_version, ProtocolVersion::V3.as_str());
         assert_eq!(response.application_version, APPLICATION_VERSION);
-        assert_eq!(response.supported_protocol_versions, ["v3"]);
+        assert_eq!(response.supported_protocol_versions, ["v3", "v4"]);
     }
 
     #[tokio::test]
@@ -335,7 +399,46 @@ mod tests {
                 ProtocolVersion::PREFERRED.as_str(),
                 "an unserved request falls back to the preferred served version"
             );
-            assert_eq!(response.supported_protocol_versions, ["v3"]);
+            assert_eq!(response.supported_protocol_versions, ["v3", "v4"]);
         }
+    }
+
+    async fn get_version_on_v4(requested: &str) -> v4::GetVersionResponse {
+        v4::system_server::System::get_version(
+            &V4System,
+            Request::new(v4::GetVersionRequest {
+                protocol_version: requested.to_owned(),
+            }),
+        )
+        .await
+        .expect("GetVersion never rejects a requested version")
+        .into_inner()
+    }
+
+    /// `v4` keeps the echo every version must keep: the version asked for,
+    /// whenever it is served — including an *older* one, which is what a
+    /// client that dialled `v4`'s route to ask about `v3` is owed.
+    #[tokio::test]
+    async fn v4_echoes_the_requested_version_and_advertises_preference_order() {
+        for requested in ["v4", "v3"] {
+            let response = get_version_on_v4(requested).await;
+
+            assert_eq!(response.protocol_version, requested);
+            assert_eq!(response.application_version, APPLICATION_VERSION);
+            assert_eq!(response.supported_protocol_versions, ["v4", "v3"]);
+        }
+        let unserved = get_version_on_v4("v1").await;
+        assert_eq!(unserved.protocol_version, ProtocolVersion::V4.as_str());
+    }
+
+    #[tokio::test]
+    async fn v4_identity_requires_a_principal() {
+        let refused = v4::system_server::System::get_identity(
+            &V4System,
+            Request::new(v4::GetIdentityRequest {}),
+        )
+        .await
+        .expect_err("no principal is attached");
+        assert_eq!(refused.code(), tonic::Code::Unauthenticated);
     }
 }

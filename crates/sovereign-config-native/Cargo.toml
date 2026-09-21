@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 http.workspace = true
+prost-types.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 rustix.workspace = true
 serde.workspace = true
@@ -23,7 +24,6 @@ tonic = { workspace = true, features = ["tls-native-roots", "transport"] }
 
 [dev-dependencies]
 axum.workspace = true
-prost-types.workspace = true
 tokio-stream = { version = "0.1.18", features = ["net"] }
 
 [lints]
