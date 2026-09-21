@@ -27,8 +27,9 @@ use tower::{Layer, ServiceExt, service_fn};
 
 use super::{
     AuthenticatedPrincipal, AuthenticationLayer, Authenticator, Grant, HANDSHAKE_RPC,
-    IntrospectionResponse, Permission, bearer_token, canonical_prefix, grpc_service_layer,
-    is_operational_rpc, is_web_asset_request, require_rs256, validate_introspection,
+    IntrospectionResponse, MAX_DISPLAY_NAME_CHARACTERS, Permission, bearer_token, canonical_prefix,
+    display_name, grpc_service_layer, is_operational_rpc, is_web_asset_request, require_rs256,
+    validate_introspection,
 };
 use crate::{
     config::AuthenticationConfig,
@@ -219,7 +220,13 @@ fn token(algorithm: &str) -> String {
 }
 
 fn valid_response() -> IntrospectionResponse {
-    serde_json::from_value(json!({
+    serde_json::from_value(valid_claims()).unwrap()
+}
+
+/// The claims of a valid introspection response, before deserialization, so a
+/// test can add or replace one and see what the real `serde` path makes of it.
+fn valid_claims() -> Value {
+    json!({
         "active": true,
         "iss": "https://issuer.example/application/o/sovereign-config/",
         "aud": "sovereign-config",
@@ -230,8 +237,26 @@ fn valid_response() -> IntrospectionResponse {
             {"prefix": "/apps/api", "permissions": ["read"]},
             {"prefix": "/apps/api", "permissions": ["write"]}
         ]
-    }))
-    .unwrap()
+    })
+}
+
+/// A valid response carrying `claims` in addition, deserialized exactly as the
+/// authenticator deserializes Authentik's reply.
+fn response_with(claims: &[(&str, Value)]) -> IntrospectionResponse {
+    let mut body = valid_claims();
+    for (name, value) in claims {
+        body[*name] = value.clone();
+    }
+    serde_json::from_value(body).expect("any claim value must deserialize")
+}
+
+fn authenticate(response: IntrospectionResponse) -> AuthenticatedPrincipal {
+    validate_introspection(
+        response,
+        "https://issuer.example/application/o/sovereign-config/",
+        "sovereign-config",
+    )
+    .expect("a valid response must authenticate")
 }
 
 #[test]
@@ -283,6 +308,88 @@ fn valid_claims_merge_duplicate_prefix_permissions() {
     assert_eq!(
         principal.grants[1].permissions,
         BTreeSet::from([Permission::Read, Permission::Write])
+    );
+}
+
+#[test]
+fn the_display_name_prefers_preferred_username_and_falls_back_to_username() {
+    let name = |preferred: Option<Value>, username: Option<Value>| {
+        display_name(preferred.as_ref(), username.as_ref())
+    };
+
+    assert_eq!(
+        name(Some(json!("alice")), Some(json!("alice-sa"))).as_deref(),
+        Some("alice")
+    );
+    assert_eq!(
+        name(None, Some(json!("alice-sa"))).as_deref(),
+        Some("alice-sa")
+    );
+    // A preferred name that is empty once cleaned is no name at all, so the
+    // fallback is used rather than an empty label.
+    for unusable in [json!(""), json!("   "), json!("\u{7}\u{1b}"), json!(42)] {
+        assert_eq!(
+            name(Some(unusable.clone()), Some(json!("alice-sa"))).as_deref(),
+            Some("alice-sa"),
+            "{unusable}"
+        );
+    }
+    assert_eq!(name(None, None), None);
+    assert_eq!(name(Some(json!(null)), Some(json!({"a": 1}))), None);
+}
+
+#[test]
+fn the_display_name_is_stripped_of_control_characters_trimmed_and_bounded() {
+    let name = |claim: &str| display_name(Some(&json!(claim)), None);
+
+    assert_eq!(name("  ali\u{7}ce\n ").as_deref(), Some("alice"));
+    let long = "x".repeat(MAX_DISPLAY_NAME_CHARACTERS + 50);
+    assert_eq!(
+        name(&long).map(|kept| kept.chars().count()),
+        Some(MAX_DISPLAY_NAME_CHARACTERS)
+    );
+    // Bounded in characters, not bytes, so a multi-byte name is not cut
+    // through the middle of a character.
+    let wide = "é".repeat(MAX_DISPLAY_NAME_CHARACTERS + 1);
+    assert_eq!(name(&wide), Some("é".repeat(MAX_DISPLAY_NAME_CHARACTERS)));
+}
+
+/// The name decides nothing, so no value of either claim may fail
+/// authentication. Driven through `serde` deliberately: tightening a claim's
+/// field to `Option<String>` would reject these at deserialization and lock
+/// out every identity whose provider sends one, and only this layer sees it.
+#[test]
+fn no_value_of_a_name_claim_can_fail_authentication() {
+    for odd in [
+        json!(42),
+        json!({"nested": "object"}),
+        json!(["a", "b"]),
+        json!(true),
+        json!(null),
+        json!(""),
+    ] {
+        for claim in ["preferred_username", "username"] {
+            let principal = authenticate(response_with(&[(claim, odd.clone())]));
+            assert_eq!(principal.subject, "principal-id", "{claim}: {odd}");
+            assert_eq!(principal.name, None, "{claim}: {odd}");
+        }
+    }
+}
+
+#[test]
+fn a_name_claim_reaches_the_principal_without_affecting_its_grants() {
+    let principal = authenticate(response_with(&[
+        ("preferred_username", json!("alice")),
+        ("username", json!("alice-service")),
+    ]));
+
+    assert_eq!(principal.name.as_deref(), Some("alice"));
+    assert_eq!(
+        principal,
+        AuthenticatedPrincipal {
+            name: Some("alice".into()),
+            ..authenticate(valid_response())
+        }
     );
 }
 

@@ -18,8 +18,9 @@ use sovereign_config_proto::sovereign::config::v3::{
 
 use crate::protocol::NegotiatedProtocolVersion;
 
+use crate::audit::BULK_EVENT_CAP;
 use crate::audit::test_support::{
-    break_audit_writes, clear_trail, kinds, restore_audit_writes, trail,
+    TrailRow, break_audit_writes, clear_trail, kinds, restore_audit_writes, trail,
 };
 
 use super::startup::wrong_key;
@@ -2628,4 +2629,156 @@ async fn the_recorded_version_comes_from_the_route_the_call_arrived_on() {
 
     clear_test_paths(&pool, &[AUDIT_ROOT]).await;
     clear_trail(&pool, AUDIT_ROOT).await;
+}
+
+const BULK_ROOT: &str = "/tests/audit-bulk";
+
+/// One value past the cap, named so that path order is numeric order: the
+/// value outside the itemized prefix is always the last, `k1000`.
+fn bulk_path(root: &str, index: usize) -> String {
+    format!("{root}/k{index:04}")
+}
+
+/// Seeds `count` plain values under `root` in one statement, so crossing the
+/// cap costs one round trip rather than a thousand.
+///
+/// Inserted in **reverse** path order, so the rows' physical order is not
+/// already path order. Otherwise a delete's `RETURNING` would come back sorted
+/// by accident, and dropping the sort the itemized prefix depends on would go
+/// unnoticed.
+async fn seed_bulk(pool: &PgPool, root: &str, count: usize) {
+    sqlx::query(
+        r"
+        WITH contents AS (
+            INSERT INTO configuration_value_contents (value, classification, created_at, updated_at)
+            SELECT 'v' || n, 'plain', NOW(), NOW()
+            FROM generate_series($2 - 1, 0, -1) AS n
+            RETURNING id, value
+        )
+        INSERT INTO configuration_paths (path, content_id, created_at, updated_at)
+        SELECT $1 || '/k' || lpad(substr(value, 2), 4, '0'), id, NOW(), NOW()
+        FROM contents
+        ",
+    )
+    .bind(root)
+    .bind(i32::try_from(count).unwrap())
+    .execute(pool)
+    .await
+    .expect("bulk values must seed");
+}
+
+/// The itemized paths of `kind` under `root`, sorted.
+fn itemized(rows: &[TrailRow], kind: &str) -> Vec<String> {
+    let mut paths: Vec<String> = rows
+        .iter()
+        .filter(|row| row.kind == kind)
+        .map(|row| row.display_path.clone())
+        .collect();
+    paths.sort_unstable();
+    paths
+}
+
+/// Past the cap a recursive delete itemizes exactly `BULK_EVENT_CAP` values —
+/// the path-sorted prefix, the same one every time — and its summary counts
+/// every deletion and says how many it did not itemize.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn a_recursive_delete_past_the_cap_itemizes_the_sorted_prefix_and_counts_the_rest() {
+    let pool = pool_or_skip!();
+    let root = format!("{BULK_ROOT}/delete");
+    clear_test_paths(&pool, &[BULK_ROOT]).await;
+    clear_trail(&pool, BULK_ROOT).await;
+    let service = v3_service(pool.clone(), test_cipher());
+    let total = BULK_EVENT_CAP + 1;
+    seed_bulk(&pool, &root, total).await;
+
+    let deleted = service
+        .delete_values(request_with_grants(
+            DeleteValuesRequest {
+                path: root.clone(),
+                recurse: true,
+            },
+            &[(BULK_ROOT, &[Permission::Write])],
+        ))
+        .await
+        .expect("the recursive delete must succeed")
+        .into_inner();
+    assert_eq!(deleted.deleted_count, u64::try_from(total).unwrap());
+
+    let rows = trail(&pool, BULK_ROOT).await;
+    assert_eq!(rows.len(), BULK_EVENT_CAP + 1, "the cap plus one summary");
+    let expected: Vec<String> = (0..BULK_EVENT_CAP)
+        .map(|index| bulk_path(&root, index))
+        .collect();
+    assert_eq!(itemized(&rows, "value.deleted"), expected);
+
+    let summaries: Vec<&TrailRow> = rows
+        .iter()
+        .filter(|row| row.kind == "subtree.deleted")
+        .collect();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].display_path, root);
+    assert!(
+        summaries[0].narrative.ends_with(&format!(
+            "deleted {total} values at or below {root}; 1 deletion not recorded individually"
+        )),
+        "{}",
+        summaries[0].narrative
+    );
+
+    clear_test_paths(&pool, &[BULK_ROOT]).await;
+    clear_trail(&pool, BULK_ROOT).await;
+}
+
+/// The same for a replacement, whose summary counts differently: it sums
+/// created, changed and deleted before subtracting what it itemized.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn a_replacement_past_the_cap_itemizes_the_sorted_prefix_and_counts_the_rest() {
+    let pool = pool_or_skip!();
+    let root = format!("{BULK_ROOT}/replace");
+    clear_test_paths(&pool, &[BULK_ROOT]).await;
+    clear_trail(&pool, BULK_ROOT).await;
+    let service = v3_service(pool.clone(), test_cipher());
+    let total = BULK_EVENT_CAP + 1;
+    // Sent in reverse, so an itemized prefix taken in request order rather
+    // than path order would fail.
+    let values: Vec<SubTreeMutationValue> = (0..total)
+        .rev()
+        .map(|index| plain_mutation(&bulk_path(&root, index), "fresh"))
+        .collect();
+
+    service
+        .replace_sub_tree(request_with_grants(
+            ReplaceSubTreeRequest {
+                path: root.clone(),
+                values,
+            },
+            &[(BULK_ROOT, &[Permission::Write, Permission::Manage])],
+        ))
+        .await
+        .expect("the replacement must succeed");
+
+    let rows = trail(&pool, BULK_ROOT).await;
+    assert_eq!(rows.len(), BULK_EVENT_CAP + 1, "the cap plus one summary");
+    let expected: Vec<String> = (0..BULK_EVENT_CAP)
+        .map(|index| bulk_path(&root, index))
+        .collect();
+    assert_eq!(itemized(&rows, "value.created"), expected);
+
+    let summaries: Vec<&TrailRow> = rows
+        .iter()
+        .filter(|row| row.kind == "subtree.replaced")
+        .collect();
+    assert_eq!(summaries.len(), 1);
+    assert!(
+        summaries[0].narrative.ends_with(&format!(
+            "replaced subtree {root}: {total} created, 0 changed, 0 deleted; 1 change not recorded individually"
+        )),
+        "{}",
+        summaries[0].narrative
+    );
+
+    clear_test_paths(&pool, &[BULK_ROOT]).await;
+    clear_trail(&pool, BULK_ROOT).await;
 }

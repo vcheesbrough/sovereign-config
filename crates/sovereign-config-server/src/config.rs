@@ -32,14 +32,6 @@ pub(crate) struct AuditConfig {
     pub(crate) retention: Duration,
     /// The window inside which repeated accesses collapse into one event.
     pub(crate) coalesce_window: Duration,
-    /// The default, and the most, events one page of the trail returns. Nothing
-    /// reads the trail over the protocol yet; it is parsed here so that every
-    /// audit setting is validated at the same startup.
-    #[expect(
-        dead_code,
-        reason = "consumed by the audit query API, which needs its own protocol version"
-    )]
-    pub(crate) page_size: u32,
 }
 
 pub(crate) struct ManagedConnectionConfig {
@@ -130,7 +122,6 @@ impl Config {
                     168,
                 )?) * SECONDS_PER_HOUR,
             ),
-            page_size: optional_bounded("SOVEREIGN_CONFIG_AUDIT_PAGE_SIZE", 100, 500)?,
         };
 
         Ok(Self {
@@ -343,8 +334,8 @@ pub(crate) fn required_secret(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        issuer_api_origin, required_env, validate_introspection_url, validate_issuer_url,
-        validated_group_name, validated_public_origin,
+        bounded_setting, issuer_api_origin, required_env, validate_introspection_url,
+        validate_issuer_url, validated_group_name, validated_public_origin,
     };
 
     #[test]
@@ -431,6 +422,56 @@ mod tests {
             issuer_api_origin(&issuer).unwrap().as_str(),
             "https://auth.example.test/"
         );
+    }
+
+    const SETTING: &str = "SOVEREIGN_CONFIG_AUDIT_RETENTION_DAYS";
+
+    #[test]
+    fn an_absent_or_blank_bounded_setting_takes_its_default() {
+        for absent in [None, Some(""), Some("   "), Some("\t\n")] {
+            assert_eq!(
+                bounded_setting(SETTING, absent, 365, 3650).unwrap(),
+                365,
+                "{absent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bounded_setting_accepts_every_whole_number_in_range() {
+        assert_eq!(bounded_setting(SETTING, Some("1"), 365, 3650).unwrap(), 1);
+        assert_eq!(
+            bounded_setting(SETTING, Some("3650"), 365, 3650).unwrap(),
+            3650
+        );
+        assert_eq!(
+            bounded_setting(SETTING, Some(" 30 "), 365, 3650).unwrap(),
+            30
+        );
+    }
+
+    /// The promise the README makes: a value that is set but unusable fails
+    /// startup rather than falling back. Zero matters most — a retention of
+    /// zero days would have the hourly sweep delete the entire trail.
+    #[test]
+    fn a_set_but_unusable_bounded_setting_fails_rather_than_falling_back() {
+        for unusable in [
+            "0",
+            "3651",
+            "-1",
+            "7d",
+            "1.5",
+            "365 days",
+            "4294967296",
+            "one",
+        ] {
+            let error = bounded_setting(SETTING, Some(unusable), 365, 3650)
+                .expect_err(unusable)
+                .to_string();
+            // Names the variable, so the operator knows which one to fix.
+            assert!(error.contains(SETTING), "{unusable:?}: {error}");
+            assert!(error.contains("1 to 3650"), "{unusable:?}: {error}");
+        }
     }
 
     #[test]
