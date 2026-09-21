@@ -90,7 +90,7 @@ steps:
     commands:
       - |
         rm -rf .browser-dist
-        docker build --target web-dist-artifact --output type=local,dest=.browser-dist .
+        docker build -f docker/web.Dockerfile --output type=local,dest=.browser-dist .
         CONTAINER=$$(docker create --workdir /tests \
           --env PLAYWRIGHT_STATIC=1 \
           --env PLAYWRIGHT_STATIC_DIR=/web-dist \

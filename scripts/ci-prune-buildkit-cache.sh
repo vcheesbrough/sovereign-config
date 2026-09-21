@@ -2,7 +2,7 @@
 # Bound this repository's BuildKit cargo target cache on the CI Docker host.
 #
 # The image builds compile into a BuildKit cache mount
-# (`--mount=type=cache,id=sovereign-config-cargo-target` in the Dockerfile).
+# (`--mount=type=cache,id=sovereign-config-cargo-target` in every docker/*.Dockerfile).
 # Like the Woodpecker volume ci-prune-cargo-target.sh bounds (bored card #326),
 # cargo never reaps artifacts from commits it no longer builds, so the mount
 # only grows — and nothing else on the host bounds it.

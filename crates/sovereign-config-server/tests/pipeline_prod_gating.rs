@@ -142,24 +142,147 @@ fn build_and_dev_deploy_steps_never_run_on_a_deployment() {
     }
 }
 
-/// The Dockerfile has three final stages, so an untargeted `docker build .`
-/// silently tags the *last* one. Without `--target`, `build-server` would
-/// publish the broker binary under the server's image name — a failure that
-/// would only surface at deploy time.
+/// The repository root, where the `docker/` build files live.
+fn repo_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn dockerfile(image: &str) -> String {
+    let path = repo_root().join(format!("docker/{image}.Dockerfile"));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{} should be readable: {error}", path.display()))
+}
+
+/// Every `docker/*.Dockerfile`, by file name.
+fn all_dockerfiles() -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = std::fs::read_dir(repo_root().join("docker"))
+        .expect("docker/ should be readable")
+        .map(|entry| entry.expect("docker/ entry should be readable").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "Dockerfile")
+        })
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let text = std::fs::read_to_string(&path).expect("Dockerfile should be readable");
+            (name, text)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// The digest-pinned references to `image@sha256:` in a Dockerfile.
+fn pinned_digests<'a>(dockerfile: &'a str, image: &str) -> BTreeSet<&'a str> {
+    dockerfile
+        .split_whitespace()
+        .filter(|word| word.contains(&format!("{image}@sha256:")))
+        .collect()
+}
+
+/// Each image builds from its own file, which has one final stage, so no build
+/// can pick the wrong image by omitting a `--target`.
 #[test]
-fn each_image_build_names_its_dockerfile_target() {
+fn each_image_build_uses_its_own_dockerfile() {
     let pipeline = pipeline();
-    for (name, target) in [
-        ("build-server", "--target server-runtime"),
-        ("build-broker", "--target broker-runtime"),
-        ("build-cli", "--target cli-runtime"),
+    for (name, image) in [
+        ("build-server", "server"),
+        ("build-broker", "broker"),
+        ("build-cli", "cli"),
     ] {
         let commands = commands_text(step(&pipeline, name));
+        let file = format!("-f docker/{image}.Dockerfile ");
         assert!(
-            commands.contains("docker build") && commands.contains(target),
-            "{name} must build with {target}"
+            commands.contains("docker build") && commands.contains(&file),
+            "{name} must build with {file}"
+        );
+        assert!(
+            !commands.contains("--target"),
+            "{name} must not select a stage: its Dockerfile builds one image"
+        );
+        dockerfile(image);
+    }
+    assert!(
+        !repo_root().join("Dockerfile").exists(),
+        "there must be no root Dockerfile for an untargeted `docker build .` to pick up"
+    );
+}
+
+/// The builder stages are duplicated across the files, not shared, so their
+/// base images must not drift apart.
+#[test]
+fn every_dockerfile_pins_the_same_base_images() {
+    let files = all_dockerfiles();
+    assert!(
+        files.len() >= 4,
+        "expected web/server/broker/cli Dockerfiles, found {files:?}"
+    );
+    for image in [
+        "docker.io/library/rust",
+        "docker.io/library/debian",
+        "docker:27-cli",
+        "docker/dockerfile:1.7",
+    ] {
+        let digests: BTreeSet<&str> = files
+            .iter()
+            .flat_map(|(_, text)| pinned_digests(text, image))
+            .collect();
+        assert!(
+            digests.len() <= 1,
+            "every docker/*.Dockerfile must pin {image} to one digest, found {digests:?}"
         );
     }
+    for (name, text) in &files {
+        assert_eq!(
+            pinned_digests(text, "docker.io/library/rust").len(),
+            1,
+            "{name} must build from the pinned rust image"
+        );
+        let mut stages: Vec<&str> = Vec::new();
+        for from in text.lines().filter(|line| line.starts_with("FROM ")) {
+            let words: Vec<&str> = from
+                .split_whitespace()
+                .filter(|word| !word.starts_with("--"))
+                .collect();
+            let base = words.get(1).copied().unwrap_or_default();
+            assert!(
+                base == "scratch" || base.contains("@sha256:") || stages.contains(&base),
+                "{name}: {from} must pin its base image by digest or build on an earlier stage"
+            );
+            if let Some(stage) = words
+                .iter()
+                .position(|word| word.eq_ignore_ascii_case("AS"))
+                .and_then(|index| words.get(index + 1))
+            {
+                stages.push(stage);
+            }
+        }
+    }
+}
+
+/// The broker and CLI never ship the web bundle, and the broker never ships
+/// the server, so neither build pays for them.
+#[test]
+fn broker_and_cli_builds_compile_only_what_they_ship() {
+    for image in ["broker", "cli"] {
+        let text = dockerfile(image);
+        assert!(
+            !text.contains("trunk") && !text.contains("wasm32") && !text.contains("web-dist"),
+            "docker/{image}.Dockerfile must not build the web bundle"
+        );
+        assert!(
+            !text.contains("--package sovereign-config-server"),
+            "docker/{image}.Dockerfile must not compile the server"
+        );
+    }
+    assert!(
+        dockerfile("broker").contains("--package sovereign-config-woodpecker-broker"),
+        "the broker Dockerfile must compile the broker"
+    );
+    assert!(
+        dockerfile("cli").contains("--package sovereign-config-cli"),
+        "the CLI Dockerfile must compile the CLI"
+    );
 }
 
 /// The CLI image is the exact docker CLI image the pipeline's own docker steps
@@ -167,10 +290,7 @@ fn each_image_build_names_its_dockerfile_target() {
 /// swap its image for it and gain `sovereign-config` without losing `docker`.
 #[test]
 fn the_cli_image_is_the_pipeline_docker_image_plus_the_cli() {
-    let dockerfile = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Dockerfile"),
-    )
-    .expect("Dockerfile should be readable");
+    let dockerfile = dockerfile("cli");
     let stage = dockerfile
         .split("\nFROM ")
         .find(|stage| {
@@ -179,7 +299,11 @@ fn the_cli_image_is_the_pipeline_docker_image_plus_the_cli() {
                 .next()
                 .is_some_and(|from| from.ends_with(" AS cli-runtime"))
         })
-        .expect("the Dockerfile must define a cli-runtime stage");
+        .expect("docker/cli.Dockerfile must define a cli-runtime stage");
+    assert!(
+        dockerfile.trim_end().ends_with(stage.trim_end()),
+        "cli-runtime must be the final stage, so the untargeted build produces it"
+    );
     let base = stage
         .split_whitespace()
         .next()
@@ -194,10 +318,21 @@ fn the_cli_image_is_the_pipeline_docker_image_plus_the_cli() {
         "cli-runtime must be based on the digest-pinned docker CLI image the pipeline uses, got {base}"
     );
     assert!(
-        stage.contains(
-            "COPY --from=installer-builder /tmp/bin/sovereign-config /usr/local/bin/sovereign-config"
-        ),
-        "cli-runtime must carry the static musl CLI the installer is built from"
+        stage.contains("COPY --from=builder /tmp/sovereign-config /usr/local/bin/sovereign-config"),
+        "cli-runtime must carry the static musl CLI"
+    );
+    assert!(
+        dockerfile.contains("--target x86_64-unknown-linux-musl"),
+        "the CLI must be built as a static musl binary"
+    );
+    // build-server strips and packages the same musl path in the shared target
+    // cache, possibly at the same time, so the CLI image builds elsewhere.
+    assert!(
+        dockerfile.contains("--target-dir /src/target/cli-image")
+            && dockerfile.contains(
+                "/src/target/cli-image/x86_64-unknown-linux-musl/release/sovereign-config"
+            ),
+        "the CLI image must build into its own target directory, not the server's musl output"
     );
     assert!(
         !stage.contains("ENTRYPOINT") && !stage.contains("\nUSER "),
