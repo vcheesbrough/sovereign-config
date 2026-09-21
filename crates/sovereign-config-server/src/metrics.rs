@@ -3,6 +3,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::audit::EventKind;
+
 /// The bucket a request counts against when its route names a `sovereign.config`
 /// protocol version this server does not serve.
 ///
@@ -451,6 +453,87 @@ impl ManagedConnectionMetrics {
                 .expect("writing metrics to a String cannot fail");
             }
         }
+        output
+    }
+}
+
+/// Whether an audit event reached the trail.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AuditWriteOutcome {
+    Recorded,
+    Failed,
+}
+
+impl AuditWriteOutcome {
+    const ALL: [Self; 2] = [Self::Recorded, Self::Failed];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Audit trail writes by event kind and outcome, and the retention sweep.
+///
+/// `outcome="failed"` is the series to alert on. A failed write either failed
+/// the operation it belonged to — a change, a secret access — or, for a plain
+/// read, was dropped while the read was served; in both cases the trail and
+/// reality have parted, and this counter is the only place that shows.
+#[derive(Default)]
+pub(crate) struct AuditMetrics {
+    writes: [[AtomicU64; AuditWriteOutcome::ALL.len()]; EventKind::ALL.len()],
+    swept: AtomicU64,
+    sweep_failures: AtomicU64,
+}
+
+impl AuditMetrics {
+    pub(crate) fn record_write(&self, kind: EventKind, outcome: AuditWriteOutcome) {
+        self.writes[kind.index()][outcome.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_swept(&self, rows: u64) {
+        self.swept.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_sweep_failure(&self) {
+        self.sweep_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn render(&self) -> String {
+        let mut output = String::from(
+            "# HELP sovereign_config_audit_events_total Audit trail writes by event kind and outcome.\n\
+             # TYPE sovereign_config_audit_events_total counter\n",
+        );
+        for kind in EventKind::ALL {
+            for outcome in AuditWriteOutcome::ALL {
+                let value = self.writes[kind.index()][outcome.index()].load(Ordering::Relaxed);
+                writeln!(
+                    output,
+                    "sovereign_config_audit_events_total{{kind=\"{}\",outcome=\"{}\"}} {value}",
+                    kind.as_str(),
+                    outcome.as_str(),
+                )
+                .expect("writing metrics to a String cannot fail");
+            }
+        }
+        writeln!(
+            output,
+            "# HELP sovereign_config_audit_retention_swept_total Audit events deleted by the retention sweep.\n\
+             # TYPE sovereign_config_audit_retention_swept_total counter\n\
+             sovereign_config_audit_retention_swept_total {}\n\
+             # HELP sovereign_config_audit_retention_sweep_failures_total Retention sweeps that failed.\n\
+             # TYPE sovereign_config_audit_retention_sweep_failures_total counter\n\
+             sovereign_config_audit_retention_sweep_failures_total {}",
+            self.swept.load(Ordering::Relaxed),
+            self.sweep_failures.load(Ordering::Relaxed),
+        )
+        .expect("writing metrics to a String cannot fail");
         output
     }
 }

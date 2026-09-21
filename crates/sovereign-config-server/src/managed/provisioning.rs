@@ -13,6 +13,7 @@ use tonic::Status;
 use super::ManagedConnectionsService;
 use super::store::ConnectionRow;
 use super::wire::{ProvisionedConnection, dependency_error, internal_error, metadata};
+use crate::audit::{Actor, AuditEvent};
 use crate::authentik::{AdminError, CreatedServiceAccount};
 use crate::metrics::{ManagedDependencyCall, ManagedDependencyOutcome};
 
@@ -37,6 +38,7 @@ impl ManagedConnectionsService {
         username: &str,
         root: &ConfigPath,
         permissions: &ManagedPermissions,
+        created: (&Actor<'_>, AuditEvent<'_>),
     ) -> Result<ProvisionedConnection, Status> {
         let account = match self.admin.create_service_account(username).await {
             Ok(account) => {
@@ -58,7 +60,14 @@ impl ManagedConnectionsService {
         };
 
         let (row, connection_url) = match self
-            .complete_provisioning(connection_id, username, root, permissions, &account)
+            .complete_provisioning(
+                connection_id,
+                username,
+                root,
+                permissions,
+                &account,
+                created,
+            )
             .await
         {
             Ok(completed) => completed,
@@ -84,6 +93,7 @@ impl ManagedConnectionsService {
         root: &ConfigPath,
         permissions: &ManagedPermissions,
         account: &CreatedServiceAccount,
+        (actor, event): (&Actor<'_>, AuditEvent<'_>),
     ) -> Result<(ConnectionRow, ConnectionUrl), Status> {
         // Record the external identity immediately so a crash from here on
         // leaves a row that revocation can reconcile and clean up.
@@ -99,11 +109,17 @@ impl ManagedConnectionsService {
             &account.app_password,
         )
         .map_err(|_| internal_error())?;
+        // The creation is recorded with the transition that completes it. If
+        // the record cannot be written this step fails like any other, and the
+        // caller compensates by deleting the account it created: a connection
+        // that was never recorded never comes to exist.
         let row = self
-            .transition_state(
+            .transition_state_recorded(
                 connection_id,
                 ManagedConnectionState::Provisioning,
                 ManagedConnectionState::Active,
+                actor,
+                event,
             )
             .await?
             .ok_or_else(internal_error)?;

@@ -68,13 +68,24 @@ pub(super) struct PathContentRow {
 #[derive(FromRow)]
 pub(super) struct PathContentClassRow {
     pub(super) content_id: i64,
+    /// The stored representation being overwritten — ciphertext when
+    /// `classification` is secret. Selected for the audit trail, which keeps
+    /// it only when it is plain.
+    pub(super) value: String,
     pub(super) classification: String,
     pub(super) path_count: i64,
 }
 
+/// A path row a statement deleted, with the content it pointed at as it stood
+/// when it was deleted. `value` and `classification` exist for the audit trail
+/// and must be read before orphaned contents are pruned — which they are,
+/// because the `DELETE … RETURNING` that produces this row captures them.
 #[derive(FromRow)]
 pub(super) struct DeletedPathRow {
+    pub(super) path: String,
     pub(super) content_id: i64,
+    pub(super) value: String,
+    pub(super) classification: String,
 }
 
 #[derive(FromRow)]
@@ -352,6 +363,7 @@ pub(super) async fn path_content_class(
         r"
             SELECT
                 p.content_id,
+                c.value,
                 c.classification,
                 (
                     SELECT COUNT(*)
@@ -429,7 +441,7 @@ pub(super) async fn delete_plain_paths_except(
     fold: &str,
     keep: &[String],
 ) -> Result<Vec<DeletedPathRow>, Status> {
-    sqlx::query_as::<_, DeletedPathRow>(
+    let mut deleted = sqlx::query_as::<_, DeletedPathRow>(
         r"
             DELETE FROM configuration_paths p
             USING configuration_value_contents c
@@ -437,14 +449,17 @@ pub(super) async fn delete_plain_paths_except(
               AND ($1 = '/' OR p.lowercase_path = $1 OR starts_with(p.lowercase_path, $1 || '/'))
               AND c.classification = 'plain'
               AND NOT (p.lowercase_path = ANY($2::TEXT[]))
-            RETURNING p.content_id
+            RETURNING p.path, p.content_id, c.value, c.classification
             ",
     )
     .bind(fold)
     .bind(keep)
     .fetch_all(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())
+    .map_err(|_| storage_unavailable())?;
+    // See `delete_paths`: the audit trail itemizes a bounded prefix.
+    deleted.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(deleted)
 }
 
 /// The content a fold path resolves to, if any.
@@ -461,53 +476,81 @@ where
     .map_err(|_| storage_unavailable())
 }
 
-/// Overwrites a content row with a plain value.
+/// What a content row held before it was overwritten.
+#[derive(FromRow)]
+pub(super) struct PreviousContentRow {
+    pub(super) value: String,
+    pub(super) classification: String,
+}
+
+/// Overwrites a content row with a plain value, returning what it held before.
+///
+/// Subtree replacement never reaches a secret, so the previous content is
+/// plain in practice; its classification is returned anyway so the audit trail
+/// decides what it may keep from the row itself rather than from that promise.
 pub(super) async fn update_plain_content(
     transaction: &mut Transaction<'_, Postgres>,
     content_id: i64,
     value: &str,
     now: OffsetDateTime,
-) -> Result<(), Status> {
-    sqlx::query(
+) -> Result<PreviousContentRow, Status> {
+    // `UPDATE … RETURNING` yields the new row, so the old one is read by a
+    // locking CTE in the same statement rather than by a second round trip.
+    sqlx::query_as::<_, PreviousContentRow>(
         r"
-                UPDATE configuration_value_contents
+                WITH previous AS (
+                    SELECT value, classification
+                    FROM configuration_value_contents
+                    WHERE id = $1
+                    FOR UPDATE
+                )
+                UPDATE configuration_value_contents c
                 SET value = $2, classification = 'plain', updated_at = $3
-                WHERE id = $1
+                FROM previous
+                WHERE c.id = $1
+                RETURNING previous.value, previous.classification
                 ",
     )
     .bind(content_id)
     .bind(value)
     .bind(now)
-    .execute(&mut **transaction)
+    .fetch_one(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())?;
-    Ok(())
+    .map_err(|_| storage_unavailable())
 }
 
 /// Deletes the path at `fold`, or with `recurse` every path at or below it,
-/// returning the content each deleted path referenced.
+/// returning each deleted path and the content it referenced, in path order.
 pub(super) async fn delete_paths(
     transaction: &mut Transaction<'_, Postgres>,
     fold: &str,
     recurse: bool,
 ) -> Result<Vec<DeletedPathRow>, Status> {
-    if recurse {
-        sqlx::query_as::<_, DeletedPathRow>(
-            "DELETE FROM configuration_paths WHERE $1 = '/' OR lowercase_path = $1 OR starts_with(lowercase_path, $1 || '/') RETURNING content_id",
-        )
-        .bind(fold)
-        .fetch_all(&mut **transaction)
-        .await
-        .map_err(|_| storage_unavailable())
+    let statement = if recurse {
+        r"
+            DELETE FROM configuration_paths p
+            USING configuration_value_contents c
+            WHERE p.content_id = c.id
+              AND ($1 = '/' OR p.lowercase_path = $1 OR starts_with(p.lowercase_path, $1 || '/'))
+            RETURNING p.path, p.content_id, c.value, c.classification
+            "
     } else {
-        sqlx::query_as::<_, DeletedPathRow>(
-            "DELETE FROM configuration_paths WHERE lowercase_path = $1 RETURNING content_id",
-        )
+        r"
+            DELETE FROM configuration_paths p
+            USING configuration_value_contents c
+            WHERE p.content_id = c.id AND p.lowercase_path = $1
+            RETURNING p.path, p.content_id, c.value, c.classification
+            "
+    };
+    let mut deleted = sqlx::query_as::<_, DeletedPathRow>(statement)
         .bind(fold)
         .fetch_all(&mut **transaction)
         .await
-        .map_err(|_| storage_unavailable())
-    }
+        .map_err(|_| storage_unavailable())?;
+    // `RETURNING` promises no order, and the audit trail itemizes a bounded
+    // prefix of these — which must be the same prefix every time.
+    deleted.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(deleted)
 }
 
 /// The stored representation behind one fold path, for a reveal.

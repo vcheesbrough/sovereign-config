@@ -10,6 +10,7 @@ use tonic::Status;
 
 use super::ManagedConnectionsService;
 use super::wire::{internal_error, not_found};
+use crate::audit::{Actor, AuditEvent};
 use crate::auth::{AuthenticatedPrincipal, Permission};
 use crate::authentik::CreatedServiceAccount;
 use crate::rpc::storage_unavailable;
@@ -91,6 +92,76 @@ impl ManagedConnectionsService {
         .fetch_optional(&self.database)
         .await
         .map_err(|_| storage_unavailable())
+    }
+
+    /// [`Self::transition_state`] for the transition that *completes* an
+    /// operation, recording `event` in the same transaction.
+    ///
+    /// These flows call Authentik between their database steps, so there is no
+    /// one transaction to put the audit record in. The last step is the one
+    /// that makes the operation visible as done, so that is the one the record
+    /// is atomic with: if the record cannot be written the row stays in the
+    /// intermediate state it was already in, which is exactly the state the
+    /// rest of this service recovers from — a compensated create, a
+    /// re-rotatable `rotation_unknown`. Nothing is recorded when a concurrent
+    /// operation already moved the row.
+    pub(super) async fn transition_state_recorded(
+        &self,
+        connection_id: &ConnectionId,
+        expected_state: ManagedConnectionState,
+        state: ManagedConnectionState,
+        actor: &Actor<'_>,
+        event: AuditEvent<'_>,
+    ) -> Result<Option<ConnectionRow>, Status> {
+        let mut transaction = self.begin().await?;
+        let now = OffsetDateTime::now_utc();
+        let row = sqlx::query_as::<_, ConnectionRow>(
+            r"
+            UPDATE managed_connections
+            SET state = $3, updated_at = $4
+            WHERE connection_id = $1 AND state = $2
+            RETURNING connection_id, display_name, root, provider_user_id,
+                      credential_identifier, state, permissions, created_at, updated_at
+            ",
+        )
+        .bind(connection_id.as_str())
+        .bind(expected_state.as_str())
+        .bind(state.as_str())
+        .bind(now)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| storage_unavailable())?;
+        if row.is_some() {
+            self.audit
+                .record_in(&mut transaction, actor, now, &[event])
+                .await?;
+        }
+        commit(transaction).await?;
+        Ok(row)
+    }
+
+    /// Deletes a revoked connection's row and records the revocation, in one
+    /// transaction. A failure leaves the row `revoking`, and revocation can be
+    /// retried until it is both gone and recorded. A row a concurrent revoke
+    /// already removed is recorded by that revoke, not twice.
+    pub(super) async fn delete_connection_recorded(
+        &self,
+        connection_id: &ConnectionId,
+        actor: &Actor<'_>,
+        event: AuditEvent<'_>,
+    ) -> Result<(), Status> {
+        let mut transaction = self.begin().await?;
+        let deleted = sqlx::query("DELETE FROM managed_connections WHERE connection_id = $1")
+            .bind(connection_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| storage_unavailable())?;
+        if deleted.rows_affected() > 0 {
+            self.audit
+                .record_in(&mut transaction, actor, OffsetDateTime::now_utc(), &[event])
+                .await?;
+        }
+        commit(transaction).await
     }
 
     pub(super) async fn delete_row(&self, connection_id: &ConnectionId) -> bool {

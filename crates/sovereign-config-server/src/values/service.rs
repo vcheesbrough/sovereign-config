@@ -6,6 +6,12 @@
 //! — because validating them is this layer's job, in an order that is part of
 //! the behaviour every protocol version promises. Nothing here may import the
 //! proto crate: a version is a shim over this file (`v3`), never a branch in it.
+//!
+//! Every operation that changes, reveals or reads configuration records it in
+//! the audit trail, here rather than in a shim, so that no protocol version is
+//! a way around the trail. A change is recorded inside its own transaction and
+//! a secret access before its value is returned — both fail closed — while a
+//! plain read records best effort, because it performs no other write.
 
 use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 
@@ -27,6 +33,7 @@ use super::store::{
 };
 use super::subtree::{self, NormalizedSubtree, SubTreeEntry, SubTreeEntryContent};
 use super::{PLAIN, SECRET};
+use crate::audit::{Actor, AuditEvent, AuditRecorder, BULK_EVENT_CAP, Recorded};
 use crate::auth::Permission;
 use crate::encryption::{DecryptError, ValueCipher};
 use crate::rpc::{CallContext, storage_unavailable, to_timestamp};
@@ -35,6 +42,7 @@ use crate::rpc::{CallContext, storage_unavailable, to_timestamp};
 pub(crate) struct ConfigurationService {
     database: PgPool,
     cipher: Arc<ValueCipher>,
+    audit: AuditRecorder,
 }
 
 /// What a caller asked `put_value` to store, before any of it is validated.
@@ -67,12 +75,23 @@ pub(super) struct AliasPaths<'a> {
 /// for a `HashMap`.
 struct ResolvedWrites<'a> {
     shared: BTreeMap<i64, &'a String>,
+    /// Every written path that landed on existing content, with that content.
+    /// `shared` forgets which paths led to it; the audit trail needs them.
+    shared_paths: Vec<(&'a String, i64)>,
     fresh: Vec<(&'a String, &'a String)>,
 }
 
 impl ConfigurationService {
-    pub(crate) fn new(database: PgPool, cipher: Arc<ValueCipher>) -> Self {
-        Self { database, cipher }
+    pub(crate) const fn new(
+        database: PgPool,
+        cipher: Arc<ValueCipher>,
+        audit: AuditRecorder,
+    ) -> Self {
+        Self {
+            database,
+            cipher,
+            audit,
+        }
     }
 
     /// Produces the representation to store for a value of `classification`.
@@ -104,7 +123,7 @@ impl ConfigurationService {
     async fn overwrite_existing(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
-        existing: store::PathContentClassRow,
+        existing: &store::PathContentClassRow,
         value: &str,
         classification: &str,
         now: OffsetDateTime,
@@ -167,6 +186,7 @@ impl ConfigurationService {
         let selected = ConfigPath::parse_selection(path)
             .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
         let principal = context.principal()?;
+        let actor = context.actor()?;
         let candidates = store::path_candidates(&self.database).await?;
 
         // Group every readable path by the content it resolves to so a listed
@@ -225,6 +245,14 @@ impl ConfigurationService {
             namespaces
                 .push(ConfigPath::parse_selection(display).map_err(|_| storage_unavailable())?);
         }
+        self.audit
+            .record_best_effort(
+                &self.database,
+                &actor,
+                OffsetDateTime::now_utc(),
+                AuditEvent::values_listed(&actor, selected.as_str(), values.len()),
+            )
+            .await;
         Ok(ValueListing {
             values,
             paths: namespaces,
@@ -237,6 +265,7 @@ impl ConfigurationService {
         path: &str,
     ) -> Result<ValueSubTree, Status> {
         let path = authorize(context, path, &[Permission::Read], true)?;
+        let actor = context.actor()?;
         let rows = store::sub_tree_rows(&self.database, &path.fold()).await?;
         let mut values = Vec::with_capacity(rows.len());
         for row in rows {
@@ -247,6 +276,14 @@ impl ConfigurationService {
                 value,
             });
         }
+        self.audit
+            .record_best_effort(
+                &self.database,
+                &actor,
+                OffsetDateTime::now_utc(),
+                AuditEvent::subtree_read(&actor, path.as_str(), values.len()),
+            )
+            .await;
         Ok(ValueSubTree { values })
     }
 
@@ -267,10 +304,12 @@ impl ConfigurationService {
                 "configuration value contains an invalid character",
             ));
         }
+        let actor = context.actor()?;
         let mut transaction = store::begin(&self.database).await?;
         lock_mutation_path(&mut transaction, &path).await?;
         let now = OffsetDateTime::from(SystemTime::now());
-        let row = match store::path_content_class(&mut transaction, &path.fold()).await? {
+        let existing = store::path_content_class(&mut transaction, &path.fold()).await?;
+        let row = match &existing {
             Some(existing) => {
                 self.overwrite_existing(&mut transaction, existing, value, classification, now)
                     .await?
@@ -280,6 +319,22 @@ impl ConfigurationService {
                     .await?
             }
         };
+        // `Recorded::of` is what keeps a secret out of the trail, on both
+        // sides: the value being written, and the stored one it replaces —
+        // which for a secret is ciphertext, and no more welcome there.
+        let written = Recorded::of(classification, value);
+        let event = match &existing {
+            Some(existing) => AuditEvent::value_updated(
+                &actor,
+                path.as_str(),
+                Recorded::of(&existing.classification, &existing.value),
+                written,
+            ),
+            None => AuditEvent::value_created(&actor, path.as_str(), written),
+        };
+        self.audit
+            .record_in(&mut transaction, &actor, now, &[event])
+            .await?;
         store::commit(transaction).await?;
 
         Ok(PutMetadata {
@@ -304,6 +359,7 @@ impl ConfigurationService {
             mut values,
             displays,
         } = subtree::normalize(&path, values)?;
+        let actor = context.actor()?;
 
         let mut transaction = store::begin(&self.database).await?;
         lock_mutation_path(&mut transaction, &path).await?;
@@ -320,16 +376,32 @@ impl ConfigurationService {
         // `plain`, and the validation above rejects a plain value colliding
         // with a secret path. Every content row reached here is therefore
         // already plaintext and stays that way.
+        let mut previous = BTreeMap::new();
         for (content_id, content) in &writes.shared {
-            store::update_plain_content(&mut transaction, *content_id, content, now).await?;
+            let replaced =
+                store::update_plain_content(&mut transaction, *content_id, content, now).await?;
+            previous.insert(*content_id, replaced);
         }
-        for (path, content) in writes.fresh {
+        for (path, content) in &writes.fresh {
             let content_id = reserve_content_id(&mut transaction).await?;
             let inserted =
                 insert_content(&mut transaction, content_id, content, PLAIN, now).await?;
-            let display = displays.get(path).map_or(path.as_str(), String::as_str);
+            let display = displays.get(*path).map_or(path.as_str(), String::as_str);
             insert_path(&mut transaction, display, inserted.id, now).await?;
         }
+        let events = replacement_events(
+            &actor,
+            &path,
+            &SubtreeChanges {
+                cleared: &cleared,
+                writes: &writes,
+                previous: &previous,
+                displays: &displays,
+            },
+        );
+        self.audit
+            .record_in(&mut transaction, &actor, now, &events)
+            .await?;
         store::commit(transaction).await?;
         Ok(ReplaceMetadata {
             updated_at: to_timestamp(now)?,
@@ -344,6 +416,7 @@ impl ConfigurationService {
         recurse: bool,
     ) -> Result<DeleteMetadata, Status> {
         let path = authorize(context, path, &[Permission::Write], recurse)?;
+        let actor = context.actor()?;
         let mut transaction = store::begin(&self.database).await?;
         lock_mutation_path(&mut transaction, &path).await?;
         let deleted = store::delete_paths(&mut transaction, &path.fold(), recurse).await?;
@@ -354,8 +427,14 @@ impl ConfigurationService {
         // left with no remaining paths so deleting the last path removes the
         // value for good, while shared values survive.
         prune_orphan_contents(&mut transaction, &content_ids(&deleted)).await?;
-        store::commit(transaction).await?;
+        // Taken before the commit rather than after it, so the time the caller
+        // is told and the time the trail records are the same instant.
         let deleted_at = OffsetDateTime::from(SystemTime::now());
+        let events = deletion_events(&actor, &path, &deleted, recurse);
+        self.audit
+            .record_in(&mut transaction, &actor, deleted_at, &events)
+            .await?;
+        store::commit(transaction).await?;
         Ok(DeleteMetadata {
             deleted_at: to_timestamp(deleted_at)?,
             deleted_count: u64::try_from(deleted.len()).map_err(|_| storage_unavailable())?,
@@ -368,6 +447,7 @@ impl ConfigurationService {
         path: &str,
     ) -> Result<RevealedSecret, Status> {
         let path = authorize(context, path, &[Permission::Read], false)?;
+        let actor = context.actor()?;
         let row = store::revealed_row(&self.database, &path.fold())
             .await?
             .ok_or_else(|| Status::not_found("configuration value not found"))?;
@@ -384,6 +464,19 @@ impl ConfigurationService {
             .cipher
             .decrypt(row.content_id, &row.classification, &row.value)
             .map_err(|error| decryption_failed(row.content_id, &error))?;
+        // Recorded before the secret leaves, and failing closed: if the access
+        // cannot be recorded it does not happen. The failure is the storage
+        // fault this RPC already reports when its own read fails, so no caller
+        // sees a status it does not already handle. Only a successful reveal is
+        // recorded — a refused or missing one disclosed nothing.
+        self.audit
+            .record(
+                &self.database,
+                &actor,
+                OffsetDateTime::now_utc(),
+                AuditEvent::secret_revealed(&actor, path.as_str()),
+            )
+            .await?;
         Ok(RevealedSecret::new(value))
     }
 
@@ -393,6 +486,7 @@ impl ConfigurationService {
         paths: AliasPaths<'_>,
     ) -> Result<AddPathMetadata, Status> {
         let principal = context.principal()?;
+        let actor = context.actor()?;
         let source = ConfigPath::parse_operation(paths.source)
             .map_err(|_| Status::invalid_argument("configuration path is invalid"))?;
         let new_path = ConfigPath::parse_operation(paths.new_path)
@@ -441,6 +535,14 @@ impl ConfigurationService {
         let now = OffsetDateTime::from(SystemTime::now());
         // The path exactly as written establishes this alias's display case.
         insert_path(&mut transaction, new_path.as_str(), content_id, now).await?;
+        self.audit
+            .record_in(
+                &mut transaction,
+                &actor,
+                now,
+                &AuditEvent::path_added(&actor, &source, &new_path),
+            )
+            .await?;
         store::commit(transaction).await?;
         Ok(AddPathMetadata {
             created_at: to_timestamp(now)?,
@@ -495,6 +597,7 @@ async fn resolve_plain_writes<'a>(
 ) -> Result<ResolvedWrites<'a>, Status> {
     let mut writes = ResolvedWrites {
         shared: BTreeMap::new(),
+        shared_paths: Vec::new(),
         fresh: Vec::new(),
     };
     for value in values {
@@ -502,23 +605,146 @@ async fn resolve_plain_writes<'a>(
             continue;
         };
         match store::content_id_at(&mut **transaction, &value.path).await? {
-            Some(content_id) => match writes.shared.get(&content_id) {
-                // Aliases of one value must agree; a genuine conflict is
-                // ambiguous, so reject it rather than pick a winner.
-                Some(assigned) if *assigned != content => {
-                    return Err(Status::invalid_argument(
-                        "configuration subtree assigns conflicting values to one stored value",
-                    ));
+            Some(content_id) => {
+                writes.shared_paths.push((&value.path, content_id));
+                match writes.shared.get(&content_id) {
+                    // Aliases of one value must agree; a genuine conflict is
+                    // ambiguous, so reject it rather than pick a winner.
+                    Some(assigned) if *assigned != content => {
+                        return Err(Status::invalid_argument(
+                            "configuration subtree assigns conflicting values to one stored value",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        writes.shared.insert(content_id, content);
+                    }
                 }
-                Some(_) => {}
-                None => {
-                    writes.shared.insert(content_id, content);
-                }
-            },
+            }
             None => writes.fresh.push((&value.path, content)),
         }
     }
     Ok(writes)
+}
+
+/// Everything a subtree replacement did, as the audit trail needs to see it.
+struct SubtreeChanges<'a> {
+    cleared: &'a [store::DeletedPathRow],
+    writes: &'a ResolvedWrites<'a>,
+    /// What each overwritten content held before, by content id.
+    previous: &'a BTreeMap<i64, store::PreviousContentRow>,
+    displays: &'a BTreeMap<String, String>,
+}
+
+/// The events of one subtree replacement: a summary on the root, always, and
+/// one event per value that actually changed, up to [`BULK_EVENT_CAP`].
+///
+/// A replacement rewrites every value it is given, changed or not, so a path
+/// whose value is the same afterwards is not an event — otherwise a provider
+/// re-applying an unchanged file would bury the trail in non-changes. The
+/// summary is written even when nothing changed, because that someone ran a
+/// replacement against this root is itself worth knowing.
+fn replacement_events<'a>(
+    actor: &Actor<'_>,
+    root: &'a ConfigPath,
+    changes: &SubtreeChanges<'a>,
+) -> Vec<AuditEvent<'a>> {
+    let display = |fold: &'a String| {
+        changes
+            .displays
+            .get(fold)
+            .map_or(fold.as_str(), String::as_str)
+    };
+
+    let deleted = changes.cleared.iter().map(|row| {
+        AuditEvent::value_deleted(
+            actor,
+            &row.path,
+            Recorded::of(&row.classification, &row.value),
+        )
+    });
+    let updated = changes
+        .writes
+        .shared_paths
+        .iter()
+        .filter_map(|(fold, content_id)| {
+            let before = changes.previous.get(content_id)?;
+            let after = changes.writes.shared.get(content_id)?;
+            (before.value != **after || before.classification != PLAIN).then(|| {
+                AuditEvent::value_updated(
+                    actor,
+                    display(fold),
+                    Recorded::of(&before.classification, &before.value),
+                    Recorded::of(PLAIN, after),
+                )
+            })
+        });
+    let created = changes.writes.fresh.iter().map(|(fold, content)| {
+        AuditEvent::value_created(actor, display(fold), Recorded::of(PLAIN, content))
+    });
+
+    let deleted_count = changes.cleared.len();
+    let created_count = changes.writes.fresh.len();
+    let mut updated_count = 0;
+    let mut events = Vec::new();
+    for event in deleted {
+        push_capped(&mut events, event);
+    }
+    for event in updated {
+        updated_count += 1;
+        push_capped(&mut events, event);
+    }
+    for event in created {
+        push_capped(&mut events, event);
+    }
+    let total = deleted_count + updated_count + created_count;
+    events.push(AuditEvent::subtree_replaced(
+        actor,
+        root.as_str(),
+        created_count,
+        updated_count,
+        deleted_count,
+        total - events.len(),
+    ));
+    events
+}
+
+/// The events of one deletion: one per deleted value up to
+/// [`BULK_EVENT_CAP`], and for a recursive delete a summary on the root saying
+/// how many went and how many of those are not itemized.
+fn deletion_events<'a>(
+    actor: &Actor<'_>,
+    root: &'a ConfigPath,
+    deleted: &'a [store::DeletedPathRow],
+    recurse: bool,
+) -> Vec<AuditEvent<'a>> {
+    let mut events = Vec::new();
+    for row in deleted {
+        push_capped(
+            &mut events,
+            AuditEvent::value_deleted(
+                actor,
+                &row.path,
+                Recorded::of(&row.classification, &row.value),
+            ),
+        );
+    }
+    if recurse {
+        let unrecorded = deleted.len() - events.len();
+        events.push(AuditEvent::subtree_deleted(
+            actor,
+            root.as_str(),
+            deleted.len(),
+            unrecorded,
+        ));
+    }
+    events
+}
+
+fn push_capped<'a>(events: &mut Vec<AuditEvent<'a>>, event: AuditEvent<'a>) {
+    if events.len() < BULK_EVENT_CAP {
+        events.push(event);
+    }
 }
 
 fn encryption_failed() -> Status {

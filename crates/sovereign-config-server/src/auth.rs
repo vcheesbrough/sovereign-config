@@ -64,6 +64,9 @@ pub(crate) struct Authenticator {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuthenticatedPrincipal {
     pub(crate) subject: String,
+    /// What the identity provider calls this identity, for the audit trail to
+    /// show beside the opaque subject. Never consulted for authorization.
+    pub(crate) name: Option<String>,
     pub(crate) grants: Vec<Grant>,
 }
 
@@ -138,6 +141,8 @@ struct IntrospectionResponse {
     sub: Option<serde_json::Value>,
     scope: Option<serde_json::Value>,
     sovereign_config_grants: Option<serde_json::Value>,
+    preferred_username: Option<serde_json::Value>,
+    username: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -333,13 +338,50 @@ fn validate_introspection_for_any(
     })?)
     .map_err(|_| AuthenticationFailure::unauthenticated(AuthenticationResult::InvalidClaims))?;
     let grants = validate_grants(raw_grants)?;
+    let name = display_name(
+        response.preferred_username.as_ref(),
+        response.username.as_ref(),
+    );
     Ok(AuthenticatedPrincipal {
         subject: response
             .sub
             .and_then(|subject| subject.as_str().map(str::to_owned))
             .expect("subject was validated as a non-empty string"),
+        name,
         grants,
     })
+}
+
+/// The longest display name kept. It is shown in a list, not relied on.
+const MAX_DISPLAY_NAME_CHARACTERS: usize = 128;
+
+/// The name the audit trail shows for an identity: `preferred_username`, else
+/// `username`, made safe to store and to print.
+///
+/// **It can never fail authentication.** The name decides nothing — the
+/// subject is the identity and the grants are the authority — so a claim that
+/// is missing, not a string, or empty once cleaned is simply no name. Control
+/// characters are dropped because the value is stored and later rendered in a
+/// list, and comes from the identity provider rather than from anything this
+/// server validated.
+fn display_name(
+    preferred_username: Option<&serde_json::Value>,
+    username: Option<&serde_json::Value>,
+) -> Option<String> {
+    [preferred_username, username]
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|claim| {
+            claim
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(MAX_DISPLAY_NAME_CHARACTERS)
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        })
+        .find(|name| !name.is_empty())
 }
 
 fn audience_contains(audience: &serde_json::Value, expected: &str) -> bool {

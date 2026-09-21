@@ -26,7 +26,9 @@ async fn connect_when_ready(database_url: &str) -> PgPool {
 
 async fn reset_schema(pool: &PgPool, context: &str) {
     sqlx::query(
-        "DROP TABLE IF EXISTS configuration_paths, configuration_value_contents, configuration_values, managed_connections, schema_metadata, _sqlx_migrations CASCADE",
+        // Every table the migrations create, so a reset leaves nothing for the
+        // next `run` to collide with. A new migration adds its table here.
+        "DROP TABLE IF EXISTS audit_events, configuration_paths, configuration_value_contents, configuration_values, managed_connections, schema_metadata, _sqlx_migrations CASCADE",
     )
     .execute(pool)
     .await
@@ -407,7 +409,6 @@ async fn migrations_are_repeatable_against_postgresql() {
             OR table_name LIKE '%grant%'
             OR table_name LIKE '%token%'
             OR table_name LIKE '%session%'
-            OR table_name LIKE '%audit%'
             OR table_name LIKE '%history%'
             OR table_name LIKE '%tombstone%'
             OR table_name LIKE '%key%'
@@ -417,6 +418,21 @@ async fn migrations_are_repeatable_against_postgresql() {
     .fetch_one(&pool)
     .await
     .expect("authorization table inventory must be readable");
+    // Audit storage was forbidden outright until the audit trail (card #373)
+    // introduced exactly one table. It is named here so that a *second* one,
+    // or a differently named one, still fails: the trail is a deliberate,
+    // singular exception, not an opening for storing authorization state.
+    let audit_tables: Vec<String> = sqlx::query_scalar(
+        r"
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = current_schema() AND table_name LIKE '%audit%'
+        ORDER BY table_name
+        ",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit table inventory must be readable");
 
     // The alias split replaces configuration_values with a content table and a
     // path table referencing it.
@@ -494,9 +510,10 @@ async fn migrations_are_repeatable_against_postgresql() {
     .fetch_one(&pool)
     .await
     .expect("credential column inventory must be readable");
-    assert_eq!(applied_migrations, 9);
+    assert_eq!(applied_migrations, 10);
     assert_eq!(metadata_rows, 1);
     assert_eq!(authorization_tables, 0);
+    assert_eq!(audit_tables, ["audit_events"]);
     assert!(legacy_value_table.is_none());
     assert_eq!(content_columns, 5);
     assert_eq!(path_columns, 4);

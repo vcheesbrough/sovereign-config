@@ -1,3 +1,4 @@
+mod audit;
 mod auth;
 mod authentik;
 mod config;
@@ -30,12 +31,13 @@ use tonic_health::server::HealthReporter;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
+use audit::AuditRecorder;
 use auth::{Authenticator, grpc_service_layer};
 use authentik::AuthentikAdminClient;
 use config::{Config, ManagedConnectionConfig, required_env};
 use handshake::HandshakeService;
 use managed::{ManagedConnectionsService, ManagedSettings, V3ManagedConnections};
-use metrics::{AuthenticationMetrics, ManagedConnectionMetrics, ProtocolMetrics};
+use metrics::{AuditMetrics, AuthenticationMetrics, ManagedConnectionMetrics, ProtocolMetrics};
 use protocol::ProtocolVersionLayer;
 use sovereign_config_core::Secret;
 use sovereign_config_proto::sovereign::config::{
@@ -65,15 +67,17 @@ struct AppState {
     authentication_metrics: Arc<AuthenticationMetrics>,
     managed_metrics: Arc<ManagedConnectionMetrics>,
     protocol_metrics: Arc<ProtocolMetrics>,
+    audit_metrics: Arc<AuditMetrics>,
 }
 
 impl AppState {
     fn render_metrics(&self, up: u8) -> String {
         format!(
-            "sovereign_config_up {up}\n{}{}{}",
+            "sovereign_config_up {up}\n{}{}{}{}",
             self.authentication_metrics.render(),
             self.managed_metrics.render(),
             self.protocol_metrics.render(),
+            self.audit_metrics.render(),
         )
     }
 }
@@ -111,6 +115,8 @@ async fn main() -> Result<()> {
     let authentication_metrics = Arc::new(AuthenticationMetrics::default());
     let managed_metrics = Arc::new(ManagedConnectionMetrics::default());
     let protocol_metrics = Arc::new(ProtocolMetrics::new(SERVED_PROTOCOL_LABELS));
+    let audit_metrics = Arc::new(AuditMetrics::default());
+    let audit = AuditRecorder::new(Arc::clone(&audit_metrics), config.audit.coalesce_window);
     let (managed_admin, managed_settings) = managed_dependencies(config.managed)?;
     let database = connect_database(&config.database_url).await?;
     let value_cipher = Arc::new(config.value_cipher);
@@ -121,20 +127,28 @@ async fn main() -> Result<()> {
         authentication_metrics: Arc::clone(&authentication_metrics),
         managed_metrics: Arc::clone(&managed_metrics),
         protocol_metrics: Arc::clone(&protocol_metrics),
+        audit_metrics,
     };
     spawn_metrics_server(config.metrics_addr, state.clone()).await?;
+    spawn_audit_retention_sweep(
+        state.database.clone(),
+        audit.clone(),
+        config.audit.retention,
+    );
     let (_health_reporter, health_service) = serving_health_service().await;
     // One implementation of each service, whatever the number of protocol
     // versions served: every version registered below is a shim over these.
     let configuration = Arc::new(ConfigurationService::new(
         state.database.clone(),
         Arc::clone(&value_cipher),
+        audit.clone(),
     ));
     let managed_connections = Arc::new(ManagedConnectionsService::new(
         state.database.clone(),
         managed_admin,
         managed_settings,
         managed_metrics,
+        audit,
     ));
 
     info!(
@@ -246,6 +260,31 @@ async fn spawn_metrics_server(address: SocketAddr, state: AppState) -> Result<()
         }
     });
     Ok(())
+}
+
+/// How often the audit trail is swept. Retention is measured in days, so an
+/// hour's slack on when an expired event actually goes is immaterial, and each
+/// sweep finds at most an hour's worth of expiries to delete.
+const AUDIT_SWEEP_INTERVAL: Duration = Duration::from_hours(1);
+
+/// Deletes expired audit events in the background, for as long as the server
+/// runs. The first sweep is immediate, so a server that is restarted often
+/// still sweeps. A failed sweep is counted, logged and retried at the next
+/// interval: it must never take the server down, and nothing is lost by
+/// keeping an event an hour longer.
+fn spawn_audit_retention_sweep(database: PgPool, audit: AuditRecorder, retention: Duration) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(AUDIT_SWEEP_INTERVAL);
+        loop {
+            interval.tick().await;
+            let cutoff = time::OffsetDateTime::now_utc() - retention;
+            match audit.sweep_expired(&database, cutoff).await {
+                Ok(0) => {}
+                Ok(swept) => info!(swept, "expired audit events deleted"),
+                Err(error) => error!(error = %error, "audit retention sweep failed"),
+            }
+        }
+    });
 }
 
 /// The gRPC health service with every served service marked serving. The

@@ -23,8 +23,9 @@ pub(crate) use service::ConfigurationService;
 pub(crate) use startup::encrypt_stored_secrets;
 pub(crate) use v3::V3Configuration;
 
-/// Classification of a value the caller may read back in the clear.
-const PLAIN: &str = "plain";
+/// Classification of a value the caller may read back in the clear — and the
+/// only classification whose values the audit trail will hold.
+pub(crate) const PLAIN: &str = "plain";
 /// Classification of a value stored as ciphertext and masked on read.
 const SECRET: &str = "secret";
 

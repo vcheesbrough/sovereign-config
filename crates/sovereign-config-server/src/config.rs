@@ -8,6 +8,9 @@ use crate::encryption::{ValueCipher, decode_key};
 const INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(3);
 const MANAGER_TIMEOUT: Duration = Duration::from_secs(5);
 
+const SECONDS_PER_HOUR: u64 = 60 * 60;
+const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
+
 pub(crate) struct Config {
     pub(crate) database_url: String,
     pub(crate) grpc_addr: SocketAddr,
@@ -15,10 +18,20 @@ pub(crate) struct Config {
     pub(crate) authentication: AuthenticationConfig,
     pub(crate) web: WebConfig,
     pub(crate) managed: ManagedConnectionConfig,
+    pub(crate) audit: AuditConfig,
     /// Seals secret-classified configuration values before they reach
     /// `PostgreSQL`. Held as a live cipher rather than key bytes so no part of
     /// the process keeps a copy that could be printed.
     pub(crate) value_cipher: ValueCipher,
+}
+
+/// Audit trail settings. Every one is optional, because the defaults are the
+/// intended configuration and a deployment that sets none of them is correct.
+pub(crate) struct AuditConfig {
+    /// How long an event is kept after it was last seen.
+    pub(crate) retention: Duration,
+    /// The window inside which repeated accesses collapse into one event.
+    pub(crate) coalesce_window: Duration,
 }
 
 pub(crate) struct ManagedConnectionConfig {
@@ -94,6 +107,22 @@ impl Config {
         let api_origin = issuer_api_origin(&issuer_url)?;
         let api_token = required_secret("SOVEREIGN_CONFIG_MANAGER_API_TOKEN")?;
         let value_cipher = value_cipher_from_env()?;
+        let audit = AuditConfig {
+            retention: Duration::from_secs(
+                u64::from(optional_bounded(
+                    "SOVEREIGN_CONFIG_AUDIT_RETENTION_DAYS",
+                    365,
+                    3650,
+                )?) * SECONDS_PER_DAY,
+            ),
+            coalesce_window: Duration::from_secs(
+                u64::from(optional_bounded(
+                    "SOVEREIGN_CONFIG_AUDIT_COALESCE_WINDOW_HOURS",
+                    24,
+                    168,
+                )?) * SECONDS_PER_HOUR,
+            ),
+        };
 
         Ok(Self {
             database_url,
@@ -126,6 +155,7 @@ impl Config {
                 api_token,
                 timeout: MANAGER_TIMEOUT,
             },
+            audit,
             value_cipher,
         })
     }
@@ -202,6 +232,25 @@ fn validated_group_name(value: &str) -> Result<String> {
         bail!("SOVEREIGN_CONFIG_MANAGER_GROUP is not a permitted group name");
     }
     Ok(value.to_owned())
+}
+
+/// An optional whole-number setting: `default` when unset or blank, otherwise
+/// a value from `1` to `maximum`.
+fn optional_bounded(name: &str, default: u32, maximum: u32) -> Result<u32> {
+    bounded_setting(name, env::var(name).ok().as_deref(), default, maximum)
+}
+
+/// A setting that is present but unusable fails startup rather than falling
+/// back: an operator who set a one-week retention and mistyped it must not
+/// silently get a year, and must certainly not get zero.
+fn bounded_setting(name: &str, value: Option<&str>, default: u32, maximum: u32) -> Result<u32> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(default);
+    };
+    match value.parse::<u32>() {
+        Ok(parsed) if (1..=maximum).contains(&parsed) => Ok(parsed),
+        _ => bail!("{name} must be a whole number from 1 to {maximum}"),
+    }
 }
 
 /// Derives the Authentik administration origin from the configured issuer so
@@ -285,8 +334,8 @@ pub(crate) fn required_secret(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        issuer_api_origin, required_env, validate_introspection_url, validate_issuer_url,
-        validated_group_name, validated_public_origin,
+        bounded_setting, issuer_api_origin, required_env, validate_introspection_url,
+        validate_issuer_url, validated_group_name, validated_public_origin,
     };
 
     #[test]
@@ -373,6 +422,56 @@ mod tests {
             issuer_api_origin(&issuer).unwrap().as_str(),
             "https://auth.example.test/"
         );
+    }
+
+    const SETTING: &str = "SOVEREIGN_CONFIG_AUDIT_RETENTION_DAYS";
+
+    #[test]
+    fn an_absent_or_blank_bounded_setting_takes_its_default() {
+        for absent in [None, Some(""), Some("   "), Some("\t\n")] {
+            assert_eq!(
+                bounded_setting(SETTING, absent, 365, 3650).unwrap(),
+                365,
+                "{absent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bounded_setting_accepts_every_whole_number_in_range() {
+        assert_eq!(bounded_setting(SETTING, Some("1"), 365, 3650).unwrap(), 1);
+        assert_eq!(
+            bounded_setting(SETTING, Some("3650"), 365, 3650).unwrap(),
+            3650
+        );
+        assert_eq!(
+            bounded_setting(SETTING, Some(" 30 "), 365, 3650).unwrap(),
+            30
+        );
+    }
+
+    /// The promise the README makes: a value that is set but unusable fails
+    /// startup rather than falling back. Zero matters most — a retention of
+    /// zero days would have the hourly sweep delete the entire trail.
+    #[test]
+    fn a_set_but_unusable_bounded_setting_fails_rather_than_falling_back() {
+        for unusable in [
+            "0",
+            "3651",
+            "-1",
+            "7d",
+            "1.5",
+            "365 days",
+            "4294967296",
+            "one",
+        ] {
+            let error = bounded_setting(SETTING, Some(unusable), 365, 3650)
+                .expect_err(unusable)
+                .to_string();
+            // Names the variable, so the operator knows which one to fix.
+            assert!(error.contains(SETTING), "{unusable:?}: {error}");
+            assert!(error.contains("1 to 3650"), "{unusable:?}: {error}");
+        }
     }
 
     #[test]

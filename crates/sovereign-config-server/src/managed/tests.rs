@@ -30,6 +30,10 @@ use super::identity::{
 };
 use super::store::ConnectionRow;
 use super::{ManagedConnectionsService, ManagedSettings, V3ManagedConnections};
+use crate::audit::AuditRecorder;
+use crate::audit::test_support::{
+    break_audit_writes, clear_trail, kinds, restore_audit_writes, trail,
+};
 use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
 use crate::authentik::AuthentikAdminClient;
 use crate::metrics::ManagedConnectionMetrics;
@@ -398,6 +402,7 @@ async fn mock_authentik() -> MockAuthentik {
 fn principal(grants: &[(&str, &[Permission])]) -> AuthenticatedPrincipal {
     AuthenticatedPrincipal {
         subject: "test-subject".to_owned(),
+        name: Some("Test Operator".to_owned()),
         grants: grants
             .iter()
             .map(|(prefix, permissions)| Grant {
@@ -422,6 +427,16 @@ fn request<T>(message: T, principal: &AuthenticatedPrincipal) -> Request<T> {
     let mut request = Request::new(message);
     request.extensions_mut().insert(principal.clone());
     request
+}
+
+/// The same database the service under test uses, for asserting on the trail.
+async fn test_pool() -> Option<sqlx::PgPool> {
+    let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL").ok()?;
+    PgPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&database_url)
+        .await
+        .ok()
 }
 
 async fn service(mock: &MockAuthentik) -> Option<V3ManagedConnections> {
@@ -465,6 +480,7 @@ async fn service_with_metrics(
                 rotation_lease: ROTATION_LEASE,
             },
             metrics,
+            AuditRecorder::for_tests(),
         ),
     )))
 }
@@ -1581,4 +1597,106 @@ async fn revocation_confirms_absence_via_credential_when_the_user_lookup_is_refu
         .expect("a refused lookup with no surviving credential must confirm revocation");
 
     assert!(rows(&service).await.is_empty());
+}
+
+/// Managed connections are configuration access, so their lifecycle is in the
+/// trail — and a connection URL or credential never is.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn the_connection_lifecycle_is_recorded_without_any_credential() {
+    let mock = mock_authentik().await;
+    let service = service_or_skip!(&mock);
+    let pool = test_pool().await.expect("the pool must be reachable");
+    clear_trail(&pool, "/apps/api").await;
+
+    let (connection_id, created_url) = create(&service, "Auditable", "/apps/api", &operator("/"))
+        .await
+        .expect("create must succeed");
+    let rotated_url = service
+        .rotate_managed_connection(request(
+            RotateManagedConnectionRequest {
+                connection_id: connection_id.clone(),
+            },
+            &operator("/"),
+        ))
+        .await
+        .expect("rotation must succeed")
+        .into_inner()
+        .connection_url;
+    service
+        .revoke_managed_connection(request(
+            RevokeManagedConnectionRequest {
+                connection_id: connection_id.clone(),
+            },
+            &operator("/"),
+        ))
+        .await
+        .expect("revocation must succeed");
+
+    let rows = trail(&pool, "/apps/api").await;
+    assert_eq!(
+        kinds(&rows),
+        [
+            "connection.created",
+            "connection.rotated",
+            "connection.revoked"
+        ]
+    );
+    for row in &rows {
+        let everything = row.everything();
+        assert_eq!(row.display_path, "/apps/api");
+        assert!(everything.contains(&connection_id), "{everything}");
+        assert!(everything.contains("Auditable"), "{everything}");
+        // The URL carries the credential, so neither it nor any part of it
+        // may appear anywhere in the trail.
+        assert!(!everything.contains(&created_url), "{everything}");
+        assert!(!everything.contains(&rotated_url), "{everything}");
+    }
+    assert!(rows[0].narrative.contains("read"), "{}", rows[0].narrative);
+
+    clear_trail(&pool, "/apps/api").await;
+}
+
+/// A revocation that cannot be recorded is not a revocation: the row stays
+/// `revoking`, which is the state revocation already retries from.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn an_unrecordable_revocation_leaves_the_connection_retryable() {
+    let mock = mock_authentik().await;
+    let service = service_or_skip!(&mock);
+    let pool = test_pool().await.expect("the pool must be reachable");
+    clear_trail(&pool, "/apps/api").await;
+    let (connection_id, _) = create(&service, "Unrecordable", "/apps/api", &operator("/"))
+        .await
+        .expect("create must succeed");
+
+    break_audit_writes(&pool, "managed", "/apps/api").await;
+    let status = service
+        .revoke_managed_connection(request(
+            RevokeManagedConnectionRequest {
+                connection_id: connection_id.clone(),
+            },
+            &operator("/"),
+        ))
+        .await
+        .expect_err("an unrecordable revocation must fail");
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert_eq!(rows(&service).await[0].state, "revoking");
+
+    // Once writes work again the same revocation completes and is recorded.
+    restore_audit_writes(&pool, "managed").await;
+    service
+        .revoke_managed_connection(request(
+            RevokeManagedConnectionRequest { connection_id },
+            &operator("/"),
+        ))
+        .await
+        .expect("the retried revocation must succeed");
+    assert!(rows(&service).await.is_empty());
+    assert_eq!(
+        kinds(&trail(&pool, "/apps/api").await),
+        ["connection.created", "connection.revoked"]
+    );
+
+    clear_trail(&pool, "/apps/api").await;
 }
