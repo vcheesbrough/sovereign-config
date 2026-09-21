@@ -68,6 +68,23 @@ const fn required_permission(permission: ManagedPermission) -> Permission {
     }
 }
 
+/// How a failed operation is counted.
+fn refusal_outcome(status: &Status) -> ManagedOperationResult {
+    match status.code() {
+        tonic::Code::InvalidArgument => ManagedOperationResult::InvalidRequest,
+        tonic::Code::Unauthenticated => ManagedOperationResult::Unauthenticated,
+        tonic::Code::PermissionDenied => ManagedOperationResult::PermissionDenied,
+        tonic::Code::NotFound => ManagedOperationResult::NotFound,
+        tonic::Code::Aborted => ManagedOperationResult::Conflict,
+        tonic::Code::Unavailable => match status.message() {
+            STORAGE_UNAVAILABLE_MESSAGE => ManagedOperationResult::Storage,
+            CLEANUP_MESSAGE => ManagedOperationResult::CleanupRequired,
+            _ => ManagedOperationResult::Dependency,
+        },
+        _ => ManagedOperationResult::Internal,
+    }
+}
+
 /// The operations a protocol shim calls. Each records its outcome here, so a
 /// version can neither forget the metric nor count a call twice.
 impl ManagedConnectionsService {
@@ -130,22 +147,18 @@ impl ManagedConnectionsService {
         }
     }
 
+    /// A request a version's shim refused before calling in, counted exactly
+    /// as the same refusal made here would be. Returns the refusal.
+    pub(super) fn refused(&self, operation: ManagedOperation, status: Status) -> Status {
+        self.metrics
+            .record_operation(operation, refusal_outcome(&status));
+        status
+    }
+
     pub(super) fn record<T>(&self, operation: ManagedOperation, result: &Result<T, Status>) {
         let outcome = match result {
             Ok(_) => ManagedOperationResult::Success,
-            Err(status) => match status.code() {
-                tonic::Code::InvalidArgument => ManagedOperationResult::InvalidRequest,
-                tonic::Code::Unauthenticated => ManagedOperationResult::Unauthenticated,
-                tonic::Code::PermissionDenied => ManagedOperationResult::PermissionDenied,
-                tonic::Code::NotFound => ManagedOperationResult::NotFound,
-                tonic::Code::Aborted => ManagedOperationResult::Conflict,
-                tonic::Code::Unavailable => match status.message() {
-                    STORAGE_UNAVAILABLE_MESSAGE => ManagedOperationResult::Storage,
-                    CLEANUP_MESSAGE => ManagedOperationResult::CleanupRequired,
-                    _ => ManagedOperationResult::Dependency,
-                },
-                _ => ManagedOperationResult::Internal,
-            },
+            Err(status) => refusal_outcome(status),
         };
         self.metrics.record_operation(operation, outcome);
     }

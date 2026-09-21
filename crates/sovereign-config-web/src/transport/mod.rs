@@ -11,7 +11,9 @@
 //! [`dialer`]. That match is exhaustive over [`ProtocolVersion`], so declaring
 //! a version the browser cannot dial does not compile.
 
+mod adapter;
 mod v3;
+mod v4;
 
 use std::{future::Future, rc::Rc};
 
@@ -19,15 +21,16 @@ use async_trait::async_trait;
 use js_sys::{Date, Uint8Array};
 use prost::Message;
 use sovereign_config_client::{
-    AccessTokenProvider, Client, Connection, Handshake, ManagedConnectionTransport, RpcCode,
-    Session, SessionTransport, Transport, ValueTransport, VersionReply, map_rpc_status,
+    AccessTokenProvider, AuditTransport, Client, Connection, Handshake, ManagedConnectionTransport,
+    RpcCode, Session, SessionTransport, Transport, ValueTransport, VersionReply, map_rpc_status,
 };
 use sovereign_config_core::{
-    AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata,
-    DisplayName, ERROR_KIND_METADATA, ErrorKind, ManagedConnectionMetadata, ManagedPermissions,
-    PlainValue, ProtocolVersion, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata,
-    RevealedSecret, Secret, SecretInput, ServedVersion, SubTreeMutationValue,
-    VERSION_NOT_SERVED_KIND, ValueListing, ValuePaths, ValueSubTree,
+    AddPathMetadata, AuditPage, AuditQuery, AuthenticationStatus, ClientError, ConfigPath,
+    ConnectionId, DeleteMetadata, DisplayName, ERROR_KIND_METADATA, ErrorKind,
+    ManagedConnectionMetadata, ManagedPermissions, PlainValue, ProtocolVersion,
+    ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret, Secret,
+    SecretInput, ServedVersion, SubTreeMutationValue, VERSION_NOT_SERVED_KIND, ValueListing,
+    ValuePaths, ValueSubTree,
 };
 use sovereign_config_proto::sovereign::config::{NegotiateRequest, NegotiateResponse};
 use wasm_bindgen::{JsCast, JsValue};
@@ -47,6 +50,7 @@ use crate::session::{
 /// until that version has a dialer.
 fn dialer(version: ProtocolVersion) -> Box<dyn SessionTransport> {
     match version {
+        ProtocolVersion::V4 => Box::new(v4::Dialer),
         ProtocolVersion::V3 => Box::new(v3::Dialer),
     }
 }
@@ -55,6 +59,7 @@ fn dialer(version: ProtocolVersion) -> Box<dyn SessionTransport> {
 #[cfg(test)]
 fn routes(version: ProtocolVersion) -> &'static [&'static str] {
     match version {
+        ProtocolVersion::V4 => v4::ROUTES,
         ProtocolVersion::V3 => v3::ROUTES,
     }
 }
@@ -313,6 +318,18 @@ impl ManagedConnectionTransport for BrowserTransport {
     }
 }
 
+#[async_trait(?Send)]
+impl AuditTransport for BrowserTransport {
+    async fn query_audit_trail(
+        &self,
+        query: &AuditQuery,
+        bearer: &Secret,
+    ) -> Result<AuditPage, ClientError> {
+        self.dial(|dialer| async move { dialer.query_audit_trail(query, bearer).await })
+            .await
+    }
+}
+
 pub(crate) struct MemoryAuthentication {
     pub(crate) client_id: String,
 }
@@ -512,7 +529,7 @@ mod tests {
 
     use sovereign_config_core::{ClientError, ErrorKind, ProtocolVersion};
 
-    use super::{BrowserTransport, routes};
+    use super::{BrowserTransport, routes, v4};
 
     /// The RPCs a version's routes have to cover: `System` (2),
     /// `Configuration` (8) and `ManagedConnections` (4). Written as the sum so
@@ -564,6 +581,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `v4`'s own routes — the ones no other version shares — name `v4` too.
+    /// Kept apart from the shared table above, which every version must match
+    /// exactly, so that table still catches a version missing a shared RPC.
+    #[test]
+    fn v4_audit_routes_name_v4() {
+        assert_eq!(
+            v4::AUDIT_ROUTES,
+            ["/sovereign.config.v4.Audit/QueryAuditTrail"]
+        );
+    }
+
+    /// `v3` has no audit trail, so its dialer answers an audit query itself,
+    /// bounded, rather than posting to a route `v3` does not have. It would
+    /// fail differently had it tried: there is no window to fetch from here.
+    #[tokio::test]
+    async fn a_v3_dialer_answers_an_audit_query_without_posting() {
+        use sovereign_config_client::AuditTransport as _;
+        use sovereign_config_core::{AuditQuery, Secret};
+
+        let error = super::v3::Dialer
+            .query_audit_trail(&AuditQuery::default(), &Secret::new("audit-token"))
+            .await
+            .expect_err("v3 has no audit trail");
+
+        assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
+        assert_eq!(
+            error.message(),
+            "the audit trail is not available on protocol v3"
+        );
     }
 
     /// A page whose handshake failed has agreed no version, and there is no

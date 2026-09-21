@@ -9,6 +9,8 @@
 
 use std::fmt::Write as _;
 
+use time::{OffsetDateTime, UtcOffset};
+
 use super::Recorded;
 
 /// How much of a plain value a narrative quotes. The whole value is kept in
@@ -197,15 +199,77 @@ pub(super) fn connection_revoked(
     )
 }
 
+/// A coalesced event's narrative as it is served: the stored sentence, which
+/// describes the latest access, followed by how many accesses the row stands
+/// for and over what period. Rendered on read, never stored, so bumping a
+/// window stays a single-statement upsert.
+pub(super) fn served(
+    narrative: &str,
+    event_count: u32,
+    first: OffsetDateTime,
+    last: OffsetDateTime,
+) -> String {
+    if event_count <= 1 {
+        return narrative.to_owned();
+    }
+    format!(
+        "{narrative} — {event_count} times between {} and {}",
+        utc(first),
+        utc(last)
+    )
+}
+
+/// A time as a narrative states it: to the second, in UTC, and saying so.
+fn utc(at: OffsetDateTime) -> String {
+    let at = at.to_offset(UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second()
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use time::{OffsetDateTime, UtcOffset};
+
     use super::super::Recorded;
     use super::{
-        QUOTED_VALUE_CHARACTERS, quoted, subtree_deleted, subtree_read, subtree_replaced,
+        QUOTED_VALUE_CHARACTERS, quoted, served, subtree_deleted, subtree_read, subtree_replaced,
         value_created, value_deleted, value_updated,
     };
 
     const SECRET_TEXT: &str = "hunter2-do-not-record";
+
+    #[test]
+    fn a_single_event_is_served_as_stored() {
+        let at = OffsetDateTime::from_unix_timestamp(1_789_981_320).unwrap();
+        assert_eq!(
+            served("alice read subtree /apps (3 values)", 1, at, at),
+            "alice read subtree /apps (3 values)"
+        );
+    }
+
+    #[test]
+    fn a_coalesced_event_is_served_with_its_count_and_period() {
+        assert_eq!(
+            served(
+                "alice revealed secret /apps/db/password",
+                14,
+                OffsetDateTime::from_unix_timestamp(1_789_981_323).unwrap(),
+                // Rendered in UTC whatever offset it arrives in.
+                OffsetDateTime::from_unix_timestamp(1_790_009_159)
+                    .unwrap()
+                    .to_offset(UtcOffset::from_hms(1, 0, 0).unwrap()),
+            ),
+            "alice revealed secret /apps/db/password — 14 times between \
+             2026-09-21 09:02:03 UTC and 2026-09-21 16:45:59 UTC"
+        );
+    }
 
     #[test]
     fn a_plain_change_names_both_values() {

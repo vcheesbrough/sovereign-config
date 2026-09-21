@@ -14,5 +14,9 @@ pub mod sovereign {
         pub mod v3 {
             tonic::include_proto!("sovereign.config.v3");
         }
+
+        pub mod v4 {
+            tonic::include_proto!("sovereign.config.v4");
+        }
     }
 }

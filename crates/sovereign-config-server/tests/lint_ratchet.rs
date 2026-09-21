@@ -29,8 +29,8 @@ const PROTO_CRATE: &str = "sovereign_config_proto::";
 /// types besides the `vN.rs` shims.
 ///
 /// - `main.rs` registers each version's servers;
-/// - `system.rs` is `v3`'s `System` service, per-version by nature because
-///   `GetVersion` echoes the version it was asked for;
+/// - `system.rs` is each version's `System` service, per-version by nature
+///   because `GetVersion` echoes the version it was asked for;
 /// - `handshake.rs` names the **unversioned** `sovereign.config` package. It is
 ///   the one service that belongs to no version, which is exactly why it needs
 ///   naming here: the scan sees the proto crate, not which package of it, so
@@ -40,7 +40,7 @@ const VERSION_AWARE: [&str; 3] = ["main.rs", "system.rs", "handshake.rs"];
 /// The server modules split at the protocol seam. Each holds one shared
 /// implementation, `<module>/service.rs`, and a `<module>/vN.rs` shim per
 /// protocol version served.
-const SEAM_MODULES: [&str; 2] = ["values", "managed"];
+const SEAM_MODULES: [&str; 3] = ["values", "managed", "audit"];
 
 /// The `vN` in `<module>/vN.rs` when `relative` is a protocol version's shim.
 ///

@@ -126,12 +126,14 @@ impl MockState {
             GITHUB_TOKEN.to_owned(),
         );
 
+        // The version whose routes this mock implements, and so the only one
+        // it may claim to serve.
         Self {
-            protocol_version: sovereign_config_core::ProtocolVersion::PREFERRED
+            protocol_version: sovereign_config_core::ProtocolVersion::V3
                 .as_str()
                 .to_owned(),
             supported_protocol_versions: vec![
-                sovereign_config_core::ProtocolVersion::PREFERRED
+                sovereign_config_core::ProtocolVersion::V3
                     .as_str()
                     .to_owned(),
             ],

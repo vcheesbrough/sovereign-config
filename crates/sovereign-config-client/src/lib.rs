@@ -7,11 +7,11 @@ use std::{
 
 use async_trait::async_trait;
 use sovereign_config_core::{
-    AddPathMetadata, AuthenticationStatus, ClientError, ConfigPath, ConnectionId, DeleteMetadata,
-    DisplayName, ErrorKind, ManagedConnectionMetadata, ManagedPermissions, PlainValue,
-    ProtocolVersion, ProvisionedManagedConnection, PutMetadata, ReplaceMetadata, RevealedSecret,
-    Secret, SecretInput, ServedVersion, ServiceStatus, SubTreeMutationValue, Timestamp,
-    ValueListing, ValuePaths, ValueSubTree,
+    AddPathMetadata, AuditPage, AuditQuery, AuthenticationStatus, ClientError, ConfigPath,
+    ConnectionId, DeleteMetadata, DisplayName, ErrorKind, ManagedConnectionMetadata,
+    ManagedPermissions, PlainValue, ProtocolVersion, ProvisionedManagedConnection, PutMetadata,
+    ReplaceMetadata, RevealedSecret, Secret, SecretInput, ServedVersion, ServiceStatus,
+    SubTreeMutationValue, Timestamp, ValueListing, ValuePaths, ValueSubTree,
 };
 use tracing::{info, warn};
 
@@ -438,6 +438,35 @@ pub trait ManagedConnectionTransport: Transport {
     ) -> Result<(), ClientError>;
 }
 
+/// Reading the audit trail back.
+///
+/// Every dialer implements it, including one for a version with no `Audit`
+/// service: that one answers with [`audit_not_available`] and dials nothing,
+/// rather than calling a route its version does not have.
+#[async_trait(?Send)]
+pub trait AuditTransport: Transport {
+    async fn query_audit_trail(
+        &self,
+        query: &AuditQuery,
+        bearer: &Secret,
+    ) -> Result<AuditPage, ClientError>;
+}
+
+/// What a dialer whose protocol version has no `Audit` service answers an
+/// audit query with.
+///
+/// [`ErrorKind::IncompatibleProtocol`], never
+/// [`ErrorKind::VersionNotServed`]: the version *is* served, it simply has no
+/// such operation, and reporting it as unserved would send [`Session::call`]
+/// into a re-handshake that lands on the same version.
+#[must_use]
+pub fn audit_not_available(version: ProtocolVersion) -> ClientError {
+    ClientError::described(
+        ErrorKind::IncompatibleProtocol,
+        format!("the audit trail is not available on protocol {version}"),
+    )
+}
+
 /// Everything one protocol version's routes can carry.
 ///
 /// A transport holds the dialer for the version its session negotiated as a
@@ -446,7 +475,7 @@ pub trait ManagedConnectionTransport: Transport {
 /// module implements it, holding that version's stubs or route paths and its
 /// proto↔core mapping — which is what makes retiring a version a deletion.
 #[async_trait(?Send)]
-pub trait SessionTransport: ValueTransport + ManagedConnectionTransport {
+pub trait SessionTransport: ValueTransport + ManagedConnectionTransport + AuditTransport {
     /// The version whose routes this dialer dials.
     ///
     /// Declared by the same module that owns the routes, so a session reports
@@ -549,6 +578,25 @@ where
         self.transport
             .revoke_managed_connection(connection_id, &token)
             .await
+    }
+}
+
+impl<T, A> Client<T, A>
+where
+    T: AuditTransport,
+    A: AccessTokenProvider,
+{
+    /// Reads one page of the audit trail, newest first, restricted to events
+    /// on paths the caller may read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded authentication, validation, or dependency error, or
+    /// [`ErrorKind::IncompatibleProtocol`] when the session's protocol version
+    /// has no audit trail.
+    pub async fn query_audit_trail(&self, query: &AuditQuery) -> Result<AuditPage, ClientError> {
+        let token = self.required_token().await?;
+        self.transport.query_audit_trail(query, &token).await
     }
 }
 
@@ -935,7 +983,7 @@ mod tests {
     /// an unversioned one settles the question in a single round trip.
     #[tokio::test]
     async fn negotiation_is_one_unversioned_handshake() {
-        let service = ScriptedService::serving(&["v3"]);
+        let service = ScriptedService::serving(&[ProtocolVersion::PREFERRED.as_str()]);
 
         let status = negotiate(&service).await.unwrap();
 

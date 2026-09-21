@@ -31,12 +31,14 @@ use tonic_health::server::HealthReporter;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use audit::AuditRecorder;
+use audit::{AuditRecorder, AuditTrailService, v4::V4Audit};
 use auth::{Authenticator, grpc_service_layer};
 use authentik::AuthentikAdminClient;
 use config::{Config, ManagedConnectionConfig, required_env};
 use handshake::HandshakeService;
-use managed::{ManagedConnectionsService, ManagedSettings, V3ManagedConnections};
+use managed::{
+    ManagedConnectionsService, ManagedSettings, V3ManagedConnections, V4ManagedConnections,
+};
 use metrics::{AuditMetrics, AuthenticationMetrics, ManagedConnectionMetrics, ProtocolMetrics};
 use protocol::ProtocolVersionLayer;
 use sovereign_config_core::Secret;
@@ -46,9 +48,10 @@ use sovereign_config_proto::sovereign::config::{
         configuration_server::ConfigurationServer,
         managed_connections_server::ManagedConnectionsServer, system_server::SystemServer,
     },
+    v4,
 };
-use system::{SERVED_PROTOCOL_LABELS, SystemService};
-use values::{ConfigurationService, V3Configuration, encrypt_stored_secrets};
+use system::{SERVED_PROTOCOL_LABELS, SystemService, V4System};
+use values::{ConfigurationService, V3Configuration, V4Configuration, encrypt_stored_secrets};
 use web::WebAssetsLayer;
 
 const SYSTEM_SERVICE_NAME: &str = "sovereign.config.v3.System";
@@ -150,6 +153,10 @@ async fn main() -> Result<()> {
         managed_metrics,
         audit,
     ));
+    let audit_trail = Arc::new(AuditTrailService::new(
+        state.database.clone(),
+        config.audit.page_size,
+    ));
 
     info!(
         grpc_addr = %config.grpc_addr,
@@ -188,6 +195,20 @@ async fn main() -> Result<()> {
         ))))
         .add_service(ManagedConnectionsServer::new(V3ManagedConnections::new(
             Arc::clone(&managed_connections),
+        )))
+        // `v4`: the same implementations again, plus the audit trail, which
+        // `v3` has no service for.
+        .add_service(v4::system_server::SystemServer::new(V4System))
+        .add_service(v4::configuration_server::ConfigurationServer::new(
+            V4Configuration::new(Arc::clone(&configuration)),
+        ))
+        .add_service(
+            v4::managed_connections_server::ManagedConnectionsServer::new(
+                V4ManagedConnections::new(Arc::clone(&managed_connections)),
+            ),
+        )
+        .add_service(v4::audit_server::AuditServer::new(V4Audit::new(
+            audit_trail,
         )))
         .serve_with_shutdown(config.grpc_addr, shutdown_signal())
         .await
@@ -299,6 +320,18 @@ async fn serving_health_service() -> (HealthReporter, HealthServer<impl Health>)
         .await;
     health_reporter
         .set_serving::<ManagedConnectionsServer<ManagedConnectionsService>>()
+        .await;
+    health_reporter
+        .set_serving::<v4::system_server::SystemServer<V4System>>()
+        .await;
+    health_reporter
+        .set_serving::<v4::configuration_server::ConfigurationServer<V4Configuration>>()
+        .await;
+    health_reporter
+        .set_serving::<v4::managed_connections_server::ManagedConnectionsServer<V4ManagedConnections>>()
+        .await;
+    health_reporter
+        .set_serving::<v4::audit_server::AuditServer<V4Audit>>()
         .await;
     (health_reporter, health_service)
 }
