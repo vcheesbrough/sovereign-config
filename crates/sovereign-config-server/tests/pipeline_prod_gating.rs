@@ -172,6 +172,25 @@ fn all_dockerfiles() -> Vec<(String, String)> {
     files
 }
 
+/// One named build stage of a Dockerfile: its `FROM … AS <name>` line up to the
+/// next `FROM`.
+///
+/// `ARG` is scoped to the stage that declares it, so an assertion against the
+/// whole file cannot tell "the server build receives this" from "some other
+/// stage does". Only a slice can.
+fn stage<'a>(dockerfile: &'a str, name: &str) -> &'a str {
+    let header = format!(" AS {name}\n");
+    let start = dockerfile
+        .find(&header)
+        .unwrap_or_else(|| panic!("the Dockerfile should have a stage named {name}"))
+        + header.len();
+    let rest = &dockerfile[start..];
+    match rest.find("\nFROM ") {
+        Some(end) => &rest[..end],
+        None => rest,
+    }
+}
+
 /// The digest-pinned references to `image@sha256:` in a Dockerfile.
 fn pinned_digests<'a>(dockerfile: &'a str, image: &str) -> BTreeSet<&'a str> {
     dockerfile
@@ -231,6 +250,46 @@ fn image_build_flags_are_never_glued_to_the_value_before_them() {
             );
         }
     }
+}
+
+/// The revision reaches the binary only if all four links hold: CI passes the
+/// commit as a build arg, the **server** stage declares that arg, that stage
+/// exports it to `cargo build`, and `build.rs` reads it into the compiled
+/// binary.
+///
+/// A broken link degrades silently to `revision="unknown"` — the same value a
+/// local build reports — so nothing fails and no unit test can tell the two
+/// apart. The chain is only visible to someone scraping a deployment.
+///
+/// The `ARG` assertion is scoped to the `builder` stage on purpose: Docker
+/// scopes `ARG` per stage, so an `ARG REVISION` sitting in `installer-builder`
+/// would satisfy a file-wide search while the server binary got nothing.
+#[test]
+fn the_server_image_is_stamped_with_the_commit_it_was_built_from() {
+    let commands = commands_text(step(&pipeline(), "build-server"));
+    assert!(
+        commands.contains("--build-arg REVISION=\"$$CI_COMMIT_SHA\""),
+        "the build must pass the commit to the image"
+    );
+
+    let server_dockerfile = dockerfile("server");
+    let builder = stage(&server_dockerfile, "builder");
+    assert!(
+        builder.contains("ARG REVISION"),
+        "the stage that builds the server must declare the arg it is passed"
+    );
+    assert!(
+        builder.contains("SOVEREIGN_CONFIG_REVISION=\"$REVISION\""),
+        "the stage must export the arg to cargo, or build.rs never sees it"
+    );
+
+    let build_script =
+        std::fs::read_to_string(repo_root().join("crates/sovereign-config-server/build.rs"))
+            .expect("build.rs should be readable");
+    assert!(
+        build_script.contains("SOVEREIGN_CONFIG_REVISION"),
+        "build.rs must read the variable the image build exports"
+    );
 }
 
 /// The builder stages are duplicated across the files, not shared, so their

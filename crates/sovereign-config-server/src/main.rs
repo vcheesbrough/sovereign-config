@@ -87,19 +87,34 @@ struct AppState {
     audit_metrics: Arc<AuditMetrics>,
 }
 
+/// The whole `/metrics` exposition, assembled from the parts each family
+/// renders.
+///
+/// Free, and taking its inputs rather than reading them off [`AppState`], so a
+/// test can assert what the endpoint actually serves: `AppState` carries a
+/// `PgPool`, and a composition only reachable through one is a composition only
+/// a test with a database can check. What belongs in the exposition is not a
+/// database question.
+fn compose_metrics(up: u8, build_info: &str, families: [&str; 4]) -> String {
+    let [authentication, managed, protocol, audit] = families;
+    format!("sovereign_config_up {up}\n{build_info}{authentication}{managed}{protocol}{audit}")
+}
+
 impl AppState {
     fn render_metrics(&self, up: u8) -> String {
-        format!(
-            "sovereign_config_up {up}\n{}{}{}{}{}",
-            metrics::render_build_info(
+        compose_metrics(
+            up,
+            &metrics::render_build_info(
                 APPLICATION_VERSION,
                 APPLICATION_REVISION,
                 &SERVED_PROTOCOL_LABELS.join(","),
             ),
-            self.authentication_metrics.render(),
-            self.managed_metrics.render(),
-            self.protocol_metrics.render(),
-            self.audit_metrics.render(),
+            [
+                &self.authentication_metrics.render(),
+                &self.managed_metrics.render(),
+                &self.protocol_metrics.render(),
+                &self.audit_metrics.render(),
+            ],
         )
     }
 }
@@ -411,7 +426,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::{
         APPLICATION_REVISION, APPLICATION_VERSION, SYSTEM_SERVICE_NAME, application_revision,
-        application_version,
+        application_version, compose_metrics,
     };
     use crate::{
         metrics::render_build_info,
@@ -432,23 +447,33 @@ mod tests {
         assert_eq!(application_revision(Some("")), "unknown");
     }
 
-    /// The identity `sovereign_config_build_info` exports is the same identity
-    /// the process reports elsewhere, and its `protocol` label is the whole
-    /// served set — not just the preferred version.
+    /// What `/metrics` actually serves — the composition, not its parts.
+    ///
+    /// Asserting `render_build_info` alone would only restate that the renderer
+    /// renders; it is [`compose_metrics`] that decides build identity is in the
+    /// exposition at all. The families are stand-ins here: what is under test
+    /// is that every part reaches the output and that `up` stays the first
+    /// line, which is where a scrape looks for it.
     #[test]
-    fn build_info_reports_the_running_identity_and_every_served_version() {
-        let rendered = render_build_info(
-            APPLICATION_VERSION,
-            APPLICATION_REVISION,
-            &SERVED_PROTOCOL_LABELS.join(","),
+    fn the_exposition_carries_build_identity_alongside_every_family() {
+        let rendered = compose_metrics(
+            1,
+            &render_build_info(
+                APPLICATION_VERSION,
+                APPLICATION_REVISION,
+                &SERVED_PROTOCOL_LABELS.join(","),
+            ),
+            ["auth\n", "managed\n", "protocol\n", "audit\n"],
         );
 
         assert!(
-            rendered.contains(&format!("version=\"{APPLICATION_VERSION}\"")),
+            rendered.starts_with("sovereign_config_up 1\n"),
             "{rendered}"
         );
         assert!(
-            rendered.contains(&format!("revision=\"{APPLICATION_REVISION}\"")),
+            rendered.contains(&format!(
+                "version=\"{APPLICATION_VERSION}\",revision=\"{APPLICATION_REVISION}\""
+            )),
             "{rendered}"
         );
         for version in SERVED_PROTOCOL_LABELS {
@@ -458,6 +483,12 @@ mod tests {
             );
         }
         assert_eq!(rendered.matches("sovereign_config_build_info{").count(), 1);
+        for family in ["auth", "managed", "protocol", "audit"] {
+            assert!(
+                rendered.contains(family),
+                "{family} missing from {rendered}"
+            );
+        }
     }
 
     #[test]
