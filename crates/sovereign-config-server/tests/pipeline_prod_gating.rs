@@ -208,6 +208,31 @@ fn each_image_build_uses_its_own_dockerfile() {
     );
 }
 
+/// Every flag in an image build command must start a token of its own.
+///
+/// The build commands are single long shell lines, so an edit that drops one
+/// space glues a flag onto the value before it. Docker does not complain about
+/// an unknown flag — it takes the merged token as the build context path and
+/// fails with a usage error about the argument count, which names neither the
+/// flag nor the label that swallowed it. Nothing else here reads the command as
+/// tokens, so only this catches it, and it catches it before a pipeline run
+/// rather than after one.
+#[test]
+fn image_build_flags_are_never_glued_to_the_value_before_them() {
+    let pipeline = pipeline();
+    for name in ["build-server", "build-broker", "build-cli"] {
+        let commands = commands_text(step(&pipeline, name));
+        for (offset, _) in commands.match_indices("--") {
+            let preceding = commands[..offset].chars().next_back();
+            assert!(
+                matches!(preceding, None | Some(' ' | '\n' | '"')),
+                "{name}: a flag is glued to the token before it at {:?}",
+                &commands[offset.saturating_sub(40)..commands.len().min(offset + 20)]
+            );
+        }
+    }
+}
+
 /// The builder stages are duplicated across the files, not shared, so their
 /// base images must not drift apart.
 #[test]
