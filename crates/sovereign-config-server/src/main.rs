@@ -56,11 +56,25 @@ use web::WebAssetsLayer;
 
 const SYSTEM_SERVICE_NAME: &str = "sovereign.config.v3.System";
 const APPLICATION_VERSION: &str = application_version(option_env!("SOVEREIGN_CONFIG_RELEASE"));
+const APPLICATION_REVISION: &str = application_revision(option_env!("SOVEREIGN_CONFIG_REVISION"));
 
 const fn application_version(release_version: Option<&str>) -> &str {
     match release_version {
         Some(version) if !version.is_empty() => version,
         _ => env!("CARGO_PKG_VERSION"),
+    }
+}
+
+/// The commit this binary was built from, or `unknown`.
+///
+/// Unlike the version there is no source-tree fallback: a local `cargo build`
+/// has no commit stamped into it, and reporting the *checkout's* HEAD would
+/// claim an identity the binary may not have — a dirty tree, or a build kept
+/// across commits. `unknown` says plainly that nothing stamped it.
+const fn application_revision(revision: Option<&str>) -> &str {
+    match revision {
+        Some(revision) if !revision.is_empty() => revision,
+        _ => "unknown",
     }
 }
 
@@ -76,7 +90,12 @@ struct AppState {
 impl AppState {
     fn render_metrics(&self, up: u8) -> String {
         format!(
-            "sovereign_config_up {up}\n{}{}{}{}",
+            "sovereign_config_up {up}\n{}{}{}{}{}",
+            metrics::render_build_info(
+                APPLICATION_VERSION,
+                APPLICATION_REVISION,
+                &SERVED_PROTOCOL_LABELS.join(","),
+            ),
             self.authentication_metrics.render(),
             self.managed_metrics.render(),
             self.protocol_metrics.render(),
@@ -390,14 +409,55 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{APPLICATION_VERSION, SYSTEM_SERVICE_NAME, application_version};
-    use crate::system::SERVED_PROTOCOL_VERSIONS;
+    use super::{
+        APPLICATION_REVISION, APPLICATION_VERSION, SYSTEM_SERVICE_NAME, application_revision,
+        application_version,
+    };
+    use crate::{
+        metrics::render_build_info,
+        system::{SERVED_PROTOCOL_LABELS, SERVED_PROTOCOL_VERSIONS},
+    };
 
     #[test]
     fn configured_release_version_overrides_cargo_version() {
         assert_eq!(application_version(Some("1.3.42")), "1.3.42");
         assert_eq!(application_version(None), env!("CARGO_PKG_VERSION"));
         assert_eq!(application_version(Some("")), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn an_unstamped_build_reports_an_unknown_revision() {
+        assert_eq!(application_revision(Some("a1b2c3d")), "a1b2c3d");
+        assert_eq!(application_revision(None), "unknown");
+        assert_eq!(application_revision(Some("")), "unknown");
+    }
+
+    /// The identity `sovereign_config_build_info` exports is the same identity
+    /// the process reports elsewhere, and its `protocol` label is the whole
+    /// served set — not just the preferred version.
+    #[test]
+    fn build_info_reports_the_running_identity_and_every_served_version() {
+        let rendered = render_build_info(
+            APPLICATION_VERSION,
+            APPLICATION_REVISION,
+            &SERVED_PROTOCOL_LABELS.join(","),
+        );
+
+        assert!(
+            rendered.contains(&format!("version=\"{APPLICATION_VERSION}\"")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("revision=\"{APPLICATION_REVISION}\"")),
+            "{rendered}"
+        );
+        for version in SERVED_PROTOCOL_LABELS {
+            assert!(
+                rendered.contains(version),
+                "{version} missing from {rendered}"
+            );
+        }
+        assert_eq!(rendered.matches("sovereign_config_build_info{").count(), 1);
     }
 
     #[test]
