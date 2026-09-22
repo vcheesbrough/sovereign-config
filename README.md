@@ -686,6 +686,10 @@ Each value row in the Configuration grid has a history button that opens `/audit
 
 The application writes structured redacted JSON logs to stdout. Authentication events contain only the RPC path and bounded outcome/reason values. Internal Alloy discovers `/metrics` using the Docker labels in `compose.yaml`; that endpoint is not routed through Traefik. `sovereign_config_authentication_total` reports bounded success/failure reasons without request-derived labels. OTLP export is introduced by its separate card.
 
+`compose.yaml` labels **both** containers — the server and its database — with `observability.service.name` and `observability.deployment.environment`, so each is one service in two environments rather than two services named after their containers. Only the server carries the `observability.metrics.*` labels; Postgres exposes no Prometheus endpoint. The labels state identity only: **build identity is never a discovery label**, because a label carrying the release starts a fresh set of series on every deploy.
+
+Build identity is `sovereign_config_build_info{version="…",revision="…",protocol="…"} 1` instead — a gauge pinned at 1, joined onto other series with `… * on(instance) group_left(version, revision, protocol)`. `version` is the release the binary was stamped with, `revision` the commit (`unknown` for an unstamped local build), and `protocol` **the whole served set, most preferred first** — `v4,v3`. It is one series and stays one series: a series per version would match an instance twice and break that join, and a single preferred version would claim the server had dropped the older versions it still serves. Per-version traffic, and the retirement gate, are `sovereign_config_protocol_requests_total` below.
+
 `sovereign_config_protocol_requests_total{version="…",outcome="…"}` counts gRPC requests by the protocol version their route names, in two series:
 
 | `outcome` | Counts | Answers |

@@ -28,10 +28,17 @@ RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/carg
 # The server embeds web-dist/ (rust-embed), so it builds on top of the bundle.
 FROM web-builder AS builder
 ARG RELEASE_VERSION
+# Stamped into the binary so `sovereign_config_build_info` can report it; the
+# image's org.opencontainers.image.revision label is unreadable from inside.
+# Only the server needs it — the cli/mcp installers report a version, not a
+# commit, so leaving it out of installer-builder keeps that stage's layer cache
+# valid across commits that share a release tag.
+ARG REVISION
 RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=sovereign-config-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=sovereign-config-cargo-target,target=/src/target \
-    SOVEREIGN_CONFIG_RELEASE="$RELEASE_VERSION" cargo build --release --locked \
+    SOVEREIGN_CONFIG_RELEASE="$RELEASE_VERSION" SOVEREIGN_CONFIG_REVISION="$REVISION" \
+    cargo build --release --locked \
         --package sovereign-config-server \
     && cp /src/target/release/sovereign-config-server /tmp/sovereign-config-server
 

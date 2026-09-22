@@ -14,6 +14,46 @@ use crate::audit::EventKind;
 /// that something is addressing a protocol version this build does not know.
 pub(crate) const UNRECOGNISED_PROTOCOL_LABEL: &str = "unrecognised";
 
+/// The build identity of the running process, as the homelab's
+/// `<app>_build_info` convention: a gauge pinned at `1` whose labels carry the
+/// facts, so a dashboard joins it onto any other series with
+/// `… * on(instance) group_left(version, revision, protocol)` instead of
+/// stamping build identity onto every series — which would start a fresh series
+/// set on every deploy.
+///
+/// **One series, never one per served version.** `protocol` carries the whole
+/// served set most-preferred-first (`v4,v3`), the same string startup logs as
+/// `protocol_versions`. A series per version would match an instance more than
+/// once and break exactly the `group_left` join this metric exists for, and a
+/// single most-preferred value would claim the server had dropped the older
+/// versions it is still serving. Per-version traffic — and the retirement gate
+/// — is `sovereign_config_protocol_requests_total`; this label is descriptive.
+///
+/// The values are compiled in, but `version` and `revision` reach the build
+/// from CI environment variables rather than from source, so they are escaped
+/// rather than trusted: an unescaped quote or newline in a label value does not
+/// corrupt one metric, it makes the whole exposition unparseable and takes the
+/// endpoint down.
+pub(crate) fn render_build_info(version: &str, revision: &str, protocol: &str) -> String {
+    format!(
+        "# HELP sovereign_config_build_info Build identity of the running server: always 1.\n\
+         # TYPE sovereign_config_build_info gauge\n\
+         sovereign_config_build_info{{version=\"{}\",revision=\"{}\",protocol=\"{}\"}} 1\n",
+        escape_label_value(version),
+        escape_label_value(revision),
+        escape_label_value(protocol),
+    )
+}
+
+/// The three escapes the Prometheus text exposition format defines for a label
+/// value: backslash, double quote, and line feed.
+fn escape_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 /// Per-protocol-version request counts, in two series.
 ///
 /// - `outcome="attempted"` counts every `POST` whose route names the version,
@@ -543,7 +583,34 @@ mod tests {
     use super::{
         AuthenticationMetrics, AuthenticationResult, ManagedConnectionMetrics,
         ManagedDependencyCall, ManagedDependencyOutcome, ManagedOperation, ManagedOperationResult,
+        render_build_info,
     };
+
+    #[test]
+    fn build_info_is_one_gauge_at_one() {
+        let rendered = render_build_info("2.34.0", "a1b2c3d", "v4,v3");
+
+        assert!(rendered.contains("# TYPE sovereign_config_build_info gauge\n"));
+        assert!(rendered.ends_with(
+            "sovereign_config_build_info{version=\"2.34.0\",revision=\"a1b2c3d\",protocol=\"v4,v3\"} 1\n"
+        ));
+    }
+
+    /// The version and revision are stamped in from CI environment variables,
+    /// not written in the source. A quote or newline arriving that way must not
+    /// be able to end the label, the line, or the exposition.
+    #[test]
+    fn build_info_escapes_stamped_label_values() {
+        let rendered = render_build_info("2.34.0\" evil=\"", "sha\nup 0", "v4\\v3");
+
+        assert!(
+            rendered.contains(
+                "{version=\"2.34.0\\\" evil=\\\"\",revision=\"sha\\nup 0\",protocol=\"v4\\\\v3\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert_eq!(rendered.lines().count(), 3);
+    }
 
     #[test]
     fn metrics_use_only_bounded_result_labels() {

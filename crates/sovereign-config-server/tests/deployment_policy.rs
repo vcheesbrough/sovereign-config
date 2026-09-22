@@ -40,6 +40,49 @@ fn compose_delivers_the_value_encryption_key_like_every_other_secret() {
     assert!(compose.contains("      - value_encryption_key"));
 }
 
+/// Both containers must be discoverable as one service in two environments.
+///
+/// The database's labels are the whole reason this test exists: an unlabelled
+/// container still ships logs, so nothing fails — Loki just files them under
+/// the container name, and `{deployment_environment="prod"}` quietly misses the
+/// database. The failure mode is an absence, which only a test asserting the
+/// presence catches.
+#[test]
+fn every_container_is_labelled_for_log_and_metric_discovery() {
+    let compose = include_str!("../../../compose.yaml");
+
+    for (service, expected) in [
+        ("postgres", "sovereign-config-postgres"),
+        ("sovereign-config", "sovereign-config"),
+    ] {
+        assert!(
+            compose.contains(&format!("\"observability.service.name={expected}\"")),
+            "{service} must name itself for Loki and Prometheus"
+        );
+    }
+    assert_eq!(
+        compose
+            .matches("\"observability.deployment.environment=${SOVEREIGN_CONFIG_ENV:-dev}\"")
+            .count(),
+        2,
+        "both containers must carry the environment, from the same variable"
+    );
+}
+
+/// Build identity belongs on `sovereign_config_build_info`, not on every series.
+///
+/// Alloy stopped reading these labels, so leaving them here would be dead
+/// configuration that still reads as the supported way to report a release —
+/// and the release they carried was a per-deploy value that started a fresh
+/// series set each time.
+#[test]
+fn compose_does_not_stamp_build_identity_onto_discovery_labels() {
+    let compose = include_str!("../../../compose.yaml");
+
+    assert!(!compose.contains("observability.release"));
+    assert!(!compose.contains("observability.protocol"));
+}
+
 #[test]
 fn readme_documents_the_value_encryption_boundary() {
     let readme = include_str!("../../../README.md");

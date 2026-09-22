@@ -172,6 +172,25 @@ fn all_dockerfiles() -> Vec<(String, String)> {
     files
 }
 
+/// One named build stage of a Dockerfile: its `FROM … AS <name>` line up to the
+/// next `FROM`.
+///
+/// `ARG` is scoped to the stage that declares it, so an assertion against the
+/// whole file cannot tell "the server build receives this" from "some other
+/// stage does". Only a slice can.
+fn stage<'a>(dockerfile: &'a str, name: &str) -> &'a str {
+    let header = format!(" AS {name}\n");
+    let start = dockerfile
+        .find(&header)
+        .unwrap_or_else(|| panic!("the Dockerfile should have a stage named {name}"))
+        + header.len();
+    let rest = &dockerfile[start..];
+    match rest.find("\nFROM ") {
+        Some(end) => &rest[..end],
+        None => rest,
+    }
+}
+
 /// The digest-pinned references to `image@sha256:` in a Dockerfile.
 fn pinned_digests<'a>(dockerfile: &'a str, image: &str) -> BTreeSet<&'a str> {
     dockerfile
@@ -205,6 +224,71 @@ fn each_image_build_uses_its_own_dockerfile() {
     assert!(
         !repo_root().join("Dockerfile").exists(),
         "there must be no root Dockerfile for an untargeted `docker build .` to pick up"
+    );
+}
+
+/// Every flag in an image build command must start a token of its own.
+///
+/// The build commands are single long shell lines, so an edit that drops one
+/// space glues a flag onto the value before it. Docker does not complain about
+/// an unknown flag — it takes the merged token as the build context path and
+/// fails with a usage error about the argument count, which names neither the
+/// flag nor the label that swallowed it. Nothing else here reads the command as
+/// tokens, so only this catches it, and it catches it before a pipeline run
+/// rather than after one.
+#[test]
+fn image_build_flags_are_never_glued_to_the_value_before_them() {
+    let pipeline = pipeline();
+    for name in ["build-server", "build-broker", "build-cli"] {
+        let commands = commands_text(step(&pipeline, name));
+        for (offset, _) in commands.match_indices("--") {
+            let preceding = commands[..offset].chars().next_back();
+            assert!(
+                matches!(preceding, None | Some(' ' | '\n' | '"')),
+                "{name}: a flag is glued to the token before it at {:?}",
+                &commands[offset.saturating_sub(40)..commands.len().min(offset + 20)]
+            );
+        }
+    }
+}
+
+/// The revision reaches the binary only if all four links hold: CI passes the
+/// commit as a build arg, the **server** stage declares that arg, that stage
+/// exports it to `cargo build`, and `build.rs` reads it into the compiled
+/// binary.
+///
+/// A broken link degrades silently to `revision="unknown"` — the same value a
+/// local build reports — so nothing fails and no unit test can tell the two
+/// apart. The chain is only visible to someone scraping a deployment.
+///
+/// The `ARG` assertion is scoped to the `builder` stage on purpose: Docker
+/// scopes `ARG` per stage, so an `ARG REVISION` sitting in `installer-builder`
+/// would satisfy a file-wide search while the server binary got nothing.
+#[test]
+fn the_server_image_is_stamped_with_the_commit_it_was_built_from() {
+    let commands = commands_text(step(&pipeline(), "build-server"));
+    assert!(
+        commands.contains("--build-arg REVISION=\"$$CI_COMMIT_SHA\""),
+        "the build must pass the commit to the image"
+    );
+
+    let server_dockerfile = dockerfile("server");
+    let builder = stage(&server_dockerfile, "builder");
+    assert!(
+        builder.contains("ARG REVISION"),
+        "the stage that builds the server must declare the arg it is passed"
+    );
+    assert!(
+        builder.contains("SOVEREIGN_CONFIG_REVISION=\"$REVISION\""),
+        "the stage must export the arg to cargo, or build.rs never sees it"
+    );
+
+    let build_script =
+        std::fs::read_to_string(repo_root().join("crates/sovereign-config-server/build.rs"))
+            .expect("build.rs should be readable");
+    assert!(
+        build_script.contains("SOVEREIGN_CONFIG_REVISION"),
+        "build.rs must read the variable the image build exports"
     );
 }
 

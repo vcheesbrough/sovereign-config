@@ -19,6 +19,13 @@ services:
       start_period: 10s
     networks:
       - sovereign_config_private
+    # Without these the database's stdout reaches Loki under its container name,
+    # so dev and prod look like two unrelated services and neither answers to
+    # `deployment_environment`. No metrics labels: Postgres exposes no
+    # Prometheus endpoint for Alloy to scrape.
+    labels:
+      - "observability.service.name=sovereign-config-postgres"
+      - "observability.deployment.environment=${SOVEREIGN_CONFIG_ENV:-dev}"
     restart: unless-stopped
 
   sovereign-config:
@@ -70,8 +77,6 @@ services:
       - "observability.metrics.scheme=http"
       - "observability.service.name=sovereign-config"
       - "observability.deployment.environment=${SOVEREIGN_CONFIG_ENV:-dev}"
-      - "observability.release=${SOVEREIGN_CONFIG_IMAGE_TAG:-local}"
-      - "observability.protocol=v3"
     restart: unless-stopped
 
 secrets:
