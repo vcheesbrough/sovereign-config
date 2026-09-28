@@ -17,7 +17,7 @@ use tonic::Status;
 use tracing::{field::Empty, instrument};
 
 use super::paths::parent_path;
-use crate::rpc::storage_unavailable;
+use crate::rpc::store_unavailable;
 
 #[derive(FromRow)]
 pub(super) struct ListedValueRow {
@@ -131,7 +131,7 @@ pub(super) async fn path_collides(
     .bind(path)
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())?;
+    .map_err(|_| store_unavailable())?;
     Ok(collision.is_some())
 }
 
@@ -156,7 +156,7 @@ pub(super) async fn reserve_content_id(
     )
     .fetch_one(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())
+    .map_err(|_| store_unavailable())
 }
 
 /// Inserts a content row under a previously reserved identity.
@@ -189,7 +189,7 @@ pub(super) async fn insert_content(
     .bind(now)
     .fetch_one(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())
+    .map_err(|_| store_unavailable())
 }
 
 /// Inserts a path row. `path` is the exact case it was written with;
@@ -217,7 +217,7 @@ pub(super) async fn insert_path(
     .bind(now)
     .execute(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())?;
+    .map_err(|_| store_unavailable())?;
     Ok(())
 }
 
@@ -255,7 +255,7 @@ pub(super) async fn prune_orphan_contents(
             .bind(content_id)
             .execute(&mut **transaction)
             .await
-            .map_err(|_| storage_unavailable())?;
+            .map_err(|_| store_unavailable())?;
     }
     sqlx::query(
         r"
@@ -269,7 +269,7 @@ pub(super) async fn prune_orphan_contents(
     .bind(content_ids)
     .execute(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())?;
+    .map_err(|_| store_unavailable())?;
     Ok(())
 }
 
@@ -319,7 +319,7 @@ pub(super) async fn lock_path(
         .bind(path)
         .execute(&mut **transaction)
         .await
-        .map_err(|_| storage_unavailable())?;
+        .map_err(|_| store_unavailable())?;
     Ok(())
 }
 
@@ -329,7 +329,7 @@ pub(super) async fn lock_path(
     fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "begin")
 )]
 pub(super) async fn begin(database: &PgPool) -> Result<Transaction<'static, Postgres>, Status> {
-    database.begin().await.map_err(|_| storage_unavailable())
+    database.begin().await.map_err(|_| store_unavailable())
 }
 
 #[instrument(
@@ -338,10 +338,7 @@ pub(super) async fn begin(database: &PgPool) -> Result<Transaction<'static, Post
     fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "commit")
 )]
 pub(super) async fn commit(transaction: Transaction<'_, Postgres>) -> Result<(), Status> {
-    transaction
-        .commit()
-        .await
-        .map_err(|_| storage_unavailable())
+    transaction.commit().await.map_err(|_| store_unavailable())
 }
 
 /// Every stored path with its content, in fold order — the candidate set a
@@ -357,7 +354,7 @@ pub(super) async fn path_candidates(database: &PgPool) -> Result<Vec<PathContent
     )
     .fetch_all(database)
     .await
-    .map_err(|_| storage_unavailable())
+    .map_err(|_| store_unavailable())
 }
 
 /// The listed values stored at exactly the given fold paths.
@@ -382,7 +379,7 @@ pub(super) async fn listed_values(
     .bind(fold_paths)
     .fetch_all(database)
     .await
-    .map_err(|_| storage_unavailable())
+    .map_err(|_| store_unavailable())
 }
 
 /// Every value at or below `fold`, in fold order.
@@ -407,7 +404,7 @@ pub(super) async fn sub_tree_rows(
     .bind(fold)
     .fetch_all(database)
     .await
-    .map_err(|_| storage_unavailable())
+    .map_err(|_| store_unavailable())
 }
 
 /// The content, classification and alias count behind one fold path.
@@ -439,7 +436,7 @@ pub(super) async fn path_content_class(
     .bind(fold)
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())
+    .map_err(|_| store_unavailable())
 }
 
 /// Overwrites a content row's stored representation and classification.
@@ -470,7 +467,7 @@ pub(super) async fn update_content(
     .bind(now)
     .fetch_one(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())
+    .map_err(|_| store_unavailable())
 }
 
 /// Fold keys of every secret at, below, or above `fold`.
@@ -501,7 +498,7 @@ pub(super) async fn secret_paths_touching(
     .bind(fold)
     .fetch_all(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())?;
+    .map_err(|_| store_unavailable())?;
     Ok(rows.into_iter().map(|row| row.path).collect())
 }
 
@@ -532,7 +529,7 @@ pub(super) async fn delete_plain_paths_except(
     .bind(keep)
     .fetch_all(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())?;
+    .map_err(|_| store_unavailable())?;
     // See `delete_paths`: the audit trail itemizes a bounded prefix.
     deleted.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(deleted)
@@ -554,7 +551,7 @@ where
     .bind(fold)
     .fetch_optional(executor)
     .await
-    .map_err(|_| storage_unavailable())
+    .map_err(|_| store_unavailable())
 }
 
 /// What a content row held before it was overwritten.
@@ -602,7 +599,7 @@ pub(super) async fn update_plain_content(
     .bind(now)
     .fetch_one(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())
+    .map_err(|_| store_unavailable())
 }
 
 /// Deletes the path at `fold`, or with `recurse` every path at or below it,
@@ -637,7 +634,7 @@ pub(super) async fn delete_paths(
         .bind(fold)
         .fetch_all(&mut **transaction)
         .await
-        .map_err(|_| storage_unavailable())?;
+        .map_err(|_| store_unavailable())?;
     // `RETURNING` promises no order, and the audit trail itemizes a bounded
     // prefix of these — which must be the same prefix every time.
     deleted.sort_by(|left, right| left.path.cmp(&right.path));
@@ -665,7 +662,7 @@ pub(super) async fn revealed_row(
     .bind(fold)
     .fetch_optional(database)
     .await
-    .map_err(|_| storage_unavailable())
+    .map_err(|_| store_unavailable())
 }
 
 /// Whether a path row already exists at exactly `fold`.
@@ -684,7 +681,7 @@ pub(super) async fn path_is_occupied(
     .bind(fold)
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())?;
+    .map_err(|_| store_unavailable())?;
     Ok(occupied.is_some())
 }
 
@@ -704,7 +701,7 @@ pub(super) async fn paths_of_content(
     .bind(content_id)
     .fetch_all(database)
     .await
-    .map_err(|_| storage_unavailable())
+    .map_err(|_| store_unavailable())
 }
 
 /// Serializes concurrent start-of-day encryption passes for the transaction.

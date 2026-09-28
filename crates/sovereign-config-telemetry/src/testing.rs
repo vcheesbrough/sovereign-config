@@ -219,6 +219,28 @@ impl Capture {
                 }
             })
             .collect();
+        let duplicated = self
+            .spans
+            .spans
+            .lock()
+            .expect("recorder lock")
+            .iter()
+            .filter_map(|span| {
+                let mut keys: Vec<&str> =
+                    span.attributes.iter().map(|kv| kv.key.as_str()).collect();
+                keys.sort_unstable();
+                let before = keys.len();
+                keys.dedup();
+                (keys.len() != before).then(|| span.name.to_string())
+            })
+            .collect::<Vec<_>>();
+        // The SDK appends a re-recorded attribute rather than replacing it, so
+        // a span can leave with one key twice; the plain map below would hide
+        // that, so it is refused here.
+        assert!(
+            duplicated.is_empty(),
+            "spans exported with an attribute key recorded twice: {duplicated:?}"
+        );
         let exported = Exported { spans, logs };
         let unknown = exported.unknown_attribute_keys();
         assert!(

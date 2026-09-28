@@ -14,7 +14,7 @@ use super::wire::{internal_error, not_found};
 use crate::audit::{Actor, AuditEvent};
 use crate::auth::{AuthenticatedPrincipal, Permission};
 use crate::authentik::CreatedServiceAccount;
-use crate::rpc::storage_unavailable;
+use crate::rpc::store_unavailable;
 
 #[derive(FromRow)]
 pub(super) struct ConnectionRow {
@@ -36,10 +36,7 @@ impl ManagedConnectionsService {
         fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "begin")
     )]
     pub(super) async fn begin(&self) -> Result<Transaction<'_, Postgres>, Status> {
-        self.database
-            .begin()
-            .await
-            .map_err(|_| storage_unavailable())
+        self.database.begin().await.map_err(|_| store_unavailable())
     }
 
     /// Locks one row and requires the caller to manage its root; a missing row
@@ -67,7 +64,7 @@ impl ManagedConnectionsService {
         .bind(connection_id.as_str())
         .fetch_optional(&mut **transaction)
         .await
-        .map_err(|_| storage_unavailable())?
+        .map_err(|_| store_unavailable())?
         .ok_or_else(not_found)?;
         let root = ConfigPath::parse(&row.root).map_err(|_| internal_error())?;
         if !principal.allows(&root, Permission::Manage) {
@@ -107,7 +104,7 @@ impl ManagedConnectionsService {
         .bind(OffsetDateTime::now_utc())
         .fetch_optional(&self.database)
         .await
-        .map_err(|_| storage_unavailable())
+        .map_err(|_| store_unavailable())
     }
 
     /// [`Self::transition_state`] for the transition that *completes* an
@@ -151,7 +148,7 @@ impl ManagedConnectionsService {
         .bind(now)
         .fetch_optional(&mut *transaction)
         .await
-        .map_err(|_| storage_unavailable())?;
+        .map_err(|_| store_unavailable())?;
         if row.is_some() {
             self.audit
                 .record_in(&mut transaction, actor, now, &[event])
@@ -181,7 +178,7 @@ impl ManagedConnectionsService {
             .bind(connection_id.as_str())
             .execute(&mut *transaction)
             .await
-            .map_err(|_| storage_unavailable())?;
+            .map_err(|_| store_unavailable())?;
         if deleted.rows_affected() > 0 {
             self.audit
                 .record_in(&mut transaction, actor, OffsetDateTime::now_utc(), &[event])
@@ -207,7 +204,7 @@ impl ManagedConnectionsService {
             .bind(connection_id.as_str())
             .execute(&self.database)
             .await
-            .map_err(|_| storage_unavailable())?;
+            .map_err(|_| store_unavailable())?;
         Ok(())
     }
 
@@ -228,7 +225,7 @@ impl ManagedConnectionsService {
         )
         .fetch_all(&self.database)
         .await
-        .map_err(|_| storage_unavailable())
+        .map_err(|_| store_unavailable())
     }
 
     /// Inserts a new connection in `provisioning`, before any external call.
@@ -259,7 +256,7 @@ impl ManagedConnectionsService {
         .bind(now)
         .execute(&self.database)
         .await
-        .map_err(|_| storage_unavailable())?;
+        .map_err(|_| store_unavailable())?;
         Ok(())
     }
 
@@ -286,7 +283,7 @@ impl ManagedConnectionsService {
         .bind(OffsetDateTime::now_utc())
         .execute(&self.database)
         .await
-        .map_err(|_| storage_unavailable())?;
+        .map_err(|_| store_unavailable())?;
         Ok(())
     }
 
@@ -312,7 +309,7 @@ impl ManagedConnectionsService {
         .bind(OffsetDateTime::now_utc())
         .execute(&self.database)
         .await
-        .map_err(|_| storage_unavailable())?;
+        .map_err(|_| store_unavailable())?;
         Ok(())
     }
 }
@@ -323,10 +320,7 @@ impl ManagedConnectionsService {
     fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "commit")
 )]
 pub(super) async fn commit(transaction: Transaction<'_, Postgres>) -> Result<(), Status> {
-    transaction
-        .commit()
-        .await
-        .map_err(|_| storage_unavailable())
+    transaction.commit().await.map_err(|_| store_unavailable())
 }
 
 /// Marks a locked row `rotation_unknown` before the external call, so an
@@ -351,7 +345,7 @@ pub(super) async fn mark_rotation_unknown(
     .bind(OffsetDateTime::now_utc())
     .execute(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())?;
+    .map_err(|_| store_unavailable())?;
     Ok(())
 }
 
@@ -376,6 +370,6 @@ pub(super) async fn mark_revoking(
     .bind(OffsetDateTime::now_utc())
     .execute(&mut **transaction)
     .await
-    .map_err(|_| storage_unavailable())?;
+    .map_err(|_| store_unavailable())?;
     Ok(())
 }
