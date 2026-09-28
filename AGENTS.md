@@ -116,6 +116,45 @@ supported — a server upgrade alone must never break them.
   change (releases 2.15.0, 2.18.0, 2.26.0 and 2.28.0 all did). Negotiation does
   not protect against that class.
 
+## 4. Observability
+
+The `observability` skill (baseline §10) is the contract; this section records
+how this repo applies it and where it does not yet.
+
+- **`sovereign-config-telemetry` is the only crate that may name an
+  OpenTelemetry SDK or exporter type** (`opentelemetry_sdk`,
+  `opentelemetry_otlp`, `tracing_opentelemetry`,
+  `opentelemetry_appender_tracing`), in source or in a manifest.
+  `crates/sovereign-config-telemetry/tests/allowlist.rs` fails otherwise.
+  Product code logs through `tracing`. The telemetry crates are pinned as one
+  set in the workspace `Cargo.toml`, paced by `tracing-opentelemetry`; move
+  them together, re-verifying the pairing on crates.io.
+- **The `OTEL_*` variables are the whole configuration interface.** Never add
+  a `SOVEREIGN_CONFIG_*` name or a config field for a telemetry knob.
+  `compose.yaml` passes names only (`deployment_policy.rs` enforces it); the
+  values live in the deploy steps (README `## Observability` says why).
+- **Every card that changes behaviour records its telemetry decision** — new
+  or changed log fields, spans, metrics, dashboards, alerts or runbook text —
+  including "no change needed". Not having thought about it is not a
+  decision.
+
+### Deviations register
+
+What differs from the skill today, why, and what closes it. Remove an entry
+in the change that closes it.
+
+| Deviation | Why | Closed by |
+| --- | --- | --- |
+| Metrics are scraped from `/metrics` (Docker labels), not pushed over OTLP. | Predates the contract. | #421 |
+| No spans; log records carry no `trace_id`/`span_id`. | Predates the contract. | #420 |
+| The SDK exports nothing about itself (no dropped-record or failed-export counter). | The Rust SDK has none; recorded rather than wrapped for now. Export failures show as `ERROR` lines from the `opentelemetry_sdk` target on stdout. | A wrapped exporter counting drops, when metrics go over OTLP (#421) |
+| `grpc` is not a supported `OTEL_EXPORTER_OTLP_PROTOCOL`; it fails startup. | The tonic exporter would add a second tonic beside the server's 0.12 and needs an async-runtime batch processor, for a transport the estate's collector does not need. (The `http/protobuf` path already brings second majors of prost and reqwest; that was accepted.) | Adding `grpc-tonic` when a collector requires it |
+| The platform indexes `log_source` and `deployment_environment`, not the skill's `telemetry_source` and `deployment.environment.name`. | The product emits only the skill's names; the shared collector (`monitor-alloy`, mini-config) copies the resource attributes `telemetry_source` → `log_source` and `deployment.environment.name` → `deployment.environment` at ingest when absent; Loki stores them as the labels `log_source` and `deployment_environment` (dots become underscores). No second key is emitted from here. | A platform rename in mini-config |
+| The same log line reaches Loki twice: from stdout (`log_source="docker"`) and over OTLP (`log_source="otlp"`). | `docker logs` stays useful, and whether the platform ships this container's stdout is the platform's decision. Postgres keeps its Docker stream regardless. | The platform dropping the server container's Docker stream once OTLP is trusted |
+| The `OTEL_*` values live in the deploy pipelines, not a sovereign-config `otel` layer. | This service is the store `render` reads; its own deploy cannot depend on it. | — (deliberate) |
+| The server's own `hyper_util` client and `reqwest` events are never exported over OTLP (stdout only). | They are also the exporter's HTTP client; bridging them would let an export produce records that need exporting. The server's gRPC stack (`tonic`, `h2`, `hyper`) is bridged. | — (deliberate) |
+| The web UI, CLI, MCP server, provider and broker emit no telemetry. | Out of scope so far. | #376 (clients), #423 (broker) |
+
 *Kanban workflow and automated test coverage follow the agent-shared baseline
 unchanged — see baseline §1 and §6. Start a card with the **`start-iteration`**
 skill (baseline §2). PR self-review + comment loop: run the **`pr-review-loop`**

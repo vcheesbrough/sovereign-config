@@ -185,9 +185,27 @@ steps:
         from_secret: sovereign_config_dev_value_encryption_key
     commands:
       - |
+        # Telemetry (README "Observability"): non-secret, so kept here with the
+        # deploy rather than in the store this deploy would have to read itself
+        # from. compose.yaml passes the names through.
+        #
+        # Compose runs as its plugin binary, not as `docker compose`: the
+        # docker 27 CLI overwrites OTEL_RESOURCE_ATTRIBUTES with its own
+        # `docker.cli.cobra.command_path=…` when it execs a plugin, so the
+        # server would lose deployment.environment.name (pipelines 311, 312).
+        COMPOSE=/usr/local/libexec/docker/cli-plugins/docker-compose
+        export OTEL_SERVICE_NAME=sovereign-config
+        export OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=dev,telemetry_source=otlp
+        export OTEL_EXPORTER_OTLP_ENDPOINT=http://monitor-alloy:4318
+        export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+        export OTEL_LOGS_EXPORTER=otlp
+        # Until spans (#420) and OTLP metrics (#421) exist.
+        export OTEL_METRICS_EXPORTER=none
+        export OTEL_TRACES_EXPORTER=none
+        printf 'telemetry: %s\n' "$$OTEL_RESOURCE_ATTRIBUTES"
         ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
-        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL="$$OIDC_INTROSPECTION_URL" SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config-dev/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET_FILE= SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET="$$OIDC_INTROSPECTION_CLIENT_SECRET" SOVEREIGN_CONFIG_PUBLIC_ORIGIN=https://sovereign-config-dev.desync.link SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE=sovereign_config_dev_grants SOVEREIGN_CONFIG_MANAGER_GROUP=sovereign-config-dev-connections SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE= SOVEREIGN_CONFIG_MANAGER_API_TOKEN="$$MANAGER_API_TOKEN" SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE= SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY="$$VALUE_ENCRYPTION_KEY" docker compose -p sovereign-config-dev up -d --wait --wait-timeout 90 || {
-          docker compose -p sovereign-config-dev logs --tail 200
+        SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL="$$OIDC_INTROSPECTION_URL" SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config-dev/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection-dev SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET_FILE= SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET="$$OIDC_INTROSPECTION_CLIENT_SECRET" SOVEREIGN_CONFIG_PUBLIC_ORIGIN=https://sovereign-config-dev.desync.link SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE=sovereign_config_dev_grants SOVEREIGN_CONFIG_MANAGER_GROUP=sovereign-config-dev-connections SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE= SOVEREIGN_CONFIG_MANAGER_API_TOKEN="$$MANAGER_API_TOKEN" SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE= SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY="$$VALUE_ENCRYPTION_KEY" "$$COMPOSE" -p sovereign-config-dev up -d --wait --wait-timeout 90 || {
+          "$$COMPOSE" -p sovereign-config-dev logs --tail 200
           exit 1
         }
 

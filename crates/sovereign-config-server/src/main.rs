@@ -29,7 +29,6 @@ use tonic_health::pb::{
 };
 use tonic_health::server::HealthReporter;
 use tracing::{error, info};
-use tracing_subscriber::{EnvFilter, fmt};
 
 use audit::{AuditRecorder, AuditTrailService, v4::V4Audit};
 use auth::{Authenticator, grpc_service_layer};
@@ -144,8 +143,17 @@ async fn main() -> Result<()> {
     if env::args().nth(1).as_deref() == Some("healthcheck") {
         return healthcheck().await;
     }
-    init_logging();
+    // First, before anything logs: it installs the subscriber, and it fails
+    // startup on a half-configured OTEL_* set rather than exporting nowhere.
+    let mut telemetry = sovereign_config_telemetry::init(APPLICATION_VERSION)?;
+    let served = serve().await;
+    // Inside the runtime and after serving has stopped, so the records of the
+    // shutdown itself are flushed. Bounded, and never able to fail the exit.
+    telemetry.shutdown();
+    served
+}
 
+async fn serve() -> Result<()> {
     let config = Config::from_env()?;
     let web_assets = WebAssetsLayer::new(&config.web);
     let authenticator = Authenticator::new(config.authentication)?;
@@ -247,17 +255,6 @@ async fn main() -> Result<()> {
         .serve_with_shutdown(config.grpc_addr, shutdown_signal())
         .await
         .context("gRPC server terminated")
-}
-
-/// Structured JSON logs to stdout, filtered by `RUST_LOG`-style environment
-/// configuration and defaulting to `info`.
-fn init_logging() {
-    fmt()
-        .json()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
 }
 
 /// The Authentik admin client and the non-secret settings the managed
