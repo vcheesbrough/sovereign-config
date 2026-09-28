@@ -49,6 +49,23 @@ services:
       SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE: ${SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE-/run/secrets/manager_api_token}
       SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY: ${SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY:-}
       SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE: ${SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE-/run/secrets/value_encryption_key}
+      # Telemetry: names only, never a value. Each is passed through from the
+      # deploy step's environment when set there and left unset otherwise, so
+      # a deployment without them runs with telemetry off (README
+      # "Observability"). The values live with the deploy step.
+      OTEL_SERVICE_NAME:
+      OTEL_RESOURCE_ATTRIBUTES:
+      OTEL_EXPORTER_OTLP_ENDPOINT:
+      OTEL_EXPORTER_OTLP_PROTOCOL:
+      OTEL_EXPORTER_OTLP_HEADERS:
+      OTEL_LOGS_EXPORTER:
+      OTEL_METRICS_EXPORTER:
+      OTEL_TRACES_EXPORTER:
+      OTEL_SDK_DISABLED:
+    # The source of service.instance.id (a UUID derived from it): named after
+    # the container rather than Docker's per-container id, so it survives a
+    # redeploy and the instance keeps one identity.
+    hostname: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}
     secrets:
       - database_url
       - oidc_introspection_client_secret

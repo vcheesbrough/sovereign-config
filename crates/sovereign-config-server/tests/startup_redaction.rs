@@ -174,3 +174,52 @@ fn malformed_value_encryption_key_fails_startup_without_echoing_values() {
         "startup output echoed the supplied key: {rendered}"
     );
 }
+
+/// Telemetry configuration can carry a credential (`OTEL_EXPORTER_OTLP_HEADERS`)
+/// and names internal addresses, so no `OTEL_*` value may reach a log line —
+/// on the path where telemetry starts and exports, and the server then fails
+/// on its database and logs about it.
+#[test]
+fn telemetry_configuration_values_never_reach_the_output() {
+    const HEADER_SECRET: &str = "otlp-header-sentinel-7c2d9e10";
+    const ENDPOINT: &str = "http://otlp-endpoint-sentinel.invalid:4318";
+    const ENVIRONMENT: &str = "environment-sentinel-31f0";
+
+    let mut environment = configured_environment("127.0.0.1:50051");
+    environment.extend([
+        ("OTEL_SERVICE_NAME", "sovereign-config".to_owned()),
+        (
+            "OTEL_RESOURCE_ATTRIBUTES",
+            format!("deployment.environment.name={ENVIRONMENT},telemetry_source=otlp"),
+        ),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", ENDPOINT.to_owned()),
+        (
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            format!("authorization=Bearer {HEADER_SECRET}"),
+        ),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf".to_owned()),
+        ("OTEL_LOGS_EXPORTER", "otlp".to_owned()),
+        ("OTEL_METRICS_EXPORTER", "none".to_owned()),
+        ("OTEL_TRACES_EXPORTER", "none".to_owned()),
+        // Verbose, so a value the product or the exporter logs at any level
+        // an operator would plausibly run at shows here. (At `trace` the HTTP
+        // client library names the host it dials; that level is a deliberate
+        // debugging choice, not a deployment setting.)
+        ("RUST_LOG", "debug".to_owned()),
+    ]);
+    let output = run_server(&environment);
+
+    assert_secret_is_redacted(&output);
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(rendered.contains("telemetry on"), "{rendered}");
+    for value in [HEADER_SECRET, "otlp-endpoint-sentinel", ENVIRONMENT] {
+        assert!(
+            !rendered.contains(value),
+            "startup output exposed an OTEL_* value ({value}): {rendered}"
+        );
+    }
+}

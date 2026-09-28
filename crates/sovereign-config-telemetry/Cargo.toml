@@ -1,0 +1,29 @@
+[package]
+name = "sovereign-config-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The one module that owns telemetry: OTEL_* validation, resource identity, OTLP export and shutdown"
+publish = false
+
+[dependencies]
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-appender-tracing.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+tracing-opentelemetry.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rustix = { workspace = true, features = ["system"] }
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,355 @@
+//! What actually leaves the process, asserted on what an exporter received —
+//! the SDK's in-memory one, or the real OTLP one pointed at nothing — rather
+//! than on configuration (`observability` skill §7).
+
+use std::{
+    io::Write,
+    net::TcpListener,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use opentelemetry::{Key, logs::AnyValue};
+use opentelemetry_sdk::{
+    Resource,
+    error::OTelSdkResult,
+    logs::{BatchConfig, BatchConfigBuilder, InMemoryLogExporter, LogBatch, LogExporter},
+};
+use sovereign_config_telemetry::{
+    Assembly, Identity, InitError, OtelEnv, Plan, SHUTDOWN_TIMEOUT, assemble, config::validate,
+};
+use tracing_subscriber::fmt::MakeWriter;
+
+const VERSION: &str = "2.35.0-test";
+
+/// The variables a dev deployment carries, with a stale version planted in
+/// the attribute list to prove the build's wins.
+const DEPLOYED: [(&str, &str); 7] = [
+    ("OTEL_SERVICE_NAME", "sovereign-config"),
+    (
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "deployment.environment.name=dev,telemetry_source=otlp,service.version=0.0.1-stale",
+    ),
+    ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://monitor-alloy:4318"),
+    ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
+    ("OTEL_LOGS_EXPORTER", "otlp"),
+    ("OTEL_METRICS_EXPORTER", "none"),
+    ("OTEL_TRACES_EXPORTER", "none"),
+];
+
+/// Captures what the `fmt` layer writes, in place of stdout.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Captured {
+    fn lines(&self) -> Vec<String> {
+        String::from_utf8(self.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for Captured {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The in-memory exporter clears what it holds when shut down; this keeps
+/// it, so a test can read what shutdown flushed.
+#[derive(Debug, Clone)]
+struct Kept(InMemoryLogExporter);
+
+impl LogExporter for Kept {
+    async fn export(&self, batch: LogBatch<'_>) -> OTelSdkResult {
+        self.0.export(batch).await
+    }
+    fn set_resource(&mut self, resource: &Resource) {
+        self.0.set_resource(resource);
+    }
+}
+
+fn identity(hostname: Option<&str>) -> Identity {
+    Identity {
+        version: VERSION.to_owned(),
+        hostname: hostname.map(str::to_owned),
+    }
+}
+
+/// A batch delay long enough that nothing is exported until shutdown flushes
+/// it, so a test that sees records has proved the flush.
+fn slow_batches() -> BatchConfig {
+    BatchConfigBuilder::default()
+        .with_scheduled_delay(Duration::from_secs(3600))
+        .build()
+}
+
+fn assemble_with(
+    plan: Plan,
+    exporter: &InMemoryLogExporter,
+    stdout: &Captured,
+    hostname: Option<&str>,
+) -> Assembly {
+    let exporter = Kept(exporter.clone());
+    assemble(
+        plan,
+        &identity(hostname),
+        "info",
+        stdout.clone(),
+        move || Ok::<_, InitError>(exporter),
+        slow_batches(),
+    )
+    .expect("assembly must succeed")
+}
+
+fn attribute(value: &opentelemetry::Value) -> String {
+    value.to_string()
+}
+
+#[test]
+fn every_exported_record_carries_the_resource_identity() {
+    let exporter = InMemoryLogExporter::default();
+    let stdout = Captured::default();
+    let plan = validate(&OtelEnv::from_pairs(DEPLOYED)).unwrap();
+    let Assembly {
+        subscriber,
+        mut telemetry,
+    } = assemble_with(plan, &exporter, &stdout, Some("sovereign-config-dev"));
+
+    tracing::subscriber::with_default(subscriber, || {
+        telemetry.announce();
+        tracing::info!(answer = 42, "first");
+        tracing::warn!("second");
+        telemetry.shutdown();
+    });
+
+    let records = exporter.get_emitted_logs().unwrap();
+    assert_eq!(records.len(), 3, "the announcement and both events");
+    for record in &records {
+        let resource = &record.resource;
+        let get = |key: &'static str| {
+            resource
+                .get(&Key::from_static_str(key))
+                .map(|value| attribute(&value))
+        };
+        assert_eq!(get("service.name").as_deref(), Some("sovereign-config"));
+        assert_eq!(get("deployment.environment.name").as_deref(), Some("dev"));
+        assert_eq!(get("telemetry_source").as_deref(), Some("otlp"));
+        assert_eq!(
+            get("service.version").as_deref(),
+            Some(VERSION),
+            "the build's version must win over OTEL_RESOURCE_ATTRIBUTES"
+        );
+        assert!(get("service.instance.id").is_some());
+    }
+    // The records are structured, not preformatted lines.
+    let first = records
+        .iter()
+        .find(|r| r.record.body() == Some(&AnyValue::from("first")))
+        .expect("the first event was exported");
+    assert!(
+        first
+            .record
+            .attributes_iter()
+            .any(|(key, value)| key.as_str() == "answer" && *value == AnyValue::Int(42))
+    );
+    // stdout still gets every line: `docker logs` keeps working.
+    assert_eq!(stdout.lines().len(), 3, "{:?}", stdout.lines());
+}
+
+#[test]
+fn the_instance_id_is_identical_across_two_inits_on_one_hostname() {
+    let ids: Vec<String> = (0..2)
+        .map(|_| {
+            let exporter = InMemoryLogExporter::default();
+            let plan = validate(&OtelEnv::from_pairs(DEPLOYED)).unwrap();
+            let Assembly {
+                subscriber,
+                mut telemetry,
+            } = assemble_with(plan, &exporter, &Captured::default(), Some("host-a"));
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!("one");
+                telemetry.shutdown();
+            });
+            let records = exporter.get_emitted_logs().unwrap();
+            attribute(
+                &records[0]
+                    .resource
+                    .get(&Key::from_static_str("service.instance.id"))
+                    .expect("an instance id"),
+            )
+        })
+        .collect();
+    assert_eq!(ids[0], ids[1]);
+}
+
+#[test]
+fn off_builds_no_provider_and_says_so_once() {
+    for plan in [
+        validate(&OtelEnv::default()).unwrap(),
+        validate(&OtelEnv::from_pairs(
+            DEPLOYED.into_iter().chain([("OTEL_SDK_DISABLED", "true")]),
+        ))
+        .unwrap(),
+    ] {
+        let exporter = InMemoryLogExporter::default();
+        let stdout = Captured::default();
+        let built = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&built);
+        let Assembly {
+            subscriber,
+            mut telemetry,
+        } = assemble(
+            plan,
+            &identity(Some("host")),
+            "",
+            stdout.clone(),
+            move || {
+                *flag.lock().unwrap() = true;
+                Ok::<_, InitError>(exporter)
+            },
+            slow_batches(),
+        )
+        .unwrap();
+
+        assert!(!telemetry.is_exporting());
+        assert!(!*built.lock().unwrap(), "no exporter may be built when off");
+        tracing::subscriber::with_default(subscriber, || {
+            telemetry.announce();
+            tracing::info!("served");
+            telemetry.shutdown();
+        });
+        let lines = stdout.lines();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("telemetry off"))
+                .count(),
+            1,
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("served")));
+    }
+}
+
+#[test]
+fn shutdown_flushes_pending_records_within_its_timeout() {
+    let exporter = InMemoryLogExporter::default();
+    let plan = validate(&OtelEnv::from_pairs(DEPLOYED)).unwrap();
+    let Assembly {
+        subscriber,
+        mut telemetry,
+    } = assemble_with(plan, &exporter, &Captured::default(), None);
+
+    tracing::subscriber::with_default(subscriber, || {
+        for n in 0..100 {
+            tracing::info!(n, "pending");
+        }
+    });
+    assert!(
+        exporter.get_emitted_logs().unwrap().is_empty(),
+        "nothing is exported before the hour-long batch delay"
+    );
+    let started = Instant::now();
+    telemetry.shutdown();
+    assert!(started.elapsed() < SHUTDOWN_TIMEOUT);
+    assert_eq!(exporter.get_emitted_logs().unwrap().len(), 100);
+}
+
+#[test]
+fn the_sdk_s_own_diagnostics_never_reach_the_log_bridge() {
+    let exporter = InMemoryLogExporter::default();
+    let stdout = Captured::default();
+    let plan = validate(&OtelEnv::from_pairs(DEPLOYED)).unwrap();
+    let Assembly {
+        subscriber,
+        mut telemetry,
+    } = assemble_with(plan, &exporter, &stdout, None);
+
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::warn!(target: "opentelemetry_sdk", "export failed");
+        tracing::debug!(target: "opentelemetry_otlp", url = "http://collector", "detail");
+        tracing::warn!(target: "reqwest::blocking", "connection refused");
+        telemetry.shutdown();
+    });
+
+    assert!(exporter.get_emitted_logs().unwrap().is_empty());
+    let lines = stdout.lines();
+    // The warning is the failure signal on stdout; the debug detail, which
+    // names the endpoint, is not written at all.
+    assert!(lines.iter().any(|line| line.contains("export failed")));
+    assert!(!lines.iter().any(|line| line.contains("http://collector")));
+}
+
+#[test]
+fn an_unreachable_collector_costs_nothing_and_shutdown_stays_bounded() {
+    use opentelemetry_otlp::{Protocol, WithExportConfig};
+
+    // A port that was free a moment ago: nothing listens on it.
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let endpoint = format!("http://127.0.0.1:{port}/v1/logs");
+    let plan = validate(&OtelEnv::from_pairs(DEPLOYED)).unwrap();
+    let stdout = Captured::default();
+    let Assembly {
+        subscriber,
+        mut telemetry,
+    } = assemble(
+        plan,
+        &identity(Some("host")),
+        "info",
+        stdout.clone(),
+        move || {
+            opentelemetry_otlp::LogExporter::builder()
+                .with_http()
+                .with_protocol(Protocol::HttpBinary)
+                .with_endpoint(endpoint)
+                .with_timeout(Duration::from_secs(2))
+                .build()
+                .map_err(|_| InitError::Exporter)
+        },
+        BatchConfigBuilder::default()
+            .with_scheduled_delay(Duration::from_millis(50))
+            .build(),
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    tracing::subscriber::with_default(subscriber, || {
+        for n in 0..50 {
+            tracing::info!(n, "served while the collector is down");
+        }
+        // Emitting never waits on the export.
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(300));
+        telemetry.shutdown();
+    });
+    assert!(started.elapsed() < SHUTDOWN_TIMEOUT + Duration::from_secs(1));
+    // The SDK reports the failure from its own batch thread, which sees the
+    // global subscriber rather than this test's scoped one, so what reaches
+    // stdout in production is asserted by the server's process tests. Here:
+    // nothing written on this thread names the endpoint.
+    let lines = stdout.lines();
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains(&format!("127.0.0.1:{port}"))),
+        "{lines:?}"
+    );
+}

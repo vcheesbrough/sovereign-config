@@ -128,3 +128,78 @@ fn readme_lists_every_production_secret_the_deployment_consumes() {
         assert!(readme.contains(secret), "{secret} missing from README");
     }
 }
+
+/// Telemetry is configured by the standard `OTEL_*` variables, whose values
+/// belong to the deploy step (README "Observability"). The compose file names
+/// them so they reach the server, and holds no value: a value here would be a
+/// second place to retarget telemetry, and one that needs a commit to change.
+#[test]
+fn compose_passes_the_otel_names_and_no_value() {
+    let compose = include_str!("../../../compose.yaml");
+    let passed: Vec<&str> = compose
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("OTEL_"))
+        .collect();
+
+    for name in [
+        "OTEL_SERVICE_NAME",
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "OTEL_LOGS_EXPORTER",
+        "OTEL_METRICS_EXPORTER",
+        "OTEL_TRACES_EXPORTER",
+        "OTEL_SDK_DISABLED",
+    ] {
+        assert!(
+            passed.contains(&format!("{name}:").as_str()),
+            "compose must pass {name} through"
+        );
+    }
+    for line in &passed {
+        assert!(
+            line.ends_with(':') && !line.contains(' '),
+            "compose must name an OTEL_* variable without a value or default: {line}"
+        );
+    }
+    assert!(
+        !compose.contains("${OTEL_"),
+        "no OTEL_* interpolation (and so no default) in compose"
+    );
+}
+
+/// `service.instance.id` is derived from the hostname, which must therefore
+/// survive a redeploy: Docker's default is the container id, new each time.
+#[test]
+fn the_server_hostname_is_its_stable_container_name() {
+    let compose = include_str!("../../../compose.yaml");
+    assert!(compose.contains(
+        "    hostname: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}\n"
+    ));
+}
+
+/// Every deployment that sets telemetry sets the whole working set, with its
+/// own environment's name, and never names a backend behind the collector.
+#[test]
+fn deploys_set_the_telemetry_values_for_their_environment() {
+    for (workflow, environment) in [("deploy-dev", "dev"), ("deploy-prod", "prod")] {
+        let path = format!(
+            "{}/../../.woodpecker/{workflow}.yml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let text = std::fs::read_to_string(&path).expect("workflow readable");
+        for expected in [
+            "OTEL_SERVICE_NAME: sovereign-config".to_owned(),
+            format!(
+                "OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name={environment},telemetry_source=otlp"
+            ),
+            "OTEL_EXPORTER_OTLP_ENDPOINT: http://monitor-alloy:4318".to_owned(),
+            "OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf".to_owned(),
+            "OTEL_LOGS_EXPORTER: otlp".to_owned(),
+        ] {
+            assert!(text.contains(&expected), "{workflow} must set `{expected}`");
+        }
+        assert!(!text.contains("loki"), "{workflow} must not name a backend");
+    }
+}

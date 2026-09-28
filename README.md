@@ -41,7 +41,7 @@ docker compose up -d
 
 `SOVEREIGN_CONFIG_PUBLIC_ORIGIN` is the exact canonical HTTPS origin embedded in generated connection URLs. It must carry no userinfo, no path other than `/`, no query, and no fragment; numeric-loopback HTTP is accepted only in tests. `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE` names the environment-specific Authentik user attribute that carries managed grants, matching the scope mapping in that environment's blueprint. `SOVEREIGN_CONFIG_MANAGER_GROUP` names the Authentik group each managed connection's service account is added to purely so an operator can browse them together; it grants no permissions and must match a plain group entry in that environment's blueprint. Both names are enumerated per environment under [Authentik objects by environment](#authentik-objects-by-environment). The Authentik administration origin is derived from `SOVEREIGN_CONFIG_OIDC_ISSUER`, so the API and issuer origins can never diverge.
 
-`SOVEREIGN_CONFIG_IMAGE_TAG` selects the published Zot image; it defaults to `local` for local builds. `SOVEREIGN_CONFIG_ENV` labels metrics and logs and defaults to `dev`. PostgreSQL is pinned by digest. The service starts only after PostgreSQL reports healthy.
+`SOVEREIGN_CONFIG_IMAGE_TAG` selects the published Zot image; it defaults to `local` for local builds. `SOVEREIGN_CONFIG_ENV` sets the Docker discovery labels on scraped metrics and stdout logs and defaults to `dev`; records exported over OTLP carry their environment in `OTEL_RESOURCE_ATTRIBUTES` instead (see [Observability](#observability)). PostgreSQL is pinned by digest. The service starts only after PostgreSQL reports healthy.
 
 Cargo supplies the `major.minor` release line. After a successful development deployment, Woodpecker tags the deployed commit and the next deployment advances the patch version. The deployed `System.GetVersion` response reports that computed release version; local builds report the Cargo version.
 
@@ -349,7 +349,8 @@ Each crate has one consumer, target, or artifact. Dependencies only point down t
 | --- | --- | --- |
 | `sovereign-config-proto` | Generated gRPC types: one module per protocol version (`v3`, `v4`) plus the unversioned handshake. | — |
 | `sovereign-config-core` | The shared contract: paths, value and secret newtypes, listing shapes, the JSON subtree codec, connection URLs, and `ClientError`. No I/O and no async. | — |
-| `sovereign-config-server` | The service binary: gRPC, gRPC-Web, PostgreSQL, Authentik. | proto, core |
+| `sovereign-config-telemetry` | The server's telemetry module: `OTEL_*` validation, resource identity, OTLP export and flushing shutdown. The only crate that may name an OpenTelemetry SDK or exporter type; its `tests/allowlist.rs` fails if any other does. | — |
+| `sovereign-config-server` | The service binary: gRPC, gRPC-Web, PostgreSQL, Authentik. | proto, core, telemetry |
 | `sovereign-config-client` | The transport-agnostic client: the `Handshake` trait and the `negotiate` function that settles a session's protocol version, the `Transport`, `ValueTransport`, `ManagedConnectionTransport` and `AuditTransport` traits a transport bound to that version implements, `SessionTransport` for one version's whole surface, `AccessTokenProvider`, and the `Client` facade. | core |
 | `sovereign-config-native` | The native tonic transport, split into a `TonicChannel` that can only negotiate and the `TonicTransport` its `speaking` returns, with one dialer module per protocol version; plus OIDC device and refresh flows and the profile store. | proto, core, client |
 | `sovereign-config-web` | The browser UI, compiled to WebAssembly, with its own gRPC-Web transport and dialer module per protocol version. | proto, core, client |
@@ -684,7 +685,36 @@ Each value row in the Configuration grid has a history button that opens `/audit
 
 ## Observability
 
-The application writes structured redacted JSON logs to stdout. Authentication events contain only the RPC path and bounded outcome/reason values. Internal Alloy discovers `/metrics` using the Docker labels in `compose.yaml`; that endpoint is not routed through Traefik. `sovereign_config_authentication_total` reports bounded success/failure reasons without request-derived labels. OTLP export is introduced by its separate card.
+The server's telemetry is owned by one crate, `sovereign-config-telemetry`, and configured by the standard `OTEL_*` environment variables and nothing else — there is no telemetry section in the server's own configuration.
+
+**What leaves, over what.** Structured log records leave the process over **OTLP (`http/protobuf`)** to one collector endpoint, the estate's shared collector (`http://monitor-alloy:4318` on the `proxy-backend` network). The server knows nothing behind that endpoint; which store keeps the records is the platform's business. Every record carries the same resource identity: `service.name`, `service.version` (the release the binary was built as — never overridable by the environment), `deployment.environment.name`, `service.instance.id` (a version 5 UUID of the container hostname, which `compose.yaml` pins to the container name so it survives a redeploy) and `telemetry_source=otlp`. The same records are also written as JSON to stdout, so `docker logs` keeps working. Authentication events contain only the RPC path and bounded outcome/reason values. **Metrics are still scraped, as an interim:** internal Alloy discovers `/metrics` using the Docker labels in `compose.yaml` (not routed through Traefik) until metrics move to OTLP; there are no spans yet. `sovereign_config_authentication_total` reports bounded success/failure reasons without request-derived labels.
+
+**Configured how.** Three states, decided by the variables alone:
+
+| Variables | Behaviour |
+| --- | --- |
+| No `OTEL_*` variable set | Telemetry off: stdout only, no exporter, no background thread, one startup line saying so. This is `cargo run`, `cargo test` and CI — nothing needs setting. |
+| `OTEL_SDK_DISABLED=true` | The same, for a deployment that carries the variables and wants them silent. |
+| Anything else | The whole set is validated before the server does anything else, then logs export. |
+
+Validation fails startup — naming the variable, never quoting its value — on: a signal exporting with no `OTEL_EXPORTER_OTLP_ENDPOINT` (the SDK's localhost default is never used); an endpoint that is not an absolute `http(s)` URL; a protocol other than `http/protobuf` (`grpc` is a valid value elsewhere but this server is not built with it); an exporter other than `otlp`/`none`; `OTEL_PROPAGATORS` other than `tracecontext`; an unknown sampler or a sampler argument outside 0–1; a non-numeric batch or timeout setting; and a missing `service.name` or `deployment.environment.name`. `RUST_LOG` stays the one setting outside the family and filters the log output only.
+
+A deployment sets:
+
+| Variable | Dev / prod value |
+| --- | --- |
+| `OTEL_SERVICE_NAME` | `sovereign-config` |
+| `OTEL_RESOURCE_ATTRIBUTES` | `deployment.environment.name=<dev\|prod>,telemetry_source=otlp` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://monitor-alloy:4318` |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` |
+| `OTEL_LOGS_EXPORTER` | `otlp` |
+| `OTEL_METRICS_EXPORTER`, `OTEL_TRACES_EXPORTER` | `none`, until metrics and spans are exported over OTLP |
+
+`compose.yaml` passes these **names** through and never holds a value. The values live in the deploy steps of `.woodpecker/deploy-dev.yml` and `deploy-prod.yml`, not in a Sovereign Config layer as other products on the estate keep them: this service is the store `render` reads, and rendering its own deploy from itself would make redeploying a broken store depend on the store. None of the values is secret; `OTEL_EXPORTER_OTLP_HEADERS` is passed through for a collector that needs a credential, and would then come from a pipeline secret.
+
+**Failure never reaches the service.** Nothing connects to the collector until the first batch; an unreachable collector costs dropped records and an `ERROR` line from the `opentelemetry_sdk` target on stdout per failed batch, never a failed request, a failed start or a failed health check. Shutdown flushes pending records within a 5-second bound. The deploy gate (`docker compose up --wait` on the gRPC health check) has no telemetry dependency.
+
+In Loki the server's records select as `{service_name="sovereign-config", deployment_environment="dev", log_source="otlp"}`: the platform's collector copies `telemetry_source` to its `log_source` label and `deployment.environment.name` to `deployment_environment` at ingest, and keeps `telemetry_source` as structured metadata. The same lines also arrive once more from the container's stdout under `log_source="docker"` while both paths run.
 
 `compose.yaml` labels **both** containers — the server and its database — with `observability.service.name` and `observability.deployment.environment`, so each is one service in two environments rather than two services named after their containers. Only the server carries the `observability.metrics.*` labels; Postgres exposes no Prometheus endpoint. The labels state identity only: **build identity is never a discovery label**, because a label carrying the release starts a fresh set of series on every deploy.
 
