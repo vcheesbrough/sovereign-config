@@ -207,8 +207,6 @@ fn deploys_set_the_telemetry_values_for_their_environment() {
             !text.contains("docker compose -p"),
             "{workflow} must not deploy through `docker compose`"
         );
-        assert!(text.contains(
-            "COMPOSE=/usr/local/libexec/docker/cli-plugins/docker-compose\n"
-        ));
+        assert!(text.contains("COMPOSE=/usr/local/libexec/docker/cli-plugins/docker-compose\n"));
     }
 }
