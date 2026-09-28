@@ -201,5 +201,14 @@ fn deploys_set_the_telemetry_values_for_their_environment() {
             assert!(text.contains(&expected), "{workflow} must set `{expected}`");
         }
         assert!(!text.contains("loki"), "{workflow} must not name a backend");
+        // The docker CLI replaces OTEL_RESOURCE_ATTRIBUTES when it execs the
+        // compose plugin, so the deploy must run the plugin binary itself.
+        assert!(
+            !text.contains("docker compose -p"),
+            "{workflow} must not deploy through `docker compose`"
+        );
+        assert!(text.contains(
+            "COMPOSE=/usr/local/libexec/docker/cli-plugins/docker-compose\n"
+        ));
     }
 }

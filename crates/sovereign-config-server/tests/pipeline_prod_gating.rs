@@ -552,7 +552,7 @@ fn production_deploy_targets_the_production_environment() {
     let command = commands_text(step(&pipeline, "deploy-prod"));
     assert!(command.contains("SOVEREIGN_CONFIG_ENV=prod"));
     assert!(command.contains("SOVEREIGN_CONFIG_HOST=sovereign-config.desync.link"));
-    assert!(command.contains("docker compose -p sovereign-config-prod"));
+    assert!(command.contains("\"$$COMPOSE\" -p sovereign-config-prod"));
     // It deploys the resolved, already-built tag and pulls it rather than
     // relying on a locally built image (there is no build on the deploy path).
     assert!(command.contains("SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag)"));
