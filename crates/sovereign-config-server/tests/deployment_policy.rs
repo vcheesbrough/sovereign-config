@@ -194,7 +194,7 @@ fn deploys_set_the_telemetry_values_for_their_environment() {
             format!(
                 "export OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name={environment},telemetry_source=otlp\n"
             ),
-            "export OTEL_EXPORTER_OTLP_ENDPOINT=http://".to_owned(),
+            "export OTEL_EXPORTER_OTLP_ENDPOINT=http://monitor-alloy:4318\n".to_owned(),
             "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf\n".to_owned(),
             "export OTEL_LOGS_EXPORTER=otlp\n".to_owned(),
         ] {

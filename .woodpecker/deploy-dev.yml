@@ -196,7 +196,7 @@ steps:
         COMPOSE=/usr/local/libexec/docker/cli-plugins/docker-compose
         export OTEL_SERVICE_NAME=sovereign-config
         export OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=dev,telemetry_source=otlp
-        export OTEL_EXPORTER_OTLP_ENDPOINT=http://10.255.255.1:4318
+        export OTEL_EXPORTER_OTLP_ENDPOINT=http://monitor-alloy:4318
         export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
         export OTEL_LOGS_EXPORTER=otlp
         # Until spans (#420) and OTLP metrics (#421) exist.
