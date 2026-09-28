@@ -190,13 +190,13 @@ fn deploys_set_the_telemetry_values_for_their_environment() {
         );
         let text = std::fs::read_to_string(&path).expect("workflow readable");
         for expected in [
-            "OTEL_SERVICE_NAME: sovereign-config".to_owned(),
+            "export OTEL_SERVICE_NAME=sovereign-config".to_owned(),
             format!(
-                "OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name={environment},telemetry_source=otlp"
+                "export OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name={environment},telemetry_source=otlp\n"
             ),
-            "OTEL_EXPORTER_OTLP_ENDPOINT: http://monitor-alloy:4318".to_owned(),
-            "OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf".to_owned(),
-            "OTEL_LOGS_EXPORTER: otlp".to_owned(),
+            "export OTEL_EXPORTER_OTLP_ENDPOINT=http://monitor-alloy:4318\n".to_owned(),
+            "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf\n".to_owned(),
+            "export OTEL_LOGS_EXPORTER=otlp\n".to_owned(),
         ] {
             assert!(text.contains(&expected), "{workflow} must set `{expected}`");
         }

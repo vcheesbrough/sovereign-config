@@ -207,20 +207,24 @@ steps:
         from_secret: sovereign_config_prod_manager_api_token
       VALUE_ENCRYPTION_KEY:
         from_secret: sovereign_config_prod_value_encryption_key
-      # Telemetry (README "Observability"): non-secret, so kept here with
-      # the deploy rather than in the store this deploy would have to read
-      # itself from. compose.yaml passes the names through.
-      OTEL_SERVICE_NAME: sovereign-config
-      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=prod,telemetry_source=otlp
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://monitor-alloy:4318
-      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-      OTEL_LOGS_EXPORTER: otlp
-      # Until spans (#420) and OTLP metrics (#421) exist.
-      OTEL_METRICS_EXPORTER: none
-      OTEL_TRACES_EXPORTER: none
     commands:
       - echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
       - |
+        # Telemetry (README "Observability"): non-secret, so kept here with the
+        # deploy rather than in the store this deploy would have to read itself
+        # from. Exported in the shell, like every other value this command
+        # passes, rather than as step environment: a step-environment
+        # OTEL_RESOURCE_ATTRIBUTES did not reach compose intact (pipeline 311).
+        # compose.yaml passes the names through.
+        export OTEL_SERVICE_NAME=sovereign-config
+        export OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=prod,telemetry_source=otlp
+        export OTEL_EXPORTER_OTLP_ENDPOINT=http://monitor-alloy:4318
+        export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+        export OTEL_LOGS_EXPORTER=otlp
+        # Until spans (#420) and OTLP metrics (#421) exist.
+        export OTEL_METRICS_EXPORTER=none
+        export OTEL_TRACES_EXPORTER=none
+        printf 'telemetry: %s\n' "$$OTEL_RESOURCE_ATTRIBUTES"
         ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
         SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=prod SOVEREIGN_CONFIG_HOST=sovereign-config.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-production POSTGRES_DATA_VOLUME=sovereign-config-production-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL="$$OIDC_INTROSPECTION_URL" SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID=sovereign-config-introspection SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET_FILE= SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET="$$OIDC_INTROSPECTION_CLIENT_SECRET" SOVEREIGN_CONFIG_PUBLIC_ORIGIN=https://sovereign-config.desync.link SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE=sovereign_config_prod_grants SOVEREIGN_CONFIG_MANAGER_GROUP=sovereign-config-connections SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE= SOVEREIGN_CONFIG_MANAGER_API_TOKEN="$$MANAGER_API_TOKEN" SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE= SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY="$$VALUE_ENCRYPTION_KEY" docker compose -p sovereign-config-prod up -d --pull always --wait --wait-timeout 90 || {
           docker compose -p sovereign-config-prod logs --tail 200
