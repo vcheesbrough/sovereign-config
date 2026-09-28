@@ -388,7 +388,8 @@ impl ManagedConnectionsService {
         let actor = context.actor()?;
         let username = managed_username(&connection_id, &row.display_name);
         if let Some(user_id) = self.revocation_target(&row, &username).await? {
-            self.delete_account_confirmed(user_id, &username).await?;
+            self.delete_account_confirmed(&connection_id, user_id, &username)
+                .await?;
         }
         let event = AuditEvent::connection_revoked(
             &actor,
@@ -453,6 +454,7 @@ impl ManagedConnectionsService {
                 // the account.
                 if !self.credential_is_gone(username).await {
                     warn!(
+                        connection_id = row.connection_id.as_str(),
                         "revocation could neither find the account nor confirm its credential is gone; the connection stays revoking"
                     );
                     return Err(dependency_error());
@@ -465,7 +467,12 @@ impl ManagedConnectionsService {
     /// Deletes the account, or confirms it is already gone. The row stays
     /// `revoking` on failure, so revocation can be retried until absence is
     /// confirmed.
-    async fn delete_account_confirmed(&self, user_id: i64, username: &str) -> Result<(), Status> {
+    async fn delete_account_confirmed(
+        &self,
+        connection_id: &ConnectionId,
+        user_id: i64,
+        username: &str,
+    ) -> Result<(), Status> {
         match self.admin.delete_user(user_id).await {
             Ok(()) => {
                 self.metrics.record_dependency(
@@ -492,6 +499,7 @@ impl ManagedConnectionsService {
                     // The row stays `revoking`; revocation can be retried
                     // until absence is confirmed.
                     warn!(
+                        connection_id = connection_id.as_str(),
                         "revocation could not confirm the account's credential is gone; the connection stays revoking"
                     );
                     return Err(dependency_error());

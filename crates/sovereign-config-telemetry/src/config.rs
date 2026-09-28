@@ -31,10 +31,15 @@ pub const OTEL_TRACES_SAMPLER_ARG: &str = "OTEL_TRACES_SAMPLER_ARG";
 /// silently getting HTTP.
 pub const HTTP_PROTOBUF: &str = "http/protobuf";
 
-const SAMPLERS: [&str; 6] = [
+/// The samplers a deployment may choose. `traceidratio` is left out on
+/// purpose: it decides from the trace id alone, and an inbound `traceparent`
+/// lets the caller pick that id — so it would let any caller keep its own
+/// requests, and the `user.*` they carry, out of the trace store. The
+/// `parentbased_*` samplers are safe because the transport adopts an inbound
+/// parent as sampled (`crate::context::adopt_parent`).
+const SAMPLERS: [&str; 5] = [
     "always_on",
     "always_off",
-    "traceidratio",
     "parentbased_always_on",
     "parentbased_always_off",
     "parentbased_traceidratio",
@@ -351,7 +356,7 @@ fn validate_sampler(env: &OtelEnv) -> Result<(), ConfigError> {
     {
         return Err(ConfigError::new(
             OTEL_TRACES_SAMPLER,
-            "must name a standard sampler, such as parentbased_traceidratio",
+            "must be always_on, always_off or a parentbased_* sampler (traceidratio lets a caller choose, through its trace id, whether its request is recorded)",
         ));
     }
     if let Some(argument) = env.get(OTEL_TRACES_SAMPLER_ARG)
@@ -654,6 +659,14 @@ mod tests {
             &deployed_with(&[("OTEL_TRACES_SAMPLER", "sometimes")]),
             "OTEL_TRACES_SAMPLER",
             "sometimes",
+        );
+        // A caller picks its trace id, so a sampler that decides from the
+        // trace id alone would let it opt out of tracing.
+        assert_eq!(
+            validate(&deployed_with(&[("OTEL_TRACES_SAMPLER", "traceidratio")]))
+                .unwrap_err()
+                .variable,
+            "OTEL_TRACES_SAMPLER"
         );
         for value in ["1.5", "-0.1", "half"] {
             assert_rejects(

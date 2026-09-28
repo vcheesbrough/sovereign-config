@@ -1262,6 +1262,21 @@ async fn managed_decisions_and_degraded_outcomes_are_logged() {
             .rotate_managed_connection(rotate_request())
             .instrument(rpc())
             .await;
+        // Revocation whose delete fails while the credential is still
+        // visible: it cannot confirm the account is gone.
+        mock.script(|script| {
+            script.delete_user = Behavior::Status(StatusCode::INTERNAL_SERVER_ERROR);
+        });
+        sleep(ROTATION_LEASE).await;
+        let _ = service
+            .revoke_managed_connection(request(
+                RevokeManagedConnectionRequest {
+                    connection_id: connection_id.clone(),
+                },
+                &operator("/"),
+            ))
+            .instrument(rpc())
+            .await;
     }
     let exported = capture.finish();
 
@@ -1283,6 +1298,13 @@ async fn managed_decisions_and_degraded_outcomes_are_logged() {
     expect("rotation failed before the credential changed; the previous URL stays current");
     expect(
         "rotation outcome is unknown; the connection stays rotation_unknown until its lease expires and a retry settles it",
+    );
+    let revoking = expect(
+        "revocation could not confirm the account's credential is gone; the connection stays revoking",
+    );
+    assert_eq!(
+        revoking.attributes.get("connection_id"),
+        Some(&connection_id)
     );
     // Each is in the trace of the call that decided it.
     for log in &exported.logs {
