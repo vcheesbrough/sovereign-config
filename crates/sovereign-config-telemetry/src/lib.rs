@@ -50,27 +50,39 @@ const SHUTDOWN_TARGET: &str = "sovereign_config_telemetry::shutdown";
 /// Targets kept out of the log bridge, whatever `RUST_LOG` says, so that
 /// exporting can never produce a record that itself needs exporting: the SDK's
 /// own diagnostics (every `opentelemetry*` crate logs under its crate name)
-/// and the HTTP stack the exporter sends through.
-const NEVER_BRIDGED: [&str; 6] = [
+/// and the HTTP client the exporter sends through (`reqwest` over
+/// `hyper_util`'s client, which also names the host it dials). These reach
+/// stdout only — the server's own outbound `reqwest` calls included, a loss
+/// recorded in `AGENTS.md`. The server's gRPC stack (`tonic`, `h2`, `hyper`)
+/// is deliberately bridged: its transport errors are worth exporting.
+/// `hyper`'s shared HTTP/1 codec also serves the exporter, but logs only at
+/// `trace`, a deliberate debugging level.
+const NEVER_BRIDGED: [&str; 4] = [
     "opentelemetry",
-    "hyper",
-    "h2",
     "reqwest",
-    "tonic",
+    "hyper_util::client",
     SHUTDOWN_TARGET,
 ];
 
 /// Why telemetry could not start.
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
+    /// Not a `#[source]`: the message already carries it, and `anyhow` would
+    /// print it a second time as the cause.
     #[error("invalid telemetry configuration: {0}")]
-    Config(#[from] ConfigError),
+    Config(ConfigError),
     /// The exporter's own message is deliberately not carried: the SDK quotes
     /// the endpoint in it.
     #[error("the OTLP log exporter could not be built")]
     Exporter,
     #[error("a global tracing subscriber is already installed")]
     AlreadyInstalled,
+}
+
+impl From<ConfigError> for InitError {
+    fn from(error: ConfigError) -> Self {
+        Self::Config(error)
+    }
 }
 
 /// The facts about this process that are not the deployment's to state.

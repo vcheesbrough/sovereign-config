@@ -14,7 +14,6 @@ opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-semantic-conventions.workspace = true
-tracing-opentelemetry.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -24,6 +23,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true

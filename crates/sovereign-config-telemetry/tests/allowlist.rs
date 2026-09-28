@@ -98,18 +98,42 @@ fn no_other_source_names_an_sdk_or_exporter_crate() {
     );
 }
 
+/// Asked of Cargo rather than read off the manifests, so the table form, a
+/// target-specific table and a `package = "…"` rename are all resolved to the
+/// real package name before the check.
 #[test]
-fn no_other_manifest_depends_on_an_sdk_or_exporter_crate() {
+fn no_other_member_depends_on_an_sdk_or_exporter_crate() {
+    let output = std::process::Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+        ])
+        .current_dir(workspace_root())
+        .output()
+        .expect("cargo metadata must run");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cargo metadata emits JSON");
+    let packages = metadata["packages"].as_array().expect("a package list");
+    assert!(packages.len() > 5, "the check must see the workspace");
+
     let mut offenders = Vec::new();
-    for member in other_members() {
-        let manifest = member.join("Cargo.toml");
-        let Ok(text) = fs::read_to_string(&manifest) else {
+    for package in packages {
+        let name = package["name"].as_str().unwrap_or_default();
+        if name == THIS_CRATE {
             continue;
-        };
-        for line in text.lines() {
-            let name = line.split(['=', '.', ' ']).next().unwrap_or_default();
-            if SDK_PACKAGES.contains(&name) {
-                offenders.push(format!("{} depends on {name}", manifest.display()));
+        }
+        for dependency in package["dependencies"].as_array().into_iter().flatten() {
+            let dependency = dependency["name"].as_str().unwrap_or_default();
+            if SDK_PACKAGES.contains(&dependency) {
+                offenders.push(format!("{name} depends on {dependency}"));
             }
         }
     }

@@ -73,7 +73,8 @@ uuid = { version = "1.26.1", features = ["v5"] }
 # `tracing-opentelemetry` has its own number and lags. It sets the pace: the
 # core is pinned to the `opentelemetry` requirement of the newest
 # `tracing-opentelemetry` release, never inferred from version numbers. On
-# 2026-09-28 that was `tracing-opentelemetry` 0.34.0, requiring core 0.33.
+# 2026-09-28 that was `tracing-opentelemetry` 0.34.0, requiring core 0.33;
+# spans (#420) add it at exactly that version, or move the whole set.
 #
 # Only `sovereign-config-telemetry` may depend on `_sdk`, `-otlp`,
 # `-appender-tracing` or `tracing-opentelemetry` (its allowlist test enforces
@@ -83,12 +84,14 @@ uuid = { version = "1.26.1", features = ["v5"] }
 opentelemetry = { version = "0.33.0", default-features = false, features = ["trace", "logs"] }
 opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["trace", "logs"] }
 # http/protobuf only, over the blocking reqwest client the SDK's batch thread
-# drives. `grpc-tonic` is left out: it would pull a second tonic/prost major
-# beside the server's, for a transport this estate's collector does not need.
+# drives. This path already brings second majors of prost (0.14, via
+# `opentelemetry-proto`) and reqwest (0.13) beside the server's 0.13 and 0.12;
+# that was accepted. `grpc-tonic` is left out because it would add a second
+# tonic as well, and needs an async-runtime batch processor, for a transport
+# this estate's collector does not need.
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "logs", "internal-logs"] }
 opentelemetry-appender-tracing = { version = "0.33.0", default-features = false }
 opentelemetry-semantic-conventions = "0.33.0"
-tracing-opentelemetry = { version = "0.34.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

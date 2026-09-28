@@ -223,6 +223,16 @@ fn an_invalid_otel_set_fails_startup_naming_the_variable_but_not_the_value() {
     }
 }
 
+/// Whether stdout carries the SDK's report of a failed export — the only
+/// signal of dropped records, since the SDK exports no counter (AGENTS.md
+/// deviations register).
+fn reports_export_failure(stdout: &str) -> bool {
+    stdout.lines().any(|line| {
+        line.contains("\"target\":\"opentelemetry")
+            && (line.contains("\"level\":\"ERROR\"") || line.contains("\"level\":\"WARN\""))
+    }) || stdout.contains("telemetry did not flush cleanly")
+}
+
 #[test]
 fn an_unreachable_collector_neither_fails_startup_nor_delays_exit() {
     let endpoint = format!("http://127.0.0.1:{}", unused_port());
@@ -233,6 +243,11 @@ fn an_unreachable_collector_neither_fails_startup_nor_delays_exit() {
     assert!(stderr.contains("SOVEREIGN_CONFIG_GRPC_ADDR"), "{stderr}");
     assert!(elapsed < EXIT_BOUND, "exit took {elapsed:?}");
     assert!(!stdout.contains(&endpoint), "{stdout}");
+    // The records flushed at exit went to a dead port, and that must show.
+    assert!(
+        reports_export_failure(&stdout),
+        "an export failure must be visible on stdout: {stdout}"
+    );
 }
 
 /// Sends SIGTERM, as `docker stop` does.
@@ -368,4 +383,9 @@ async fn with_the_collector_unreachable_the_server_serves_and_stops_within_the_b
     assert!(stdout.contains("sovereign-config started"), "{stdout}");
     assert!(elapsed < EXIT_BOUND, "exit took {elapsed:?}");
     assert!(!stdout.contains(&endpoint), "{stdout}");
+    // The records flushed at exit went to a dead port, and that must show.
+    assert!(
+        reports_export_failure(&stdout),
+        "an export failure must be visible on stdout: {stdout}"
+    );
 }

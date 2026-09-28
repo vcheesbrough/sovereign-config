@@ -283,10 +283,24 @@ fn the_sdk_s_own_diagnostics_never_reach_the_log_bridge() {
         tracing::warn!(target: "opentelemetry_sdk", "export failed");
         tracing::debug!(target: "opentelemetry_otlp", url = "http://collector", "detail");
         tracing::warn!(target: "reqwest::blocking", "connection refused");
+        tracing::warn!(target: "hyper_util::client::legacy::connect::http", "dial failed");
+        // The server's own gRPC stack is not the exporter's, and is bridged.
+        tracing::warn!(target: "tonic::transport::server", "h2c protocol error");
         telemetry.shutdown();
     });
 
-    assert!(exporter.get_emitted_logs().unwrap().is_empty());
+    let bridged_targets: Vec<String> = exporter
+        .get_emitted_logs()
+        .unwrap()
+        .iter()
+        .map(|log| {
+            log.record
+                .target()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(bridged_targets, ["tonic::transport::server"]);
     let lines = stdout.lines();
     // The warning is the failure signal on stdout; the debug detail, which
     // names the endpoint, is not written at all.
