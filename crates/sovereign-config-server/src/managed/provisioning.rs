@@ -194,11 +194,12 @@ impl ManagedConnectionsService {
         // Group membership is an operator convenience for browsing accounts in
         // Authentik; it grants nothing and its failure must never fail or roll
         // back a connection that is otherwise fully functional.
-        self.assign_managed_group(account.user_id).await;
+        self.assign_managed_group(connection_id, account.user_id)
+            .await;
         Ok(())
     }
 
-    pub(super) async fn assign_managed_group(&self, user_id: i64) {
+    pub(super) async fn assign_managed_group(&self, connection_id: &ConnectionId, user_id: i64) {
         let outcome = match self
             .admin
             .find_group_by_name(&self.settings.managed_group)
@@ -213,6 +214,7 @@ impl ManagedConnectionsService {
         };
         if !matches!(outcome, ManagedDependencyOutcome::Ok) {
             warn!(
+                connection_id = connection_id.as_str(),
                 outcome = outcome.as_str(),
                 "the service account was not added to the browsing group; the connection works regardless"
             );

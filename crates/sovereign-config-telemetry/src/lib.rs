@@ -148,21 +148,29 @@ impl Telemetry {
     }
 
     /// Flushes and stops every provider, waiting at most [`SHUTDOWN_TIMEOUT`]
-    /// for each. Idempotent. Spans go first, so the log records a span's end
-    /// produced are still flushed after it. A failure is reported on stdout
-    /// only: the provider it would be exported through is the thing that just
-    /// stopped.
+    /// in all: the providers flush **at the same time**, each with the whole
+    /// bound, so an unreachable collector costs one timeout rather than one
+    /// per signal — which matters inside Docker's default ten-second stop
+    /// grace, where whatever is still flushing at the end is killed.
+    /// Idempotent. A failure is reported on stdout only: the provider it would
+    /// be exported through is the thing that just stopped.
     pub fn shutdown(&mut self) {
-        if let Some(traces) = self.traces.take()
-            && let Err(error) = traces.shutdown_with_timeout(SHUTDOWN_TIMEOUT)
-        {
-            warn!(target: SHUTDOWN_TARGET, signal = "traces", error = %error, "telemetry did not flush cleanly");
-        }
-        if let Some(logs) = self.logs.take()
-            && let Err(error) = logs.shutdown_with_timeout(SHUTDOWN_TIMEOUT)
-        {
-            warn!(target: SHUTDOWN_TARGET, signal = "logs", error = %error, "telemetry did not flush cleanly");
-        }
+        let traces = self.traces.take();
+        let logs = self.logs.take();
+        std::thread::scope(|scope| {
+            if let Some(traces) = traces {
+                scope.spawn(move || {
+                    if let Err(error) = traces.shutdown_with_timeout(SHUTDOWN_TIMEOUT) {
+                        warn!(target: SHUTDOWN_TARGET, signal = "traces", error = %error, "telemetry did not flush cleanly");
+                    }
+                });
+            }
+            if let Some(logs) = logs
+                && let Err(error) = logs.shutdown_with_timeout(SHUTDOWN_TIMEOUT)
+            {
+                warn!(target: SHUTDOWN_TARGET, signal = "logs", error = %error, "telemetry did not flush cleanly");
+            }
+        });
     }
 }
 

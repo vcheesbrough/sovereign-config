@@ -435,3 +435,74 @@ fn stdout_lines_carry_no_span_fields() {
         );
     }
 }
+
+/// A collector that accepts connections and never answers — the worst case
+/// for a flush — costs one shutdown bound, not one per signal: both signals
+/// flush at once, inside Docker's default stop grace.
+#[test]
+fn a_hung_collector_costs_one_shutdown_bound_for_both_signals() {
+    use opentelemetry_otlp::{Protocol, WithExportConfig};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let holder = Arc::clone(&held);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            holder.lock().unwrap().push(stream);
+        }
+    });
+    let plan = validate(&OtelEnv::from_pairs(
+        DEPLOYED
+            .into_iter()
+            .chain([("OTEL_TRACES_EXPORTER", "otlp")]),
+    ))
+    .unwrap();
+    let Assembly {
+        subscriber,
+        mut telemetry,
+    } = assemble(
+        plan,
+        &identity(Some("host")),
+        "info",
+        Captured::default(),
+        Exporters {
+            logs: move || {
+                opentelemetry_otlp::LogExporter::builder()
+                    .with_http()
+                    .with_protocol(Protocol::HttpBinary)
+                    .with_endpoint(format!("http://{address}/v1/logs"))
+                    .with_timeout(Duration::from_secs(30))
+                    .build()
+                    .map_err(|_| InitError::Exporter("log"))
+            },
+            log_batch: slow_batches(),
+            spans: move || {
+                opentelemetry_otlp::SpanExporter::builder()
+                    .with_http()
+                    .with_protocol(Protocol::HttpBinary)
+                    .with_endpoint(format!("http://{address}/v1/traces"))
+                    .with_timeout(Duration::from_secs(30))
+                    .build()
+                    .map_err(|_| InitError::Exporter("span"))
+            },
+            span_batch: trace::BatchConfigBuilder::default()
+                .with_scheduled_delay(Duration::from_secs(3600))
+                .build(),
+        },
+    )
+    .unwrap();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!(target: "sovereign_config_test", "work");
+        let _entered = span.enter();
+        tracing::info!("pending");
+    });
+    let started = Instant::now();
+    telemetry.shutdown();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < SHUTDOWN_TIMEOUT + Duration::from_millis(1500),
+        "shutdown took {elapsed:?}"
+    );
+}
