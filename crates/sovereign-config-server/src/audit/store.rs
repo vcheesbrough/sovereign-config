@@ -9,7 +9,7 @@ use std::borrow::Cow;
 
 use sqlx::{FromRow, PgExecutor, PgPool, Postgres, QueryBuilder};
 use time::OffsetDateTime;
-use tracing::instrument;
+use tracing::{field::Empty, instrument};
 
 use super::{Actor, EventKind};
 
@@ -50,7 +50,7 @@ fn storable(text: &str) -> Cow<'_, str> {
 #[instrument(
     name = "insert_events audit_events",
     skip_all,
-    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "insert_events", db.collection.name = "audit_events")
+    fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "insert_events", db.collection.name = "audit_events")
 )]
 pub(super) async fn insert_events<'e, E>(
     executor: E,
@@ -114,7 +114,8 @@ where
     .bind(narratives)
     .bind(coalesce_digests)
     .execute(executor)
-    .await?;
+    .await
+    .inspect_err(crate::spans::record_storage_error)?;
     Ok(())
 }
 
@@ -123,7 +124,7 @@ where
 #[instrument(
     name = "delete_before audit_events",
     skip_all,
-    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "delete_before", db.collection.name = "audit_events")
+    fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "delete_before", db.collection.name = "audit_events")
 )]
 pub(super) async fn delete_before(
     database: &PgPool,
@@ -132,7 +133,8 @@ pub(super) async fn delete_before(
     let swept = sqlx::query("DELETE FROM audit_events WHERE occurred_at < $1")
         .bind(cutoff)
         .execute(database)
-        .await?;
+        .await
+        .inspect_err(crate::spans::record_storage_error)?;
     Ok(swept.rows_affected())
 }
 
@@ -240,7 +242,7 @@ fn push_covered<'a>(
 #[instrument(
     name = "query_events audit_events",
     skip_all,
-    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "query_events", db.collection.name = "audit_events")
+    fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "query_events", db.collection.name = "audit_events")
 )]
 pub(super) async fn query_events(
     database: &PgPool,
@@ -312,7 +314,11 @@ pub(super) async fn query_events(
     query
         .push(" ORDER BY first_occurred_at DESC, id DESC LIMIT ")
         .push_bind(filter.limit);
-    query.build_query_as().fetch_all(database).await
+    query
+        .build_query_as()
+        .fetch_all(database)
+        .await
+        .inspect_err(crate::spans::record_storage_error)
 }
 
 #[cfg(test)]

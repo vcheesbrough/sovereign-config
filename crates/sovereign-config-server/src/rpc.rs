@@ -109,9 +109,16 @@ pub(crate) const fn to_proto_timestamp(value: Timestamp) -> prost_types::Timesta
 /// outcome by matching it, exactly as before the helper was shared.
 pub(crate) const STORAGE_UNAVAILABLE_MESSAGE: &str = "configuration storage is unavailable";
 
+/// The storage failure every service reports, and the one place a failed
+/// store call is marked on its span: called inside a store function's
+/// `#[instrument]` span, it records `error.type=storage_unavailable` there.
 pub(crate) fn storage_unavailable() -> Status {
+    crate::spans::record_error(STORAGE_UNAVAILABLE_TYPE);
     Status::unavailable(STORAGE_UNAVAILABLE_MESSAGE)
 }
+
+/// `error.type` of a failed store call.
+pub(crate) const STORAGE_UNAVAILABLE_TYPE: &str = "storage_unavailable";
 
 fn invalid_timestamp() -> Status {
     Status::internal("configuration timestamp is invalid")

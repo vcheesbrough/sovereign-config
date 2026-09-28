@@ -903,3 +903,242 @@ async fn only_authenticated_traffic_moves_the_retirement_gate() {
         "{rendered}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Spans through the authentication stack, as `main.rs` layers it
+// ---------------------------------------------------------------------------
+
+/// A native gRPC answer with its status in trailers, as a handler produces.
+fn grpc_answer(code: tonic::Code) -> Response<BoxBody> {
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", HeaderValue::from(code as i32));
+    let body = empty_body()
+        .with_trailers(async move { Some(Ok(trailers)) })
+        .boxed_unsync();
+    let mut response = Response::new(body);
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));
+    response
+}
+
+/// Sends `request` through the trace layer and the gRPC stack, answering at
+/// the bottom with `answer`, and reads the whole response so its trailers —
+/// and the span's end — are reached.
+async fn through_the_stack(
+    authenticator: Authenticator,
+    request: Request<BoxBody>,
+    answer: tonic::Code,
+) -> Response<()> {
+    let stack = grpc_service_layer(
+        authenticator,
+        Arc::new(AuthenticationMetrics::default()),
+        Arc::new(ProtocolMetrics::new(&["v3"])),
+        &["v3"],
+    );
+    let inner =
+        service_fn(
+            move |_: Request<BoxBody>| async move { Ok::<_, Infallible>(grpc_answer(answer)) },
+        );
+    let response = crate::spans::TraceLayer
+        .layer(stack.layer(inner))
+        .oneshot(request)
+        .await
+        .unwrap();
+    let (parts, body) = response.into_parts();
+    body.collect().await.unwrap();
+    Response::from_parts(parts, ())
+}
+
+fn grpc_request(path: &str, content_type: &'static str, headers: HeaderMap) -> Request<BoxBody> {
+    // Native gRPC is HTTP/2; gRPC-Web arrives over HTTP/1.1, as from a browser.
+    let version = if content_type == "application/grpc" {
+        http::Version::HTTP_2
+    } else {
+        http::Version::HTTP_11
+    };
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .version(version)
+        .uri(path)
+        .header(CONTENT_TYPE, content_type)
+        .body(empty_body())
+        .unwrap();
+    request.headers_mut().extend(headers);
+    request
+}
+
+/// `user.*` is the one place personal data enters a span: stamped from the
+/// introspected token on an authenticated call, absent from a refused one,
+/// and never copied onto a log record.
+#[tokio::test]
+async fn an_authenticated_call_is_stamped_with_who_made_it_and_nothing_else_is() {
+    let mut claims = valid_response_json();
+    claims["preferred_username"] = json!("Span Operator");
+    let server = fake_server(StatusCode::OK, claims.to_string(), Duration::ZERO).await;
+    let capture = sovereign_config_telemetry::testing::Capture::exporting();
+    {
+        let _guard = capture.enter();
+        through_the_stack(
+            authenticator(server.url.clone(), Duration::from_secs(1)),
+            grpc_request(
+                "/sovereign.config.v3.System/GetIdentity",
+                "application/grpc",
+                authenticated_headers(),
+            ),
+            tonic::Code::Ok,
+        )
+        .await;
+        through_the_stack(
+            authenticator(server.url.clone(), Duration::from_secs(1)),
+            grpc_request(
+                "/sovereign.config.v3.System/GetIdentity",
+                "application/grpc",
+                HeaderMap::new(),
+            ),
+            tonic::Code::Ok,
+        )
+        .await;
+    }
+    let exported = capture.finish();
+
+    let calls = exported.spans_named("sovereign.config.v3.System/GetIdentity");
+    assert_eq!(calls.len(), 2);
+    let accepted = calls
+        .iter()
+        .find(|span| span.attribute("rpc.response.status_code") == Some("OK"))
+        .expect("the authenticated call");
+    assert_eq!(accepted.attribute("user.id"), Some("principal-id"));
+    assert_eq!(accepted.attribute("user.name"), Some("Span Operator"));
+    let introspection = exported.span("POST");
+    assert!(introspection.is_child_of(accepted));
+    assert_eq!(introspection.kind, "client");
+
+    let refused = calls
+        .iter()
+        .find(|span| span.attribute("rpc.response.status_code") == Some("UNAUTHENTICATED"))
+        .expect("the refused call");
+    assert_eq!(refused.attribute("user.id"), None);
+    assert_eq!(refused.attribute("user.name"), None);
+    assert!(
+        !refused.is_error,
+        "a refusal is the client's error, not ours"
+    );
+
+    for log in &exported.logs {
+        assert!(
+            !log.attributes.keys().any(|key| key.starts_with("user.")),
+            "{log:?}"
+        );
+        assert!(
+            !log.attributes
+                .values()
+                .any(|value| value.contains("Span Operator") || value == "principal-id"),
+            "{log:?}"
+        );
+    }
+    for value in exported.all_values() {
+        assert!(!value.contains(TEST_CLIENT_SECRET), "{value}");
+        assert!(!value.contains(&token("RS256")), "{value}");
+    }
+}
+
+/// The status recorder sees every answer: a handler's trailers, the
+/// trailers-only refusals of the catch-all and of authentication, and a
+/// browser's call — which only works because the recorder sits inside
+/// gRPC-Web. Only the conventions' server-error codes fail the span.
+#[tokio::test]
+async fn every_grpc_status_is_recorded_and_only_server_errors_fail_the_span() {
+    let unavailable = fake_server(StatusCode::SERVICE_UNAVAILABLE, "{}", Duration::ZERO).await;
+    let capture = sovereign_config_telemetry::testing::Capture::exporting();
+    let browser_content_type;
+    {
+        let _guard = capture.enter();
+        let authenticator = || authenticator(unavailable.url.clone(), Duration::from_secs(1));
+        // Authentication cannot reach its dependency: UNAVAILABLE, trailers-only.
+        through_the_stack(
+            authenticator(),
+            grpc_request(
+                "/sovereign.config.v3.System/GetIdentity",
+                "application/grpc",
+                authenticated_headers(),
+            ),
+            tonic::Code::Ok,
+        )
+        .await;
+        // A retired version: FAILED_PRECONDITION from the catch-all.
+        through_the_stack(
+            authenticator(),
+            grpc_request(
+                "/sovereign.config.v99.System/GetVersion",
+                "application/grpc",
+                HeaderMap::new(),
+            ),
+            tonic::Code::Ok,
+        )
+        .await;
+        // A handler's NOT_FOUND, in trailers.
+        through_the_stack(
+            authenticator(),
+            grpc_request(
+                "/sovereign.config.v3.System/GetVersion",
+                "application/grpc",
+                HeaderMap::new(),
+            ),
+            tonic::Code::NotFound,
+        )
+        .await;
+        // A browser's call, answered INTERNAL in trailers the browser sees
+        // framed into the body.
+        let response = through_the_stack(
+            authenticator(),
+            grpc_request(
+                "/sovereign.config.v3.System/GetVersion",
+                "application/grpc-web+proto",
+                HeaderMap::new(),
+            ),
+            tonic::Code::Internal,
+        )
+        .await;
+        browser_content_type = response.headers().get(CONTENT_TYPE).cloned();
+    }
+    let exported = capture.finish();
+    assert_eq!(
+        browser_content_type.as_ref().map(HeaderValue::as_bytes),
+        Some(&b"application/grpc-web+proto"[..])
+    );
+
+    let identity = exported.span("sovereign.config.v3.System/GetIdentity");
+    assert_eq!(
+        identity.attribute("rpc.response.status_code"),
+        Some("UNAVAILABLE")
+    );
+    assert!(identity.is_error);
+    assert_eq!(identity.attribute("error.type"), Some("UNAVAILABLE"));
+    let introspection = exported.span("POST");
+    assert!(introspection.is_error);
+    assert_eq!(introspection.attribute("error.type"), Some("unavailable"));
+    assert_eq!(
+        introspection.attribute("http.response.status_code"),
+        Some("503")
+    );
+
+    let retired = exported.span("_OTHER");
+    assert_eq!(
+        retired.attribute("rpc.response.status_code"),
+        Some("FAILED_PRECONDITION")
+    );
+    assert!(!retired.is_error);
+
+    let versions = exported.spans_named("sovereign.config.v3.System/GetVersion");
+    let status = |code: &str| {
+        versions
+            .iter()
+            .find(|span| span.attribute("rpc.response.status_code") == Some(code))
+            .unwrap_or_else(|| panic!("no GetVersion span answered {code}: {versions:?}"))
+    };
+    assert!(!status("NOT_FOUND").is_error);
+    let browser = status("INTERNAL");
+    assert!(browser.is_error);
+    assert_eq!(browser.attribute("error.type"), Some("INTERNAL"));
+}

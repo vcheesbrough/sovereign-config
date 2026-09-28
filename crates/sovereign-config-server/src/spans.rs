@@ -430,6 +430,13 @@ pub(crate) async fn send(
     Ok(response)
 }
 
+/// Marks the current store span failed, for a store function that returns
+/// `sqlx::Error` rather than going through [`crate::rpc::storage_unavailable`].
+/// Never records the error itself: its text can quote SQL or a value.
+pub(crate) fn record_storage_error(_: &sqlx::Error) {
+    record_error(crate::rpc::STORAGE_UNAVAILABLE_TYPE);
+}
+
 /// Marks the current span failed, with a bounded classification as its
 /// `error.type`.
 pub(crate) fn record_error(classification: &'static str) {

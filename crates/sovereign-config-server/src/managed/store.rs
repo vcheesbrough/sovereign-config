@@ -7,7 +7,7 @@ use sovereign_config_core::{
 use sqlx::{FromRow, Postgres, Transaction};
 use time::OffsetDateTime;
 use tonic::Status;
-use tracing::instrument;
+use tracing::{field::Empty, instrument};
 
 use super::ManagedConnectionsService;
 use super::wire::{internal_error, not_found};
@@ -33,7 +33,7 @@ impl ManagedConnectionsService {
     #[instrument(
         name = "begin",
         skip_all,
-        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "begin")
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "begin")
     )]
     pub(super) async fn begin(&self) -> Result<Transaction<'_, Postgres>, Status> {
         self.database
@@ -47,7 +47,7 @@ impl ManagedConnectionsService {
     #[instrument(
         name = "lock_manageable managed_connections",
         skip_all,
-        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "lock_manageable", db.collection.name = "managed_connections")
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "lock_manageable", db.collection.name = "managed_connections")
     )]
     pub(super) async fn lock_manageable(
         &self,
@@ -84,7 +84,7 @@ impl ManagedConnectionsService {
     #[instrument(
         name = "transition_state managed_connections",
         skip_all,
-        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "transition_state", db.collection.name = "managed_connections")
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "transition_state", db.collection.name = "managed_connections")
     )]
     pub(super) async fn transition_state(
         &self,
@@ -124,7 +124,7 @@ impl ManagedConnectionsService {
     #[instrument(
         name = "transition_state_recorded managed_connections",
         skip_all,
-        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "transition_state_recorded", db.collection.name = "managed_connections")
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "transition_state_recorded", db.collection.name = "managed_connections")
     )]
     pub(super) async fn transition_state_recorded(
         &self,
@@ -168,7 +168,7 @@ impl ManagedConnectionsService {
     #[instrument(
         name = "delete_connection_recorded managed_connections",
         skip_all,
-        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "delete_connection_recorded", db.collection.name = "managed_connections")
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "delete_connection_recorded", db.collection.name = "managed_connections")
     )]
     pub(super) async fn delete_connection_recorded(
         &self,
@@ -197,7 +197,7 @@ impl ManagedConnectionsService {
     #[instrument(
         name = "delete_connection managed_connections",
         skip_all,
-        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "delete_connection", db.collection.name = "managed_connections")
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "delete_connection", db.collection.name = "managed_connections")
     )]
     pub(super) async fn delete_connection(
         &self,
@@ -215,7 +215,7 @@ impl ManagedConnectionsService {
     #[instrument(
         name = "list_rows managed_connections",
         skip_all,
-        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "list_rows", db.collection.name = "managed_connections")
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "list_rows", db.collection.name = "managed_connections")
     )]
     pub(super) async fn list_rows(&self) -> Result<Vec<ConnectionRow>, Status> {
         sqlx::query_as::<_, ConnectionRow>(
@@ -235,7 +235,7 @@ impl ManagedConnectionsService {
     #[instrument(
         name = "insert_provisioning managed_connections",
         skip_all,
-        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "insert_provisioning", db.collection.name = "managed_connections")
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "insert_provisioning", db.collection.name = "managed_connections")
     )]
     pub(super) async fn insert_provisioning(
         &self,
@@ -266,7 +266,7 @@ impl ManagedConnectionsService {
     #[instrument(
         name = "record_provider_user managed_connections",
         skip_all,
-        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "record_provider_user", db.collection.name = "managed_connections")
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "record_provider_user", db.collection.name = "managed_connections")
     )]
     pub(super) async fn record_provider_user(
         &self,
@@ -293,7 +293,7 @@ impl ManagedConnectionsService {
     #[instrument(
         name = "record_credential_identifier managed_connections",
         skip_all,
-        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "record_credential_identifier", db.collection.name = "managed_connections")
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "record_credential_identifier", db.collection.name = "managed_connections")
     )]
     pub(super) async fn record_credential_identifier(
         &self,
@@ -320,7 +320,7 @@ impl ManagedConnectionsService {
 #[instrument(
     name = "commit",
     skip_all,
-    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "commit")
+    fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "commit")
 )]
 pub(super) async fn commit(transaction: Transaction<'_, Postgres>) -> Result<(), Status> {
     transaction
@@ -334,7 +334,7 @@ pub(super) async fn commit(transaction: Transaction<'_, Postgres>) -> Result<(),
 #[instrument(
     name = "mark_rotation_unknown managed_connections",
     skip_all,
-    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "mark_rotation_unknown", db.collection.name = "managed_connections")
+    fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "mark_rotation_unknown", db.collection.name = "managed_connections")
 )]
 pub(super) async fn mark_rotation_unknown(
     transaction: &mut Transaction<'_, Postgres>,
@@ -359,7 +359,7 @@ pub(super) async fn mark_rotation_unknown(
 #[instrument(
     name = "mark_revoking managed_connections",
     skip_all,
-    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "mark_revoking", db.collection.name = "managed_connections")
+    fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "mark_revoking", db.collection.name = "managed_connections")
 )]
 pub(super) async fn mark_revoking(
     transaction: &mut Transaction<'_, Postgres>,

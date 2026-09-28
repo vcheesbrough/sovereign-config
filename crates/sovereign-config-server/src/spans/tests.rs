@@ -216,6 +216,58 @@ async fn a_request_without_traceparent_starts_a_new_trace() {
     assert_ne!(exported.spans[0].trace_id, exported.spans[1].trace_id);
 }
 
+/// The caller's "not sampled" flag is not obeyed: honouring it would let
+/// anyone keep a request, and who made it, out of the trace store with one
+/// header. The trace id and parent are still adopted.
+#[tokio::test]
+async fn a_caller_cannot_opt_a_request_out_of_tracing() {
+    let capture = Capture::exporting();
+    {
+        let _guard = capture.enter();
+        let unsampled = format!("00-{INBOUND_TRACE_ID}-{INBOUND_SPAN_ID}-00");
+        serve_one(get("/index.html", Some(&unsampled))).await;
+    }
+    let exported = capture.finish();
+
+    let span = exported.span("GET");
+    assert_eq!(span.trace_id, INBOUND_TRACE_ID);
+    assert_eq!(span.parent_span_id.as_deref(), Some(INBOUND_SPAN_ID));
+}
+
+#[tokio::test]
+async fn a_server_error_on_the_web_ui_marks_its_span_failed() {
+    let capture = Capture::exporting();
+    {
+        let _guard = capture.enter();
+        let handler = service_fn(|_request: Request<BoxBody>| async {
+            let mut response = Response::new(empty_body());
+            *response.status_mut() = http::StatusCode::INTERNAL_SERVER_ERROR;
+            Ok::<_, std::convert::Infallible>(response)
+        });
+        TraceLayer
+            .layer(handler)
+            .oneshot(get("/index.html", None))
+            .await
+            .unwrap();
+        serve_one(get("/missing", None)).await;
+    }
+    let exported = capture.finish();
+
+    let spans = exported.spans_named("GET");
+    let failed = spans
+        .iter()
+        .find(|span| span.attribute("url.path") == Some("/index.html"))
+        .unwrap();
+    assert!(failed.is_error);
+    assert_eq!(failed.attribute("http.response.status_code"), Some("500"));
+    assert_eq!(failed.attribute("error.type"), Some("500"));
+    let fine = spans
+        .iter()
+        .find(|span| span.attribute("url.path") == Some("/missing"))
+        .unwrap();
+    assert!(!fine.is_error);
+}
+
 #[tokio::test]
 async fn a_log_record_inside_a_request_span_carries_its_trace_and_span_ids() {
     let capture = Capture::exporting();
@@ -502,6 +554,9 @@ async fn a_store_call_is_a_child_span_that_carries_no_sql() {
     assert_eq!(store.attribute("db.system.name"), Some("postgresql"));
     assert_eq!(store.attribute("db.operation.name"), Some("delete_before"));
     assert_eq!(store.attribute("db.collection.name"), Some("audit_events"));
+    // The unreachable database fails the call, and the span says so.
+    assert!(store.is_error, "{store:?}");
+    assert_eq!(store.attribute("error.type"), Some("storage_unavailable"));
     for span in &exported.spans {
         for text in span.attributes.values().chain(std::iter::once(&span.name)) {
             for forbidden in FORBIDDEN_IN_DATABASE_SPANS {
@@ -539,11 +594,9 @@ async fn the_audit_sweep_is_a_root_span_even_when_something_else_is_current() {
     );
     assert_ne!(sweep.trace_id, exported.span("GET").trace_id);
     assert!(sweep.is_error, "the unreachable database fails the sweep");
-    assert!(
-        exported
-            .span("delete_before audit_events")
-            .is_child_of(sweep)
-    );
+    let store = exported.span("delete_before audit_events");
+    assert!(store.is_child_of(sweep));
+    assert!(store.is_error);
     // The failure is a log record in the sweep's trace, for the operator.
     let log = exported
         .log("audit retention sweep failed; retrying at the next interval")
