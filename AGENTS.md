@@ -165,7 +165,6 @@ in the change that closes it.
 | The internal listener (`/readyz`, `/metrics`) and the public port's gRPC health service (`grpc.health.v1.Health/*`) open no span. | Health is separate from telemetry, and the container health check probes every few seconds: a span per probe is noise. | — (deliberate) |
 | A Postgres span's `db.operation.name` is the store function's name (`insert_provisioning`), not the SQL verb, and there is no `db.query.summary`. | sqlx has no hook, so spans sit at the store functions, where the query *names* are; naming by function keeps SQL text off spans by construction (a test fails on `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`$1` in any attribute). | — (deliberate) |
 | Spans carry `code.module.name`, the span bridge's own key, which is not a semantic-convention name. | It is the quickest way from a span to the code that opened it; it is the one allowed exception in `sovereign-config-telemetry`'s key check. | Dropping it, if the conventions gain nothing `tracing` can fill |
-| A `POST` to an unserved route is an `rpc.method=_OTHER` span without the conventions' `rpc.method_original`. | The original route is request-derived; recording it would let a caller write arbitrary text into spans. | — (deliberate) |
 | The web UI, CLI, MCP server, provider and broker emit no telemetry. | Out of scope so far. | #376 (clients), #423 (broker) |
 
 *Kanban workflow and automated test coverage follow the agent-shared baseline

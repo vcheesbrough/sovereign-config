@@ -1202,6 +1202,100 @@ async fn ambiguous_creation_reconciles_only_the_exact_generated_account() {
     assert_eq!(rows[0].state, "cleanup_required");
 }
 
+/// The degraded managed-connection outcomes each leave one human-readable
+/// log line, at `warn`, in the request's trace — the line an operator reads
+/// to learn why a connection is in the state it is in. Decisions are `info`.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn managed_decisions_and_degraded_outcomes_are_logged() {
+    let mock = mock_authentik().await;
+    let service = service_or_skip!(&mock);
+    let (connection_id, _) = create(&service, "Logged", "/apps/api", &operator("/"))
+        .await
+        .expect("create must succeed");
+    let rotate_request = || {
+        request(
+            RotateManagedConnectionRequest {
+                connection_id: connection_id.clone(),
+            },
+            &operator("/"),
+        )
+    };
+
+    let rpc = || {
+        crate::spans::server_span(
+            &http::Method::POST,
+            "/sovereign.config.v3.ManagedConnections/CreateManagedConnection",
+        )
+        .expect("a served route has a span")
+    };
+    let capture = sovereign_config_telemetry::testing::Capture::exporting();
+    {
+        let _guard = capture.enter();
+        // Refused outright: a decision.
+        mock.script(|script| script.create_account = Behavior::Status(StatusCode::FORBIDDEN));
+        let _ = create(&service, "Refused", "/apps/api", &operator("/"))
+            .instrument(rpc())
+            .await;
+        // Ambiguous, found, and compensation fails: degraded, cleanup required.
+        mock.script(|script| {
+            script.create_account = Behavior::Timeout;
+            script.user_exists = true;
+            script.delete_user = Behavior::Status(StatusCode::INTERNAL_SERVER_ERROR);
+        });
+        let _ = create(&service, "Unrecoverable", "/apps/api", &operator("/"))
+            .instrument(rpc())
+            .await;
+        // Rotation refused, then ambiguous.
+        mock.script(|script| {
+            script.create_account = Behavior::Ok;
+            script.user_exists = false;
+            script.delete_user = Behavior::Ok;
+            script.set_credential = Behavior::Status(StatusCode::BAD_REQUEST);
+        });
+        let _ = service
+            .rotate_managed_connection(rotate_request())
+            .instrument(rpc())
+            .await;
+        mock.script(|script| script.set_credential = Behavior::Timeout);
+        let _ = service
+            .rotate_managed_connection(rotate_request())
+            .instrument(rpc())
+            .await;
+    }
+    let exported = capture.finish();
+
+    let expect = |body: &str| {
+        exported
+            .log(body)
+            .unwrap_or_else(|| panic!("no log record {body:?}; exported: {:?}", exported.logs))
+    };
+    expect("service account creation definitively failed; the connection was discarded");
+    expect("service account creation outcome is unknown; reconciling by the generated username");
+    expect("reconciliation found the account the ambiguous create made; removing it");
+    expect("compensation could not delete the created service account");
+    let cleanup =
+        expect("managed connection requires cleanup; revoking it removes any account left behind");
+    assert_eq!(
+        cleanup.attributes.get("reason").map(String::as_str),
+        Some("a service account may survive a failed creation")
+    );
+    expect("rotation failed before the credential changed; the previous URL stays current");
+    expect(
+        "rotation outcome is unknown; the connection stays rotation_unknown until its lease expires and a retry settles it",
+    );
+    // Each is in the trace of the call that decided it.
+    for log in &exported.logs {
+        assert!(log.trace_id.is_some(), "{log:?}");
+    }
+    for log in &exported.logs {
+        for value in log.attributes.values().chain(log.body.as_ref()) {
+            assert!(!value.contains(APP_PASSWORD_SENTINEL), "{value}");
+            assert!(!value.contains("authentik-body-sentinel"), "{value}");
+        }
+    }
+}
+
 /// Regression: a 2xx create response that fails this server's own strict
 /// validation (not a transport failure) must be reconciled the same way
 /// as a timeout, because Authentik may genuinely have committed the

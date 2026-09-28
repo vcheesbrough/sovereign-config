@@ -392,3 +392,46 @@ fn an_unreachable_collector_costs_nothing_and_shutdown_stays_bounded() {
         "{lines:?}"
     );
 }
+
+/// A span's attributes are the span's: stdout lines carry no span fields,
+/// so `user.*` recorded on a request span never reaches `docker logs`.
+#[test]
+fn stdout_lines_carry_no_span_fields() {
+    let exporter = InMemoryLogExporter::default();
+    let stdout = Captured::default();
+    let plan = validate(&OtelEnv::from_pairs(DEPLOYED)).unwrap();
+    let Assembly {
+        subscriber,
+        mut telemetry,
+    } = assemble_with(plan, &exporter, &stdout, None);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!(
+            target: "sovereign_config_server::spans",
+            "rpc",
+            user.id = "subject-sentinel",
+            user.name = "name-sentinel",
+        );
+        let _entered = span.enter();
+        tracing::info!("inside the span");
+        telemetry.shutdown();
+    });
+
+    let lines = stdout.lines();
+    let line = lines
+        .iter()
+        .find(|line| line.contains("inside the span"))
+        .expect("the event reached stdout");
+    for absent in ["subject-sentinel", "name-sentinel", "\"span\"", "\"spans\""] {
+        assert!(!line.contains(absent), "{absent} on stdout: {line}");
+    }
+    // Nor on the exported record: the bridge copies no span attributes.
+    for record in exporter.get_emitted_logs().unwrap() {
+        assert!(
+            !record
+                .record
+                .attributes_iter()
+                .any(|(key, _)| key.as_str().starts_with("user.")),
+        );
+    }
+}

@@ -148,21 +148,27 @@ pub(crate) fn server_span(method: &Method, path: &str) -> Option<Span> {
             user.id = Empty,
             user.name = Empty,
         ),
-        Route::OtherRpc => tracing::info_span!(
-            "rpc",
-            otel.name = OTHER,
-            otel.kind = "server",
-            otel.status_code = Empty,
-            rpc.system.name = "grpc",
-            rpc.method = OTHER,
-            rpc.response.status_code = Empty,
-            error.type = Empty,
-            user.id = Empty,
-            user.name = Empty,
-        ),
+        Route::OtherRpc => {
+            // The route as requested, as the conventions ask of `_OTHER`: an
+            // attribute, never the name, and bounded like `url.path`.
+            let original = bounded_path(path);
+            tracing::info_span!(
+                "rpc",
+                otel.name = OTHER,
+                otel.kind = "server",
+                otel.status_code = Empty,
+                rpc.system.name = "grpc",
+                rpc.method = OTHER,
+                rpc.method_original = original.trim_start_matches('/'),
+                rpc.response.status_code = Empty,
+                error.type = Empty,
+                user.id = Empty,
+                user.name = Empty,
+            )
+        }
         Route::Http => {
             let (name, recorded) = http_method(method);
-            let path: String = path.chars().take(MAX_RECORDED_PATH).collect();
+            let path = bounded_path(path);
             tracing::info_span!(
                 "http",
                 otel.name = name,
@@ -176,6 +182,13 @@ pub(crate) fn server_span(method: &Method, path: &str) -> Option<Span> {
         }
     };
     Some(span)
+}
+
+/// A request-derived path as a span attribute may carry it: the first
+/// [`MAX_RECORDED_PATH`] characters. Attributes may be as specific as the
+/// request (skill §3); span *names* stay bounded.
+fn bounded_path(path: &str) -> String {
+    path.chars().take(MAX_RECORDED_PATH).collect()
 }
 
 /// The span name and `http.request.method` for `method`: the method itself

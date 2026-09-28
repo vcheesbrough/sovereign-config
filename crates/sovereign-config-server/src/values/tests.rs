@@ -2782,3 +2782,26 @@ async fn a_replacement_past_the_cap_itemizes_the_sorted_prefix_and_counts_the_re
     clear_test_paths(&pool, &[BULK_ROOT]).await;
     clear_trail(&pool, BULK_ROOT).await;
 }
+
+/// A store call that fails marks its own span, through the same
+/// `storage_unavailable()` every service reports the failure with.
+#[tokio::test]
+async fn a_failed_store_call_marks_its_span_through_storage_unavailable() {
+    let pool = PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(500))
+        .connect_lazy("postgresql://span_test:span-test@127.0.0.1:1/span_test")
+        .unwrap();
+    let capture = sovereign_config_telemetry::testing::Capture::exporting();
+    {
+        let _guard = capture.enter();
+        let Err(status) = super::store::path_candidates(&pool).await else {
+            panic!("an unreachable database fails the call");
+        };
+        assert_eq!(status.code(), Code::Unavailable);
+    }
+    let exported = capture.finish();
+
+    let span = exported.span("path_candidates configuration_paths");
+    assert!(span.is_error, "{span:?}");
+    assert_eq!(span.attribute("error.type"), Some("storage_unavailable"));
+}

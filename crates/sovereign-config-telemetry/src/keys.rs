@@ -10,8 +10,8 @@
 pub use opentelemetry_semantic_conventions::attribute::{
     CODE_FILE_PATH, CODE_LINE_NUMBER, DB_COLLECTION_NAME, DB_OPERATION_NAME, DB_SYSTEM_NAME,
     ERROR_TYPE, EXCEPTION_MESSAGE, EXCEPTION_STACKTRACE, HTTP_REQUEST_METHOD,
-    HTTP_RESPONSE_STATUS_CODE, RPC_METHOD, RPC_RESPONSE_STATUS_CODE, RPC_SYSTEM_NAME,
-    SERVER_ADDRESS, URL_PATH, URL_TEMPLATE, USER_ID, USER_NAME,
+    HTTP_RESPONSE_STATUS_CODE, RPC_METHOD, RPC_METHOD_ORIGINAL, RPC_RESPONSE_STATUS_CODE,
+    RPC_SYSTEM_NAME, SERVER_ADDRESS, URL_PATH, URL_TEMPLATE, USER_ID, USER_NAME,
 };
 
 /// The prefix of every key this product names for itself.
@@ -35,7 +35,7 @@ pub const CODE_MODULE_NAME: &str = "code.module.name";
 /// The RPC keys are the conventions' current ones (`rpc.system.name`, a
 /// fully-qualified `rpc.method`, `rpc.response.status_code`), not the
 /// deprecated `rpc.system` / `rpc.service` / `rpc.grpc.status_code`.
-pub const SEMANTIC_CONVENTION: [&str; 18] = [
+pub const SEMANTIC_CONVENTION: [&str; 19] = [
     CODE_FILE_PATH,
     CODE_LINE_NUMBER,
     DB_COLLECTION_NAME,
@@ -47,6 +47,7 @@ pub const SEMANTIC_CONVENTION: [&str; 18] = [
     HTTP_REQUEST_METHOD,
     HTTP_RESPONSE_STATUS_CODE,
     RPC_METHOD,
+    RPC_METHOD_ORIGINAL,
     RPC_RESPONSE_STATUS_CODE,
     RPC_SYSTEM_NAME,
     SERVER_ADDRESS,

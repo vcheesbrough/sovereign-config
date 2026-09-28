@@ -149,6 +149,35 @@ fn a_route_names_its_version_and_anything_unserved_is_other() {
     assert!(server_span(&Method::POST, "/grpc.health.v1.Health/Check").is_none());
 }
 
+#[tokio::test]
+async fn an_unserved_route_is_named_other_and_keeps_its_bounded_original() {
+    let capture = Capture::exporting();
+    {
+        let _guard = capture.enter();
+        let long = format!("/sovereign.config.v99.System/{}", "x".repeat(400));
+        for path in ["/sovereign.config.v99.System/GetVersion", long.as_str()] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .body(empty_body())
+                .unwrap();
+            serve_one(request).await;
+        }
+    }
+    let exported = capture.finish();
+
+    let spans = exported.spans_named("_OTHER");
+    assert_eq!(spans.len(), 2);
+    for span in &spans {
+        assert_eq!(span.attribute("rpc.method"), Some("_OTHER"));
+        let original = span.attribute("rpc.method_original").unwrap();
+        assert!(original.chars().count() < 256, "{original}");
+    }
+    assert!(spans.iter().any(|span| {
+        span.attribute("rpc.method_original") == Some("sovereign.config.v99.System/GetVersion")
+    }));
+}
+
 // ---------------------------------------------------------------------------
 // Inbound: the server span
 // ---------------------------------------------------------------------------
