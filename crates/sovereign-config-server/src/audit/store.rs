@@ -9,6 +9,7 @@ use std::borrow::Cow;
 
 use sqlx::{FromRow, PgExecutor, PgPool, Postgres, QueryBuilder};
 use time::OffsetDateTime;
+use tracing::instrument;
 
 use super::{Actor, EventKind};
 
@@ -46,6 +47,11 @@ fn storable(text: &str) -> Cow<'_, str> {
 ///
 /// Two rows of one call must not share a key, which holds because only single
 /// accesses coalesce and they are recorded one at a time.
+#[instrument(
+    name = "insert_events audit_events",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "insert_events", db.collection.name = "audit_events")
+)]
 pub(super) async fn insert_events<'e, E>(
     executor: E,
     actor: &Actor<'_>,
@@ -114,6 +120,11 @@ where
 
 /// Deletes every event last seen before `cutoff`. A coalesced row goes by its
 /// most recent occurrence, so a window still being bumped is never swept.
+#[instrument(
+    name = "delete_before audit_events",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "delete_before", db.collection.name = "audit_events")
+)]
 pub(super) async fn delete_before(
     database: &PgPool,
     cutoff: OffsetDateTime,
@@ -226,6 +237,11 @@ fn push_covered<'a>(
 /// Built clause by clause so each filter that is unset costs nothing and each
 /// that is set can use its index: a fixed statement of `$n IS NULL OR …`
 /// clauses would leave the planner a generic plan that uses none of them.
+#[instrument(
+    name = "query_events audit_events",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "query_events", db.collection.name = "audit_events")
+)]
 pub(super) async fn query_events(
     database: &PgPool,
     filter: &EventFilter<'_>,

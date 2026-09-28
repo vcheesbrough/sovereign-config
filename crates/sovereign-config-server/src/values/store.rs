@@ -14,6 +14,7 @@ use sovereign_config_core::ConfigPath;
 use sqlx::{FromRow, PgExecutor, PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use tonic::Status;
+use tracing::instrument;
 
 use super::paths::parent_path;
 use crate::rpc::storage_unavailable;
@@ -109,6 +110,11 @@ pub(super) struct ContentRow {
 
 // True if `path` is an ancestor or descendant of an existing path; values form
 // a tree of leaves, so nesting is never allowed.
+#[instrument(
+    name = "path_collides configuration_paths",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "path_collides", db.collection.name = "configuration_paths")
+)]
 pub(super) async fn path_collides(
     transaction: &mut Transaction<'_, Postgres>,
     path: &str,
@@ -137,6 +143,11 @@ pub(super) async fn path_collides(
 /// written once, already sealed: no plaintext is ever handed to `PostgreSQL`,
 /// not even briefly inside the transaction, where it would still reach the
 /// write-ahead log.
+#[instrument(
+    name = "reserve_content_id configuration_value_contents",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "reserve_content_id", db.collection.name = "configuration_value_contents")
+)]
 pub(super) async fn reserve_content_id(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<i64, Status> {
@@ -152,6 +163,11 @@ pub(super) async fn reserve_content_id(
 ///
 /// `value` is the stored representation, already encrypted when the
 /// classification calls for it — this function does no encoding of its own.
+#[instrument(
+    name = "insert_content configuration_value_contents",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "insert_content", db.collection.name = "configuration_value_contents")
+)]
 pub(super) async fn insert_content(
     transaction: &mut Transaction<'_, Postgres>,
     content_id: i64,
@@ -179,6 +195,11 @@ pub(super) async fn insert_content(
 /// Inserts a path row. `path` is the exact case it was written with;
 /// `lowercase_path` is computed by Postgres and must never appear here — the
 /// generated column rejects any attempt to write it directly.
+#[instrument(
+    name = "insert_path configuration_paths",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "insert_path", db.collection.name = "configuration_paths")
+)]
 pub(super) async fn insert_path(
     transaction: &mut Transaction<'_, Postgres>,
     path: &str,
@@ -210,6 +231,11 @@ pub(super) fn content_ids(rows: &[DeletedPathRow]) -> Vec<i64> {
 // Delete any of the given contents that no longer have a path referencing them.
 // Runs inline in the mutation transaction so the last path removal is what
 // deletes the value — no background reconciliation.
+#[instrument(
+    name = "prune_orphan_contents configuration_value_contents",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "prune_orphan_contents", db.collection.name = "configuration_value_contents")
+)]
 pub(super) async fn prune_orphan_contents(
     transaction: &mut Transaction<'_, Postgres>,
     content_ids: &[i64],
@@ -274,6 +300,11 @@ pub(super) async fn lock_mutation_path(
     lock_path(transaction, &fold, true).await
 }
 
+#[instrument(
+    name = "lock_path",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "lock_path")
+)]
 pub(super) async fn lock_path(
     transaction: &mut Transaction<'_, Postgres>,
     path: &str,
@@ -292,10 +323,20 @@ pub(super) async fn lock_path(
     Ok(())
 }
 
+#[instrument(
+    name = "begin",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "begin")
+)]
 pub(super) async fn begin(database: &PgPool) -> Result<Transaction<'static, Postgres>, Status> {
     database.begin().await.map_err(|_| storage_unavailable())
 }
 
+#[instrument(
+    name = "commit",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "commit")
+)]
 pub(super) async fn commit(transaction: Transaction<'_, Postgres>) -> Result<(), Status> {
     transaction
         .commit()
@@ -305,6 +346,11 @@ pub(super) async fn commit(transaction: Transaction<'_, Postgres>) -> Result<(),
 
 /// Every stored path with its content, in fold order — the candidate set a
 /// listing filters through the caller's grants.
+#[instrument(
+    name = "path_candidates configuration_paths",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "path_candidates", db.collection.name = "configuration_paths")
+)]
 pub(super) async fn path_candidates(database: &PgPool) -> Result<Vec<PathContentRow>, Status> {
     sqlx::query_as::<_, PathContentRow>(
         "SELECT path, lowercase_path, content_id, created_at FROM configuration_paths ORDER BY lowercase_path",
@@ -315,6 +361,11 @@ pub(super) async fn path_candidates(database: &PgPool) -> Result<Vec<PathContent
 }
 
 /// The listed values stored at exactly the given fold paths.
+#[instrument(
+    name = "listed_values configuration_paths",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "listed_values", db.collection.name = "configuration_paths")
+)]
 pub(super) async fn listed_values(
     database: &PgPool,
     fold_paths: &[String],
@@ -335,6 +386,11 @@ pub(super) async fn listed_values(
 }
 
 /// Every value at or below `fold`, in fold order.
+#[instrument(
+    name = "sub_tree_rows configuration_paths",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "sub_tree_rows", db.collection.name = "configuration_paths")
+)]
 pub(super) async fn sub_tree_rows(
     database: &PgPool,
     fold: &str,
@@ -355,6 +411,11 @@ pub(super) async fn sub_tree_rows(
 }
 
 /// The content, classification and alias count behind one fold path.
+#[instrument(
+    name = "path_content_class configuration_paths",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "path_content_class", db.collection.name = "configuration_paths")
+)]
 pub(super) async fn path_content_class(
     transaction: &mut Transaction<'_, Postgres>,
     fold: &str,
@@ -383,6 +444,11 @@ pub(super) async fn path_content_class(
 
 /// Overwrites a content row's stored representation and classification.
 /// Every path aliasing the content observes the new value.
+#[instrument(
+    name = "update_content configuration_value_contents",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "update_content", db.collection.name = "configuration_value_contents")
+)]
 pub(super) async fn update_content(
     transaction: &mut Transaction<'_, Postgres>,
     content_id: i64,
@@ -408,6 +474,11 @@ pub(super) async fn update_content(
 }
 
 /// Fold keys of every secret at, below, or above `fold`.
+#[instrument(
+    name = "secret_paths_touching configuration_paths",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "secret_paths_touching", db.collection.name = "configuration_paths")
+)]
 pub(super) async fn secret_paths_touching(
     transaction: &mut Transaction<'_, Postgres>,
     fold: &str,
@@ -436,6 +507,11 @@ pub(super) async fn secret_paths_touching(
 
 /// Deletes every plain path at or below `fold` that is not in `keep`,
 /// returning the content each deleted path referenced.
+#[instrument(
+    name = "delete_plain_paths_except configuration_paths",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "delete_plain_paths_except", db.collection.name = "configuration_paths")
+)]
 pub(super) async fn delete_plain_paths_except(
     transaction: &mut Transaction<'_, Postgres>,
     fold: &str,
@@ -463,6 +539,11 @@ pub(super) async fn delete_plain_paths_except(
 }
 
 /// The content a fold path resolves to, if any.
+#[instrument(
+    name = "content_id_at configuration_paths",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "content_id_at", db.collection.name = "configuration_paths")
+)]
 pub(super) async fn content_id_at<'e, E>(executor: E, fold: &str) -> Result<Option<i64>, Status>
 where
     E: PgExecutor<'e>,
@@ -488,6 +569,11 @@ pub(super) struct PreviousContentRow {
 /// Subtree replacement never reaches a secret, so the previous content is
 /// plain in practice; its classification is returned anyway so the audit trail
 /// decides what it may keep from the row itself rather than from that promise.
+#[instrument(
+    name = "update_plain_content configuration_value_contents",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "update_plain_content", db.collection.name = "configuration_value_contents")
+)]
 pub(super) async fn update_plain_content(
     transaction: &mut Transaction<'_, Postgres>,
     content_id: i64,
@@ -521,6 +607,11 @@ pub(super) async fn update_plain_content(
 
 /// Deletes the path at `fold`, or with `recurse` every path at or below it,
 /// returning each deleted path and the content it referenced, in path order.
+#[instrument(
+    name = "delete_paths configuration_paths",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "delete_paths", db.collection.name = "configuration_paths")
+)]
 pub(super) async fn delete_paths(
     transaction: &mut Transaction<'_, Postgres>,
     fold: &str,
@@ -554,6 +645,11 @@ pub(super) async fn delete_paths(
 }
 
 /// The stored representation behind one fold path, for a reveal.
+#[instrument(
+    name = "revealed_row configuration_paths",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "revealed_row", db.collection.name = "configuration_paths")
+)]
 pub(super) async fn revealed_row(
     database: &PgPool,
     fold: &str,
@@ -573,6 +669,11 @@ pub(super) async fn revealed_row(
 }
 
 /// Whether a path row already exists at exactly `fold`.
+#[instrument(
+    name = "path_is_occupied configuration_paths",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "path_is_occupied", db.collection.name = "configuration_paths")
+)]
 pub(super) async fn path_is_occupied(
     transaction: &mut Transaction<'_, Postgres>,
     fold: &str,
@@ -588,6 +689,11 @@ pub(super) async fn path_is_occupied(
 }
 
 /// Every path resolving to one content, in fold order.
+#[instrument(
+    name = "paths_of_content configuration_paths",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "paths_of_content", db.collection.name = "configuration_paths")
+)]
 pub(super) async fn paths_of_content(
     database: &PgPool,
     content_id: i64,
@@ -602,6 +708,11 @@ pub(super) async fn paths_of_content(
 }
 
 /// Serializes concurrent start-of-day encryption passes for the transaction.
+#[instrument(
+    name = "lock_encryption_pass",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "lock_encryption_pass")
+)]
 pub(super) async fn lock_encryption_pass(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<(), sqlx::Error> {
@@ -614,6 +725,11 @@ pub(super) async fn lock_encryption_pass(
 }
 
 /// Every secret's stored representation, in id order.
+#[instrument(
+    name = "stored_secrets configuration_value_contents",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "stored_secrets", db.collection.name = "configuration_value_contents")
+)]
 pub(super) async fn stored_secrets(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<Vec<StoredSecretRow>, sqlx::Error> {
@@ -630,6 +746,11 @@ pub(super) async fn stored_secrets(
 }
 
 /// Replaces a secret's stored representation without touching `updated_at`.
+#[instrument(
+    name = "reseal_secret configuration_value_contents",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "reseal_secret", db.collection.name = "configuration_value_contents")
+)]
 pub(super) async fn reseal_secret(
     transaction: &mut Transaction<'_, Postgres>,
     content_id: i64,

@@ -7,6 +7,7 @@ use sovereign_config_core::{
 use sqlx::{FromRow, Postgres, Transaction};
 use time::OffsetDateTime;
 use tonic::Status;
+use tracing::instrument;
 
 use super::ManagedConnectionsService;
 use super::wire::{internal_error, not_found};
@@ -29,6 +30,11 @@ pub(super) struct ConnectionRow {
 }
 
 impl ManagedConnectionsService {
+    #[instrument(
+        name = "begin",
+        skip_all,
+        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "begin")
+    )]
     pub(super) async fn begin(&self) -> Result<Transaction<'_, Postgres>, Status> {
         self.database
             .begin()
@@ -38,6 +44,11 @@ impl ManagedConnectionsService {
 
     /// Locks one row and requires the caller to manage its root; a missing row
     /// and a non-manageable row are externally indistinguishable.
+    #[instrument(
+        name = "lock_manageable managed_connections",
+        skip_all,
+        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "lock_manageable", db.collection.name = "managed_connections")
+    )]
     pub(super) async fn lock_manageable(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
@@ -70,6 +81,11 @@ impl ManagedConnectionsService {
     /// concurrent operation already moved the row, so callers can decide
     /// whether that is a no-op or a failure without a spurious error being
     /// mistaken for a storage fault.
+    #[instrument(
+        name = "transition_state managed_connections",
+        skip_all,
+        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "transition_state", db.collection.name = "managed_connections")
+    )]
     pub(super) async fn transition_state(
         &self,
         connection_id: &ConnectionId,
@@ -105,6 +121,11 @@ impl ManagedConnectionsService {
     /// rest of this service recovers from — a compensated create, a
     /// re-rotatable `rotation_unknown`. Nothing is recorded when a concurrent
     /// operation already moved the row.
+    #[instrument(
+        name = "transition_state_recorded managed_connections",
+        skip_all,
+        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "transition_state_recorded", db.collection.name = "managed_connections")
+    )]
     pub(super) async fn transition_state_recorded(
         &self,
         connection_id: &ConnectionId,
@@ -144,6 +165,11 @@ impl ManagedConnectionsService {
     /// transaction. A failure leaves the row `revoking`, and revocation can be
     /// retried until it is both gone and recorded. A row a concurrent revoke
     /// already removed is recorded by that revoke, not twice.
+    #[instrument(
+        name = "delete_connection_recorded managed_connections",
+        skip_all,
+        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "delete_connection_recorded", db.collection.name = "managed_connections")
+    )]
     pub(super) async fn delete_connection_recorded(
         &self,
         connection_id: &ConnectionId,
@@ -168,6 +194,11 @@ impl ManagedConnectionsService {
         self.delete_connection(connection_id).await.is_ok()
     }
 
+    #[instrument(
+        name = "delete_connection managed_connections",
+        skip_all,
+        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "delete_connection", db.collection.name = "managed_connections")
+    )]
     pub(super) async fn delete_connection(
         &self,
         connection_id: &ConnectionId,
@@ -181,6 +212,11 @@ impl ManagedConnectionsService {
     }
 
     /// Every connection row, oldest first.
+    #[instrument(
+        name = "list_rows managed_connections",
+        skip_all,
+        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "list_rows", db.collection.name = "managed_connections")
+    )]
     pub(super) async fn list_rows(&self) -> Result<Vec<ConnectionRow>, Status> {
         sqlx::query_as::<_, ConnectionRow>(
             r"
@@ -196,6 +232,11 @@ impl ManagedConnectionsService {
     }
 
     /// Inserts a new connection in `provisioning`, before any external call.
+    #[instrument(
+        name = "insert_provisioning managed_connections",
+        skip_all,
+        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "insert_provisioning", db.collection.name = "managed_connections")
+    )]
     pub(super) async fn insert_provisioning(
         &self,
         connection_id: &ConnectionId,
@@ -222,6 +263,11 @@ impl ManagedConnectionsService {
         Ok(())
     }
 
+    #[instrument(
+        name = "record_provider_user managed_connections",
+        skip_all,
+        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "record_provider_user", db.collection.name = "managed_connections")
+    )]
     pub(super) async fn record_provider_user(
         &self,
         connection_id: &ConnectionId,
@@ -244,6 +290,11 @@ impl ManagedConnectionsService {
         Ok(())
     }
 
+    #[instrument(
+        name = "record_credential_identifier managed_connections",
+        skip_all,
+        fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "record_credential_identifier", db.collection.name = "managed_connections")
+    )]
     pub(super) async fn record_credential_identifier(
         &self,
         connection_id: &ConnectionId,
@@ -266,6 +317,11 @@ impl ManagedConnectionsService {
     }
 }
 
+#[instrument(
+    name = "commit",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "commit")
+)]
 pub(super) async fn commit(transaction: Transaction<'_, Postgres>) -> Result<(), Status> {
     transaction
         .commit()
@@ -275,6 +331,11 @@ pub(super) async fn commit(transaction: Transaction<'_, Postgres>) -> Result<(),
 
 /// Marks a locked row `rotation_unknown` before the external call, so an
 /// interruption is always represented as an ambiguous rotation.
+#[instrument(
+    name = "mark_rotation_unknown managed_connections",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "mark_rotation_unknown", db.collection.name = "managed_connections")
+)]
 pub(super) async fn mark_rotation_unknown(
     transaction: &mut Transaction<'_, Postgres>,
     connection_id: &ConnectionId,
@@ -295,6 +356,11 @@ pub(super) async fn mark_rotation_unknown(
 }
 
 /// Marks a locked row `revoking`.
+#[instrument(
+    name = "mark_revoking managed_connections",
+    skip_all,
+    fields(otel.kind = "client", db.system.name = "postgresql", db.operation.name = "mark_revoking", db.collection.name = "managed_connections")
+)]
 pub(super) async fn mark_revoking(
     transaction: &mut Transaction<'_, Postgres>,
     connection_id: &ConnectionId,

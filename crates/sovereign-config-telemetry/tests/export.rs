@@ -14,16 +14,19 @@ use opentelemetry_sdk::{
     Resource,
     error::OTelSdkResult,
     logs::{BatchConfig, BatchConfigBuilder, InMemoryLogExporter, LogBatch, LogExporter},
+    trace::{self, InMemorySpanExporter},
 };
 use sovereign_config_telemetry::{
-    Assembly, Identity, InitError, OtelEnv, Plan, SHUTDOWN_TIMEOUT, assemble, config::validate,
+    Assembly, Exporters, Identity, InitError, OtelEnv, Plan, SHUTDOWN_TIMEOUT, assemble,
+    config::validate,
 };
 use tracing_subscriber::fmt::MakeWriter;
 
-const VERSION: &str = "2.35.0-test";
+const VERSION: &str = "2.36.0-test";
 
-/// The variables a dev deployment carries, with a stale version planted in
-/// the attribute list to prove the build's wins.
+/// The variables a deployment that exports logs only carries, with a stale
+/// version planted in the attribute list to prove the build's wins. Spans
+/// are covered by the server's tests, through `testing::Capture`.
 const DEPLOYED: [(&str, &str); 7] = [
     ("OTEL_SERVICE_NAME", "sovereign-config"),
     (
@@ -97,6 +100,25 @@ fn slow_batches() -> BatchConfig {
         .build()
 }
 
+/// Exporters around `logs`, and a span exporter that must never be built
+/// (these tests' deployment has `OTEL_TRACES_EXPORTER=none`).
+fn exporters<L>(
+    logs: impl FnOnce() -> Result<L, InitError>,
+    log_batch: BatchConfig,
+) -> Exporters<
+    impl FnOnce() -> Result<L, InitError>,
+    impl FnOnce() -> Result<InMemorySpanExporter, InitError>,
+> {
+    Exporters {
+        logs,
+        log_batch,
+        spans: || -> Result<InMemorySpanExporter, InitError> {
+            panic!("no span exporter may be built while traces are off")
+        },
+        span_batch: trace::BatchConfigBuilder::default().build(),
+    }
+}
+
 fn assemble_with(
     plan: Plan,
     exporter: &InMemoryLogExporter,
@@ -109,8 +131,7 @@ fn assemble_with(
         &identity(hostname),
         "info",
         stdout.clone(),
-        move || Ok::<_, InitError>(exporter),
-        slow_batches(),
+        exporters(move || Ok::<_, InitError>(exporter), slow_batches()),
     )
     .expect("assembly must succeed")
 }
@@ -217,11 +238,13 @@ fn off_builds_no_provider_and_says_so_once() {
             &identity(Some("host")),
             "",
             stdout.clone(),
-            move || {
-                *flag.lock().unwrap() = true;
-                Ok::<_, InitError>(exporter)
-            },
-            slow_batches(),
+            exporters(
+                move || {
+                    *flag.lock().unwrap() = true;
+                    Ok::<_, InitError>(exporter)
+                },
+                slow_batches(),
+            ),
         )
         .unwrap();
 
@@ -329,18 +352,20 @@ fn an_unreachable_collector_costs_nothing_and_shutdown_stays_bounded() {
         &identity(Some("host")),
         "info",
         stdout.clone(),
-        move || {
-            opentelemetry_otlp::LogExporter::builder()
-                .with_http()
-                .with_protocol(Protocol::HttpBinary)
-                .with_endpoint(endpoint)
-                .with_timeout(Duration::from_secs(2))
-                .build()
-                .map_err(|_| InitError::Exporter)
-        },
-        BatchConfigBuilder::default()
-            .with_scheduled_delay(Duration::from_millis(50))
-            .build(),
+        exporters(
+            move || {
+                opentelemetry_otlp::LogExporter::builder()
+                    .with_http()
+                    .with_protocol(Protocol::HttpBinary)
+                    .with_endpoint(endpoint)
+                    .with_timeout(Duration::from_secs(2))
+                    .build()
+                    .map_err(|_| InitError::Exporter("log"))
+            },
+            BatchConfigBuilder::default()
+                .with_scheduled_delay(Duration::from_millis(50))
+                .build(),
+        ),
     )
     .unwrap();
 

@@ -9,10 +9,13 @@
 
 use std::{net::IpAddr, time::Duration};
 
-use reqwest::{Client, StatusCode, Url, redirect::Policy};
+use reqwest::{Client, Method, StatusCode, Url, redirect::Policy};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use sovereign_config_core::Secret;
+use tracing::Instrument;
+
+use crate::spans;
 
 const MAX_ADMIN_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_EXTERNAL_IDENTIFIER_CHARS: usize = 128;
@@ -33,6 +36,27 @@ pub(crate) enum AdminError {
     /// The response violated the adapter's strict decoding or redirect policy.
     Invalid,
 }
+
+impl AdminError {
+    /// The classification as a span's `error.type` and a log field.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::Rejected => "rejected",
+            Self::Unavailable => "unavailable",
+            Self::Ambiguous => "ambiguous",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+/// Route templates, as client spans name them: identifiers stay placeholders.
+const SERVICE_ACCOUNT_ROUTE: &str = "/api/v3/core/users/service_account/";
+const USER_ROUTE: &str = "/api/v3/core/users/{id}/";
+const USERS_ROUTE: &str = "/api/v3/core/users/";
+const GROUPS_ROUTE: &str = "/api/v3/core/groups/";
+const TOKENS_ROUTE: &str = "/api/v3/core/tokens/";
+const SET_KEY_ROUTE: &str = "/api/v3/core/tokens/{identifier}/set_key/";
 
 /// The service account created for one managed connection.
 pub(crate) struct CreatedServiceAccount {
@@ -114,19 +138,18 @@ impl AuthentikAdminClient {
             token: String,
         }
 
-        let response = self
-            .http
-            .post(self.endpoint("/api/v3/core/users/service_account/")?)
-            .bearer_auth(self.api_token.expose())
-            .json(&json!({
-                "name": username,
-                "create_group": false,
-                "expiring": false,
-            }))
-            .send()
-            .await
-            .map_err(|error| classify_transport(&error))?;
-        let body = expect_success(response).await?;
+        let body = self
+            .call(
+                Method::POST,
+                SERVICE_ACCOUNT_ROUTE,
+                self.endpoint(SERVICE_ACCOUNT_ROUTE)?,
+                Some(json!({
+                    "name": username,
+                    "create_group": false,
+                    "expiring": false,
+                })),
+            )
+            .await?;
         let decoded: ServiceAccountResponse =
             serde_json::from_slice(&body).map_err(|_| AdminError::Invalid)?;
         if decoded.username != username
@@ -166,15 +189,14 @@ impl AuthentikAdminClient {
             grants_attribute.to_owned(),
             json!([{ "prefix": root, "permissions": permissions }]),
         );
-        let response = self
-            .http
-            .patch(self.endpoint(&format!("/api/v3/core/users/{user_id}/"))?)
-            .bearer_auth(self.api_token.expose())
-            .json(&json!({ "attributes": attributes }))
-            .send()
-            .await
-            .map_err(|error| classify_transport(&error))?;
-        expect_success(response).await.map(|_| ())
+        self.call(
+            Method::PATCH,
+            USER_ROUTE,
+            self.endpoint(&format!("/api/v3/core/users/{user_id}/"))?,
+            Some(json!({ "attributes": attributes })),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Locates a group by exact name, purely to group managed service
@@ -194,16 +216,9 @@ impl AuthentikAdminClient {
             results: Vec<GroupRecord>,
         }
 
-        let mut endpoint = self.endpoint("/api/v3/core/groups/")?;
+        let mut endpoint = self.endpoint(GROUPS_ROUTE)?;
         endpoint.query_pairs_mut().append_pair("name", name);
-        let response = self
-            .http
-            .get(endpoint)
-            .bearer_auth(self.api_token.expose())
-            .send()
-            .await
-            .map_err(|error| classify_transport(&error))?;
-        let body = expect_success(response).await?;
+        let body = self.call(Method::GET, GROUPS_ROUTE, endpoint, None).await?;
         let decoded: GroupListResponse =
             serde_json::from_slice(&body).map_err(|_| AdminError::Invalid)?;
         let mut matching = decoded.results.into_iter().filter(|record| {
@@ -227,15 +242,14 @@ impl AuthentikAdminClient {
         user_id: i64,
         group_id: &str,
     ) -> Result<(), AdminError> {
-        let response = self
-            .http
-            .patch(self.endpoint(&format!("/api/v3/core/users/{user_id}/"))?)
-            .bearer_auth(self.api_token.expose())
-            .json(&json!({ "groups": [group_id] }))
-            .send()
-            .await
-            .map_err(|error| classify_transport(&error))?;
-        expect_success(response).await.map(|_| ())
+        self.call(
+            Method::PATCH,
+            USER_ROUTE,
+            self.endpoint(&format!("/api/v3/core/users/{user_id}/"))?,
+            Some(json!({ "groups": [group_id] })),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Locates a user by exact generated username for reconciliation only.
@@ -257,16 +271,9 @@ impl AuthentikAdminClient {
             results: Vec<UserRecord>,
         }
 
-        let mut endpoint = self.endpoint("/api/v3/core/users/")?;
+        let mut endpoint = self.endpoint(USERS_ROUTE)?;
         endpoint.query_pairs_mut().append_pair("username", username);
-        let response = self
-            .http
-            .get(endpoint)
-            .bearer_auth(self.api_token.expose())
-            .send()
-            .await
-            .map_err(|error| classify_transport(&error))?;
-        let body = expect_success(response).await?;
+        let body = self.call(Method::GET, USERS_ROUTE, endpoint, None).await?;
         let decoded: UserListResponse =
             serde_json::from_slice(&body).map_err(|_| AdminError::Invalid)?;
         let mut matching = decoded
@@ -297,19 +304,12 @@ impl AuthentikAdminClient {
             results: Vec<TokenRecord>,
         }
 
-        let mut endpoint = self.endpoint("/api/v3/core/tokens/")?;
+        let mut endpoint = self.endpoint(TOKENS_ROUTE)?;
         endpoint
             .query_pairs_mut()
             .append_pair("user__username", username)
             .append_pair("intent", "app_password");
-        let response = self
-            .http
-            .get(endpoint)
-            .bearer_auth(self.api_token.expose())
-            .send()
-            .await
-            .map_err(|error| classify_transport(&error))?;
-        let body = expect_success(response).await?;
+        let body = self.call(Method::GET, TOKENS_ROUTE, endpoint, None).await?;
         let decoded: TokenListResponse =
             serde_json::from_slice(&body).map_err(|_| AdminError::Invalid)?;
         let identifiers = decoded
@@ -335,27 +335,59 @@ impl AuthentikAdminClient {
         identifier: &str,
         replacement: &Secret,
     ) -> Result<(), AdminError> {
-        let response = self
-            .http
-            .post(self.endpoint(&format!("/api/v3/core/tokens/{identifier}/set_key/"))?)
-            .bearer_auth(self.api_token.expose())
-            .json(&json!({ "key": replacement.expose() }))
-            .send()
-            .await
-            .map_err(|error| classify_transport(&error))?;
-        expect_success(response).await.map(|_| ())
+        self.call(
+            Method::POST,
+            SET_KEY_ROUTE,
+            self.endpoint(&format!("/api/v3/core/tokens/{identifier}/set_key/"))?,
+            Some(json!({ "key": replacement.expose() })),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Deletes the exact managed service account.
     pub(crate) async fn delete_user(&self, user_id: i64) -> Result<(), AdminError> {
-        let response = self
-            .http
-            .delete(self.endpoint(&format!("/api/v3/core/users/{user_id}/"))?)
-            .bearer_auth(self.api_token.expose())
-            .send()
-            .await
-            .map_err(|error| classify_transport(&error))?;
-        expect_success(response).await.map(|_| ())
+        self.call(
+            Method::DELETE,
+            USER_ROUTE,
+            self.endpoint(&format!("/api/v3/core/users/{user_id}/"))?,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// One administration call, inside its client span: the request carries
+    /// the span's `traceparent`, and the span records the response status and,
+    /// on failure, the bounded classification — never a body, a token or the
+    /// URL actually called.
+    async fn call(
+        &self,
+        method: Method,
+        route: &'static str,
+        url: Url,
+        body: Option<Value>,
+    ) -> Result<Vec<u8>, AdminError> {
+        let span = spans::client_span(&method, Some(route), &self.api_origin);
+        async {
+            let mut request = self
+                .http
+                .request(method, url)
+                .bearer_auth(self.api_token.expose());
+            if let Some(body) = body {
+                request = request.json(&body);
+            }
+            let result = match spans::send(&self.http, request).await {
+                Ok(response) => expect_success(response).await,
+                Err(error) => Err(classify_transport(&error)),
+            };
+            if let Err(error) = &result {
+                spans::record_error(error.label());
+            }
+            result
+        }
+        .instrument(span)
+        .await
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, AdminError> {

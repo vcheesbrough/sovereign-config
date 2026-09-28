@@ -38,6 +38,8 @@ sovereign-config-telemetry = { path = "../sovereign-config-telemetry" }
 
 [dev-dependencies]
 prost.workspace = true
+# Exported spans and log records in plain types, for asserting on what left.
+sovereign-config-telemetry = { path = "../sovereign-config-telemetry", features = ["testing"] }
 # SIGTERM for the telemetry process tests, as `docker stop` sends it.
 rustix.workspace = true
 serde_yaml.workspace = true

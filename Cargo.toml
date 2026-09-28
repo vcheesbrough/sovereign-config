@@ -20,7 +20,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.35.0"
+version = "2.36.0"
 edition = "2024"
 rust-version = "1.94"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -74,12 +74,13 @@ uuid = { version = "1.26.1", features = ["v5"] }
 # core is pinned to the `opentelemetry` requirement of the newest
 # `tracing-opentelemetry` release, never inferred from version numbers. On
 # 2026-09-28 that was `tracing-opentelemetry` 0.34.0, requiring core 0.33;
-# spans (#420) add it at exactly that version, or move the whole set.
+# spans (#420) added it at exactly that version (re-verified on crates.io:
+# `tracing-opentelemetry` 0.34.0 requires `opentelemetry` ^0.33.0).
 #
 # Only `sovereign-config-telemetry` may depend on `_sdk`, `-otlp`,
 # `-appender-tracing` or `tracing-opentelemetry` (its allowlist test enforces
-# the source side). `-http` belongs to the transport layer once spans land
-# (#420). Not in the set, deliberately: `prometheus`, `metrics`,
+# the source side). `-http` is the header carrier for inject and extract,
+# wrapped by the telemetry crate's `context` module. Not in the set, deliberately: `prometheus`, `metrics`,
 # `axum-tracing-opentelemetry`, `reqwest-tracing`.
 opentelemetry = { version = "0.33.0", default-features = false, features = ["trace", "logs"] }
 opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["trace", "logs"] }
@@ -89,9 +90,13 @@ opentelemetry_sdk = { version = "0.33.0", default-features = false, features = [
 # that was accepted. `grpc-tonic` is left out because it would add a second
 # tonic as well, and needs an async-runtime batch processor, for a transport
 # this estate's collector does not need.
-opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "logs", "internal-logs"] }
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "logs", "trace", "internal-logs"] }
 opentelemetry-appender-tracing = { version = "0.33.0", default-features = false }
 opentelemetry-semantic-conventions = "0.33.0"
+opentelemetry-http = { version = "0.33.0", default-features = false }
+# Spans only: its `metrics` feature is #421's to decide, and `tracing-log`
+# would turn `log` records into a second path for the same events.
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

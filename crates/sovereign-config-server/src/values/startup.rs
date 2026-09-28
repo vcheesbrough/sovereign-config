@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use sqlx::PgPool;
-use tracing::{error, info};
+use tracing::{error, info, instrument};
 
 use super::SECRET;
 use super::store::{lock_encryption_pass, reseal_secret, stored_secrets};
@@ -26,6 +26,12 @@ use crate::encryption::{ValueCipher, is_envelope};
 /// every `plain` value too, none of which needs a key at all. Those rows are
 /// logged and left exactly as found, and [`ConfigurationService::reveal_secret`]
 /// still fails closed for their paths.
+#[instrument(
+    name = "sovereign_config.startup.encrypt_stored_secrets",
+    parent = None,
+    skip_all,
+    fields(otel.kind = "internal")
+)]
 pub(crate) async fn encrypt_stored_secrets(
     database: &PgPool,
     cipher: &ValueCipher,

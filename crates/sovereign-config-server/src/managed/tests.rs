@@ -11,7 +11,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
 };
@@ -23,6 +23,7 @@ use tokio::{net::TcpListener, task::JoinHandle, time::sleep};
 
 use sovereign_config_core::Secret;
 use tonic::{Request, Status};
+use tracing::Instrument;
 
 use super::identity::{
     USERNAME_PREFIX, USERNAME_SLUG_MAX_CHARS, generate_app_password, generate_connection_id,
@@ -126,6 +127,8 @@ struct MockState {
     usernames_by_id: Arc<Mutex<std::collections::HashMap<i64, String>>>,
     rotated_keys: Arc<Mutex<Vec<String>>>,
     group_assignments: Arc<Mutex<Vec<(i64, String)>>>,
+    /// The `traceparent` each service-account create arrived with.
+    create_traceparents: Arc<Mutex<Vec<Option<String>>>>,
     next_user_id: Arc<AtomicI64>,
 }
 
@@ -161,6 +164,10 @@ impl MockAuthentik {
     fn group_assignments(&self) -> Vec<(i64, String)> {
         self.state.group_assignments.lock().unwrap().clone()
     }
+
+    fn create_traceparents(&self) -> Vec<Option<String>> {
+        self.state.create_traceparents.lock().unwrap().clone()
+    }
 }
 
 async fn apply(behavior: &Behavior) -> Option<Response> {
@@ -184,7 +191,17 @@ fn behavior(state: &MockState, select: impl FnOnce(&Script) -> Behavior) -> Beha
     select(&state.script.lock().unwrap())
 }
 
-async fn create_account(State(state): State<MockState>, Json(body): Json<Value>) -> Response {
+async fn create_account(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state.create_traceparents.lock().unwrap().push(
+        headers
+            .get("traceparent")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+    );
     let delay = state.script.lock().unwrap().create_account_delay;
     sleep(delay).await;
     if let Some(response) = apply(&behavior(&state, |script| script.create_account.clone())).await {
@@ -374,6 +391,7 @@ async fn mock_authentik() -> MockAuthentik {
         usernames_by_id: Arc::new(Mutex::new(std::collections::HashMap::new())),
         rotated_keys: Arc::new(Mutex::new(Vec::new())),
         group_assignments: Arc::new(Mutex::new(Vec::new())),
+        create_traceparents: Arc::new(Mutex::new(Vec::new())),
         next_user_id: Arc::new(AtomicI64::new(1000)),
     };
     let app = Router::new()
@@ -690,6 +708,74 @@ async fn create_provisions_exactly_one_read_only_grant_and_returns_one_url() {
     let assignments = mock.group_assignments();
     assert_eq!(assignments.len(), 1);
     assert_eq!(assignments[0].1, TEST_GROUP_ID);
+}
+
+/// The trace of one managed create, as an operator would read it in Tempo:
+/// the request's server span, a Postgres child for each store call, and an
+/// Authentik child for each admin call — whose request carried the client
+/// span's own context — and nothing secret on any of them.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn a_managed_create_is_one_trace_across_postgres_and_authentik() {
+    let mock = mock_authentik().await;
+    let service = service_or_skip!(&mock);
+    let capture = sovereign_config_telemetry::testing::Capture::exporting();
+    {
+        let _guard = capture.enter();
+        let span = crate::spans::server_span(
+            &http::Method::POST,
+            "/sovereign.config.v3.ManagedConnections/CreateManagedConnection",
+        )
+        .expect("a served route has a span");
+        create(&service, "Traced reader", "/apps/traced", &operator("/"))
+            .instrument(span)
+            .await
+            .expect("create must succeed");
+    }
+    let exported = capture.finish();
+
+    let server = exported.span("sovereign.config.v3.ManagedConnections/CreateManagedConnection");
+    let authentik = exported.span("POST /api/v3/core/users/service_account/");
+    assert!(authentik.is_child_of(server), "{authentik:?}");
+    assert_eq!(authentik.kind, "client");
+    let insert = exported.span("insert_provisioning managed_connections");
+    assert!(insert.is_child_of(server), "{insert:?}");
+    assert_eq!(insert.attribute("db.system.name"), Some("postgresql"));
+    // Every other admin call is a child of the same request.
+    for name in [
+        "GET /api/v3/core/tokens/",
+        "PATCH /api/v3/core/users/{id}/",
+        "GET /api/v3/core/groups/",
+    ] {
+        for span in exported.spans_named(name) {
+            assert!(span.is_child_of(server), "{name}: {span:?}");
+        }
+    }
+
+    let traceparents = mock.create_traceparents();
+    let header = traceparents[0]
+        .as_deref()
+        .expect("the create carried traceparent");
+    assert_eq!(
+        header,
+        format!("00-{}-{}-01", authentik.trace_id, authentik.span_id)
+    );
+
+    // The created connection is logged as a decision, in the same trace.
+    let log = exported
+        .log("managed connection created")
+        .expect("the create is logged");
+    assert_eq!(log.trace_id.as_deref(), Some(server.trace_id.as_str()));
+
+    for value in exported.all_values() {
+        for secret in [
+            APP_PASSWORD_SENTINEL,
+            "manager-api-token-sentinel",
+            PUBLIC_ORIGIN,
+        ] {
+            assert!(!value.contains(secret), "exported {secret}: {value}");
+        }
+    }
 }
 
 #[tokio::test]
