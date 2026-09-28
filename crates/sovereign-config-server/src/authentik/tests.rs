@@ -341,3 +341,36 @@ async fn group_assignment_patches_the_exact_user_with_the_exact_group() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0, "/api/v3/core/users/42/");
 }
+
+/// A failed admin call is a failed client span, classified by the bounded
+/// `AdminError` label and never by anything Authentik said.
+#[tokio::test]
+async fn a_failed_admin_call_marks_its_client_span_with_the_classification() {
+    let server = server(
+        StatusCode::FORBIDDEN,
+        "authentik-refusal-sentinel",
+        Duration::ZERO,
+        None,
+    )
+    .await;
+    let capture = sovereign_config_telemetry::testing::Capture::exporting();
+    {
+        let _guard = capture.enter();
+        let error = client(&server)
+            .delete_user(42)
+            .await
+            .expect_err("a refused delete fails");
+        assert_eq!(error, AdminError::Rejected);
+    }
+    let exported = capture.finish();
+
+    let span = exported.span("DELETE /api/v3/core/users/{id}/");
+    assert!(span.is_error);
+    assert_eq!(span.attribute("error.type"), Some("rejected"));
+    assert_eq!(span.attribute("http.response.status_code"), Some("403"));
+    for value in exported.all_values() {
+        assert!(!value.contains("authentik-refusal-sentinel"), "{value}");
+        assert!(!value.contains(TEST_API_TOKEN), "{value}");
+        assert!(!value.contains("/users/42/"), "{value}");
+    }
+}

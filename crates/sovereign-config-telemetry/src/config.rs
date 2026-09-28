@@ -31,10 +31,15 @@ pub const OTEL_TRACES_SAMPLER_ARG: &str = "OTEL_TRACES_SAMPLER_ARG";
 /// silently getting HTTP.
 pub const HTTP_PROTOBUF: &str = "http/protobuf";
 
-const SAMPLERS: [&str; 6] = [
+/// The samplers a deployment may choose. `traceidratio` is left out on
+/// purpose: it decides from the trace id alone, and an inbound `traceparent`
+/// lets the caller pick that id — so it would let any caller keep its own
+/// requests, and the `user.*` they carry, out of the trace store. The
+/// `parentbased_*` samplers are safe because the transport adopts an inbound
+/// parent as sampled (`crate::context::adopt_parent`).
+const SAMPLERS: [&str; 5] = [
     "always_on",
     "always_off",
-    "traceidratio",
     "parentbased_always_on",
     "parentbased_always_off",
     "parentbased_traceidratio",
@@ -176,15 +181,35 @@ pub enum Off {
     NothingExported,
 }
 
+/// Which of the signals this build carries a provider for are exported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exported {
+    pub logs: bool,
+    pub traces: bool,
+}
+
+impl Exported {
+    /// The exported signals, as the startup line names them.
+    #[must_use]
+    pub fn names(self) -> String {
+        [(self.logs, "logs"), (self.traces, "traces")]
+            .into_iter()
+            .filter_map(|(on, name)| on.then_some(name))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 /// What the validated set asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
     Off(Off),
-    /// Export log records over OTLP, identified by these resource attributes
-    /// (as the deployment stated them; the build's own facts are added by
-    /// [`crate::resource`]).
-    ExportLogs {
+    /// Export the named signals over OTLP, identified by these resource
+    /// attributes (as the deployment stated them; the build's own facts are
+    /// added by [`crate::resource`]). At least one signal is on.
+    Export {
         attributes: Vec<(String, String)>,
+        signals: Exported,
     },
 }
 
@@ -225,11 +250,18 @@ pub fn validate(env: &OtelEnv) -> Result<Plan, ConfigError> {
     // Identity is required of anything that exports, whichever signal it is.
     let attributes = resource_attributes(env)?;
 
-    // Traces and metrics are validated like every other signal — their
-    // variables are part of the contract — but this build has no provider for
-    // them yet (#420, #421), so only logs decide whether anything starts.
-    if exporting.contains(&Signal::Logs) {
-        Ok(Plan::ExportLogs { attributes })
+    // Metrics are validated like every other signal — their variables are
+    // part of the contract — but this build has no provider for them yet
+    // (#421), so only logs and traces decide whether anything starts.
+    let signals = Exported {
+        logs: exporting.contains(&Signal::Logs),
+        traces: exporting.contains(&Signal::Traces),
+    };
+    if signals.logs || signals.traces {
+        Ok(Plan::Export {
+            attributes,
+            signals,
+        })
     } else {
         Ok(Plan::Off(Off::NothingExported))
     }
@@ -324,7 +356,7 @@ fn validate_sampler(env: &OtelEnv) -> Result<(), ConfigError> {
     {
         return Err(ConfigError::new(
             OTEL_TRACES_SAMPLER,
-            "must name a standard sampler, such as parentbased_traceidratio",
+            "must be always_on, always_off or a parentbased_* sampler (traceidratio lets a caller choose, through its trace id, whether its request is recorded)",
         ));
     }
     if let Some(argument) = env.get(OTEL_TRACES_SAMPLER_ARG)
@@ -401,7 +433,7 @@ mod tests {
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
         ("OTEL_LOGS_EXPORTER", "otlp"),
         ("OTEL_METRICS_EXPORTER", "none"),
-        ("OTEL_TRACES_EXPORTER", "none"),
+        ("OTEL_TRACES_EXPORTER", "otlp"),
     ];
 
     fn deployed_with(overrides: &[(&'static str, &'static str)]) -> OtelEnv {
@@ -447,7 +479,7 @@ mod tests {
             assert_eq!(validate(&env), Ok(Plan::Off(Off::Disabled)));
         }
         let env = deployed_with(&[("OTEL_SDK_DISABLED", "false")]);
-        assert!(matches!(validate(&env), Ok(Plan::ExportLogs { .. })));
+        assert!(matches!(validate(&env), Ok(Plan::Export { .. })));
         assert_rejects(
             &deployed_with(&[("OTEL_SDK_DISABLED", "yes-please")]),
             "OTEL_SDK_DISABLED",
@@ -456,10 +488,22 @@ mod tests {
     }
 
     #[test]
-    fn the_deployed_set_exports_logs_with_its_attributes() {
-        let Ok(Plan::ExportLogs { attributes }) = validate(&deployed_with(&[])) else {
-            panic!("the deployed set must export logs");
+    fn the_deployed_set_exports_logs_and_traces_with_its_attributes() {
+        let Ok(Plan::Export {
+            attributes,
+            signals,
+        }) = validate(&deployed_with(&[]))
+        else {
+            panic!("the deployed set must export");
         };
+        assert_eq!(
+            signals,
+            Exported {
+                logs: true,
+                traces: true
+            }
+        );
+        assert_eq!(signals.names(), "logs,traces");
         assert_eq!(
             attributes,
             [
@@ -495,7 +539,53 @@ mod tests {
                     "http://collector:4318/v1/logs",
                 )]),
         );
-        assert!(matches!(validate(&env), Ok(Plan::ExportLogs { .. })));
+        // ...but not another signal's: traces still export, with nowhere to go.
+        assert_eq!(
+            validate(&env).unwrap_err().variable,
+            "OTEL_EXPORTER_OTLP_ENDPOINT"
+        );
+        let env = OtelEnv::from_pairs(
+            DEPLOYED
+                .into_iter()
+                .filter(|(n, _)| *n != "OTEL_EXPORTER_OTLP_ENDPOINT")
+                .chain([
+                    (
+                        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                        "http://collector:4318/v1/logs",
+                    ),
+                    ("OTEL_TRACES_EXPORTER", "none"),
+                ]),
+        );
+        assert!(matches!(validate(&env), Ok(Plan::Export { .. })));
+    }
+
+    #[test]
+    fn each_signal_is_silenced_on_its_own() {
+        let Ok(Plan::Export { signals, .. }) =
+            validate(&deployed_with(&[("OTEL_TRACES_EXPORTER", "none")]))
+        else {
+            panic!("logs still export");
+        };
+        assert_eq!(
+            signals,
+            Exported {
+                logs: true,
+                traces: false
+            }
+        );
+        let Ok(Plan::Export { signals, .. }) =
+            validate(&deployed_with(&[("OTEL_LOGS_EXPORTER", "none")]))
+        else {
+            panic!("traces still export");
+        };
+        assert_eq!(signals.names(), "traces");
+        assert_eq!(
+            validate(&deployed_with(&[
+                ("OTEL_LOGS_EXPORTER", "none"),
+                ("OTEL_TRACES_EXPORTER", "none"),
+            ])),
+            Ok(Plan::Off(Off::NothingExported))
+        );
     }
 
     #[test]
@@ -570,6 +660,14 @@ mod tests {
             "OTEL_TRACES_SAMPLER",
             "sometimes",
         );
+        // A caller picks its trace id, so a sampler that decides from the
+        // trace id alone would let it opt out of tracing.
+        assert_eq!(
+            validate(&deployed_with(&[("OTEL_TRACES_SAMPLER", "traceidratio")]))
+                .unwrap_err()
+                .variable,
+            "OTEL_TRACES_SAMPLER"
+        );
         for value in ["1.5", "-0.1", "half"] {
             assert_rejects(
                 &deployed_with(&[("OTEL_TRACES_SAMPLER_ARG", value)]),
@@ -606,7 +704,7 @@ mod tests {
                     "service.name=sovereign-config,deployment.environment.name=dev",
                 )]),
         );
-        assert!(matches!(validate(&env), Ok(Plan::ExportLogs { .. })));
+        assert!(matches!(validate(&env), Ok(Plan::Export { .. })));
 
         assert_eq!(
             validate(&deployed_with(&[(
@@ -633,7 +731,7 @@ mod tests {
             "OTEL_RESOURCE_ATTRIBUTES",
             "service.name=stale,deployment.environment.name=dev",
         )]);
-        let Ok(Plan::ExportLogs { attributes }) = validate(&env) else {
+        let Ok(Plan::Export { attributes, .. }) = validate(&env) else {
             panic!("must export");
         };
         assert!(attributes.contains(&("service.name".to_owned(), "sovereign-config".to_owned())));
@@ -644,6 +742,6 @@ mod tests {
         // Compose passes a name with no value as an empty string in some
         // setups; an empty exporter is the default, not an invalid value.
         let env = deployed_with(&[("OTEL_TRACES_EXPORTER", ""), ("OTEL_PROPAGATORS", "")]);
-        assert!(matches!(validate(&env), Ok(Plan::ExportLogs { .. })));
+        assert!(matches!(validate(&env), Ok(Plan::Export { .. })));
     }
 }

@@ -14,29 +14,41 @@
 //! - **`OTEL_SDK_DISABLED=true`** — the same, for a deployment that carries
 //!   the variables and wants them silent.
 //! - **anything else** — the whole set is validated first, then log records
-//!   leave over OTLP (`http/protobuf`) to the one configured collector, as
-//!   well as reaching stdout.
+//!   and spans leave over OTLP (`http/protobuf`) to the one configured
+//!   collector; log records also reach stdout.
 //!
-//! Spans (#420) and metrics (#421) will be added here, as further layers and
-//! providers on the same [`resource`]; nothing outside this crate changes when
-//! they are.
+//! In every state the span layer is installed and the W3C propagator is used
+//! by [`context`], so inbound trace context still reaches outbound requests
+//! when nothing exports (skill §2). Metrics (#421) will be added here, as a
+//! further provider on the same [`resource`]; nothing outside this crate
+//! changes when they are.
 
 pub mod config;
+pub mod context;
+pub mod keys;
 pub mod resource;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 use std::time::Duration;
 
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_sdk::{
-    logs::{BatchConfig, BatchConfigBuilder, BatchLogProcessor, LogExporter, SdkLoggerProvider},
+    logs::{self, BatchLogProcessor, LogExporter, SdkLoggerProvider},
     propagation::TraceContextPropagator,
+    trace::{self, BatchSpanProcessor, SdkTracerProvider, SpanExporter},
 };
-use tracing::{Subscriber, info, warn};
+use tracing::{Metadata, Subscriber, info, warn};
 use tracing_subscriber::{
-    EnvFilter, Layer, fmt::MakeWriter, layer::SubscriberExt, registry::Registry,
+    EnvFilter, Layer,
+    filter::{FilterFn, filter_fn},
+    fmt::MakeWriter,
+    layer::SubscriberExt,
+    registry::Registry,
 };
 
-pub use config::{ConfigError, Off, OtelEnv, Plan};
+pub use config::{ConfigError, Exported, Off, OtelEnv, Plan};
 
 /// How long [`Telemetry::shutdown`] may take to flush. It bounds the wait,
 /// not the exporter: records still unsent when it passes are lost, which is
@@ -73,8 +85,8 @@ pub enum InitError {
     Config(ConfigError),
     /// The exporter's own message is deliberately not carried: the SDK quotes
     /// the endpoint in it.
-    #[error("the OTLP log exporter could not be built")]
-    Exporter,
+    #[error("the OTLP {0} exporter could not be built")]
+    Exporter(&'static str),
     #[error("a global tracing subscriber is already installed")]
     AlreadyInstalled,
 }
@@ -102,6 +114,7 @@ pub struct Identity {
 pub struct Telemetry {
     plan: Plan,
     logs: Option<SdkLoggerProvider>,
+    traces: Option<SdkTracerProvider>,
 }
 
 impl Telemetry {
@@ -109,7 +122,7 @@ impl Telemetry {
     /// exporter and no background thread exist.
     #[must_use]
     pub fn is_exporting(&self) -> bool {
-        self.logs.is_some()
+        self.logs.is_some() || self.traces.is_some()
     }
 
     /// Says once, at startup, which state telemetry is in — so "why are there
@@ -126,23 +139,38 @@ impl Telemetry {
             Plan::Off(Off::NothingExported) => {
                 info!("telemetry off: every signal this server exports is set to none");
             }
-            Plan::ExportLogs { .. } => info!(
-                signals = "logs",
+            Plan::Export { signals, .. } => info!(
+                signals = signals.names(),
                 protocol = config::HTTP_PROTOBUF,
                 "telemetry on: exporting over OTLP to the configured collector"
             ),
         }
     }
 
-    /// Flushes and stops every provider, waiting at most [`SHUTDOWN_TIMEOUT`].
+    /// Flushes and stops every provider, waiting at most [`SHUTDOWN_TIMEOUT`]
+    /// in all: the providers flush **at the same time**, each with the whole
+    /// bound, so an unreachable collector costs one timeout rather than one
+    /// per signal — which matters inside Docker's default ten-second stop
+    /// grace, where whatever is still flushing at the end is killed.
     /// Idempotent. A failure is reported on stdout only: the provider it would
     /// be exported through is the thing that just stopped.
     pub fn shutdown(&mut self) {
-        if let Some(logs) = self.logs.take()
-            && let Err(error) = logs.shutdown_with_timeout(SHUTDOWN_TIMEOUT)
-        {
-            warn!(target: SHUTDOWN_TARGET, error = %error, "telemetry did not flush cleanly");
-        }
+        let traces = self.traces.take();
+        let logs = self.logs.take();
+        std::thread::scope(|scope| {
+            if let Some(traces) = traces {
+                scope.spawn(move || {
+                    if let Err(error) = traces.shutdown_with_timeout(SHUTDOWN_TIMEOUT) {
+                        warn!(target: SHUTDOWN_TARGET, signal = "traces", error = %error, "telemetry did not flush cleanly");
+                    }
+                });
+            }
+            if let Some(logs) = logs
+                && let Err(error) = logs.shutdown_with_timeout(SHUTDOWN_TIMEOUT)
+            {
+                warn!(target: SHUTDOWN_TARGET, signal = "logs", error = %error, "telemetry did not flush cleanly");
+            }
+        });
     }
 }
 
@@ -159,63 +187,157 @@ pub struct Assembly {
     pub telemetry: Telemetry,
 }
 
-/// Builds the layers for `plan`. The exporter and batch settings are
-/// parameters so that tests assemble exactly what production does around an
-/// in-memory exporter; `exporter` is called only when logs export.
+/// The exporters and batch settings [`assemble`] builds providers around.
+/// Parameters so that tests assemble exactly what production does around
+/// in-memory exporters; each exporter is built only when its signal exports.
+pub struct Exporters<L, S> {
+    pub logs: L,
+    pub log_batch: logs::BatchConfig,
+    pub spans: S,
+    pub span_batch: trace::BatchConfig,
+}
+
+/// The instrumentation scope every span is recorded under.
+const TRACER_NAME: &str = "sovereign-config";
+
+/// Builds the layers for `plan`.
 ///
 /// Layers:
+/// - the span layer, always. It sees **span metadata only**, from this
+///   product's own crates (`sovereign_config*` targets), and no level filter:
+///   events are the log bridge's, so one fact is never both a span event and
+///   a log record (skill §3), and `RUST_LOG` can never silently drop a span.
+///   Dependencies' internal spans (`h2`, `hyper`, `tonic`) are left out as
+///   noise. With traces exporting it records into the SDK tracer; otherwise
+///   into a no-op tracer, which keeps propagation working (see [`context`]).
 /// - `fmt`, JSON to `writer`, filtered by `log_filter` (`RUST_LOG`), with the
 ///   SDK's own targets held at `warn` — that is where a failing export shows,
-///   once per batch interval (skill §6);
-/// - the log bridge, when exporting, filtered by the same `log_filter` minus
-///   [`NEVER_BRIDGED`]. It copies no span attributes onto records (skill §3).
+///   once per batch interval (skill §6). It writes no span fields: a span's
+///   attributes are the span's, not every log line's.
+/// - the log bridge, when logs export, filtered by the same `log_filter` minus
+///   [`NEVER_BRIDGED`]. It copies no span attributes onto records (skill §3);
+///   the SDK stamps each record with the current span's `trace_id` and
+///   `span_id`.
 ///
 /// # Errors
 ///
-/// The exporter could not be built.
-pub fn assemble<E, W>(
+/// An exporter could not be built.
+pub fn assemble<LE, SE, W>(
     plan: Plan,
     identity: &Identity,
     log_filter: &str,
     writer: W,
-    exporter: impl FnOnce() -> Result<E, InitError>,
-    batch: BatchConfig,
+    exporters: Exporters<
+        impl FnOnce() -> Result<LE, InitError>,
+        impl FnOnce() -> Result<SE, InitError>,
+    >,
 ) -> Result<Assembly, InitError>
 where
-    E: LogExporter + 'static,
+    LE: LogExporter + 'static,
+    SE: SpanExporter + 'static,
     W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
-    let stdout = tracing_subscriber::fmt::layer()
-        .json()
-        .with_writer(writer)
-        .with_filter(stdout_filter(log_filter));
+    let Exporters {
+        logs: log_exporter,
+        log_batch,
+        spans: span_exporter,
+        span_batch,
+    } = exporters;
+    let (signals, resource) = match &plan {
+        Plan::Export {
+            attributes,
+            signals,
+        } => (
+            *signals,
+            Some(resource::build(
+                attributes,
+                &identity.version,
+                identity.hostname.as_deref(),
+            )),
+        ),
+        Plan::Off(_) => (
+            Exported {
+                logs: false,
+                traces: false,
+            },
+            None,
+        ),
+    };
 
-    let logs = match &plan {
-        Plan::ExportLogs { attributes } => Some(
-            SdkLoggerProvider::builder()
-                .with_resource(resource::build(
-                    attributes,
-                    &identity.version,
-                    identity.hostname.as_deref(),
-                ))
-                .with_log_processor(
-                    BatchLogProcessor::builder(exporter()?)
-                        .with_batch_config(batch)
+    let traces = match &resource {
+        Some(resource) if signals.traces => Some(
+            SdkTracerProvider::builder()
+                .with_resource(resource.clone())
+                .with_span_processor(
+                    BatchSpanProcessor::builder(span_exporter()?)
+                        .with_batch_config(span_batch)
                         .build(),
                 )
                 .build(),
         ),
-        Plan::Off(_) => None,
+        _ => None,
     };
+    let logs = match resource {
+        Some(resource) if signals.logs => Some(
+            SdkLoggerProvider::builder()
+                .with_resource(resource)
+                .with_log_processor(
+                    BatchLogProcessor::builder(log_exporter()?)
+                        .with_batch_config(log_batch)
+                        .build(),
+                )
+                .build(),
+        ),
+        _ => None,
+    };
+
+    let spans: Box<dyn Layer<Registry> + Send + Sync> = match &traces {
+        Some(provider) => {
+            span_layer(tracing_opentelemetry::layer().with_tracer(provider.tracer(TRACER_NAME)))
+        }
+        None => span_layer(tracing_opentelemetry::layer()),
+    };
+    let stdout = tracing_subscriber::fmt::layer()
+        .json()
+        .with_current_span(false)
+        .with_span_list(false)
+        .with_writer(writer)
+        .with_filter(stdout_filter(log_filter));
     let bridge = logs.as_ref().map(|provider| {
         OpenTelemetryTracingBridge::new(provider).with_filter(bridge_filter(log_filter))
     });
 
-    let subscriber = Registry::default().with(stdout).with(bridge);
+    let subscriber = Registry::default().with(spans).with(stdout).with(bridge);
     Ok(Assembly {
         subscriber: Box::new(subscriber),
-        telemetry: Telemetry { plan, logs },
+        telemetry: Telemetry { plan, logs, traces },
     })
+}
+
+/// The span bridge, configured once for either tracer: location on (it is
+/// how a span leads back to code); busy/idle timings, thread and target off,
+/// because none of them is a semantic-convention key (`keys`) and the timings
+/// duplicate what the span's own duration says.
+fn span_layer<T>(
+    layer: tracing_opentelemetry::OpenTelemetryLayer<Registry, T>,
+) -> Box<dyn Layer<Registry> + Send + Sync>
+where
+    T: opentelemetry::trace::Tracer + Send + Sync + 'static,
+    T::Span: Send + Sync,
+{
+    layer
+        .with_location(true)
+        .with_tracked_inactivity(false)
+        .with_threads(false)
+        .with_target(false)
+        .with_level(false)
+        .with_filter(span_filter())
+        .boxed()
+}
+
+/// Spans from this product's own crates, and nothing else.
+fn span_filter() -> FilterFn<fn(&Metadata<'_>) -> bool> {
+    filter_fn(|metadata| metadata.is_span() && metadata.target().starts_with("sovereign_config"))
 }
 
 /// `RUST_LOG`, or `info` when it is unset or does not parse.
@@ -266,9 +388,14 @@ pub fn init(version: &str) -> Result<Telemetry, InitError> {
         &identity,
         &log_filter,
         std::io::stdout,
-        otlp_log_exporter,
-        // Reads the OTEL_BLRP_* variables, which config validated.
-        BatchConfigBuilder::default().build(),
+        Exporters {
+            logs: otlp_log_exporter,
+            // Reads the OTEL_BLRP_* variables, which config validated.
+            log_batch: logs::BatchConfigBuilder::default().build(),
+            spans: otlp_span_exporter,
+            // Reads the OTEL_BSP_* variables, likewise.
+            span_batch: trace::BatchConfigBuilder::default().build(),
+        },
     )?;
 
     // Propagation runs whether or not anything exports: a silent service
@@ -290,5 +417,19 @@ fn otlp_log_exporter() -> Result<opentelemetry_otlp::LogExporter, InitError> {
         .with_http()
         .with_protocol(Protocol::HttpBinary)
         .build()
-        .map_err(|_| InitError::Exporter)
+        .map_err(|_| InitError::Exporter("log"))
+}
+
+/// The OTLP span exporter, configured exactly as the log exporter is. The
+/// sampler (`OTEL_TRACES_SAMPLER`, `_ARG`) is read by the SDK's tracer
+/// provider; unset, it samples everything, and sampling is the collector's
+/// decision (skill §2).
+fn otlp_span_exporter() -> Result<opentelemetry_otlp::SpanExporter, InitError> {
+    use opentelemetry_otlp::{Protocol, WithExportConfig};
+
+    opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_protocol(Protocol::HttpBinary)
+        .build()
+        .map_err(|_| InitError::Exporter("span"))
 }

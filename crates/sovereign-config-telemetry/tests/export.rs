@@ -14,16 +14,19 @@ use opentelemetry_sdk::{
     Resource,
     error::OTelSdkResult,
     logs::{BatchConfig, BatchConfigBuilder, InMemoryLogExporter, LogBatch, LogExporter},
+    trace::{self, InMemorySpanExporter},
 };
 use sovereign_config_telemetry::{
-    Assembly, Identity, InitError, OtelEnv, Plan, SHUTDOWN_TIMEOUT, assemble, config::validate,
+    Assembly, Exporters, Identity, InitError, OtelEnv, Plan, SHUTDOWN_TIMEOUT, assemble,
+    config::validate,
 };
 use tracing_subscriber::fmt::MakeWriter;
 
-const VERSION: &str = "2.35.0-test";
+const VERSION: &str = "2.36.0-test";
 
-/// The variables a dev deployment carries, with a stale version planted in
-/// the attribute list to prove the build's wins.
+/// The variables a deployment that exports logs only carries, with a stale
+/// version planted in the attribute list to prove the build's wins. Spans
+/// are covered by the server's tests, through `testing::Capture`.
 const DEPLOYED: [(&str, &str); 7] = [
     ("OTEL_SERVICE_NAME", "sovereign-config"),
     (
@@ -97,6 +100,25 @@ fn slow_batches() -> BatchConfig {
         .build()
 }
 
+/// Exporters around `logs`, and a span exporter that must never be built
+/// (these tests' deployment has `OTEL_TRACES_EXPORTER=none`).
+fn exporters<L>(
+    logs: impl FnOnce() -> Result<L, InitError>,
+    log_batch: BatchConfig,
+) -> Exporters<
+    impl FnOnce() -> Result<L, InitError>,
+    impl FnOnce() -> Result<InMemorySpanExporter, InitError>,
+> {
+    Exporters {
+        logs,
+        log_batch,
+        spans: || -> Result<InMemorySpanExporter, InitError> {
+            panic!("no span exporter may be built while traces are off")
+        },
+        span_batch: trace::BatchConfigBuilder::default().build(),
+    }
+}
+
 fn assemble_with(
     plan: Plan,
     exporter: &InMemoryLogExporter,
@@ -109,8 +131,7 @@ fn assemble_with(
         &identity(hostname),
         "info",
         stdout.clone(),
-        move || Ok::<_, InitError>(exporter),
-        slow_batches(),
+        exporters(move || Ok::<_, InitError>(exporter), slow_batches()),
     )
     .expect("assembly must succeed")
 }
@@ -217,11 +238,13 @@ fn off_builds_no_provider_and_says_so_once() {
             &identity(Some("host")),
             "",
             stdout.clone(),
-            move || {
-                *flag.lock().unwrap() = true;
-                Ok::<_, InitError>(exporter)
-            },
-            slow_batches(),
+            exporters(
+                move || {
+                    *flag.lock().unwrap() = true;
+                    Ok::<_, InitError>(exporter)
+                },
+                slow_batches(),
+            ),
         )
         .unwrap();
 
@@ -329,18 +352,20 @@ fn an_unreachable_collector_costs_nothing_and_shutdown_stays_bounded() {
         &identity(Some("host")),
         "info",
         stdout.clone(),
-        move || {
-            opentelemetry_otlp::LogExporter::builder()
-                .with_http()
-                .with_protocol(Protocol::HttpBinary)
-                .with_endpoint(endpoint)
-                .with_timeout(Duration::from_secs(2))
-                .build()
-                .map_err(|_| InitError::Exporter)
-        },
-        BatchConfigBuilder::default()
-            .with_scheduled_delay(Duration::from_millis(50))
-            .build(),
+        exporters(
+            move || {
+                opentelemetry_otlp::LogExporter::builder()
+                    .with_http()
+                    .with_protocol(Protocol::HttpBinary)
+                    .with_endpoint(endpoint)
+                    .with_timeout(Duration::from_secs(2))
+                    .build()
+                    .map_err(|_| InitError::Exporter("log"))
+            },
+            BatchConfigBuilder::default()
+                .with_scheduled_delay(Duration::from_millis(50))
+                .build(),
+        ),
     )
     .unwrap();
 
@@ -365,5 +390,119 @@ fn an_unreachable_collector_costs_nothing_and_shutdown_stays_bounded() {
             .iter()
             .any(|line| line.contains(&format!("127.0.0.1:{port}"))),
         "{lines:?}"
+    );
+}
+
+/// A span's attributes are the span's: stdout lines carry no span fields,
+/// so `user.*` recorded on a request span never reaches `docker logs`.
+#[test]
+fn stdout_lines_carry_no_span_fields() {
+    let exporter = InMemoryLogExporter::default();
+    let stdout = Captured::default();
+    let plan = validate(&OtelEnv::from_pairs(DEPLOYED)).unwrap();
+    let Assembly {
+        subscriber,
+        mut telemetry,
+    } = assemble_with(plan, &exporter, &stdout, None);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!(
+            target: "sovereign_config_server::spans",
+            "rpc",
+            user.id = "subject-sentinel",
+            user.name = "name-sentinel",
+        );
+        let _entered = span.enter();
+        tracing::info!("inside the span");
+        telemetry.shutdown();
+    });
+
+    let lines = stdout.lines();
+    let line = lines
+        .iter()
+        .find(|line| line.contains("inside the span"))
+        .expect("the event reached stdout");
+    for absent in ["subject-sentinel", "name-sentinel", "\"span\"", "\"spans\""] {
+        assert!(!line.contains(absent), "{absent} on stdout: {line}");
+    }
+    // Nor on the exported record: the bridge copies no span attributes.
+    for record in exporter.get_emitted_logs().unwrap() {
+        assert!(
+            !record
+                .record
+                .attributes_iter()
+                .any(|(key, _)| key.as_str().starts_with("user.")),
+        );
+    }
+}
+
+/// A collector that accepts connections and never answers — the worst case
+/// for a flush — costs one shutdown bound, not one per signal: both signals
+/// flush at once, inside Docker's default stop grace.
+#[test]
+fn a_hung_collector_costs_one_shutdown_bound_for_both_signals() {
+    use opentelemetry_otlp::{Protocol, WithExportConfig};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let holder = Arc::clone(&held);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            holder.lock().unwrap().push(stream);
+        }
+    });
+    let plan = validate(&OtelEnv::from_pairs(
+        DEPLOYED
+            .into_iter()
+            .chain([("OTEL_TRACES_EXPORTER", "otlp")]),
+    ))
+    .unwrap();
+    let Assembly {
+        subscriber,
+        mut telemetry,
+    } = assemble(
+        plan,
+        &identity(Some("host")),
+        "info",
+        Captured::default(),
+        Exporters {
+            logs: move || {
+                opentelemetry_otlp::LogExporter::builder()
+                    .with_http()
+                    .with_protocol(Protocol::HttpBinary)
+                    .with_endpoint(format!("http://{address}/v1/logs"))
+                    .with_timeout(Duration::from_secs(30))
+                    .build()
+                    .map_err(|_| InitError::Exporter("log"))
+            },
+            log_batch: slow_batches(),
+            spans: move || {
+                opentelemetry_otlp::SpanExporter::builder()
+                    .with_http()
+                    .with_protocol(Protocol::HttpBinary)
+                    .with_endpoint(format!("http://{address}/v1/traces"))
+                    .with_timeout(Duration::from_secs(30))
+                    .build()
+                    .map_err(|_| InitError::Exporter("span"))
+            },
+            span_batch: trace::BatchConfigBuilder::default()
+                .with_scheduled_delay(Duration::from_secs(3600))
+                .build(),
+        },
+    )
+    .unwrap();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!(target: "sovereign_config_test", "work");
+        let _entered = span.enter();
+        tracing::info!("pending");
+    });
+    let started = Instant::now();
+    telemetry.shutdown();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < SHUTDOWN_TIMEOUT + Duration::from_millis(1500),
+        "shutdown took {elapsed:?}"
     );
 }

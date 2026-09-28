@@ -8,12 +8,21 @@ repository.workspace = true
 description = "The one module that owns telemetry: OTEL_* validation, resource identity, OTLP export and shutdown"
 publish = false
 
+[features]
+# In-memory exporters and plain-typed results for other crates' tests; only
+# ever enabled from a `[dev-dependencies]` entry.
+testing = ["opentelemetry_sdk/testing"]
+
 [dependencies]
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-appender-tracing.workspace = true
-opentelemetry-semantic-conventions.workspace = true
+# `user.*`, `rpc.method` and `url.template` are still marked experimental.
+opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
+opentelemetry-http.workspace = true
+tracing-opentelemetry.workspace = true
+http.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

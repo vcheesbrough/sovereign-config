@@ -11,7 +11,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
 };
@@ -23,6 +23,7 @@ use tokio::{net::TcpListener, task::JoinHandle, time::sleep};
 
 use sovereign_config_core::Secret;
 use tonic::{Request, Status};
+use tracing::Instrument;
 
 use super::identity::{
     USERNAME_PREFIX, USERNAME_SLUG_MAX_CHARS, generate_app_password, generate_connection_id,
@@ -126,6 +127,8 @@ struct MockState {
     usernames_by_id: Arc<Mutex<std::collections::HashMap<i64, String>>>,
     rotated_keys: Arc<Mutex<Vec<String>>>,
     group_assignments: Arc<Mutex<Vec<(i64, String)>>>,
+    /// The `traceparent` each service-account create arrived with.
+    create_traceparents: Arc<Mutex<Vec<Option<String>>>>,
     next_user_id: Arc<AtomicI64>,
 }
 
@@ -161,6 +164,10 @@ impl MockAuthentik {
     fn group_assignments(&self) -> Vec<(i64, String)> {
         self.state.group_assignments.lock().unwrap().clone()
     }
+
+    fn create_traceparents(&self) -> Vec<Option<String>> {
+        self.state.create_traceparents.lock().unwrap().clone()
+    }
 }
 
 async fn apply(behavior: &Behavior) -> Option<Response> {
@@ -184,7 +191,17 @@ fn behavior(state: &MockState, select: impl FnOnce(&Script) -> Behavior) -> Beha
     select(&state.script.lock().unwrap())
 }
 
-async fn create_account(State(state): State<MockState>, Json(body): Json<Value>) -> Response {
+async fn create_account(
+    State(state): State<MockState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state.create_traceparents.lock().unwrap().push(
+        headers
+            .get("traceparent")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+    );
     let delay = state.script.lock().unwrap().create_account_delay;
     sleep(delay).await;
     if let Some(response) = apply(&behavior(&state, |script| script.create_account.clone())).await {
@@ -374,6 +391,7 @@ async fn mock_authentik() -> MockAuthentik {
         usernames_by_id: Arc::new(Mutex::new(std::collections::HashMap::new())),
         rotated_keys: Arc::new(Mutex::new(Vec::new())),
         group_assignments: Arc::new(Mutex::new(Vec::new())),
+        create_traceparents: Arc::new(Mutex::new(Vec::new())),
         next_user_id: Arc::new(AtomicI64::new(1000)),
     };
     let app = Router::new()
@@ -690,6 +708,74 @@ async fn create_provisions_exactly_one_read_only_grant_and_returns_one_url() {
     let assignments = mock.group_assignments();
     assert_eq!(assignments.len(), 1);
     assert_eq!(assignments[0].1, TEST_GROUP_ID);
+}
+
+/// The trace of one managed create, as an operator would read it in Tempo:
+/// the request's server span, a Postgres child for each store call, and an
+/// Authentik child for each admin call — whose request carried the client
+/// span's own context — and nothing secret on any of them.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn a_managed_create_is_one_trace_across_postgres_and_authentik() {
+    let mock = mock_authentik().await;
+    let service = service_or_skip!(&mock);
+    let capture = sovereign_config_telemetry::testing::Capture::exporting();
+    {
+        let _guard = capture.enter();
+        let span = crate::spans::server_span(
+            &http::Method::POST,
+            "/sovereign.config.v3.ManagedConnections/CreateManagedConnection",
+        )
+        .expect("a served route has a span");
+        create(&service, "Traced reader", "/apps/traced", &operator("/"))
+            .instrument(span)
+            .await
+            .expect("create must succeed");
+    }
+    let exported = capture.finish();
+
+    let server = exported.span("sovereign.config.v3.ManagedConnections/CreateManagedConnection");
+    let authentik = exported.span("POST /api/v3/core/users/service_account/");
+    assert!(authentik.is_child_of(server), "{authentik:?}");
+    assert_eq!(authentik.kind, "client");
+    let insert = exported.span("insert_provisioning managed_connections");
+    assert!(insert.is_child_of(server), "{insert:?}");
+    assert_eq!(insert.attribute("db.system.name"), Some("postgresql"));
+    // Every other admin call is a child of the same request.
+    for name in [
+        "GET /api/v3/core/tokens/",
+        "PATCH /api/v3/core/users/{id}/",
+        "GET /api/v3/core/groups/",
+    ] {
+        for span in exported.spans_named(name) {
+            assert!(span.is_child_of(server), "{name}: {span:?}");
+        }
+    }
+
+    let traceparents = mock.create_traceparents();
+    let header = traceparents[0]
+        .as_deref()
+        .expect("the create carried traceparent");
+    assert_eq!(
+        header,
+        format!("00-{}-{}-01", authentik.trace_id, authentik.span_id)
+    );
+
+    // The created connection is logged as a decision, in the same trace.
+    let log = exported
+        .log("managed connection created")
+        .expect("the create is logged");
+    assert_eq!(log.trace_id.as_deref(), Some(server.trace_id.as_str()));
+
+    for value in exported.all_values() {
+        for secret in [
+            APP_PASSWORD_SENTINEL,
+            "manager-api-token-sentinel",
+            PUBLIC_ORIGIN,
+        ] {
+            assert!(!value.contains(secret), "exported {secret}: {value}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -1114,6 +1200,122 @@ async fn ambiguous_creation_reconciles_only_the_exact_generated_account() {
     let rows = rows(&service).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].state, "cleanup_required");
+}
+
+/// The degraded managed-connection outcomes each leave one human-readable
+/// log line, at `warn`, in the request's trace — the line an operator reads
+/// to learn why a connection is in the state it is in. Decisions are `info`.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn managed_decisions_and_degraded_outcomes_are_logged() {
+    let mock = mock_authentik().await;
+    let service = service_or_skip!(&mock);
+    let (connection_id, _) = create(&service, "Logged", "/apps/api", &operator("/"))
+        .await
+        .expect("create must succeed");
+    let rotate_request = || {
+        request(
+            RotateManagedConnectionRequest {
+                connection_id: connection_id.clone(),
+            },
+            &operator("/"),
+        )
+    };
+
+    let rpc = || {
+        crate::spans::server_span(
+            &http::Method::POST,
+            "/sovereign.config.v3.ManagedConnections/CreateManagedConnection",
+        )
+        .expect("a served route has a span")
+    };
+    let capture = sovereign_config_telemetry::testing::Capture::exporting();
+    {
+        let _guard = capture.enter();
+        // Refused outright: a decision.
+        mock.script(|script| script.create_account = Behavior::Status(StatusCode::FORBIDDEN));
+        let _ = create(&service, "Refused", "/apps/api", &operator("/"))
+            .instrument(rpc())
+            .await;
+        // Ambiguous, found, and compensation fails: degraded, cleanup required.
+        mock.script(|script| {
+            script.create_account = Behavior::Timeout;
+            script.user_exists = true;
+            script.delete_user = Behavior::Status(StatusCode::INTERNAL_SERVER_ERROR);
+        });
+        let _ = create(&service, "Unrecoverable", "/apps/api", &operator("/"))
+            .instrument(rpc())
+            .await;
+        // Rotation refused, then ambiguous.
+        mock.script(|script| {
+            script.create_account = Behavior::Ok;
+            script.user_exists = false;
+            script.delete_user = Behavior::Ok;
+            script.set_credential = Behavior::Status(StatusCode::BAD_REQUEST);
+        });
+        let _ = service
+            .rotate_managed_connection(rotate_request())
+            .instrument(rpc())
+            .await;
+        mock.script(|script| script.set_credential = Behavior::Timeout);
+        let _ = service
+            .rotate_managed_connection(rotate_request())
+            .instrument(rpc())
+            .await;
+        // Revocation whose delete fails while the credential is still
+        // visible: it cannot confirm the account is gone.
+        mock.script(|script| {
+            script.delete_user = Behavior::Status(StatusCode::INTERNAL_SERVER_ERROR);
+        });
+        sleep(ROTATION_LEASE).await;
+        let _ = service
+            .revoke_managed_connection(request(
+                RevokeManagedConnectionRequest {
+                    connection_id: connection_id.clone(),
+                },
+                &operator("/"),
+            ))
+            .instrument(rpc())
+            .await;
+    }
+    let exported = capture.finish();
+
+    let expect = |body: &str| {
+        exported
+            .log(body)
+            .unwrap_or_else(|| panic!("no log record {body:?}; exported: {:?}", exported.logs))
+    };
+    expect("service account creation definitively failed; the connection was discarded");
+    expect("service account creation outcome is unknown; reconciling by the generated username");
+    expect("reconciliation found the account the ambiguous create made; removing it");
+    expect("compensation could not delete the created service account");
+    let cleanup =
+        expect("managed connection requires cleanup; revoking it removes any account left behind");
+    assert_eq!(
+        cleanup.attributes.get("reason").map(String::as_str),
+        Some("a service account may survive a failed creation")
+    );
+    expect("rotation failed before the credential changed; the previous URL stays current");
+    expect(
+        "rotation outcome is unknown; the connection stays rotation_unknown until its lease expires and a retry settles it",
+    );
+    let revoking = expect(
+        "revocation could not confirm the account's credential is gone; the connection stays revoking",
+    );
+    assert_eq!(
+        revoking.attributes.get("connection_id"),
+        Some(&connection_id)
+    );
+    // Each is in the trace of the call that decided it.
+    for log in &exported.logs {
+        assert!(log.trace_id.is_some(), "{log:?}");
+    }
+    for log in &exported.logs {
+        for value in log.attributes.values().chain(log.body.as_ref()) {
+            assert!(!value.contains(APP_PASSWORD_SENTINEL), "{value}");
+            assert!(!value.contains("authentik-body-sentinel"), "{value}");
+        }
+    }
 }
 
 /// Regression: a 2xx create response that fails this server's own strict

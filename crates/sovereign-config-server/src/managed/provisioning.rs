@@ -9,6 +9,7 @@ use sovereign_config_core::{
 };
 use tokio::time::sleep;
 use tonic::Status;
+use tracing::{info, warn};
 
 use super::ManagedConnectionsService;
 use super::store::ConnectionRow;
@@ -193,11 +194,12 @@ impl ManagedConnectionsService {
         // Group membership is an operator convenience for browsing accounts in
         // Authentik; it grants nothing and its failure must never fail or roll
         // back a connection that is otherwise fully functional.
-        self.assign_managed_group(account.user_id).await;
+        self.assign_managed_group(connection_id, account.user_id)
+            .await;
         Ok(())
     }
 
-    pub(super) async fn assign_managed_group(&self, user_id: i64) {
+    pub(super) async fn assign_managed_group(&self, connection_id: &ConnectionId, user_id: i64) {
         let outcome = match self
             .admin
             .find_group_by_name(&self.settings.managed_group)
@@ -210,6 +212,13 @@ impl ManagedConnectionsService {
             Ok(None) => ManagedDependencyOutcome::NotFound,
             Err(error) => dependency_outcome(error),
         };
+        if !matches!(outcome, ManagedDependencyOutcome::Ok) {
+            warn!(
+                connection_id = connection_id.as_str(),
+                outcome = outcome.as_str(),
+                "the service account was not added to the browsing group; the connection works regardless"
+            );
+        }
         self.metrics
             .record_dependency(ManagedDependencyCall::AssignGroup, outcome);
     }
@@ -232,9 +241,18 @@ impl ManagedConnectionsService {
                     }),
                 );
                 if self.delete_row(connection_id).await {
+                    info!(
+                        connection_id = connection_id.as_str(),
+                        "creation failed after the service account existed; the account was deleted and the connection discarded"
+                    );
                     failure
                 } else {
-                    cleanup_required(connection_id, self).await
+                    cleanup_required(
+                        connection_id,
+                        self,
+                        "the created service account was deleted, but its connection row could not be removed",
+                    )
+                    .await
                 }
             }
             Err(error) => {
@@ -242,7 +260,16 @@ impl ManagedConnectionsService {
                     ManagedDependencyCall::DeleteUser,
                     dependency_outcome(error),
                 );
-                cleanup_required(connection_id, self).await
+                warn!(
+                    connection_id = connection_id.as_str(),
+                    "compensation could not delete the created service account"
+                );
+                cleanup_required(
+                    connection_id,
+                    self,
+                    "a service account may survive a failed creation",
+                )
+                .await
             }
         }
     }
@@ -264,8 +291,16 @@ impl ManagedConnectionsService {
             // Only a transport-level rejection or unavailability is
             // definitive: the request could not have been applied.
             let _ = self.delete_row(connection_id).await;
+            info!(
+                connection_id = connection_id.as_str(),
+                "service account creation definitively failed; the connection was discarded"
+            );
             return dependency_error();
         }
+        warn!(
+            connection_id = connection_id.as_str(),
+            "service account creation outcome is unknown; reconciling by the generated username"
+        );
         // Authentik may have committed the account; probe only the exact
         // generated username and remove only the matching managed account. A
         // single immediate probe cannot distinguish "never created" from "the
@@ -284,6 +319,11 @@ impl ManagedConnectionsService {
                         ManagedDependencyCall::FindUser,
                         ManagedDependencyOutcome::Ok,
                     );
+                    info!(
+                        connection_id = connection_id.as_str(),
+                        attempt = attempt + 1,
+                        "reconciliation found the account the ambiguous create made; removing it"
+                    );
                     return self
                         .compensate_created_account(connection_id, user.user_id, dependency_error())
                         .await;
@@ -301,11 +341,21 @@ impl ManagedConnectionsService {
                         ManagedDependencyCall::FindUser,
                         dependency_outcome(probe_error),
                     );
-                    return cleanup_required(connection_id, self).await;
+                    return cleanup_required(
+                        connection_id,
+                        self,
+                        "reconciliation could not look the account up",
+                    )
+                    .await;
                 }
             }
         }
-        cleanup_required(connection_id, self).await
+        cleanup_required(
+            connection_id,
+            self,
+            "reconciliation found no account, but a late create could still land",
+        )
+        .await
     }
 
     /// Confirms that no app password remains for the exact managed username.
@@ -340,10 +390,18 @@ impl ManagedConnectionsService {
     }
 }
 
+/// Marks the connection `cleanup_required` — its external state is unknown,
+/// and only a revocation can settle it — and says why, once, at `warn`: a
+/// connection in this state may be holding a live credential nobody has.
 pub(super) async fn cleanup_required(
     connection_id: &ConnectionId,
     service: &ManagedConnectionsService,
+    reason: &'static str,
 ) -> Status {
+    warn!(
+        connection_id = connection_id.as_str(),
+        reason, "managed connection requires cleanup; revoking it removes any account left behind"
+    );
     let _ = service
         .transition_state(
             connection_id,

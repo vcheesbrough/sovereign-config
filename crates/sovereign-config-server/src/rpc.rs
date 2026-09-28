@@ -109,9 +109,23 @@ pub(crate) const fn to_proto_timestamp(value: Timestamp) -> prost_types::Timesta
 /// outcome by matching it, exactly as before the helper was shared.
 pub(crate) const STORAGE_UNAVAILABLE_MESSAGE: &str = "configuration storage is unavailable";
 
+/// The storage failure every service reports.
 pub(crate) fn storage_unavailable() -> Status {
     Status::unavailable(STORAGE_UNAVAILABLE_MESSAGE)
 }
+
+/// [`storage_unavailable`] from inside a store function: it also marks that
+/// function's `#[instrument]` span failed with
+/// `error.type=storage_unavailable`. Only store functions call it — anywhere
+/// else the current span is the request's, whose failure the gRPC status
+/// recorder already classifies.
+pub(crate) fn store_unavailable() -> Status {
+    crate::spans::record_error(STORAGE_UNAVAILABLE_TYPE);
+    storage_unavailable()
+}
+
+/// `error.type` of a failed store call.
+pub(crate) const STORAGE_UNAVAILABLE_TYPE: &str = "storage_unavailable";
 
 fn invalid_timestamp() -> Status {
     Status::internal("configuration timestamp is invalid")

@@ -25,12 +25,13 @@ use tower::{
     Layer, Service,
     layer::util::{Identity, Stack},
 };
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
 
 use crate::{
     config::{AcceptedIdentity, AuthenticationConfig},
     metrics::{AuthenticationMetrics, AuthenticationResult, ProtocolMetrics},
     protocol::{NegotiatedProtocolVersion, UnservedVersionLayer},
+    spans::{self, GrpcStatusLayer, RequestSpan},
     system::served,
 };
 
@@ -174,25 +175,38 @@ impl Authenticator {
         let token = bearer_token(headers)?;
         require_rs256(token)?;
 
-        let response = self
+        let body = self
+            .introspect(token)
+            .instrument(spans::client_span(
+                &Method::POST,
+                None,
+                &self.introspection_url,
+            ))
+            .await?;
+        let response: IntrospectionResponse =
+            serde_json::from_slice(&body).map_err(|_| AuthenticationFailure::unavailable())?;
+        validate_introspection_for_any(response, &self.accepted_identities)
+    }
+
+    /// The introspection call itself, inside its client span. The endpoint is
+    /// configuration, so the span is named by its method alone.
+    async fn introspect(&self, token: &str) -> Result<Vec<u8>, AuthenticationFailure> {
+        let request = self
             .client
             .post(self.introspection_url.clone())
             .basic_auth(
                 &self.introspection_client_id,
                 Some(&self.introspection_client_secret),
             )
-            .form(&[("token", token)])
-            .send()
-            .await
-            .map_err(|_| AuthenticationFailure::unavailable())?;
-        if !response.status().is_success() {
-            return Err(AuthenticationFailure::unavailable());
+            .form(&[("token", token)]);
+        let result = match spans::send(&self.client, request).await {
+            Ok(response) if response.status().is_success() => read_bounded_response(response).await,
+            _ => Err(AuthenticationFailure::unavailable()),
+        };
+        if result.is_err() {
+            spans::record_error("unavailable");
         }
-
-        let response = read_bounded_response(response).await?;
-        let response: IntrospectionResponse =
-            serde_json::from_slice(&response).map_err(|_| AuthenticationFailure::unavailable())?;
-        validate_introspection_for_any(response, &self.accepted_identities)
+        result
     }
 }
 
@@ -480,11 +494,18 @@ impl AuthenticationLayer {
     }
 }
 
-pub(crate) type GrpcServiceLayer =
-    Stack<AuthenticationLayer, Stack<UnservedVersionLayer, Stack<GrpcWebLayer, Identity>>>;
+pub(crate) type GrpcServiceLayer = Stack<
+    AuthenticationLayer,
+    Stack<UnservedVersionLayer, Stack<GrpcStatusLayer, Stack<GrpcWebLayer, Identity>>>,
+>;
 
-/// The gRPC stack, outermost first: gRPC-Web, then the version-not-served
-/// catch-all, then authentication.
+/// The gRPC stack, outermost first: gRPC-Web, then the span's gRPC status
+/// recorder, then the version-not-served catch-all, then authentication.
+///
+/// The status recorder is *inside* `GrpcWebLayer` because only there is a
+/// browser's status still in trailers rather than framed into the body, and
+/// *outside* the catch-all and authentication so that their refusals are
+/// recorded as well.
 ///
 /// **Both boundaries are load-bearing.**
 ///
@@ -510,7 +531,10 @@ pub(crate) fn grpc_service_layer(
         AuthenticationLayer::new(authenticator, metrics, protocol_metrics),
         Stack::new(
             UnservedVersionLayer::new(served_versions),
-            Stack::new(GrpcWebLayer::new(), Identity::new()),
+            Stack::new(
+                GrpcStatusLayer,
+                Stack::new(GrpcWebLayer::new(), Identity::new()),
+            ),
         ),
     )
 }
@@ -585,6 +609,9 @@ where
                         reason = "accepted",
                         "gRPC authentication succeeded"
                     );
+                    if let Some(RequestSpan(span)) = request.extensions().get::<RequestSpan>() {
+                        spans::stamp_user(span, &principal);
+                    }
                     request.extensions_mut().insert(principal);
                     inner.call(request).await
                 }

@@ -17,6 +17,7 @@ use sovereign_config_core::{
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use tonic::Status;
+use tracing::{info, warn};
 
 use super::identity::{generate_app_password, generate_connection_id, managed_username};
 use super::provisioning::{CLEANUP_MESSAGE, dependency_outcome};
@@ -227,14 +228,20 @@ impl ManagedConnectionsService {
             },
             &permissions.as_storage(),
         );
-        self.provision_inserted(
-            &connection_id,
-            &username,
-            &root,
-            &permissions,
-            (&actor, event),
-        )
-        .await
+        let provisioned = self
+            .provision_inserted(
+                &connection_id,
+                &username,
+                &root,
+                &permissions,
+                (&actor, event),
+            )
+            .await?;
+        info!(
+            connection_id = connection_id.as_str(),
+            "managed connection created"
+        );
+        Ok(provisioned)
     }
 
     /// Locks the row, validates it is rotatable, and transitions it to
@@ -355,8 +362,16 @@ impl ManagedConnectionsService {
             )
             .await?
         else {
+            warn!(
+                connection_id = connection_id.as_str(),
+                "the new credential was applied, but a concurrent revocation claimed the connection; the rotation is not reported as current"
+            );
             return Err(dependency_error());
         };
+        info!(
+            connection_id = connection_id.as_str(),
+            "managed connection rotated"
+        );
         Ok(ProvisionedConnection {
             metadata: metadata(&row)?,
             connection_url,
@@ -373,7 +388,8 @@ impl ManagedConnectionsService {
         let actor = context.actor()?;
         let username = managed_username(&connection_id, &row.display_name);
         if let Some(user_id) = self.revocation_target(&row, &username).await? {
-            self.delete_account_confirmed(user_id, &username).await?;
+            self.delete_account_confirmed(&connection_id, user_id, &username)
+                .await?;
         }
         let event = AuditEvent::connection_revoked(
             &actor,
@@ -384,7 +400,12 @@ impl ManagedConnectionsService {
             },
         );
         self.delete_connection_recorded(&connection_id, &actor, event)
-            .await
+            .await?;
+        info!(
+            connection_id = connection_id.as_str(),
+            "managed connection revoked"
+        );
+        Ok(())
     }
 
     /// Locks a manageable row and marks it `revoking`, so a concurrent
@@ -432,6 +453,10 @@ impl ManagedConnectionsService {
                 // because the token view is global and cascades with
                 // the account.
                 if !self.credential_is_gone(username).await {
+                    warn!(
+                        connection_id = row.connection_id.as_str(),
+                        "revocation could neither find the account nor confirm its credential is gone; the connection stays revoking"
+                    );
                     return Err(dependency_error());
                 }
                 Ok(None)
@@ -442,7 +467,12 @@ impl ManagedConnectionsService {
     /// Deletes the account, or confirms it is already gone. The row stays
     /// `revoking` on failure, so revocation can be retried until absence is
     /// confirmed.
-    async fn delete_account_confirmed(&self, user_id: i64, username: &str) -> Result<(), Status> {
+    async fn delete_account_confirmed(
+        &self,
+        connection_id: &ConnectionId,
+        user_id: i64,
+        username: &str,
+    ) -> Result<(), Status> {
         match self.admin.delete_user(user_id).await {
             Ok(()) => {
                 self.metrics.record_dependency(
@@ -468,6 +498,10 @@ impl ManagedConnectionsService {
                 if !self.credential_is_gone(username).await {
                     // The row stays `revoking`; revocation can be retried
                     // until absence is confirmed.
+                    warn!(
+                        connection_id = connection_id.as_str(),
+                        "revocation could not confirm the account's credential is gone; the connection stays revoking"
+                    );
                     return Err(dependency_error());
                 }
             }
@@ -482,6 +516,10 @@ impl ManagedConnectionsService {
             // Definitive rejection before mutation: the previous
             // credential is still current.
             AdminError::Rejected | AdminError::Unavailable => {
+                warn!(
+                    connection_id = connection_id.as_str(),
+                    "rotation failed before the credential changed; the previous URL stays current"
+                );
                 let _ = self
                     .transition_state(
                         connection_id,
@@ -492,6 +530,10 @@ impl ManagedConnectionsService {
             }
             // The token is gone; only revocation can clean this up.
             AdminError::NotFound => {
+                warn!(
+                    connection_id = connection_id.as_str(),
+                    "the credential to rotate no longer exists; the connection requires cleanup by revocation"
+                );
                 let _ = self
                     .transition_state(
                         connection_id,
@@ -501,7 +543,10 @@ impl ManagedConnectionsService {
                     .await;
             }
             // Ambiguous: Authentik may have applied the new key.
-            AdminError::Ambiguous | AdminError::Invalid => {}
+            AdminError::Ambiguous | AdminError::Invalid => warn!(
+                connection_id = connection_id.as_str(),
+                "rotation outcome is unknown; the connection stays rotation_unknown until its lease expires and a retry settles it"
+            ),
         }
     }
 }

@@ -8,6 +8,7 @@ mod managed;
 mod metrics;
 mod protocol;
 mod rpc;
+mod spans;
 mod system;
 mod values;
 mod web;
@@ -28,7 +29,7 @@ use tonic_health::pb::{
     health_server::{Health, HealthServer},
 };
 use tonic_health::server::HealthReporter;
-use tracing::{error, info};
+use tracing::{Instrument, error, info};
 
 use audit::{AuditRecorder, AuditTrailService, v4::V4Audit};
 use auth::{Authenticator, grpc_service_layer};
@@ -49,6 +50,7 @@ use sovereign_config_proto::sovereign::config::{
     },
     v4,
 };
+use spans::TraceLayer;
 use system::{SERVED_PROTOCOL_LABELS, SystemService, V4System};
 use values::{ConfigurationService, V3Configuration, V4Configuration, encrypt_stored_secrets};
 use web::WebAssetsLayer;
@@ -208,7 +210,10 @@ async fn serve() -> Result<()> {
     );
     Server::builder()
         .accept_http1(true)
-        // Outermost, so every request is attributed to the protocol version its
+        // Outermost of all: the request's span covers every layer below, and
+        // adopts an inbound `traceparent` before anything else runs.
+        .layer(TraceLayer)
+        // Outermost of the rest, so every request is attributed to the protocol version its
         // route names — including one rejected by authentication, which still
         // counts as `attempted`. It must also stay outside the authentication
         // layer because that layer reads the version extension this one
@@ -281,18 +286,35 @@ fn managed_dependencies(
 }
 
 /// Connects to the required `PostgreSQL` dependency and applies the
-/// forward-only migrations before anything can serve.
+/// forward-only migrations before anything can serve — as one root span,
+/// since startup is part of no request.
 async fn connect_database(database_url: &str) -> Result<PgPool> {
-    let database = PgPoolOptions::new()
-        .acquire_timeout(Duration::from_secs(5))
-        .connect(database_url)
-        .await
-        .map_err(|_| anyhow::anyhow!("unable to connect to required PostgreSQL dependency"))?;
-    sqlx::migrate!("./migrations")
-        .run(&database)
-        .await
-        .context("database migration failed")?;
-    Ok(database)
+    async {
+        let database = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(database_url)
+            .await
+            .map_err(|_| {
+                spans::record_error("unavailable");
+                anyhow::anyhow!("unable to connect to required PostgreSQL dependency")
+            })?;
+        sqlx::migrate!("./migrations")
+            .run(&database)
+            .await
+            .inspect_err(|_| spans::record_error("migration_failed"))
+            .context("database migration failed")?;
+        Ok(database)
+    }
+    .instrument(tracing::info_span!(
+        parent: None,
+        "migrate",
+        otel.kind = "client",
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+        db.system.name = "postgresql",
+        db.operation.name = "migrate",
+    ))
+    .await
 }
 
 /// Serves `/metrics` and `/readyz` on the internal metrics listener in the
@@ -329,14 +351,39 @@ fn spawn_audit_retention_sweep(database: PgPool, audit: AuditRecorder, retention
         let mut interval = tokio::time::interval(AUDIT_SWEEP_INTERVAL);
         loop {
             interval.tick().await;
-            let cutoff = time::OffsetDateTime::now_utc() - retention;
-            match audit.sweep_expired(&database, cutoff).await {
-                Ok(0) => {}
-                Ok(swept) => info!(swept, "expired audit events deleted"),
-                Err(error) => error!(error = %error, "audit retention sweep failed"),
-            }
+            sweep_audit_trail(&database, &audit, retention).await;
         }
     });
+}
+
+/// One retention sweep, as a **root** span of its own: it is scheduled work,
+/// part of no request, and a child of whatever happened to be current would
+/// hang it off a trace it has nothing to do with.
+async fn sweep_audit_trail(database: &PgPool, audit: &AuditRecorder, retention: Duration) {
+    async {
+        let cutoff = time::OffsetDateTime::now_utc() - retention;
+        match audit.sweep_expired(database, cutoff).await {
+            Ok(swept) => {
+                tracing::Span::current().record("sovereign_config.audit.swept", swept);
+                if swept > 0 {
+                    info!(swept, "expired audit events deleted");
+                }
+            }
+            Err(error) => {
+                spans::record_error("storage_unavailable");
+                error!(error = %error, "audit retention sweep failed; retrying at the next interval");
+            }
+        }
+    }
+    .instrument(tracing::info_span!(
+        parent: None,
+        "sovereign_config.audit.sweep",
+        otel.kind = "internal",
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+        sovereign_config.audit.swept = tracing::field::Empty,
+    ))
+    .await;
 }
 
 /// The gRPC health service with every served service marked serving. The

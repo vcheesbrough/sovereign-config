@@ -1,4 +1,9 @@
-use std::process::{Command, Output};
+use std::{
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+    process::{Command, Output},
+    sync::{Arc, Mutex},
+};
 
 const SECRET: &str = "startup-redaction-sentinel-4d9a9fd8";
 const INTROSPECTION_SECRET: &str = "introspection-redaction-sentinel-a91c5e72";
@@ -221,5 +226,129 @@ fn telemetry_configuration_values_never_reach_the_output() {
             !rendered.contains(value),
             "startup output exposed an OTEL_* value ({value}): {rendered}"
         );
+    }
+}
+
+/// Every request an OTLP/HTTP collector stand-in received, as `(path, body)`.
+type Received = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// Answers one keep-alive connection's requests with `200`, recording each.
+fn serve_otlp_connection(stream: TcpStream, received: &Received) {
+    let mut reader = BufReader::new(stream.try_clone().expect("stream clones"));
+    let mut writer = stream;
+    loop {
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+            return;
+        }
+        let path = request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_owned();
+        let mut length = 0usize;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                return;
+            }
+            let header = header.trim_end();
+            if header.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = header.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0; length];
+        if reader.read_exact(&mut body).is_err() {
+            return;
+        }
+        received.lock().unwrap().push((path, body));
+        if writer
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// An OTLP/HTTP collector on an ephemeral port, recording what it receives.
+fn fake_collector() -> (String, Received) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a port binds");
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let received: Received = Arc::default();
+    let recorder = Arc::clone(&received);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let recorder = Arc::clone(&recorder);
+            std::thread::spawn(move || serve_otlp_connection(stream, &recorder));
+        }
+    });
+    (endpoint, received)
+}
+
+/// Exported telemetry is published, not private: none of the startup
+/// secrets may reach a span or a log record that leaves the process. The
+/// server runs with every secret configured and both signals exporting to a
+/// collector stand-in, spans its startup, fails on the unreachable database
+/// (whose URL carries one of the secrets), and flushes on the way out; the
+/// test then searches what the collector received.
+#[test]
+fn no_startup_secret_reaches_an_exported_span_or_log_record() {
+    let (endpoint, received) = fake_collector();
+    let mut environment = configured_environment("127.0.0.1:50051");
+    environment.extend([
+        ("OTEL_SERVICE_NAME", "sovereign-config".to_owned()),
+        (
+            "OTEL_RESOURCE_ATTRIBUTES",
+            "deployment.environment.name=test,telemetry_source=otlp".to_owned(),
+        ),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf".to_owned()),
+        ("OTEL_LOGS_EXPORTER", "otlp".to_owned()),
+        ("OTEL_TRACES_EXPORTER", "otlp".to_owned()),
+        ("OTEL_METRICS_EXPORTER", "none".to_owned()),
+        ("RUST_LOG", "debug".to_owned()),
+    ]);
+    let output = run_server(&environment);
+    assert_secret_is_redacted(&output);
+
+    let received = received.lock().unwrap().clone();
+    let bodies = |path: &str| -> Vec<&[u8]> {
+        received
+            .iter()
+            .filter(|(received_path, _)| received_path == path)
+            .map(|(_, body)| body.as_slice())
+            .collect()
+    };
+    let contains = |haystack: &[u8], needle: &str| {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    };
+    let traces = bodies("/v1/traces");
+    let logs = bodies("/v1/logs");
+    assert!(
+        traces.iter().any(|body| contains(body, "migrate")),
+        "the startup span must have been exported: {:?}",
+        received.iter().map(|(path, _)| path).collect::<Vec<_>>()
+    );
+    assert!(!logs.is_empty(), "log records must have been exported");
+    for body in traces.iter().chain(&logs) {
+        for secret in [
+            SECRET,
+            INTROSPECTION_SECRET,
+            MANAGER_SECRET,
+            VALUE_ENCRYPTION_KEY,
+        ] {
+            assert!(
+                !contains(body, secret),
+                "an exported span or log record carries a startup secret"
+            );
+        }
     }
 }

@@ -32,8 +32,8 @@ fn deployed_telemetry(endpoint: &str) -> Vec<(&'static str, String)> {
         ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.to_owned()),
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf".to_owned()),
         ("OTEL_LOGS_EXPORTER", "otlp".to_owned()),
+        ("OTEL_TRACES_EXPORTER", "otlp".to_owned()),
         ("OTEL_METRICS_EXPORTER", "none".to_owned()),
-        ("OTEL_TRACES_EXPORTER", "none".to_owned()),
     ]
 }
 
