@@ -6,7 +6,7 @@
 //! rest of the module is wiring: read the form, ask the feed what to fetch, and
 //! draw what comes back only when the feed says it still belongs.
 
-use crate::telemetry::spawn_local;
+use crate::telemetry::{ActionKind, spawn_local};
 use sovereign_config_core::{
     AuditEntry, AuditEventKind, AuditQuery, ClientError, ConfigPath, ProtocolVersion, Timestamp,
 };
@@ -390,7 +390,7 @@ pub(crate) fn install_audit_actions(document: &Document) {
     });
     on_element_id(document, "retry-audit", "click", |_: Event| {
         if let Some(request) = FEED.with_borrow_mut(AuditFeed::retry) {
-            spawn_local(fetch_page(request));
+            spawn_local(ActionKind::RetryAudit, fetch_page(request));
         }
     });
     on_element_id(document, "audit-whole-trail", "click", |event: Event| {
@@ -420,7 +420,7 @@ fn install_observer() {
                     .is_ok_and(|entry| entry.is_intersecting())
             });
             if intersecting && let Some(request) = FEED.with_borrow_mut(AuditFeed::advance) {
-                spawn_local(fetch_page(request));
+                spawn_local(ActionKind::NextAuditPage, fetch_page(request));
             }
         },
     );
@@ -512,8 +512,10 @@ pub(crate) async fn load_audit() {
         reset_audit();
         return;
     };
+    // Always part of the action that loads the view: navigating, the page
+    // load, or a history pop.
     if let Some(query) = form_query(element_path.as_ref()) {
-        spawn_local(fetch_page(start_feed(query)));
+        spawn_local(ActionKind::Navigate, fetch_page(start_feed(query)));
     }
 }
 
@@ -529,7 +531,7 @@ fn apply_filters() {
     if FEED.with_borrow(|feed| feed.is_showing(&query)) {
         return;
     }
-    spawn_local(fetch_page(start_feed(query)));
+    spawn_local(ActionKind::FilterAudit, fetch_page(start_feed(query)));
 }
 
 /// Forgets the list: on leaving the view, on logging out, and when an applied

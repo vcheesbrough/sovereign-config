@@ -9,7 +9,7 @@ use sovereign_config_core::{
 use std::cell::{Cell, RefCell};
 use wasm_bindgen_futures::JsFuture;
 
-use crate::telemetry::spawn_local;
+use crate::telemetry::{ActionKind, spawn_local};
 use web_sys::{
     Document, Element, Event, HtmlDialogElement, HtmlInputElement, HtmlTextAreaElement, window,
 };
@@ -82,7 +82,9 @@ pub(crate) fn install_connections_actions(document: &Document) {
         "confirm-create-connection",
         "click",
         |_: Event| {
-            spawn_local(async { create_connection().await });
+            spawn_local(ActionKind::CreateConnection, async {
+                create_connection().await;
+            });
         },
     );
     on_element_id(document, "cancel-rotate-connection", "click", |_: Event| {
@@ -93,7 +95,9 @@ pub(crate) fn install_connections_actions(document: &Document) {
         "confirm-rotate-connection",
         "click",
         |_: Event| {
-            spawn_local(async { rotate_connection().await });
+            spawn_local(ActionKind::RotateConnection, async {
+                rotate_connection().await;
+            });
         },
     );
     on_element_id(document, "cancel-revoke-connection", "click", |_: Event| {
@@ -104,7 +108,9 @@ pub(crate) fn install_connections_actions(document: &Document) {
         "confirm-revoke-connection",
         "click",
         |_: Event| {
-            spawn_local(async { revoke_connection().await });
+            spawn_local(ActionKind::RevokeConnection, async {
+                revoke_connection().await;
+            });
         },
     );
     // Escape closes a native dialog without either button. Treat that as the
@@ -119,7 +125,9 @@ pub(crate) fn install_connections_actions(document: &Document) {
         toggle_connection_url_reveal();
     });
     on_element_id(document, "copy-connection-url", "click", |_: Event| {
-        spawn_local(async { copy_connection_url().await });
+        spawn_local(ActionKind::CopyConnectionUrl, async {
+            copy_connection_url().await;
+        });
     });
     on_element_id(document, "close-connection-url", "click", |_: Event| {
         let return_focus = CONNECTION_URL_RETURN_FOCUS.with_borrow_mut(Option::take);

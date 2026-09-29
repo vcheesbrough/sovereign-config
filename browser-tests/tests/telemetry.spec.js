@@ -20,12 +20,14 @@ async function withTelemetry(page) {
   }));
 }
 
-// Every `POST /v1/logs`, answered by `answer` (a status, or 'unreachable').
+// Every `POST /v1/logs` and `/v1/traces`, answered by `answer` (a status, or
+// 'unreachable'). Each post records which signal it carried.
 async function mockIngest(page, answer = 200) {
   const posts = [];
-  await page.route(`${endpoint}/v1/logs`, route => {
+  await page.route(`${endpoint}/v1/**`, route => {
     const request = route.request();
     posts.push({
+      signal: new URL(request.url()).pathname,
       method: request.method(),
       authorization: request.headers().authorization,
       body: JSON.parse(request.postData())
@@ -47,6 +49,14 @@ function consoleLines(page) {
   const lines = [];
   page.on('console', message => lines.push({ type: message.type(), text: message.text() }));
   return lines;
+}
+
+const logPosts = posts => posts.filter(post => post.signal === '/v1/logs');
+const tracePosts = posts => posts.filter(post => post.signal === '/v1/traces');
+
+function spans(post) {
+  return post.body.resourceSpans.flatMap(resource =>
+    resource.scopeSpans.flatMap(scope => scope.spans));
 }
 
 function records(post) {
@@ -81,7 +91,7 @@ test.describe('client telemetry', () => {
     await mockApplication(page);
   });
 
-  test('a page action is one POST /v1/logs with a bearer, and its records carry the action\'s trace', async ({ page }) => {
+  test('a page action is one POST /v1/logs with a bearer, and its records carry the call\'s span', async ({ page }) => {
     await withTelemetry(page);
     const posts = await mockIngest(page);
     const grpc = [];
@@ -100,11 +110,11 @@ test.describe('client telemetry', () => {
     grpc.length = 0;
     await openPath(page, '/apps/api');
     await expect(page.getByLabel('Value for enabled')).toHaveValue('secret-looking-content');
-    await expect.poll(() => posts.length, { timeout: 15000 }).toBe(1);
+    await expect.poll(() => logPosts(posts).length, { timeout: 15000 }).toBe(1);
     await settle(page, posts);
-    expect(posts).toHaveLength(1);
+    expect(logPosts(posts)).toHaveLength(1);
 
-    const [post] = posts;
+    const [post] = logPosts(posts);
     expect(post.method).toBe('POST');
     expect(post.authorization).toBe('Bearer access-token-two');
     const resource = post.body.resourceLogs[0].resource.attributes;
@@ -114,7 +124,7 @@ test.describe('client telemetry', () => {
     ]);
 
     // The gRPC-Web call carried a sampled W3C traceparent, and the record of
-    // that call carries the same trace and the action's span.
+    // that call carries the same trace and the call's span.
     const listing = grpc.find(call => call.url.endsWith('/ListValues'));
     expect(listing.traceparent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
     const [, traceId, spanId] = listing.traceparent.split('-');
@@ -130,6 +140,84 @@ test.describe('client telemetry', () => {
     for (const entry of records(post)) {
       for (const { key } of entry.attributes) {
         expect(key).not.toMatch(/token|password|secret|value|^user\./);
+      }
+    }
+  });
+
+  test('a page action is one trace: a root span, and a client span per call that is each traceparent\'s parent', async ({ page }) => {
+    await withTelemetry(page);
+    const posts = await mockIngest(page);
+    const grpc = [];
+    page.on('request', request => {
+      if (request.url().includes('/sovereign.config.')) {
+        grpc.push({ url: request.url(), traceparent: request.headers().traceparent });
+      }
+    });
+    await openCallback(page);
+    await expect(signedIn(page)).toBeVisible();
+    await mockValues(page, VALUES);
+    await expect.poll(() => tracePosts(posts).length, { timeout: 15000 }).toBeGreaterThan(0);
+    await settle(page, posts);
+
+    posts.length = 0;
+    grpc.length = 0;
+    await openPath(page, '/apps/api');
+    await expect(page.getByLabel('Value for enabled')).toHaveValue('secret-looking-content');
+    await expect.poll(() => tracePosts(posts).length, { timeout: 15000 }).toBeGreaterThan(0);
+    await settle(page, posts);
+
+    const exports = tracePosts(posts);
+    for (const post of exports) {
+      expect(post.method).toBe('POST');
+      expect(post.authorization).toBe('Bearer access-token-two');
+      expect(post.body.resourceSpans[0].resource.attributes).toEqual([
+        { key: 'service.name', value: { stringValue: 'sovereign-config-web' } },
+        { key: 'service.version', value: { stringValue: '2.38.0-test' } }
+      ]);
+    }
+    const exported = exports.flatMap(spans);
+    const byId = new Map(exported.map(span => [span.spanId, span]));
+
+    // Every call this action made names, as its traceparent's parent, a
+    // client span in the export, and that span hangs under the action's root.
+    expect(grpc.length).toBeGreaterThan(0);
+    // Filling the path field is an action of its own (it refreshes the path
+    // options), so calls are grouped by the root they hang under.
+    const callsByRoot = new Map();
+    let listingRoot;
+    for (const call of grpc) {
+      expect(call.traceparent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+      const [, traceId, parentId] = call.traceparent.split('-');
+      const client = byId.get(parentId);
+      expect(client, `a span for ${call.url}`).toBeTruthy();
+      expect(client.traceId).toBe(traceId);
+      expect(client.kind).toBe(3);
+      expect(`/${client.name}`).toBe(new URL(call.url).pathname);
+      expect(attribute(client, 'rpc.system.name')).toBe('grpc');
+      expect(attribute(client, 'rpc.method')).toBe(client.name);
+      expect(attribute(client, 'rpc.response.status_code')).toBe('OK');
+      const root = byId.get(client.parentSpanId);
+      expect(root, 'the call hangs under its action').toBeTruthy();
+      expect(root.parentSpanId).toBeUndefined();
+      expect(root.traceId).toBe(traceId);
+      expect(root.kind).toBe(1);
+      callsByRoot.set(root.spanId, (callsByRoot.get(root.spanId) ?? 0) + 1);
+      if (call.url.endsWith('/ListValues')) listingRoot = root;
+    }
+    expect(listingRoot.name).toBe('navigate');
+    for (const [rootId, calls] of callsByRoot) {
+      expect(Number(attribute(byId.get(rootId), 'sovereign_config.client.rpc_count'))).toBe(calls);
+    }
+
+    // Nothing the page showed, no path, no token, no claimed identity.
+    const text = JSON.stringify(exports.map(post => post.body));
+    expect(text).not.toContain('secret-looking-content');
+    expect(text).not.toContain('/apps/api');
+    expect(text).not.toContain('access-token');
+    for (const span of exported) {
+      for (const { key } of span.attributes) {
+        expect(key).not.toMatch(/token|password|secret|value|^user\./);
+        expect(key).toMatch(/^(rpc\.|error\.|sovereign_config\.)/);
       }
     }
   });

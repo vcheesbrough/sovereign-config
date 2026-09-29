@@ -1,7 +1,7 @@
 //! The Configuration grid rows: rendering plain and secret values, alias paths,
 //! and the secret padlock.
 
-use crate::telemetry::spawn_local;
+use crate::telemetry::{ActionKind, spawn_local};
 use sovereign_config_core::{ClientError, ListedValue, ValueContent, ValueListing};
 use wasm_bindgen::JsCast;
 use web_sys::{Document, Element, Event, HtmlInputElement, HtmlTextAreaElement, window};
@@ -158,7 +158,9 @@ fn render_value_row(
     listen(&actions.save, "click", move |_: Event| {
         let path = save_path.clone();
         let input = save_input.clone();
-        spawn_local(async move { save_existing_value(path, input).await });
+        spawn_local(ActionKind::SaveValue, async move {
+            save_existing_value(path, input).await;
+        });
     })?;
 
     let validation_input = input_id;
@@ -236,7 +238,10 @@ fn render_secret_value_row(
     let save_path = value.path.clone();
     let save_input = input_id.clone();
     listen(&actions.save, "click", move |_: Event| {
-        spawn_local(save_existing_secret(save_path.clone(), save_input.clone()));
+        spawn_local(
+            ActionKind::SaveSecret,
+            save_existing_secret(save_path.clone(), save_input.clone()),
+        );
     })?;
 
     let toggle_path = value.path.clone();
@@ -246,11 +251,14 @@ fn render_secret_value_row(
         if secret_field_revealed(&toggle_input) {
             lock_secret_field(&toggle_input, &toggle_button);
         } else {
-            spawn_local(reveal_existing_secret(
-                toggle_path.clone(),
-                toggle_input.clone(),
-                toggle_button.clone(),
-            ));
+            spawn_local(
+                ActionKind::RevealSecret,
+                reveal_existing_secret(
+                    toggle_path.clone(),
+                    toggle_input.clone(),
+                    toggle_button.clone(),
+                ),
+            );
         }
     })?;
 

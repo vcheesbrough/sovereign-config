@@ -5,7 +5,7 @@ use sovereign_config_core::ClientError;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
-use crate::telemetry::spawn_local;
+use crate::telemetry::{ActionKind, spawn_local};
 use web_sys::{Document, Element, Event, window};
 
 use crate::browser::{browser_error, string_property};
@@ -196,7 +196,9 @@ fn build_download_card(
     listen(&copy, "click", move |_: Event| {
         let command = command_for_copy.clone();
         let status = status_for_copy.clone();
-        spawn_local(async move { copy_to_clipboard(&command, &status).await });
+        spawn_local(ActionKind::CopyCommand, async move {
+            copy_to_clipboard(&command, &status).await;
+        });
     })?;
     append(&command_actions, &copy)?;
     append(&command_actions, &status)?;

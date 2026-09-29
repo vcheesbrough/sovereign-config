@@ -21,7 +21,7 @@ mod transport;
 mod tree;
 mod value_rows;
 
-use crate::telemetry::spawn_local;
+use crate::telemetry::{ActionKind, spawn_local};
 use sovereign_config_core::ConfigPath;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
@@ -62,10 +62,10 @@ pub fn start() {
     render_route(&route_from_location());
     // The Downloads view needs no authentication; load it independently of the
     // login flow so it renders on a direct visit to /downloads while logged out.
-    spawn_local(async {
+    spawn_local(ActionKind::LoadDownloads, async {
         load_downloads().await;
     });
-    spawn_local(async {
+    spawn_local(ActionKind::PageLoad, async {
         match app_config() {
             Ok(config) => {
                 telemetry::init(config.telemetry.as_ref());
@@ -126,7 +126,7 @@ pub(crate) fn install_actions() {
             }
             discard_connection_url();
             render_route(&route_from_location());
-            spawn_local(async {
+            spawn_local(ActionKind::HistoryNavigate, async {
                 refresh_views().await;
             });
         });
@@ -135,7 +135,7 @@ pub(crate) fn install_actions() {
         callback.forget();
     }
     on_element_id(&document, "login", "click", |_: web_sys::Event| {
-        spawn_local(async {
+        spawn_local(ActionKind::LogIn, async {
             match app_config() {
                 Ok(config) => {
                     if let Err(error) = begin_login(&config).await {

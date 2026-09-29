@@ -379,8 +379,9 @@ pub(crate) fn value_client(config: &AppConfig) -> Client<BrowserTransport, Memor
     )
 }
 
-/// One gRPC-Web call, carrying its action's `traceparent`, whose outcome is
-/// one telemetry record (by route and error kind; never its content).
+/// One gRPC-Web call: a client span in its action's trace, whose
+/// `traceparent` it carries, and one telemetry record (by route, status and
+/// error kind; never its content).
 async fn grpc_unary<M, R>(
     path: &'static str,
     message: &M,
@@ -390,16 +391,28 @@ where
     M: Message,
     R: Message + Default,
 {
-    let started = Date::now();
-    let outcome = grpc_unary_call(path, message, bearer).await;
-    telemetry::record_rpc(path, started, outcome.as_ref().err());
+    let call = telemetry::begin_call(path);
+    let mut status = None;
+    let outcome = grpc_unary_call(
+        path,
+        message,
+        bearer,
+        call.traceparent().as_deref(),
+        &mut status,
+    )
+    .await;
+    telemetry::end_call(call, status, outcome.as_ref().err());
     outcome
 }
 
+/// The call itself. `status` receives the gRPC status the server answered
+/// with, when an answer carried one.
 async fn grpc_unary_call<M, R>(
     path: &'static str,
     message: &M,
     bearer: Option<&Secret>,
+    traceparent: Option<&str>,
+    status: &mut Option<u16>,
 ) -> Result<R, ClientError>
 where
     M: Message,
@@ -416,10 +429,10 @@ where
         ("content-type", "application/grpc-web+proto"),
         ("x-grpc-web", "1"),
     ];
-    // The action's W3C context, so the server's request span is a child of
-    // it (#420). Transport metadata: no `sovereign.config` message changes.
-    let traceparent = telemetry::traceparent();
-    if let Some(traceparent) = traceparent.as_deref() {
+    // This call's W3C context, so the server's request span is a child of
+    // the call's client span (#420, #448). Transport metadata: no
+    // `sovereign.config` message changes.
+    if let Some(traceparent) = traceparent {
         headers.push(("traceparent", traceparent));
     }
     let authorization;
@@ -443,11 +456,13 @@ where
     let buffer = JsFuture::from(response.array_buffer().map_err(|_| browser_error())?)
         .await
         .map_err(|_| browser_error())?;
-    decode_grpc_web_response(
+    let (outcome, answered) = decode_grpc_web_answer(
         &Uint8Array::new(&buffer).to_vec(),
         header_status,
         header_kind.as_deref(),
-    )
+    );
+    *status = answered;
+    outcome
 }
 
 #[cfg(test)]
@@ -455,11 +470,22 @@ pub(crate) fn decode_grpc_web<R: Message + Default>(bytes: &[u8]) -> Result<R, C
     decode_grpc_web_response(bytes, None, None)
 }
 
+#[cfg(test)]
 pub(crate) fn decode_grpc_web_response<R: Message + Default>(
     bytes: &[u8],
     header_status: Option<u16>,
     header_kind: Option<&str>,
 ) -> Result<R, ClientError> {
+    decode_grpc_web_answer(bytes, header_status, header_kind).0
+}
+
+/// The decoded answer, and the gRPC status it carried when it carried one —
+/// the status for the call's span, which the error alone cannot give back.
+pub(crate) fn decode_grpc_web_answer<R: Message + Default>(
+    bytes: &[u8],
+    header_status: Option<u16>,
+    header_kind: Option<&str>,
+) -> (Result<R, ClientError>, Option<u16>) {
     let mut offset = 0;
     let mut payload = None;
     let mut status = None;
@@ -469,7 +495,7 @@ pub(crate) fn decode_grpc_web_response<R: Message + Default>(
         let length = u32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
         offset += 5;
         if offset + length > bytes.len() {
-            return Err(map_rpc_status(RpcCode::Other));
+            return (Err(map_rpc_status(RpcCode::Other)), None);
         }
         let frame = &bytes[offset..offset + length];
         if flags & 0x80 == 0 {
@@ -486,21 +512,25 @@ pub(crate) fn decode_grpc_web_response<R: Message + Default>(
         }
         offset += length;
     }
-    let status = status
-        .or(header_status)
-        .ok_or_else(|| map_rpc_status(RpcCode::Other))?;
-    if status != 0 {
+    let Some(status) = status.or(header_status) else {
+        return (Err(map_rpc_status(RpcCode::Other)), None);
+    };
+    let outcome = if status == 0 {
+        payload
+            .ok_or_else(|| map_rpc_status(RpcCode::Other))
+            .and_then(|payload| R::decode(payload).map_err(|_| map_rpc_status(RpcCode::Other)))
+    } else {
         // The marker, never the code: a retired version is something the
         // session can recover from by re-handshaking, and nothing else that
         // shares this status code is.
         let kind = kind.as_deref().or(header_kind);
         if kind == Some(VERSION_NOT_SERVED_KIND) {
-            return Err(map_rpc_status(RpcCode::VersionNotServed));
+            Err(map_rpc_status(RpcCode::VersionNotServed))
+        } else {
+            Err(map_rpc_status(grpc_status_code(status)))
         }
-        return Err(map_rpc_status(grpc_status_code(status)));
-    }
-    R::decode(payload.ok_or_else(|| map_rpc_status(RpcCode::Other))?)
-        .map_err(|_| map_rpc_status(RpcCode::Other))
+    };
+    (outcome, Some(status))
 }
 
 fn grpc_status_code(status: u16) -> RpcCode {

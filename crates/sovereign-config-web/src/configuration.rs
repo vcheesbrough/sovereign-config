@@ -1,7 +1,7 @@
 //! The Configuration view: loading a path, JSON mode, saving, deleting and
 //! aliasing values, and field validation.
 
-use crate::telemetry::spawn_local;
+use crate::telemetry::{ActionKind, spawn_local};
 use js_sys::Date;
 use sovereign_config_core::{
     ClientError, ConfigPath, ErrorKind, PlainValue, SecretInput, Timestamp, ValueListing,
@@ -53,10 +53,12 @@ pub(crate) fn install_configuration_actions(document: &Document) {
         let enabled = element::<HtmlInputElement>("json-mode").is_some_and(|input| input.checked());
         JSON_MODE.set(enabled);
         update_configuration_mode();
-        spawn_local(async { load_current_configuration().await });
+        spawn_local(ActionKind::ToggleJsonMode, async {
+            load_current_configuration().await;
+        });
     });
     on_element_id(document, "save-json", "click", |_: Event| {
-        spawn_local(async { save_json_subtree().await });
+        spawn_local(ActionKind::SaveJson, async { save_json_subtree().await });
     });
     on_element_id(document, "json-content", "input", |_: Event| {
         CONFIGURATION_LOAD_GENERATION.set(CONFIGURATION_LOAD_GENERATION.get().wrapping_add(1));
@@ -74,7 +76,7 @@ pub(crate) fn install_configuration_actions(document: &Document) {
         focus("add-value");
     });
     on_element_id(document, "save-new-value", "click", |_: Event| {
-        spawn_local(async { save_new_value().await });
+        spawn_local(ActionKind::CreateValue, async { save_new_value().await });
     });
     on_element_id(document, "new-value-name", "input", |_: Event| {
         validate_name_field();
@@ -95,13 +97,15 @@ pub(crate) fn install_configuration_actions(document: &Document) {
         cancel_delete();
     });
     on_element_id(document, "confirm-delete", "click", |_: Event| {
-        spawn_local(async { delete_selected_value().await });
+        spawn_local(ActionKind::DeleteValue, async {
+            delete_selected_value().await;
+        });
     });
     on_element_id(document, "cancel-add-path", "click", |_: Event| {
         cancel_add_path();
     });
     on_element_id(document, "confirm-add-path", "click", |_: Event| {
-        spawn_local(async { add_selected_path().await });
+        spawn_local(ActionKind::AddPath, async { add_selected_path().await });
     });
 }
 

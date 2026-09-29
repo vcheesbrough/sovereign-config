@@ -24,29 +24,41 @@ pub(crate) const SERVICE_NAME: &str = "sovereign-config-web";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Key {
     RpcSystem,
+    RpcSystemName,
     RpcService,
     RpcMethod,
+    RpcResponseStatusCode,
     ErrorType,
     DurationMs,
+    ProtocolVersion,
+    RpcCount,
 }
 
 impl Key {
     #[cfg(test)]
     pub(crate) const ALL: &'static [Self] = &[
         Self::RpcSystem,
+        Self::RpcSystemName,
         Self::RpcService,
         Self::RpcMethod,
+        Self::RpcResponseStatusCode,
         Self::ErrorType,
         Self::DurationMs,
+        Self::ProtocolVersion,
+        Self::RpcCount,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::RpcSystem => "rpc.system",
+            Self::RpcSystemName => "rpc.system.name",
             Self::RpcService => "rpc.service",
             Self::RpcMethod => "rpc.method",
+            Self::RpcResponseStatusCode => "rpc.response.status_code",
             Self::ErrorType => "error.type",
             Self::DurationMs => "sovereign_config.client.duration_ms",
+            Self::ProtocolVersion => "sovereign_config.protocol.version",
+            Self::RpcCount => "sovereign_config.client.rpc_count",
         }
     }
 }
@@ -159,6 +171,16 @@ impl Record {
 /// The request body for a batch of already-encoded records: one resource
 /// (this service and its build), one scope.
 pub(crate) fn logs_request(service_version: &str, encoded_records: &[String]) -> String {
+    let (resource, scope) = resource_and_scope(service_version);
+    format!(
+        "{{\"resourceLogs\":[{{\"resource\":{resource},\"scopeLogs\":[{{\"scope\":{scope},\"logRecords\":[{}]}}]}}]}}",
+        encoded_records.join(",")
+    )
+}
+
+/// The page's one resource — this service and its build, nothing else: the
+/// ingest stamps the environment and the identity — and its one scope.
+pub(crate) fn resource_and_scope(service_version: &str) -> (Value, Value) {
     let resource = json!({
         "attributes": [
             {"key": "service.name", "value": {"stringValue": SERVICE_NAME}},
@@ -166,13 +188,10 @@ pub(crate) fn logs_request(service_version: &str, encoded_records: &[String]) ->
         ],
     });
     let scope = json!({ "name": SERVICE_NAME, "version": service_version });
-    format!(
-        "{{\"resourceLogs\":[{{\"resource\":{resource},\"scopeLogs\":[{{\"scope\":{scope},\"logRecords\":[{}]}}]}}]}}",
-        encoded_records.join(",")
-    )
+    (resource, scope)
 }
 
-fn attribute(key: &str, value: AttributeValue) -> Value {
+pub(crate) fn attribute(key: &str, value: AttributeValue) -> Value {
     let value = match value {
         AttributeValue::Text(text) => json!({ "stringValue": text }),
         // OTLP/JSON carries 64-bit integers as strings.
@@ -181,7 +200,7 @@ fn attribute(key: &str, value: AttributeValue) -> Value {
     json!({ "key": key, "value": value })
 }
 
-fn unix_nanos(unix_ms: f64) -> String {
+pub(crate) fn unix_nanos(unix_ms: f64) -> String {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let millis = unix_ms.max(0.0).round() as u64;
     format!("{millis}000000")
