@@ -134,6 +134,25 @@ test.describe('client telemetry', () => {
     }
   });
 
+  test('logging out discards what is waiting, so nothing leaves after the session', async ({ page }) => {
+    await withTelemetry(page);
+    const posts = await mockIngest(page);
+    await openCallback(page);
+    await expect(signedIn(page)).toBeVisible();
+    await mockValues(page, VALUES);
+    await expect.poll(() => posts.length, { timeout: 15000 }).toBeGreaterThan(0);
+    await settle(page, posts);
+
+    posts.length = 0;
+    // Records from this action wait out the flush delay; the logout lands
+    // inside it.
+    await openPath(page, '/apps/api');
+    await page.getByRole('button', { name: 'Log out' }).click();
+    await expect(page.getByRole('button', { name: 'Log in' })).toBeVisible();
+    await page.waitForTimeout(4000);
+    expect(posts, 'nothing is sent once the session has ended').toHaveLength(0);
+  });
+
   test('a page with an ingest asks the provider for telemetry:write', async ({ page }) => {
     await withTelemetry(page);
     await mockDiscovery(page);

@@ -469,6 +469,18 @@ fn is_operational_rpc(path: &str) -> bool {
     OPERATIONAL_RPCS.contains(&path) || is_unauthenticated_version_handshake(path)
 }
 
+/// OTLP/HTTP's own paths, which the edge routes to the client-telemetry
+/// ingest on this same hostname (README "Observability").
+///
+/// The server never serves them. It only sees one when the ingest is not
+/// running and the edge falls back to the app's router, and then it refuses
+/// outright, before authentication: no introspection per telemetry batch, and
+/// a `404` the page reads as "no ingest here", where the gRPC fallback's
+/// HTTP `200` would read as delivered.
+pub(crate) fn is_client_telemetry_path(path: &str) -> bool {
+    path == "/v1" || path.starts_with("/v1/")
+}
+
 fn is_web_asset_request(method: &Method, path: &str) -> bool {
     matches!(*method, Method::GET | Method::HEAD) && !is_operational_rpc(path)
 }
@@ -578,6 +590,13 @@ where
     fn call(&mut self, mut request: Request<B>) -> Self::Future {
         let replacement = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, replacement);
+        if is_client_telemetry_path(request.uri().path()) {
+            return Box::pin(async {
+                let mut response = Response::new(empty_body());
+                *response.status_mut() = http::StatusCode::NOT_FOUND;
+                Ok(response)
+            });
+        }
         if is_web_asset_request(request.method(), request.uri().path())
             || is_operational_rpc(request.uri().path())
         {

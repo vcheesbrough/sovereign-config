@@ -172,6 +172,10 @@ fn emit(record: &Record) {
 
 /// Discards everything waiting to be sent. Called when the session ends, so
 /// one operator's records are never sent under the next one's token.
+///
+/// A batch already in flight when the session ends is not recalled: it left
+/// with its own operator's token, which is the one it belongs under. A flush
+/// that finds no session afterwards discards rather than waits.
 pub(crate) fn discard() {
     EXPORTER.with_borrow_mut(|exporter| {
         if let Some(exporter) = exporter.as_mut() {
