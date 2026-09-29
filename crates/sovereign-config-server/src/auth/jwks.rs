@@ -38,6 +38,12 @@ pub(crate) const RETRY_INTERVAL: Duration = Duration::from_secs(15);
 /// The fewest seconds between two fetches of one issuer's keys prompted by
 /// tokens naming a key not in the cache. Without it, a stream of tokens with
 /// invented `kid`s would be a stream of requests to Authentik.
+///
+/// Only such a fetch starts the interval; the periodic re-read and the startup
+/// retry do not, so they never delay picking up a newly rotated key. Inside
+/// the interval an unknown `kid` is refused as `bad_signature` without a
+/// fetch — which is also how a genuine token signed by a key rotated in during
+/// those seconds is answered (README "Credential rotation").
 pub(crate) const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// What a lookup of one `kid` found.
@@ -87,7 +93,9 @@ struct IssuerKeys {
 
 #[derive(Default)]
 struct LastFetch {
-    at: Option<Instant>,
+    /// When a token naming an uncached key last caused a fetch.
+    miss: Option<Instant>,
+    /// Whether the most recent fetch, of any kind, loaded the key set.
     succeeded: bool,
 }
 
@@ -144,7 +152,7 @@ impl KeySets {
     }
 
     /// The key `kid` of `issuer`, fetching the issuer's key set when the key is
-    /// not cached and the last fetch is at least the refresh interval old.
+    /// not cached and no other miss has fetched within the refresh interval.
     ///
     /// `issuer` must be one of the configured issuers; the caller checks the
     /// token's `iss` against them first, so no request ever names the host a
@@ -162,8 +170,8 @@ impl KeySets {
             return KeyLookup::Found(key);
         }
         if last
-            .at
-            .is_some_and(|at| at.elapsed() < self.min_refresh_interval)
+            .miss
+            .is_some_and(|miss| miss.elapsed() < self.min_refresh_interval)
         {
             return if last.succeeded {
                 KeyLookup::Unknown
@@ -171,6 +179,7 @@ impl KeySets {
                 KeyLookup::Unavailable
             };
         }
+        last.miss = Some(Instant::now());
         if !self.fetch(set, &mut last).await {
             return KeyLookup::Unavailable;
         }
@@ -188,7 +197,6 @@ impl KeySets {
     }
 
     async fn fetch(&self, set: &IssuerKeys, last: &mut LastFetch) -> bool {
-        last.at = Some(Instant::now());
         let fetched = self
             .fetch_keys(&set.jwks_url)
             .instrument(spans::client_span(&Method::GET, None, &set.jwks_url))

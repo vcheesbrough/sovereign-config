@@ -411,6 +411,14 @@ fn validate_for(
 
 /// The authorization claims of a token whose signature and validity window
 /// have already been checked.
+///
+/// **The required `scope` claim is also what refuses an ID token.** Authentik
+/// signs its ID tokens with the same key, issuer and audience as its access
+/// tokens, and the grants mapping writes into both; it adds `scope` only when
+/// it turns those claims into an access token. Introspection refused ID tokens
+/// by not knowing them; here, a token without `scope` fails as
+/// `invalid_claims`. `nonce` and `at_hash` do not tell the two apart — an
+/// Authentik access token copies them from its ID token.
 fn validate_claims(
     claims: TokenClaims,
     accepted_identities: &[AcceptedIdentity],

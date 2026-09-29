@@ -817,6 +817,28 @@ async fn forged_expired_and_misdirected_tokens_are_refused() {
     );
 }
 
+/// An ID token is signed by the same key with the same issuer, audience and
+/// grants as an access token; what Authentik leaves out of it is `scope`. It
+/// must be refused, since introspection used to refuse it by not knowing it.
+#[tokio::test]
+async fn an_id_token_is_not_accepted_as_an_access_token() {
+    let server = issuer().await;
+    let mut id_token = server.claims();
+    id_token.as_object_mut().unwrap().remove("scope");
+    id_token["nonce"] = json!("n-0S6_WzA2Mj");
+    id_token["at_hash"] = json!("77QmUPtjPfzWtF2AnpK9RQ");
+    id_token["amr"] = json!(["user"]);
+    id_token["preferred_username"] = json!("alice");
+
+    let failure = server
+        .authenticator(Duration::from_secs(1))
+        .authenticate(&bearer(&token_with(&id_token)))
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.result.reason(), "invalid_claims");
+}
+
 /// A token cannot supply its own key. `jku`, `x5u` and an embedded `jwk`
 /// pointing at the forger's key are ignored, so a token signed with that key
 /// still fails on the issuer's — and nothing is fetched from where they point.
@@ -870,6 +892,40 @@ async fn a_new_signing_key_is_picked_up_with_exactly_one_refresh() {
         .await
         .unwrap_err();
     assert_eq!(retired.result.reason(), "bad_signature");
+}
+
+/// With the real throttle in place: the periodic re-read does not start the
+/// refresh interval, so a key rotated in after it is picked up by the first
+/// token naming it. A token-driven fetch does start it, and a second new key
+/// inside the interval is refused without a fetch — the window the README
+/// documents.
+#[tokio::test]
+async fn only_token_driven_fetches_start_the_refresh_interval() {
+    let server = issuer().await;
+    let authenticator = server.authenticator(Duration::from_secs(1));
+    assert!(authenticator.keys.refresh().await, "the periodic re-read");
+    assert_eq!(server.calls(), 1);
+
+    server.serve(StatusCode::OK, key_set(&[KID_A, KID_B]));
+    let rotated = bearer(&signed(
+        &json!({"alg": "RS256", "kid": KID_B}),
+        &server.claims(),
+        KID_B,
+    ));
+    authenticator.authenticate(&rotated).await.unwrap();
+    assert_eq!(server.calls(), 2);
+
+    let inside_the_interval = bearer(&signed(
+        &json!({"alg": "RS256", "kid": "key-c"}),
+        &server.claims(),
+        KID_A,
+    ));
+    let failure = authenticator
+        .authenticate(&inside_the_interval)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.result.reason(), "bad_signature");
+    assert_eq!(server.calls(), 2);
 }
 
 /// Unknown `kid`s cannot be turned into requests to the issuer: within the
