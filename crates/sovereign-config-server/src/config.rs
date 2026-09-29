@@ -5,7 +5,8 @@ use reqwest::Url;
 
 use crate::encryption::{ValueCipher, decode_key};
 
-const INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(3);
+/// For one fetch of an issuer's signing keys (README "Request authentication").
+const JWKS_TIMEOUT: Duration = Duration::from_secs(3);
 const MANAGER_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SECONDS_PER_HOUR: u64 = 60 * 60;
@@ -82,10 +83,8 @@ pub(crate) struct WebConfig {
 }
 
 pub(crate) struct AuthenticationConfig {
-    pub(crate) introspection_url: Url,
     pub(crate) accepted_identities: Vec<AcceptedIdentity>,
-    pub(crate) introspection_client_id: String,
-    pub(crate) introspection_client_secret: String,
+    /// For one fetch of an issuer's signing keys.
     pub(crate) timeout: Duration,
 }
 
@@ -109,18 +108,12 @@ impl Config {
             bail!("gRPC and metrics listeners must use different addresses");
         }
 
-        let introspection_url = required_env("SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL")?
-            .parse::<Url>()
-            .context("SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL must be a valid URL")?;
-        validate_introspection_url(&introspection_url)?;
         let issuer = required_env("SOVEREIGN_CONFIG_OIDC_ISSUER")?;
         let issuer_url = issuer
             .parse::<Url>()
             .context("SOVEREIGN_CONFIG_OIDC_ISSUER must be a valid URL")?;
         validate_issuer_url(&issuer, &issuer_url)?;
         let audience = required_identifier("SOVEREIGN_CONFIG_OIDC_AUDIENCE")?;
-        let introspection_client_id =
-            required_identifier("SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID")?;
 
         let public_origin =
             validated_public_origin(&required_env("SOVEREIGN_CONFIG_PUBLIC_ORIGIN")?)?;
@@ -162,16 +155,11 @@ impl Config {
             grpc_addr,
             metrics_addr,
             authentication: AuthenticationConfig {
-                introspection_url,
                 accepted_identities: vec![AcceptedIdentity {
                     issuer: issuer.clone(),
                     audience: audience.clone(),
                 }],
-                introspection_client_id,
-                introspection_client_secret: required_secret(
-                    "SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET",
-                )?,
-                timeout: INTROSPECTION_TIMEOUT,
+                timeout: JWKS_TIMEOUT,
             },
             web: WebConfig {
                 issuer: issuer.clone(),
@@ -330,21 +318,6 @@ fn issuer_api_origin(issuer: &Url) -> Result<Url> {
         .context("SOVEREIGN_CONFIG_OIDC_ISSUER origin is not a permitted API origin")
 }
 
-fn validate_introspection_url(url: &Url) -> Result<()> {
-    if url.scheme() != "https" || url.path() != "/application/o/introspect/" {
-        bail!("SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL must use HTTPS");
-    }
-    if url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        bail!("SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL is not a permitted endpoint URL");
-    }
-    Ok(())
-}
-
 /// Rejects issuers that are valid URLs but not in the exact canonical form
 /// `ConnectionUrl::managed` requires when it later reparses the same string:
 /// accepting a non-canonical issuer here would only surface as a failure
@@ -401,9 +374,8 @@ pub(crate) fn required_secret(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        audit_page_size, bounded_setting, issuer_api_origin, required_env,
-        validate_introspection_url, validate_issuer_url, validated_client_telemetry_endpoint,
-        validated_group_name, validated_public_origin,
+        audit_page_size, bounded_setting, issuer_api_origin, required_env, validate_issuer_url,
+        validated_client_telemetry_endpoint, validated_group_name, validated_public_origin,
     };
 
     /// Absent is off; present is the public origin and nothing else, because
@@ -450,48 +422,6 @@ mod tests {
     #[test]
     fn required_env_rejects_missing_values() {
         assert!(required_env("SOVEREIGN_CONFIG_TEST_UNSET_6F63A8D9").is_err());
-    }
-
-    #[test]
-    fn introspection_url_requires_https_without_credentials_or_query() {
-        assert!(
-            validate_introspection_url(
-                &"https://example.test/application/o/introspect/"
-                    .parse()
-                    .unwrap()
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_introspection_url(
-                &"http://example.test/application/o/introspect/"
-                    .parse()
-                    .unwrap()
-            )
-            .is_err()
-        );
-        assert!(
-            validate_introspection_url(
-                &"https://user@example.test/application/o/introspect/"
-                    .parse()
-                    .unwrap()
-            )
-            .is_err()
-        );
-        assert!(
-            validate_introspection_url(
-                &"https://example.test/application/o/introspect/?token=value"
-                    .parse()
-                    .unwrap()
-            )
-            .is_err()
-        );
-        assert!(
-            validate_introspection_url(
-                &"https://example.test/application/o/other/".parse().unwrap()
-            )
-            .is_err()
-        );
     }
 
     #[test]

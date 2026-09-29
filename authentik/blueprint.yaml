@@ -57,22 +57,6 @@ entries:
   - model: authentik_providers_oauth2.oauth2provider
     state: present
     identifiers:
-      name: sovereign-config-introspection
-    attrs:
-      name: sovereign-config-introspection
-      client_id: sovereign-config-introspection
-      client_secret: ${AUTHENTIK_SOVEREIGN_CONFIG_INTROSPECTION_CLIENT_SECRET}
-      client_type: confidential
-      redirect_uris: []
-      signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
-      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
-      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
-      issuer_mode: per_provider
-      sub_mode: hashed_user_id
-
-  - model: authentik_providers_oauth2.oauth2provider
-    state: present
-    identifiers:
       name: sovereign-config
     attrs:
       name: sovereign-config
@@ -107,8 +91,9 @@ entries:
         - !Find [authentik_providers_oauth2.scopemapping, [scope_name, offline_access]]
         - !Find [authentik_providers_oauth2.scopemapping, [name, sovereign-config production grants]]
         - !Find [authentik_providers_oauth2.scopemapping, [name, sovereign-config production telemetry]]
-      jwt_federation_providers:
-        - !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config-introspection]]
+      # Cleared explicitly: a blueprint only sets the attributes it names, so
+      # dropping the key would leave the retired introspection provider linked.
+      jwt_federation_providers: []
 
   - model: authentik_core.application
     state: present
@@ -219,6 +204,13 @@ entries:
     state: absent
     identifiers:
       name: sovereign-config-cli
+
+  # Retired by #450: access tokens are verified against the issuer's JWKS,
+  # so nothing introspects them any more.
+  - model: authentik_providers_oauth2.oauth2provider
+    state: absent
+    identifiers:
+      name: sovereign-config-introspection
 
   - model: authentik_flows.flow
     state: present

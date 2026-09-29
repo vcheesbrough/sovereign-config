@@ -521,17 +521,22 @@ pub(crate) enum AuthenticationResult {
     MissingBearer,
     MalformedBearer,
     WrongAlgorithm,
+    /// Signed by no key the issuer publishes: a forged or altered token, or
+    /// one naming a key the issuer's current key set does not hold.
+    BadSignature,
+    /// Genuine, but outside its validity window: expired, or not yet valid.
     Inactive,
     InvalidClaims,
     Unavailable,
 }
 
 impl AuthenticationResult {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Success,
         Self::MissingBearer,
         Self::MalformedBearer,
         Self::WrongAlgorithm,
+        Self::BadSignature,
         Self::Inactive,
         Self::InvalidClaims,
         Self::Unavailable,
@@ -554,6 +559,7 @@ impl AuthenticationResult {
             Self::MissingBearer => "missing_bearer",
             Self::MalformedBearer => "malformed_bearer",
             Self::WrongAlgorithm => "wrong_algorithm",
+            Self::BadSignature => "bad_signature",
             Self::Inactive => "inactive",
             Self::InvalidClaims => "invalid_claims",
             Self::Unavailable => "dependency_unavailable",

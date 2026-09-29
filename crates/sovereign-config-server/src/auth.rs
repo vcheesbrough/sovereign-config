@@ -4,18 +4,19 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{
     HeaderMap, HeaderValue, Method, Request, Response,
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use http_body_util::BodyExt;
-use reqwest::{Client, Url};
 use serde::Deserialize;
 use sovereign_config_core::ConfigPath;
+use tokio::task::JoinHandle;
 use tonic::{
     Status,
     body::{BoxBody, empty_body},
@@ -25,8 +26,9 @@ use tower::{
     Layer, Service,
     layer::util::{Identity, Stack},
 };
-use tracing::{Instrument, info, warn};
+use tracing::{info, warn};
 
+use self::jwks::{KeyLookup, KeySets};
 use crate::{
     config::{AcceptedIdentity, AuthenticationConfig},
     metrics::{AuthenticationMetrics, AuthenticationResult, ProtocolMetrics},
@@ -35,8 +37,16 @@ use crate::{
     system::served,
 };
 
+mod jwks;
+
 const REQUIRED_SCOPE: &str = "sovereign-config";
-const MAX_INTROSPECTION_RESPONSE_BYTES: usize = 64 * 1024;
+/// The largest JWKS document read. Authentik's carries one key per signing
+/// certificate, each with its chain, which is a few kilobytes.
+const MAX_JWKS_RESPONSE_BYTES: usize = 64 * 1024;
+/// How far a token's `exp`, `nbf` and `iat` may disagree with this server's
+/// clock and still be accepted. Fixed, not a setting: it absorbs clock skew
+/// between Authentik and this host, and nothing else.
+const CLOCK_LEEWAY: Duration = Duration::from_secs(30);
 /// The unversioned handshake.
 ///
 /// Unauthenticated by decision, recorded in `README.md`: a client has no token
@@ -55,11 +65,8 @@ const OPERATIONAL_RPCS: [&str; 3] = [
 
 #[derive(Clone)]
 pub(crate) struct Authenticator {
-    client: Client,
-    introspection_url: Url,
-    accepted_identities: Vec<AcceptedIdentity>,
-    introspection_client_id: String,
-    introspection_client_secret: String,
+    accepted_identities: Arc<[AcceptedIdentity]>,
+    keys: Arc<KeySets>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,15 +139,30 @@ impl AuthenticatedPrincipal {
 #[derive(Deserialize)]
 struct JoseHeader {
     alg: String,
+    kid: Option<String>,
 }
 
+/// A bearer token split into the parts verification needs. Nothing in it is
+/// trusted until [`Authenticator::authenticate`] has checked the signature.
+struct Jwt<'a> {
+    kid: String,
+    signing_input: &'a [u8],
+    signature: Vec<u8>,
+    claims: TokenClaims,
+}
+
+/// The access token's claims. Each is a raw JSON value so that a claim of an
+/// unexpected type is judged by the rule that reads it — a name claim that is
+/// not a string is no name, never a failed authentication.
 #[derive(Deserialize)]
-struct IntrospectionResponse {
-    active: bool,
+struct TokenClaims {
     iss: Option<serde_json::Value>,
     aud: Option<serde_json::Value>,
     sub: Option<serde_json::Value>,
     scope: Option<serde_json::Value>,
+    exp: Option<serde_json::Value>,
+    nbf: Option<serde_json::Value>,
+    iat: Option<serde_json::Value>,
     sovereign_config_grants: Option<serde_json::Value>,
     preferred_username: Option<serde_json::Value>,
     username: Option<serde_json::Value>,
@@ -154,17 +176,47 @@ struct RawGrant {
 
 impl Authenticator {
     pub(crate) fn new(config: AuthenticationConfig) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(config.timeout)
-            .https_only(config.introspection_url.scheme() == "https")
-            .build()
-            .context("unable to configure Authentik introspection client")?;
+        Self::with_refresh_interval(config, jwks::MIN_REFRESH_INTERVAL)
+    }
+
+    fn with_refresh_interval(
+        config: AuthenticationConfig,
+        min_refresh_interval: Duration,
+    ) -> Result<Self> {
+        let keys = KeySets::new(
+            config
+                .accepted_identities
+                .iter()
+                .map(|identity| identity.issuer.as_str()),
+            config.timeout,
+            min_refresh_interval,
+        )?;
         Ok(Self {
-            client,
-            introspection_url: config.introspection_url,
-            accepted_identities: config.accepted_identities,
-            introspection_client_id: config.introspection_client_id,
-            introspection_client_secret: config.introspection_client_secret,
+            accepted_identities: config.accepted_identities.into(),
+            keys: Arc::new(keys),
+        })
+    }
+
+    /// Loads the issuers' keys now and keeps them current for as long as the
+    /// server runs. Serving does not wait for it: until the keys first load,
+    /// an authenticated call fetches them itself or fails `UNAVAILABLE`, so an
+    /// unreachable Authentik at startup is an outage of authenticated calls,
+    /// not a crash loop.
+    pub(crate) fn spawn_key_refresh(&self) -> JoinHandle<()> {
+        self.spawn_key_refresh_every(jwks::PERIODIC_REFRESH, jwks::RETRY_INTERVAL)
+    }
+
+    fn spawn_key_refresh_every(&self, periodic: Duration, retry: Duration) -> JoinHandle<()> {
+        let keys = Arc::clone(&self.keys);
+        tokio::spawn(async move {
+            loop {
+                let pause = if keys.refresh().await {
+                    periodic
+                } else {
+                    retry
+                };
+                tokio::time::sleep(pause).await;
+            }
         })
     }
 
@@ -173,40 +225,39 @@ impl Authenticator {
         headers: &HeaderMap,
     ) -> Result<AuthenticatedPrincipal, AuthenticationFailure> {
         let token = bearer_token(headers)?;
-        require_rs256(token)?;
-
-        let body = self
-            .introspect(token)
-            .instrument(spans::client_span(
-                &Method::POST,
-                None,
-                &self.introspection_url,
-            ))
-            .await?;
-        let response: IntrospectionResponse =
-            serde_json::from_slice(&body).map_err(|_| AuthenticationFailure::unavailable())?;
-        validate_introspection_for_any(response, &self.accepted_identities)
-    }
-
-    /// The introspection call itself, inside its client span. The endpoint is
-    /// configuration, so the span is named by its method alone.
-    async fn introspect(&self, token: &str) -> Result<Vec<u8>, AuthenticationFailure> {
-        let request = self
-            .client
-            .post(self.introspection_url.clone())
-            .basic_auth(
-                &self.introspection_client_id,
-                Some(&self.introspection_client_secret),
-            )
-            .form(&[("token", token)]);
-        let result = match spans::send(&self.client, request).await {
-            Ok(response) if response.status().is_success() => read_bounded_response(response).await,
-            _ => Err(AuthenticationFailure::unavailable()),
+        let jwt = parse_jwt(token)?;
+        // The issuer picks the key set, so it is checked against the
+        // configured issuers before any key is looked up: a token cannot make
+        // this server fetch from anywhere else.
+        let issuer = jwt
+            .claims
+            .iss
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .filter(|issuer| {
+                self.accepted_identities
+                    .iter()
+                    .any(|identity| identity.issuer == *issuer)
+            })
+            .ok_or_else(|| {
+                AuthenticationFailure::unauthenticated(AuthenticationResult::InvalidClaims)
+            })?;
+        let key = match self.keys.key(issuer, &jwt.kid).await {
+            KeyLookup::Found(key) => key,
+            KeyLookup::Unknown => {
+                return Err(AuthenticationFailure::unauthenticated(
+                    AuthenticationResult::BadSignature,
+                ));
+            }
+            KeyLookup::Unavailable => return Err(AuthenticationFailure::unavailable()),
         };
-        if result.is_err() {
-            spans::record_error("unavailable");
+        if !key.verifies(jwt.signing_input, &jwt.signature) {
+            return Err(AuthenticationFailure::unauthenticated(
+                AuthenticationResult::BadSignature,
+            ));
         }
-        result
+        require_current(&jwt.claims, SystemTime::now())?;
+        validate_claims(jwt.claims, &self.accepted_identities)
     }
 }
 
@@ -215,7 +266,7 @@ async fn read_bounded_response(
 ) -> Result<Vec<u8>, AuthenticationFailure> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_INTROSPECTION_RESPONSE_BYTES as u64)
+        .is_some_and(|length| length > MAX_JWKS_RESPONSE_BYTES as u64)
     {
         return Err(AuthenticationFailure::unavailable());
     }
@@ -226,7 +277,7 @@ async fn read_bounded_response(
         .await
         .map_err(|_| AuthenticationFailure::unavailable())?
     {
-        if body.len() + chunk.len() > MAX_INTROSPECTION_RESPONSE_BYTES {
+        if body.len() + chunk.len() > MAX_JWKS_RESPONSE_BYTES {
             return Err(AuthenticationFailure::unavailable());
         }
         body.extend_from_slice(&chunk);
@@ -264,7 +315,12 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthenticationFailure> {
     Ok(token)
 }
 
-fn require_rs256(token: &str) -> Result<(), AuthenticationFailure> {
+/// Splits a JWS compact token and decodes its parts, requiring `RS256` and a
+/// `kid`. Any other header field — `jku`, `x5u`, an embedded `jwk` — is
+/// ignored: the key always comes from the issuer's own key set.
+fn parse_jwt(token: &str) -> Result<Jwt<'_>, AuthenticationFailure> {
+    let malformed =
+        || AuthenticationFailure::unauthenticated(AuthenticationResult::MalformedBearer);
     let mut segments = token.split('.');
     let (Some(encoded_header), Some(payload), Some(signature), None) = (
         segments.next(),
@@ -272,37 +328,80 @@ fn require_rs256(token: &str) -> Result<(), AuthenticationFailure> {
         segments.next(),
         segments.next(),
     ) else {
-        return Err(AuthenticationFailure::unauthenticated(
-            AuthenticationResult::MalformedBearer,
-        ));
+        return Err(malformed());
     };
     if encoded_header.is_empty() || payload.is_empty() || signature.is_empty() {
-        return Err(AuthenticationFailure::unauthenticated(
-            AuthenticationResult::MalformedBearer,
-        ));
+        return Err(malformed());
     }
-    let decoded = URL_SAFE_NO_PAD.decode(encoded_header).map_err(|_| {
-        AuthenticationFailure::unauthenticated(AuthenticationResult::MalformedBearer)
-    })?;
-    let header: JoseHeader = serde_json::from_slice(&decoded).map_err(|_| {
-        AuthenticationFailure::unauthenticated(AuthenticationResult::MalformedBearer)
-    })?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded_header)
+        .map_err(|_| malformed())?;
+    let header: JoseHeader = serde_json::from_slice(&decoded).map_err(|_| malformed())?;
     if header.alg != "RS256" {
         return Err(AuthenticationFailure::unauthenticated(
             AuthenticationResult::WrongAlgorithm,
+        ));
+    }
+    let kid = header
+        .kid
+        .filter(|kid| !kid.is_empty())
+        .ok_or_else(malformed)?;
+    let claims = URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()
+        .and_then(|payload| serde_json::from_slice(&payload).ok())
+        .ok_or_else(malformed)?;
+    let signature = URL_SAFE_NO_PAD.decode(signature).map_err(|_| malformed())?;
+    Ok(Jwt {
+        kid,
+        signing_input: &token.as_bytes()[..encoded_header.len() + 1 + payload.len()],
+        signature,
+        claims,
+    })
+}
+
+/// Refuses a token outside its validity window, allowing [`CLOCK_LEEWAY`] of
+/// skew. `exp` is required; `nbf` and `iat` are checked when present.
+fn require_current(claims: &TokenClaims, now: SystemTime) -> Result<(), AuthenticationFailure> {
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let leeway = CLOCK_LEEWAY.as_secs_f64();
+    let time = |claim: &Option<serde_json::Value>| -> Result<Option<f64>, AuthenticationFailure> {
+        claim
+            .as_ref()
+            .map(|value| {
+                value.as_f64().ok_or_else(|| {
+                    AuthenticationFailure::unauthenticated(AuthenticationResult::InvalidClaims)
+                })
+            })
+            .transpose()
+    };
+    let expires = time(&claims.exp)?.ok_or_else(|| {
+        AuthenticationFailure::unauthenticated(AuthenticationResult::InvalidClaims)
+    })?;
+    let not_before = time(&claims.nbf)?;
+    let issued = time(&claims.iat)?;
+    if now > expires + leeway
+        || not_before.is_some_and(|not_before| not_before > now + leeway)
+        || issued.is_some_and(|issued| issued > now + leeway)
+    {
+        return Err(AuthenticationFailure::unauthenticated(
+            AuthenticationResult::Inactive,
         ));
     }
     Ok(())
 }
 
 #[cfg(test)]
-fn validate_introspection(
-    response: IntrospectionResponse,
+fn validate_for(
+    claims: TokenClaims,
     expected_issuer: &str,
     expected_audience: &str,
 ) -> Result<AuthenticatedPrincipal, AuthenticationFailure> {
-    validate_introspection_for_any(
-        response,
+    validate_claims(
+        claims,
         &[AcceptedIdentity {
             issuer: expected_issuer.to_owned(),
             audience: expected_audience.to_owned(),
@@ -310,24 +409,29 @@ fn validate_introspection(
     )
 }
 
-fn validate_introspection_for_any(
-    response: IntrospectionResponse,
+/// The authorization claims of a token whose signature and validity window
+/// have already been checked.
+///
+/// **The required `scope` claim is also what refuses an ID token.** Authentik
+/// signs its ID tokens with the same key, issuer and audience as its access
+/// tokens, and the grants mapping writes into both; it adds `scope` only when
+/// it turns those claims into an access token. Introspection refused ID tokens
+/// by not knowing them; here, a token without `scope` fails as
+/// `invalid_claims`. `nonce` and `at_hash` do not tell the two apart — an
+/// Authentik access token copies them from its ID token.
+fn validate_claims(
+    claims: TokenClaims,
     accepted_identities: &[AcceptedIdentity],
 ) -> Result<AuthenticatedPrincipal, AuthenticationFailure> {
-    if !response.active {
-        return Err(AuthenticationFailure::unauthenticated(
-            AuthenticationResult::Inactive,
-        ));
-    }
     let valid_identity = accepted_identities.iter().any(|identity| {
-        response.iss.as_ref().and_then(serde_json::Value::as_str) == Some(&identity.issuer)
-            && response
+        claims.iss.as_ref().and_then(serde_json::Value::as_str) == Some(&identity.issuer)
+            && claims
                 .aud
                 .as_ref()
                 .is_some_and(|audience| audience_contains(audience, &identity.audience))
     });
     let valid_claims = valid_identity
-        && response
+        && claims
             .scope
             .as_ref()
             .and_then(serde_json::Value::as_str)
@@ -336,7 +440,7 @@ fn validate_introspection_for_any(
                     .split_ascii_whitespace()
                     .any(|scope| scope == REQUIRED_SCOPE)
             })
-        && response
+        && claims
             .sub
             .as_ref()
             .and_then(serde_json::Value::as_str)
@@ -347,17 +451,14 @@ fn validate_introspection_for_any(
         ));
     }
 
-    let raw_grants = serde_json::from_value(response.sovereign_config_grants.ok_or_else(|| {
+    let raw_grants = serde_json::from_value(claims.sovereign_config_grants.ok_or_else(|| {
         AuthenticationFailure::unauthenticated(AuthenticationResult::InvalidClaims)
     })?)
     .map_err(|_| AuthenticationFailure::unauthenticated(AuthenticationResult::InvalidClaims))?;
     let grants = validate_grants(raw_grants)?;
-    let name = display_name(
-        response.preferred_username.as_ref(),
-        response.username.as_ref(),
-    );
+    let name = display_name(claims.preferred_username.as_ref(), claims.username.as_ref());
     Ok(AuthenticatedPrincipal {
-        subject: response
+        subject: claims
             .sub
             .and_then(|subject| subject.as_str().map(str::to_owned))
             .expect("subject was validated as a non-empty string"),
@@ -474,7 +575,7 @@ fn is_operational_rpc(path: &str) -> bool {
 ///
 /// The server never serves them. It only sees one when the ingest is not
 /// running and the edge falls back to the app's router, and then it refuses
-/// outright, before authentication: no introspection per telemetry batch, and
+/// outright, before authentication: no token verified per telemetry batch, and
 /// a `404` the page reads as "no ingest here", where the gRPC fallback's
 /// HTTP `200` would read as delivered.
 pub(crate) fn is_client_telemetry_path(path: &str) -> bool {

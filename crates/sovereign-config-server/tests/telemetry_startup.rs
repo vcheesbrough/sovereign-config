@@ -65,22 +65,10 @@ fn server_environment(
             VALUE_ENCRYPTION_KEY,
         ),
         (
-            "SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL",
-            "https://auth.example.test/application/o/introspect/",
-        ),
-        (
             "SOVEREIGN_CONFIG_OIDC_ISSUER",
             "https://auth.example.test/application/o/sovereign-config/",
         ),
         ("SOVEREIGN_CONFIG_OIDC_AUDIENCE", "sovereign-config"),
-        (
-            "SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID",
-            "sovereign-config-introspection",
-        ),
-        (
-            "SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET",
-            "introspection-secret",
-        ),
     ]
     .into_iter()
     .map(|(name, value)| (name, value.to_owned()))
