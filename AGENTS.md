@@ -162,10 +162,12 @@ how this repo applies it and where it does not yet.
 - **The web UI's telemetry is `crates/sovereign-config-web/src/telemetry/`**
   (README `### Client telemetry: the web UI`). Every `spawn_local` in the
   crate is `telemetry::spawn_local`, which is what gives each user action its
-  trace context — import that one, never `wasm_bindgen_futures::spawn_local`.
-  A record's body and attribute values are `&'static str` or numbers by type,
-  and its keys are `record::Key`; keep it that way, because it is what keeps
-  a token, a value or a path out of telemetry. The page sets no `user.*`, and
+  trace and root span — import that one, never
+  `wasm_bindgen_futures::spawn_local`, and name a new action with a new
+  `span::ActionKind` variant (a bounded name, never a path or a value).
+  A record's or span's name and attribute values are `&'static str` or
+  numbers by type, and its keys are `record::Key`; keep it that way, because
+  it is what keeps a token, a value or a path out of telemetry. The page sets no `user.*`, and
   telemetry never refreshes a token itself.
 - **Every card that changes behaviour records its telemetry decision** — new
   or changed log fields, spans, metrics, dashboards, alerts or runbook text —
@@ -191,7 +193,6 @@ in the change that closes it.
 | Metric label keys other than the RED and pool ones (`version`, `outcome`, `reason`, `kind`, `operation`, `result`, `call`) are neither semantic-convention names nor `sovereign_config.`-prefixed. | They predate the contract, and the retirement gate (`sovereign_config_protocol_requests_total{outcome="authenticated"}`) and the audit alert series are written against them; renaming would move every stored series. The forbidden-key test covers them; only span keys are checked against `keys::is_known`. | A protocol-gate rewrite that can afford a rename |
 | Instruments are held by what records them (`Arc` families, `RequestMetrics`, `JobMetrics`), not in statics as `references/rust.md` suggests. | Every test assembles its own capture; statics would make parallel tests share series. They are still created once, at startup. | — (deliberate) |
 | The CLI, MCP server, provider and broker emit no telemetry. | The first three are operator tools, not user devices sending to a public endpoint; the broker is a server-side process not yet instrumented. | #423 (broker); the rest — deliberate |
-| The web UI sends logs only, no spans; its trace context reaches the server as `traceparent`, and its records carry the action's ids. So every web UI trace in Tempo has a missing root: the server span's parent is the action span, never exported. | The scope of #376. The ingest already accepts `/v1/traces`. | A card adding client spans, a client change alone |
 | The web UI's OTLP is hand-built OTLP/JSON over `fetch`, not an SDK. | No OpenTelemetry SDK builds for `wasm32`; binding the JavaScript SDK is larger than the few hundred lines needed. | An SDK for `wasm32` |
 | `telemetry:write` cannot be withdrawn from one user. | Authentik grants a provider's scopes to every user who signs in to it; the skill's per-user opt-out needs a provider that withholds scopes per user or group. It does keep the CLI and MCP (same client id, never requesting it) out of the ingest. | A per-user scope policy in the provider |
 | The client ingest's own metrics are scraped from `:8888` (Docker labels), not pushed. | The published image serves Prometheus; its reference deployment scrapes it. | The image pushing its own metrics |

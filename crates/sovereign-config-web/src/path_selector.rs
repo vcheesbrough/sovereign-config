@@ -1,7 +1,7 @@
 //! The path selector combobox: options, filtering, keyboard selection, and
 //! refresh.
 
-use crate::telemetry::spawn_local;
+use crate::telemetry::{ActionKind, spawn_local};
 use sovereign_config_core::{ClientError, ValueListing};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -33,7 +33,9 @@ pub(crate) fn install_path_selector_actions(document: &Document) {
         for event_name in ["focus", "pointerdown"] {
             let callback = Closure::<dyn FnMut(_)>::new(|_: Event| {
                 open_path_options();
-                spawn_local(async { refresh_path_options().await });
+                spawn_local(ActionKind::RefreshPathOptions, async {
+                    refresh_path_options().await;
+                });
             });
             let _ = path
                 .add_event_listener_with_callback(event_name, callback.as_ref().unchecked_ref());

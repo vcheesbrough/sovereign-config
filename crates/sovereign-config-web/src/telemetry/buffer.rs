@@ -59,6 +59,11 @@ impl Buffer {
         batch
     }
 
+    /// The size of the item [`Self::take_batch`] would take first.
+    pub(crate) fn front_len(&self) -> Option<usize> {
+        self.records.front().map(String::len)
+    }
+
     pub(crate) fn clear(&mut self) {
         self.records.clear();
         self.bytes = 0;

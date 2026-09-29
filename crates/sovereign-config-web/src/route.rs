@@ -1,7 +1,7 @@
 //! Routing: URL <-> `Route`, navigation with the unsaved-edit guard, and
 //! rendering the active view.
 
-use crate::telemetry::spawn_local;
+use crate::telemetry::{ActionKind, spawn_local};
 use sovereign_config_core::ConfigPath;
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::{JsCast, JsValue};
@@ -134,7 +134,7 @@ fn navigate_with(route: &Route, replace: bool) {
         };
     }
     render_route(route);
-    spawn_local(async {
+    spawn_local(ActionKind::Navigate, async {
         refresh_views().await;
     });
 }

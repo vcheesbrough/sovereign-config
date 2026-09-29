@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use crate::configuration::parse_absolute_path;
 use crate::route::{Route, route_from_path, route_url};
 use crate::session::{classify_refresh_error, identity_display_name};
-use crate::transport::{decode_grpc_web, decode_grpc_web_response};
+use crate::transport::{decode_grpc_web, decode_grpc_web_answer, decode_grpc_web_response};
 use crate::tree::TreeGuide::{Blank, Branch, Corner, Trunk};
 use crate::tree::{TreeNode, build_tree, namespace_labels, tree_guides, value_parents_of};
 
@@ -379,6 +379,24 @@ fn grpc_web_decoder_accepts_trailers_only_status_headers() {
     let error = decode_grpc_web_response::<GetIdentityResponse>(&[], Some(7), None).unwrap_err();
     assert_eq!(error.kind, ErrorKind::PermissionDenied);
     assert_eq!(error.message(), "permission denied");
+}
+
+/// The call's span records the status the server answered with, from a
+/// trailer frame or a trailers-only header, and none when no status came.
+#[test]
+fn grpc_web_decoder_reports_the_status_it_decoded_for_the_calls_span() {
+    let trailer = b"grpc-status:5\r\n";
+    let mut framed = vec![0x80];
+    framed.extend_from_slice(&u32::try_from(trailer.len()).unwrap().to_be_bytes());
+    framed.extend_from_slice(trailer);
+    let (outcome, status) = decode_grpc_web_answer::<GetIdentityResponse>(&framed, None, None);
+    assert_eq!(outcome.unwrap_err().kind, ErrorKind::NotFound);
+    assert_eq!(status, Some(5));
+    let (_, status) = decode_grpc_web_answer::<GetIdentityResponse>(&[], Some(7), None);
+    assert_eq!(status, Some(7));
+    let (outcome, status) = decode_grpc_web_answer::<GetIdentityResponse>(&[], None, None);
+    assert_eq!(outcome.unwrap_err().kind, ErrorKind::Internal);
+    assert_eq!(status, None);
 }
 
 /// gRPC status 12 (`UNIMPLEMENTED`) is what the browser sees once the server
