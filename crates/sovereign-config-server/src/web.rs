@@ -43,17 +43,13 @@ pub(crate) struct WebAssetsLayer {
 
 impl WebAssetsLayer {
     pub(crate) fn new(config: &WebConfig) -> Self {
-        let issuer = serde_json::to_string(&config.issuer).expect("issuer must serialize");
-        let client_id = serde_json::to_string(&config.client_id).expect("client id must serialize");
         let index = Assets::get("index.html").expect("embedded administration index must exist");
         let loader_hash = inline_module_hash(index.data.as_ref());
         let dist = load_dist_catalog(config.dist_dir.as_deref());
         Self {
-            app_config: format!(
-                "globalThis.SOVEREIGN_CONFIG={{issuer:{issuer},clientId:{client_id}}};"
-            )
-            .into_bytes()
-            .into(),
+            app_config: app_config_script(config, crate::APPLICATION_VERSION)
+                .into_bytes()
+                .into(),
             content_security_policy: HeaderValue::from_str(&format!(
                 "default-src 'self'; connect-src 'self' https:; img-src 'self'; style-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-{loader_hash}'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
             ))
@@ -61,6 +57,32 @@ impl WebAssetsLayer {
             dist: Arc::new(dist),
         }
     }
+}
+
+/// The page's configuration document, `/app-config.js`: what this deployment
+/// tells the single-page app before it starts.
+///
+/// `telemetry` is present only when the deployment runs a client-telemetry
+/// ingest, and its absence is how the app learns telemetry is off — there is
+/// no compiled-in endpoint to fall back to. `serviceVersion` is this binary's
+/// release: the bundle is embedded in it, so the release that serves the page
+/// is the build of the page, which the client's records must name rather than
+/// the workspace version it was compiled from.
+///
+/// A static asset, not an RPC: nothing here belongs to a `sovereign.config`
+/// protocol version, and a client on any version reads it the same way.
+fn app_config_script(config: &WebConfig, application_version: &str) -> String {
+    let mut document = serde_json::json!({
+        "issuer": config.issuer,
+        "clientId": config.client_id,
+    });
+    if let Some(endpoint) = &config.client_telemetry_endpoint {
+        document["telemetry"] = serde_json::json!({
+            "endpoint": endpoint,
+            "serviceVersion": application_version,
+        });
+    }
+    format!("globalThis.SOVEREIGN_CONFIG={document};")
 }
 
 /// One installer as described to the Downloads single-page view.
@@ -360,6 +382,7 @@ mod tests {
             issuer: "https://auth.example.test/application/o/browser/".into(),
             client_id: "browser".into(),
             dist_dir: None,
+            client_telemetry_endpoint: None,
         });
         let inner = service_fn(|_: Request<()>| async {
             Ok::<_, Infallible>(Response::<BoxBody>::new(empty_body()))
@@ -410,6 +433,56 @@ mod tests {
         assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/html");
     }
 
+    /// The document the SPA reads its configuration from, parsed back out of
+    /// the script so the assertions are on values, not on formatting.
+    fn app_config_document(
+        client_telemetry_endpoint: Option<&str>,
+        version: &str,
+    ) -> serde_json::Value {
+        let script = super::app_config_script(
+            &WebConfig {
+                issuer: "https://auth.example.test/application/o/browser/".into(),
+                client_id: "browser".into(),
+                dist_dir: None,
+                client_telemetry_endpoint: client_telemetry_endpoint.map(str::to_owned),
+            },
+            version,
+        );
+        let json = script
+            .strip_prefix("globalThis.SOVEREIGN_CONFIG=")
+            .and_then(|rest| rest.strip_suffix(';'))
+            .expect("the script assigns one JSON document");
+        serde_json::from_str(json).expect("the document is JSON")
+    }
+
+    /// Absent is off: a deployment without an ingest hands the page no
+    /// telemetry member at all, which is the only signal the page has.
+    #[test]
+    fn app_config_carries_no_telemetry_when_the_deployment_has_none() {
+        let document = app_config_document(None, "2.38.4");
+        assert_eq!(
+            document["issuer"],
+            "https://auth.example.test/application/o/browser/"
+        );
+        assert_eq!(document["clientId"], "browser");
+        assert!(document.get("telemetry").is_none());
+    }
+
+    /// Present, it names where to send and which release the page is, so the
+    /// client's `service.version` is the deployed build and not the workspace
+    /// version the bundle was compiled with.
+    #[test]
+    fn app_config_hands_the_page_the_ingest_and_its_own_release() {
+        let document = app_config_document(Some("https://config.example.test"), "2.38.4");
+        assert_eq!(
+            document["telemetry"],
+            serde_json::json!({
+                "endpoint": "https://config.example.test",
+                "serviceVersion": "2.38.4",
+            })
+        );
+    }
+
     const INSTALLER_NAME: &str = "install-sovereign-config-cli-9.9.9-x86_64-linux.sh";
 
     fn dist_layer() -> (tempfile::TempDir, WebAssetsLayer) {
@@ -428,6 +501,7 @@ mod tests {
             issuer: "https://auth.example.test/application/o/browser/".into(),
             client_id: "browser".into(),
             dist_dir: Some(dir.path().to_path_buf()),
+            client_telemetry_endpoint: None,
         });
         (dir, layer)
     }
@@ -541,6 +615,7 @@ mod tests {
             issuer: "https://auth.example.test/application/o/browser/".into(),
             client_id: "browser".into(),
             dist_dir: Some(dir.path().to_path_buf()),
+            client_telemetry_endpoint: None,
         });
 
         let stray = layer
@@ -575,6 +650,7 @@ mod tests {
             issuer: "https://auth.example.test/application/o/browser/".into(),
             client_id: "browser".into(),
             dist_dir: None,
+            client_telemetry_endpoint: None,
         });
         let response = layer
             .layer(passthrough!())

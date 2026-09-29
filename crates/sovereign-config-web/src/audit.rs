@@ -6,13 +6,13 @@
 //! rest of the module is wiring: read the form, ask the feed what to fetch, and
 //! draw what comes back only when the feed says it still belongs.
 
+use crate::telemetry::spawn_local;
 use sovereign_config_core::{
     AuditEntry, AuditEventKind, AuditQuery, ClientError, ConfigPath, ProtocolVersion, Timestamp,
 };
 use std::cell::RefCell;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     Document, Element, Event, HtmlInputElement, IntersectionObserver, IntersectionObserverEntry,
     IntersectionObserverInit, window,

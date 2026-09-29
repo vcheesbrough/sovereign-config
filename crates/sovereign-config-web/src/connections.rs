@@ -7,7 +7,9 @@ use sovereign_config_core::{
     Secret,
 };
 use std::cell::{Cell, RefCell};
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+use wasm_bindgen_futures::JsFuture;
+
+use crate::telemetry::spawn_local;
 use web_sys::{
     Document, Element, Event, HtmlDialogElement, HtmlInputElement, HtmlTextAreaElement, window,
 };

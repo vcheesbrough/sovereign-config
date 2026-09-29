@@ -561,6 +561,50 @@ fn production_deploy_targets_the_production_environment() {
     assert!(!command.contains("sovereign-config-dev"));
 }
 
+/// Nothing gates on the client-telemetry ingest. The health-gated `up
+/// --wait` leaves its profile out, and the separate start that follows is
+/// allowed to fail: an ingest that cannot start costs the web UI's telemetry
+/// and never a deploy (README "Observability").
+#[test]
+fn no_deploy_gates_on_the_client_telemetry_ingest() {
+    let pipeline = pipeline();
+    for deploy in ["auto-deploy-dev", "deploy-prod"] {
+        let command = commands_text(step(&pipeline, deploy));
+        let lines: Vec<&str> = command.lines().map(str::trim).collect();
+        let gated: Vec<&&str> = lines
+            .iter()
+            .filter(|line| line.contains("--wait"))
+            .collect();
+        assert_eq!(gated.len(), 1, "{deploy}: one health-gated Compose run");
+        assert!(
+            !gated[0].contains("client-telemetry") && !gated[0].contains("otlp-ingest"),
+            "{deploy}: the health gate must not include the ingest"
+        );
+        let ingest: Vec<&&str> = lines
+            .iter()
+            .filter(|line| line.contains("otlp-ingest"))
+            .collect();
+        assert_eq!(ingest.len(), 1, "{deploy}: the ingest is started once");
+        assert!(
+            ingest[0].contains("--profile client-telemetry up -d --no-deps otlp-ingest ||"),
+            "{deploy}: the ingest's start must tolerate failure"
+        );
+        assert!(!ingest[0].contains("--wait"));
+        let gate_at = lines
+            .iter()
+            .position(|line| line.contains("--wait"))
+            .unwrap();
+        let ingest_at = lines
+            .iter()
+            .position(|line| line.contains("otlp-ingest"))
+            .unwrap();
+        assert!(
+            ingest_at > gate_at,
+            "{deploy}: the ingest starts after the gate"
+        );
+    }
+}
+
 #[test]
 fn prod_live_manager_check_validates_the_production_group() {
     // The live lifecycle test resolves the browsing group named by

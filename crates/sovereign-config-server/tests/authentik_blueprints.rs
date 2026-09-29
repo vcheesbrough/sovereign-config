@@ -40,6 +40,48 @@ fn blueprints_emit_isolated_granular_grants() {
     });
 }
 
+/// The web UI's provider grants `telemetry:write`, which the client-telemetry
+/// ingest requires, and `profile`, which puts the `preferred_username` it
+/// also requires on the access token. Losing either stops client telemetry
+/// in silence (README "Observability").
+#[test]
+fn the_web_ui_provider_carries_the_telemetry_scope() {
+    for (blueprint, provider, telemetry_mapping) in [
+        (
+            "blueprint-dev.yaml",
+            "sovereign-config-dev",
+            "sovereign-config development telemetry",
+        ),
+        (
+            "blueprint.yaml",
+            "sovereign-config",
+            "sovereign-config production telemetry",
+        ),
+    ] {
+        let blueprint = load_blueprint(blueprint);
+        let entries = sequence(field(mapping(&blueprint), "entries"));
+
+        let scope = present_entry(
+            entries,
+            "authentik_providers_oauth2.scopemapping",
+            telemetry_mapping,
+        );
+        let attrs = mapping(field(scope, "attrs"));
+        assert_eq!(string(field(attrs, "scope_name")), "telemetry:write");
+        // Being granted the scope is the permission; it adds no claim.
+        assert_eq!(string(field(attrs, "expression")).trim(), "return {}");
+
+        let provider = present_entry(
+            entries,
+            "authentik_providers_oauth2.oauth2provider",
+            provider,
+        );
+        let property_mappings = field(mapping(field(provider, "attrs")), "property_mappings");
+        assert!(contains_string(property_mappings, telemetry_mapping));
+        assert!(contains_string(property_mappings, "profile"));
+    }
+}
+
 fn assert_environment(environment: &Environment<'_>) {
     let blueprint = load_blueprint(environment.blueprint);
     let entries = sequence(field(mapping(&blueprint), "entries"));

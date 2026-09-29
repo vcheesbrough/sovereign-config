@@ -271,6 +271,7 @@ pub(crate) async fn begin_login(config: &AppConfig) -> Result<(), ClientError> {
     let redirect_uri = redirect_uri()?;
     let url = Url::new(&discovery.authorization_endpoint).map_err(|_| oidc_error())?;
     let parameters = url.search_params();
+    let scope = login_scope(config.telemetry.is_some());
     for (name, value) in [
         ("response_type", "code"),
         ("client_id", config.client_id.as_str()),
@@ -283,10 +284,7 @@ pub(crate) async fn begin_login(config: &AppConfig) -> Result<(), ClientError> {
         // OIDC (and in Authentik's default mappings), so it has to be listed
         // too or that last fallback can never fire. Together they buy the
         // display name and nothing the service trusts.
-        (
-            "scope",
-            "openid profile email sovereign-config offline_access",
-        ),
+        ("scope", scope),
         ("state", state.as_str()),
         ("code_challenge", challenge.as_str()),
         ("code_challenge_method", "S256"),
@@ -298,6 +296,17 @@ pub(crate) async fn begin_login(config: &AppConfig) -> Result<(), ClientError> {
         .location()
         .set_href(&url.href())
         .map_err(|_| browser_error())
+}
+
+/// The scopes the page asks for. `telemetry:write` only when this deployment
+/// runs a client-telemetry ingest, which refuses a token without it: a page
+/// that sends nothing has no reason to hold the permission.
+pub(crate) const fn login_scope(telemetry: bool) -> &'static str {
+    if telemetry {
+        "openid profile email sovereign-config offline_access telemetry:write"
+    } else {
+        "openid profile email sovereign-config offline_access"
+    }
 }
 
 pub(crate) async fn finish_login(config: &AppConfig) -> Result<(), ClientError> {
@@ -443,6 +452,8 @@ pub(crate) fn clear_persisted_refresh_token() {
 }
 
 pub(crate) fn clear_browser_session() {
+    // Nothing said under this session may leave under the next one's token.
+    crate::telemetry::discard();
     TOKENS.with_borrow_mut(|token| *token = None);
     clear_persisted_refresh_token();
 }

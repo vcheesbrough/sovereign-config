@@ -132,7 +132,12 @@ how this repo applies it and where it does not yet.
 - **The `OTEL_*` variables are the whole configuration interface.** Never add
   a `SOVEREIGN_CONFIG_*` name or a config field for a telemetry knob.
   `compose.yaml` passes names only (`deployment_policy.rs` enforces it); the
-  values live in the deploy steps (README `## Observability` says why).
+  values live in the deploy steps (README `## Observability` says why). Two
+  things are not knobs of the server's telemetry and are deliberately outside
+  this rule: `SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT`, product
+  configuration the server hands the web UI (only ever its own public
+  origin), and the client ingest's own `OTEL_SERVICE_NAME` literal in
+  `compose.yaml`.
 - **Spans are the transport's job, in `crates/sovereign-config-server/src/spans.rs`:**
   a hand-written `tower` layer opens each request's server span (no
   `tower-http`, one pin fewer), and only that module adopts or injects trace
@@ -143,6 +148,14 @@ how this repo applies it and where it does not yet.
   Span attribute keys are semantic-convention names or `sovereign_config.`-
   prefixed; `sovereign_config_telemetry::testing::Capture::finish` fails any
   test that exports another.
+- **The web UI's telemetry is `crates/sovereign-config-web/src/telemetry/`**
+  (README `### Client telemetry: the web UI`). Every `spawn_local` in the
+  crate is `telemetry::spawn_local`, which is what gives each user action its
+  trace context — import that one, never `wasm_bindgen_futures::spawn_local`.
+  A record's body and attribute values are `&'static str` or numbers by type,
+  and its keys are `record::Key`; keep it that way, because it is what keeps
+  a token, a value or a path out of telemetry. The page sets no `user.*`, and
+  telemetry never refreshes a token itself.
 - **Every card that changes behaviour records its telemetry decision** — new
   or changed log fields, spans, metrics, dashboards, alerts or runbook text —
   including "no change needed". Not having thought about it is not a
@@ -159,13 +172,18 @@ in the change that closes it.
 | The SDK exports nothing about itself (no dropped-record, dropped-span or failed-export counter). | The Rust SDK has none; recorded rather than wrapped for now. Export failures show as `ERROR` lines from the `opentelemetry_sdk` target on stdout. | A wrapped exporter counting drops, when metrics go over OTLP (#421) |
 | `grpc` is not a supported `OTEL_EXPORTER_OTLP_PROTOCOL`; it fails startup. | The tonic exporter would add a second tonic beside the server's 0.12 and needs an async-runtime batch processor, for a transport the estate's collector does not need. (The `http/protobuf` path already brings second majors of prost and reqwest; that was accepted.) | Adding `grpc-tonic` when a collector requires it |
 | The platform indexes `log_source` and `deployment_environment`, not the skill's `telemetry_source` and `deployment.environment.name`. | The product emits only the skill's names; the shared collector (`monitor-alloy`, mini-config) copies the resource attributes `telemetry_source` → `log_source` and `deployment.environment.name` → `deployment.environment` at ingest when absent; Loki stores them as the labels `log_source` and `deployment_environment` (dots become underscores). No second key is emitted from here. | A platform rename in mini-config |
-| The same log line reaches Loki twice: from stdout (`log_source="docker"`) and over OTLP (`log_source="otlp"`). | `docker logs` stays useful, and whether the platform ships this container's stdout is the platform's decision. Postgres keeps its Docker stream regardless. | The platform dropping the server container's Docker stream once OTLP is trusted |
+| The same log line reaches Loki twice: from stdout (`log_source="docker"`) and over OTLP (`log_source="otlp"`). The client ingest does the same with its own logs (its default `LOG_OUTPUT=both`, where the reference deployment sets `otlp`). | `docker logs` stays useful, and whether the platform ships this container's stdout is the platform's decision. Postgres keeps its Docker stream regardless. | The platform dropping the server container's Docker stream once OTLP is trusted |
 | The `OTEL_*` values live in the deploy pipelines, not a sovereign-config `otel` layer. | This service is the store `render` reads; its own deploy cannot depend on it. | — (deliberate) |
 | The server's own `hyper_util` client and `reqwest` events are never exported over OTLP (stdout only). | They are also the exporter's HTTP client; bridging them would let an export produce records that need exporting. The server's gRPC stack (`tonic`, `h2`, `hyper`) is bridged. | — (deliberate) |
 | The internal listener (`/readyz`, `/metrics`) and the public port's gRPC health service (`grpc.health.v1.Health/*`) open no span. | Health is separate from telemetry, and the container health check probes every few seconds: a span per probe is noise. | — (deliberate) |
 | A Postgres span's `db.operation.name` is the store function's name (`insert_provisioning`), not the SQL verb, and there is no `db.query.summary`. | sqlx has no hook, so spans sit at the store functions, where the query *names* are; naming by function keeps SQL text off spans by construction (a test fails on `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`$1` in any attribute). | — (deliberate) |
 | Spans carry `code.module.name`, the span bridge's own key, which is not a semantic-convention name. | It is the quickest way from a span to the code that opened it; it is the one allowed exception in `sovereign-config-telemetry`'s key check. | Dropping it, if the conventions gain nothing `tracing` can fill |
-| The web UI, CLI, MCP server, provider and broker emit no telemetry. | Out of scope so far. | #376 (clients), #423 (broker) |
+| The CLI, MCP server, provider and broker emit no telemetry. | The first three are operator tools, not user devices sending to a public endpoint; the broker is a server-side process not yet instrumented. | #423 (broker); the rest — deliberate |
+| The web UI sends logs only, no spans; its trace context reaches the server as `traceparent`, and its records carry the action's ids. | The scope of #376. The ingest already accepts `/v1/traces`. | A card adding client spans, a client change alone |
+| The web UI's OTLP is hand-built OTLP/JSON over `fetch`, not an SDK. | No OpenTelemetry SDK builds for `wasm32`; binding the JavaScript SDK is larger than the few hundred lines needed. | An SDK for `wasm32` |
+| `telemetry:write` cannot be withdrawn from one user. | Authentik grants a provider's scopes to every user who signs in to it; the skill's per-user opt-out needs a provider that withholds scopes per user or group. It does keep the CLI and MCP (same client id, never requesting it) out of the ingest. | A per-user scope policy in the provider |
+| The client ingest's own metrics are scraped from `:8888` (Docker labels), not pushed. | The published image serves Prometheus; its reference deployment scrapes it. | The image pushing its own metrics |
+| No client-logs or ingest-volume panel, and no ingest-volume alert. | The product has not opted into dashboards or alerts (skill §8); the panels #376 names join the product dashboard. | #422 |
 
 *Kanban workflow and automated test coverage follow the agent-shared baseline
 unchanged — see baseline §1 and §6. Start a card with the **`start-iteration`**

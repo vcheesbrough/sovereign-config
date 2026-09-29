@@ -49,6 +49,11 @@ services:
       SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE: ${SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE-/run/secrets/manager_api_token}
       SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY: ${SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY:-}
       SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE: ${SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE-/run/secrets/value_encryption_key}
+      # Where the web UI sends its logs: this deployment's public origin when
+      # the otlp-ingest service below runs, unset (client telemetry off)
+      # otherwise. Product configuration handed to the page, not a knob of the
+      # server's own telemetry.
+      SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT: ${SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT:-}
       # Telemetry: names only, never a value. Each is passed through from the
       # deploy step's environment when set there and left unset otherwise, so
       # a deployment without them runs with telemetry off (README
@@ -93,6 +98,77 @@ services:
       - "observability.metrics.path=/metrics"
       - "observability.metrics.scheme=http"
       - "observability.service.name=sovereign-config"
+      - "observability.deployment.environment=${SOVEREIGN_CONFIG_ENV:-dev}"
+    restart: unless-stopped
+
+  # The web UI's telemetry ingest (README "Observability", *Client
+  # telemetry*): the published otlp-collector-oidc image, unmodified, one per
+  # environment. It validates the operator's access token (issuer, audience =
+  # this product's client id, expiry, `telemetry:write`), stamps `user.*`, the
+  # environment and `telemetry_source=client` over whatever the page sent, and
+  # forwards to the shared collector with the same OTLP_* values as the
+  # server. Traefik routes OTLP's own `/v1/` paths on the app's hostname here,
+  # so the page sends same-origin.
+  #
+  # Never a dependency and never waited on: it is in its own profile, so a
+  # plain `up` (and its `--wait`) leaves it out; the deploy starts it after
+  # the health gate and tolerates its failure; nothing lists it in
+  # `depends_on`. Stopping this container is the emergency stop; the page
+  # drops its records and carries on.
+  otlp-ingest:
+    profiles:
+      - client-telemetry
+    image: ghcr.io/vcheesbrough/otlp-collector-oidc:0.13.0@sha256:2db8a527da487c9091b74ee3a537785153b26f914e9e6f3ca2f1684793f02666
+    container_name: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}-otlp-ingest
+    environment:
+      # The server's own issuer and audience: a token minted for any other
+      # client is refused (the confused-deputy guard).
+      OIDC_ISSUER_URL: ${SOVEREIGN_CONFIG_OIDC_ISSUER:?Set SOVEREIGN_CONFIG_OIDC_ISSUER}
+      OIDC_AUDIENCE: ${SOVEREIGN_CONFIG_OIDC_AUDIENCE:?Set SOVEREIGN_CONFIG_OIDC_AUDIENCE}
+      # `service.name` becomes a stream label: the page's one name only.
+      ALLOWED_SERVICE_NAMES: sovereign-config-web
+      CLIENT_RESOURCE_ATTRIBUTES: deployment.environment.name=${SOVEREIGN_CONFIG_ENV:-dev},telemetry_source=client
+      # Decompressed; Traefik caps the wire body at the same size below.
+      MAX_REQUEST_BODY_BYTES: "1048576"
+      # This process's own name on its own logs and metrics. Its upstream,
+      # protocol and resource attributes are the deploy step's, passed by name
+      # as for the server (and so through the compose plugin binary, which
+      # leaves OTEL_RESOURCE_ATTRIBUTES alone).
+      OTEL_SERVICE_NAME: sovereign-config-otlp-ingest
+      OTEL_RESOURCE_ATTRIBUTES:
+      OTEL_EXPORTER_OTLP_ENDPOINT:
+      OTEL_EXPORTER_OTLP_PROTOCOL:
+    networks:
+      - traefik
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy-backend"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}-otlp.entrypoints=websecure"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}-otlp.rule=Host(`${SOVEREIGN_CONFIG_HOST:?Set SOVEREIGN_CONFIG_HOST}`) && PathPrefix(`/v1/`)"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}-otlp.tls=true"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}-otlp.tls.certresolver=myresolver"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}-otlp.middlewares=lan-vpn-only@docker,rate-limit@docker,crowdsec@docker,${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}-otlp-body"
+      - "traefik.http.middlewares.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}-otlp-body.buffering.maxRequestBodyBytes=1048576"
+      - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}-otlp.service=${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}-otlp"
+      # TLS to the container's embedded self-signed certificate, which the
+      # platform's default serversTransport already accepts.
+      - "traefik.http.services.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}-otlp.loadbalancer.server.port=4318"
+      - "traefik.http.services.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}-otlp.loadbalancer.server.scheme=https"
+      # Its own metrics, among them refusals by reason and records dropped.
+      - "observability.metrics.scrape=true"
+      - "observability.metrics.port=8888"
+      - "observability.metrics.path=/metrics"
+      - "observability.metrics.scheme=http"
+      - "observability.service.name=sovereign-config-otlp-ingest"
       - "observability.deployment.environment=${SOVEREIGN_CONFIG_ENV:-dev}"
     restart: unless-stopped
 

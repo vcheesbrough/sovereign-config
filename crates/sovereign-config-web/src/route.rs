@@ -1,10 +1,10 @@
 //! Routing: URL <-> `Route`, navigation with the unsaved-edit guard, and
 //! rendering the active view.
 
+use crate::telemetry::spawn_local;
 use sovereign_config_core::ConfigPath;
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::spawn_local;
 use web_sys::{HtmlDialogElement, HtmlElement, HtmlInputElement, HtmlTextAreaElement, window};
 
 use crate::audit::{load_audit, render_audit_route};

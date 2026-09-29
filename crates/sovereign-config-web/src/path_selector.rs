@@ -1,12 +1,12 @@
 //! The path selector combobox: options, filtering, keyboard selection, and
 //! refresh.
 
+use crate::telemetry::spawn_local;
 use sovereign_config_core::{ClientError, ValueListing};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen_futures::spawn_local;
 use web_sys::{Document, Element, Event, HtmlInputElement, KeyboardEvent, window};
 
 use crate::browser::{app_config, browser_error};

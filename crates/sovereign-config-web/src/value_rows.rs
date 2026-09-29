@@ -1,9 +1,9 @@
 //! The Configuration grid rows: rendering plain and secret values, alias paths,
 //! and the secret padlock.
 
+use crate::telemetry::spawn_local;
 use sovereign_config_core::{ClientError, ListedValue, ValueContent, ValueListing};
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
 use web_sys::{Document, Element, Event, HtmlInputElement, HtmlTextAreaElement, window};
 
 use crate::browser::browser_error;
