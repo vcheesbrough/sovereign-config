@@ -70,12 +70,6 @@ fn every_container_is_labelled_for_log_discovery() {
     );
 }
 
-/// Build identity belongs on `sovereign_config_build_info`, not on every series.
-///
-/// Alloy stopped reading these labels, so leaving them here would be dead
-/// configuration that still reads as the supported way to report a release —
-/// and the release they carried was a per-deploy value that started a fresh
-/// series set each time.
 /// Metrics leave over OTLP (#421): nothing may ask the platform to scrape the
 /// server any more, or Alloy would keep a target whose `/metrics` answers 404.
 #[test]
@@ -89,6 +83,12 @@ fn compose_asks_for_no_metrics_scrape() {
     assert!(!compose.contains("/metrics"), "no scrape path");
 }
 
+/// Build identity belongs on `sovereign_config_build_info`, not on every series.
+///
+/// Alloy stopped reading these labels, so leaving them here would be dead
+/// configuration that still reads as the supported way to report a release —
+/// and the release they carried was a per-deploy value that started a fresh
+/// series set each time.
 #[test]
 fn compose_does_not_stamp_build_identity_onto_discovery_labels() {
     let compose = include_str!("../../../compose.yaml");

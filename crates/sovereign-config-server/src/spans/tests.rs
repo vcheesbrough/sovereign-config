@@ -481,6 +481,79 @@ async fn a_grpc_call_is_a_server_span_named_by_its_route_with_its_status() {
     );
 }
 
+/// A gRPC answer whose `OK` status arrives in trailers, after the body.
+fn trailered_ok() -> Response<BoxBody> {
+    use http_body_util::BodyExt as _;
+
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", HeaderValue::from_static("0"));
+    let body = empty_body()
+        .with_trailers(async move { Some(Ok(trailers)) })
+        .boxed_unsync();
+    Response::new(body)
+}
+
+fn grpc_post(path: &str) -> Request<BoxBody> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .body(empty_body())
+        .unwrap()
+}
+
+/// Each call's duration is recorded exactly once, whatever way it ends: with
+/// the status in its trailers; as `CANCELLED` when the client drops the
+/// response before the trailers arrive; as `UNKNOWN` — a server error, as
+/// tonic answers it — when the service fails outright.
+#[tokio::test]
+async fn every_call_is_timed_once_however_it_ends() {
+    use http_body_util::BodyExt as _;
+
+    const COMPLETED: &str = "/sovereign.config.v4.System/GetVersion";
+    const ABANDONED: &str = "/sovereign.config.v4.System/GetIdentity";
+    const FAILED: &str = "/sovereign.config.v4.Audit/QueryAuditTrail";
+
+    let capture = Capture::exporting();
+    {
+        let _guard = capture.enter();
+        let handler = service_fn(|request: Request<BoxBody>| async move {
+            if request.uri().path() == FAILED {
+                Err("the service failed")
+            } else {
+                Ok(trailered_ok())
+            }
+        });
+        let service = timed(&capture.meter()).layer(GrpcStatusLayer.layer(handler));
+
+        let completed = service.clone().oneshot(grpc_post(COMPLETED)).await.unwrap();
+        completed.into_body().collect().await.unwrap();
+        let abandoned = service.clone().oneshot(grpc_post(ABANDONED)).await.unwrap();
+        drop(abandoned);
+        let failed = service.oneshot(grpc_post(FAILED)).await;
+        assert!(failed.is_err());
+    }
+    let exported = capture.finish();
+
+    let duration = exported.metric("rpc.server.call.duration");
+    assert_eq!(duration.points.len(), 3, "{:?}", duration.points);
+    for (route, status, error) in [
+        (COMPLETED, "OK", None),
+        (ABANDONED, "CANCELLED", None),
+        (FAILED, "UNKNOWN", Some("UNKNOWN")),
+    ] {
+        let point = duration.point(&[
+            ("rpc.method", &route[1..]),
+            ("rpc.response.status_code", status),
+        ]);
+        assert_eq!(point.count, 1, "{route}");
+        assert_eq!(
+            point.attributes.get("error.type").map(String::as_str),
+            error,
+            "{route}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Outbound: Authentik
 // ---------------------------------------------------------------------------

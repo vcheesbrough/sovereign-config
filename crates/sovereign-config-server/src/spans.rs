@@ -243,8 +243,9 @@ pub(crate) struct CallTiming {
 }
 
 /// Records a call's duration exactly once: with its status when the status is
-/// seen, or as `CANCELLED` if the response is dropped first — the client went
-/// away before the trailers, which the server sees as a cancellation.
+/// seen, `UNKNOWN` when the service fails outright (what tonic answers), or
+/// `CANCELLED` if the response is dropped first — the client went away before
+/// the trailers, which the server sees as a cancellation.
 struct CallRecorder(Option<CallTiming>);
 
 impl CallRecorder {
@@ -347,7 +348,17 @@ where
         let recorder = span.clone();
         Box::pin(
             async move {
-                let response = inner.call(request).await?;
+                let response = match inner.call(request).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        // The connection fails rather than answering; for the
+                        // web UI's RED that is a server error.
+                        if let Some(method) = http_method {
+                            metrics.record_http(method, 500, started.elapsed());
+                        }
+                        return Err(error);
+                    }
+                };
                 // Only the HTTP span declares the field; on an RPC span this
                 // is a no-op, and the gRPC status is recorded further in.
                 let status = response.status().as_u16();
@@ -410,10 +421,18 @@ where
             .map(|RequestSpan(span)| span.clone());
         let timing = request.extensions().get::<CallTiming>().cloned();
         Box::pin(async move {
-            // Dropped unfinished — a failed call, or a body abandoned before
-            // its trailers — it records the call as cancelled.
+            // Dropped unfinished — a body abandoned before its trailers — it
+            // records the call as cancelled.
             let mut recorder = CallRecorder(timing);
-            let response = inner.call(request).await?;
+            let response = match inner.call(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    // tonic answers a service error as UNKNOWN, a server
+                    // error: count it as one, not as the client going away.
+                    recorder.finish(Code::Unknown);
+                    return Err(error);
+                }
+            };
             if span.is_none() && recorder.0.is_none() {
                 return Ok(response);
             }
