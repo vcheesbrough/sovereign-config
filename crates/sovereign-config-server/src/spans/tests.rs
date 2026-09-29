@@ -30,9 +30,21 @@ use tracing::Instrument;
 
 use super::{GrpcStatusLayer, RPC_ROUTES, Route, TraceLayer, route, server_span};
 use crate::{
-    audit::AuditRecorder, authentik::AuthentikAdminClient, system::SERVED_PROTOCOL_LABELS,
-    system::SystemService,
+    audit::AuditRecorder, authentik::AuthentikAdminClient, metrics::RequestMetrics,
+    system::SERVED_PROTOCOL_LABELS, system::SystemService,
 };
+
+/// The trace layer recording its durations on `meter`.
+fn timed(meter: &opentelemetry::metrics::Meter) -> TraceLayer {
+    TraceLayer::new(RequestMetrics::new(meter))
+}
+
+/// The trace layer recording its durations nowhere, for tests about spans.
+fn untimed() -> TraceLayer {
+    use opentelemetry::metrics::MeterProvider as _;
+
+    timed(&opentelemetry::metrics::noop::NoopMeterProvider::new().meter("untimed"))
+}
 
 /// An inbound W3C context, as a client or an edge proxy would send it.
 const INBOUND_TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
@@ -188,7 +200,7 @@ async fn serve_one(request: Request<BoxBody>) -> Response<BoxBody> {
         tracing::info!("handled inside the request span");
         Ok::<_, std::convert::Infallible>(Response::new(empty_body()))
     });
-    TraceLayer.layer(handler).oneshot(request).await.unwrap()
+    untimed().layer(handler).oneshot(request).await.unwrap()
 }
 
 fn get(path: &str, traceparent: Option<&str>) -> Request<BoxBody> {
@@ -273,7 +285,7 @@ async fn a_server_error_on_the_web_ui_marks_its_span_failed() {
             *response.status_mut() = http::StatusCode::INTERNAL_SERVER_ERROR;
             Ok::<_, std::convert::Infallible>(response)
         });
-        TraceLayer
+        timed(&capture.meter())
             .layer(handler)
             .oneshot(get("/index.html", None))
             .await
@@ -281,6 +293,24 @@ async fn a_server_error_on_the_web_ui_marks_its_span_failed() {
         serve_one(get("/missing", None)).await;
     }
     let exported = capture.finish();
+
+    // RED for the web UI: the request's duration, by method and status, with
+    // `error.type` for a server error — and never the path.
+    let duration = exported.metric("http.server.request.duration");
+    assert_eq!(
+        duration.stored_name(),
+        "http_server_request_duration_seconds"
+    );
+    let point = duration.point(&[
+        ("http.request.method", "GET"),
+        ("http.response.status_code", "500"),
+    ]);
+    assert_eq!(point.count, 1);
+    assert_eq!(
+        point.attributes.get("error.type").map(String::as_str),
+        Some("500")
+    );
+    assert!(point.attributes.keys().all(|key| key != "url.path"));
 
     let spans = exported.spans_named("GET");
     let failed = spans
@@ -347,12 +377,12 @@ struct GrpcHarness {
 }
 
 impl GrpcHarness {
-    async fn start() -> Self {
+    async fn start(meter: &opentelemetry::metrics::Meter) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (shutdown, signal) = tokio::sync::oneshot::channel::<()>();
         let router = Server::builder()
-            .layer(TraceLayer)
+            .layer(timed(meter))
             .layer(GrpcStatusLayer)
             .add_service(SystemServer::new(SystemService));
         let task = tokio::spawn(async move {
@@ -406,7 +436,7 @@ async fn a_grpc_call_is_a_server_span_named_by_its_route_with_its_status() {
     let capture = Capture::exporting();
     {
         let _guard = capture.enter();
-        let harness = GrpcHarness::start().await;
+        let harness = GrpcHarness::start(&capture.meter()).await;
         harness
             .get_version(Some(&inbound_traceparent()), "v3")
             .await;
@@ -430,6 +460,98 @@ async fn a_grpc_call_is_a_server_span_named_by_its_route_with_its_status() {
     assert_eq!(span.attribute("rpc.response.status_code"), Some("OK"));
     assert!(!span.is_error);
     assert_every_span_identified(&exported);
+
+    // RED: the same call, timed, under the span's own keys and values.
+    let duration = exported.metric("rpc.server.call.duration");
+    let point = duration.point(&[
+        ("rpc.system.name", "grpc"),
+        ("rpc.method", "sovereign.config.v3.System/GetVersion"),
+        ("rpc.response.status_code", "OK"),
+    ]);
+    assert_eq!(point.count, 1);
+    assert!(!point.attributes.contains_key("error.type"));
+    assert!(point.value > 0.0 && point.value < 10.0, "{point:?}");
+    assert_eq!(point.bounds, crate::metrics::DURATION_BOUNDARIES);
+    assert!(
+        point
+            .attributes
+            .keys()
+            .all(|key| !key.starts_with("user.") && key != "sovereign_config.protocol.version"),
+        "{point:?}"
+    );
+}
+
+/// A gRPC answer whose `OK` status arrives in trailers, after the body.
+fn trailered_ok() -> Response<BoxBody> {
+    use http_body_util::BodyExt as _;
+
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", HeaderValue::from_static("0"));
+    let body = empty_body()
+        .with_trailers(async move { Some(Ok(trailers)) })
+        .boxed_unsync();
+    Response::new(body)
+}
+
+fn grpc_post(path: &str) -> Request<BoxBody> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .body(empty_body())
+        .unwrap()
+}
+
+/// Each call's duration is recorded exactly once, whatever way it ends: with
+/// the status in its trailers; as `CANCELLED` when the client drops the
+/// response before the trailers arrive; as `UNKNOWN` — a server error, as
+/// tonic answers it — when the service fails outright.
+#[tokio::test]
+async fn every_call_is_timed_once_however_it_ends() {
+    use http_body_util::BodyExt as _;
+
+    const COMPLETED: &str = "/sovereign.config.v4.System/GetVersion";
+    const ABANDONED: &str = "/sovereign.config.v4.System/GetIdentity";
+    const FAILED: &str = "/sovereign.config.v4.Audit/QueryAuditTrail";
+
+    let capture = Capture::exporting();
+    {
+        let _guard = capture.enter();
+        let handler = service_fn(|request: Request<BoxBody>| async move {
+            if request.uri().path() == FAILED {
+                Err("the service failed")
+            } else {
+                Ok(trailered_ok())
+            }
+        });
+        let service = timed(&capture.meter()).layer(GrpcStatusLayer.layer(handler));
+
+        let completed = service.clone().oneshot(grpc_post(COMPLETED)).await.unwrap();
+        completed.into_body().collect().await.unwrap();
+        let abandoned = service.clone().oneshot(grpc_post(ABANDONED)).await.unwrap();
+        drop(abandoned);
+        let failed = service.oneshot(grpc_post(FAILED)).await;
+        assert!(failed.is_err());
+    }
+    let exported = capture.finish();
+
+    let duration = exported.metric("rpc.server.call.duration");
+    assert_eq!(duration.points.len(), 3, "{:?}", duration.points);
+    for (route, status, error) in [
+        (COMPLETED, "OK", None),
+        (ABANDONED, "CANCELLED", None),
+        (FAILED, "UNKNOWN", Some("UNKNOWN")),
+    ] {
+        let point = duration.point(&[
+            ("rpc.method", &route[1..]),
+            ("rpc.response.status_code", status),
+        ]);
+        assert_eq!(point.count, 1, "{route}");
+        assert_eq!(
+            point.attributes.get("error.type").map(String::as_str),
+            error,
+            "{route}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -610,6 +732,7 @@ async fn the_audit_sweep_is_a_root_span_even_when_something_else_is_current() {
             &unreachable_pool(),
             &AuditRecorder::for_tests(),
             Duration::from_hours(24),
+            &crate::metrics::JobMetrics::new(&capture.meter()),
         )
         .instrument(enclosing)
         .await;
@@ -631,4 +754,12 @@ async fn the_audit_sweep_is_a_root_span_even_when_something_else_is_current() {
         .log("audit retention sweep failed; retrying at the next interval")
         .expect("the failure is logged");
     assert_eq!(log.trace_id.as_deref(), Some(sweep.trace_id.as_str()));
+    // RED for scheduled work: the failed sweep is timed, and marked failed.
+    let duration = exported.metric("sovereign_config.audit.sweep.duration");
+    assert_eq!(
+        duration.stored_name(),
+        "sovereign_config_audit_sweep_duration_seconds"
+    );
+    let point = duration.point(&[("error.type", "storage_unavailable")]);
+    assert_eq!(point.count, 1);
 }

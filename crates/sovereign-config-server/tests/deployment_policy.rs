@@ -46,9 +46,10 @@ fn compose_delivers_the_value_encryption_key_like_every_other_secret() {
 /// container still ships logs, so nothing fails — Loki just files them under
 /// the container name, and `{deployment_environment="prod"}` quietly misses the
 /// database. The failure mode is an absence, which only a test asserting the
-/// presence catches.
+/// presence catches. The labels serve the stdout path only: metrics are
+/// pushed over OTLP with the process's own identity.
 #[test]
-fn every_container_is_labelled_for_log_and_metric_discovery() {
+fn every_container_is_labelled_for_log_discovery() {
     let compose = include_str!("../../../compose.yaml");
 
     for (service, expected) in [
@@ -68,6 +69,26 @@ fn every_container_is_labelled_for_log_and_metric_discovery() {
         3,
         "every container must carry the environment, from the same variable"
     );
+}
+
+/// Metrics leave over OTLP (#421): nothing may ask the platform to scrape the
+/// server any more, or Alloy would keep a target whose `/metrics` answers 404.
+///
+/// The client-telemetry ingest is the one exception, recorded in AGENTS.md's
+/// deviations register: the published image serves its own metrics on
+/// `:8888` for scraping, and pushes none.
+#[test]
+fn compose_asks_for_no_metrics_scrape() {
+    for service in ["postgres", "sovereign-config"] {
+        let labels = serde_yaml::to_string(&compose_service(service)["labels"]).unwrap();
+        assert!(
+            !labels.contains("observability.metrics"),
+            "{service}: no scrape labels"
+        );
+        assert!(!labels.contains("/metrics"), "{service}: no scrape path");
+    }
+    let ingest = serde_yaml::to_string(&compose_service("otlp-ingest")["labels"]).unwrap();
+    assert!(ingest.contains("observability.metrics.port=8888"));
 }
 
 /// Build identity belongs on `sovereign_config_build_info`, not on every series.
@@ -317,6 +338,7 @@ fn deploys_set_the_telemetry_values_for_their_environment() {
             "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf\n".to_owned(),
             "export OTEL_LOGS_EXPORTER=otlp\n".to_owned(),
             "export OTEL_TRACES_EXPORTER=otlp\n".to_owned(),
+            "export OTEL_METRICS_EXPORTER=otlp\n".to_owned(),
         ] {
             assert!(text.contains(&expected), "{workflow} must set `{expected}`");
         }

@@ -12,8 +12,8 @@ fn main() {
 
     // The commit the image was built from. It reaches the image as an OCI
     // label, which the running process cannot read, so the build stamps it in
-    // too — `sovereign_config_build_info` is the only place a scrape can learn
-    // which commit is serving.
+    // too — `sovereign_config_build_info` is the only metric that says which
+    // commit is serving.
     if let Ok(revision) = env::var("SOVEREIGN_CONFIG_REVISION")
         && !revision.trim().is_empty()
     {

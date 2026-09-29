@@ -948,7 +948,7 @@ async fn only_authenticated_traffic_moves_the_retirement_gate() {
         .unwrap();
     stack.service(inner).oneshot(handshake).await.unwrap();
 
-    let rendered = protocol_metrics.render();
+    let rendered = protocol_metrics.series();
     assert!(
         rendered.contains(
             "sovereign_config_protocol_requests_total{version=\"v3\",outcome=\"attempted\"} 3"
@@ -985,6 +985,7 @@ fn grpc_answer(code: tonic::Code) -> Response<BoxBody> {
 /// the bottom with `answer`, and reads the whole response so its trailers —
 /// and the span's end — are reached.
 async fn through_the_stack(
+    meter: &opentelemetry::metrics::Meter,
     authenticator: Authenticator,
     request: Request<BoxBody>,
     answer: tonic::Code,
@@ -999,7 +1000,7 @@ async fn through_the_stack(
         service_fn(
             move |_: Request<BoxBody>| async move { Ok::<_, Infallible>(grpc_answer(answer)) },
         );
-    let response = crate::spans::TraceLayer
+    let response = crate::spans::TraceLayer::new(crate::metrics::RequestMetrics::new(meter))
         .layer(stack.layer(inner))
         .oneshot(request)
         .await
@@ -1036,9 +1037,11 @@ async fn an_authenticated_call_is_stamped_with_who_made_it_and_nothing_else_is()
     claims["preferred_username"] = json!("Span Operator");
     let server = fake_server(StatusCode::OK, claims.to_string(), Duration::ZERO).await;
     let capture = sovereign_config_telemetry::testing::Capture::exporting();
+    let meter = capture.meter();
     {
         let _guard = capture.enter();
         through_the_stack(
+            &meter,
             authenticator(server.url.clone(), Duration::from_secs(1)),
             grpc_request(
                 "/sovereign.config.v3.System/GetIdentity",
@@ -1049,6 +1052,7 @@ async fn an_authenticated_call_is_stamped_with_who_made_it_and_nothing_else_is()
         )
         .await;
         through_the_stack(
+            &meter,
             authenticator(server.url.clone(), Duration::from_secs(1)),
             grpc_request(
                 "/sovereign.config.v3.System/GetIdentity",
@@ -1110,12 +1114,14 @@ async fn an_authenticated_call_is_stamped_with_who_made_it_and_nothing_else_is()
 async fn every_grpc_status_is_recorded_and_only_server_errors_fail_the_span() {
     let unavailable = fake_server(StatusCode::SERVICE_UNAVAILABLE, "{}", Duration::ZERO).await;
     let capture = sovereign_config_telemetry::testing::Capture::exporting();
+    let meter = capture.meter();
     let browser_content_type;
     {
         let _guard = capture.enter();
         let authenticator = || authenticator(unavailable.url.clone(), Duration::from_secs(1));
         // Authentication cannot reach its dependency: UNAVAILABLE, trailers-only.
         through_the_stack(
+            &meter,
             authenticator(),
             grpc_request(
                 "/sovereign.config.v3.System/GetIdentity",
@@ -1127,6 +1133,7 @@ async fn every_grpc_status_is_recorded_and_only_server_errors_fail_the_span() {
         .await;
         // A retired version: FAILED_PRECONDITION from the catch-all.
         through_the_stack(
+            &meter,
             authenticator(),
             grpc_request(
                 "/sovereign.config.v99.System/GetVersion",
@@ -1138,6 +1145,7 @@ async fn every_grpc_status_is_recorded_and_only_server_errors_fail_the_span() {
         .await;
         // A handler's NOT_FOUND, in trailers.
         through_the_stack(
+            &meter,
             authenticator(),
             grpc_request(
                 "/sovereign.config.v3.System/GetVersion",
@@ -1150,6 +1158,7 @@ async fn every_grpc_status_is_recorded_and_only_server_errors_fail_the_span() {
         // A browser's call, answered INTERNAL in trailers the browser sees
         // framed into the body.
         let response = through_the_stack(
+            &meter,
             authenticator(),
             grpc_request(
                 "/sovereign.config.v3.System/GetVersion",
@@ -1200,4 +1209,43 @@ async fn every_grpc_status_is_recorded_and_only_server_errors_fail_the_span() {
     let browser = status("INTERNAL");
     assert!(browser.is_error);
     assert_eq!(browser.attribute("error.type"), Some("INTERNAL"));
+
+    assert_every_call_timed_with_its_status(&exported);
+}
+
+/// RED: each call's duration is recorded once, with the span's method and
+/// status, and `error.type` exactly where the span failed.
+fn assert_every_call_timed_with_its_status(
+    exported: &sovereign_config_telemetry::testing::Exported,
+) {
+    let duration = exported.metric("rpc.server.call.duration");
+    assert_eq!(duration.unit, "s");
+    assert_eq!(duration.stored_name(), "rpc_server_call_duration_seconds");
+    for (method, code, error) in [
+        (
+            "sovereign.config.v3.System/GetIdentity",
+            "UNAVAILABLE",
+            Some("UNAVAILABLE"),
+        ),
+        ("_OTHER", "FAILED_PRECONDITION", None),
+        ("sovereign.config.v3.System/GetVersion", "NOT_FOUND", None),
+        (
+            "sovereign.config.v3.System/GetVersion",
+            "INTERNAL",
+            Some("INTERNAL"),
+        ),
+    ] {
+        let point = duration.point(&[
+            ("rpc.system.name", "grpc"),
+            ("rpc.method", method),
+            ("rpc.response.status_code", code),
+        ]);
+        assert_eq!(point.count, 1, "{method} {code}");
+        assert_eq!(
+            point.attributes.get("error.type").map(String::as_str),
+            error,
+            "{method} {code}"
+        );
+    }
+    assert_eq!(duration.points.len(), 4, "{:?}", duration.points);
 }

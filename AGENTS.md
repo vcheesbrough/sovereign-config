@@ -148,6 +148,17 @@ how this repo applies it and where it does not yet.
   Span attribute keys are semantic-convention names or `sovereign_config.`-
   prefixed; `sovereign_config_telemetry::testing::Capture::finish` fails any
   test that exports another.
+- **Metrics are pushed over OTLP, in `crates/sovereign-config-server/src/metrics.rs`**
+  (there is no `/metrics`; #421). Instruments are created once at startup on
+  `Telemetry::meter()`. A counter family counts in atomics and reports every
+  label combination through an observable counter; a duration is a seconds
+  histogram on `metrics::DURATION_BOUNDARIES`. Every label value comes from an
+  exhaustive enum match, never a request. A new instrument goes into the
+  `STORED_NAMES` table in `metrics/tests.rs` with the name the platform
+  stores it under; `Capture::finish` fails any exported series carrying a key
+  from `keys::FORBIDDEN_METRIC_KEYS`, or build identity anywhere but
+  `sovereign_config.build.info`. From #422 on, a new metric ships with its
+  dashboard panel in the same PR.
 - **The web UI's telemetry is `crates/sovereign-config-web/src/telemetry/`**
   (README `### Client telemetry: the web UI`). Every `spawn_local` in the
   crate is `telemetry::spawn_local`, which is what gives each user action its
@@ -168,16 +179,17 @@ in the change that closes it.
 
 | Deviation | Why | Closed by |
 | --- | --- | --- |
-| Metrics are scraped from `/metrics` (Docker labels), not pushed over OTLP. | Predates the contract. | #421 |
-| The SDK exports nothing about itself (no dropped-record, dropped-span or failed-export counter). | The Rust SDK has none; recorded rather than wrapped for now. Export failures show as `ERROR` lines from the `opentelemetry_sdk` target on stdout. | A wrapped exporter counting drops, when metrics go over OTLP (#421) |
+| The SDK exports nothing about itself (no dropped-record, dropped-span or failed-export counter). | **Decided in #421: kept, not wrapped.** The drops that matter happen in the SDK's batch processors when their bounded queues fill — before any exporter sees the record — so a wrapped exporter could count only failed exports, not drops. A failed-export counter would itself leave over the export path that is failing, and go dark exactly when it is needed; metrics are cumulative, so a failed metric export loses nothing the next one does not carry. Export failures show as `ERROR` lines from the `opentelemetry_sdk` target on stdout, which the platform ships independently of OTLP. | An SDK release that counts its own queue drops |
 | `grpc` is not a supported `OTEL_EXPORTER_OTLP_PROTOCOL`; it fails startup. | The tonic exporter would add a second tonic beside the server's 0.12 and needs an async-runtime batch processor, for a transport the estate's collector does not need. (The `http/protobuf` path already brings second majors of prost and reqwest; that was accepted.) | Adding `grpc-tonic` when a collector requires it |
 | The platform indexes `log_source` and `deployment_environment`, not the skill's `telemetry_source` and `deployment.environment.name`. | The product emits only the skill's names; the shared collector (`monitor-alloy`, mini-config) copies the resource attributes `telemetry_source` → `log_source` and `deployment.environment.name` → `deployment.environment` at ingest when absent; Loki stores them as the labels `log_source` and `deployment_environment` (dots become underscores). No second key is emitted from here. | A platform rename in mini-config |
 | The same log line reaches Loki twice: from stdout (`log_source="docker"`) and over OTLP (`log_source="otlp"`). The client ingest does the same with its own logs (its default `LOG_OUTPUT=both`, where the reference deployment sets `otlp`). | `docker logs` stays useful, and whether the platform ships this container's stdout is the platform's decision. Postgres keeps its Docker stream regardless. | The platform dropping the server container's Docker stream once OTLP is trusted |
 | The `OTEL_*` values live in the deploy pipelines, not a sovereign-config `otel` layer. | This service is the store `render` reads; its own deploy cannot depend on it. | — (deliberate) |
 | The server's own `hyper_util` client and `reqwest` events are never exported over OTLP (stdout only). | They are also the exporter's HTTP client; bridging them would let an export produce records that need exporting. The server's gRPC stack (`tonic`, `h2`, `hyper`) is bridged. | — (deliberate) |
-| The internal listener (`/readyz`, `/metrics`) and the public port's gRPC health service (`grpc.health.v1.Health/*`) open no span. | Health is separate from telemetry, and the container health check probes every few seconds: a span per probe is noise. | — (deliberate) |
+| The internal listener (`/readyz`) and the public port's gRPC health service (`grpc.health.v1.Health/*`) open no span and record no RED data point. | Health is separate from telemetry, and the container health check probes every few seconds: a span or data point per probe is noise. | — (deliberate) |
 | A Postgres span's `db.operation.name` is the store function's name (`insert_provisioning`), not the SQL verb, and there is no `db.query.summary`. | sqlx has no hook, so spans sit at the store functions, where the query *names* are; naming by function keeps SQL text off spans by construction (a test fails on `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`$1` in any attribute). | — (deliberate) |
 | Spans carry `code.module.name`, the span bridge's own key, which is not a semantic-convention name. | It is the quickest way from a span to the code that opened it; it is the one allowed exception in `sovereign-config-telemetry`'s key check. | Dropping it, if the conventions gain nothing `tracing` can fill |
+| Metric label keys other than the RED and pool ones (`version`, `outcome`, `reason`, `kind`, `operation`, `result`, `call`) are neither semantic-convention names nor `sovereign_config.`-prefixed. | They predate the contract, and the retirement gate (`sovereign_config_protocol_requests_total{outcome="authenticated"}`) and the audit alert series are written against them; renaming would move every stored series. The forbidden-key test covers them; only span keys are checked against `keys::is_known`. | A protocol-gate rewrite that can afford a rename |
+| Instruments are held by what records them (`Arc` families, `RequestMetrics`, `JobMetrics`), not in statics as `references/rust.md` suggests. | Every test assembles its own capture; statics would make parallel tests share series. They are still created once, at startup. | — (deliberate) |
 | The CLI, MCP server, provider and broker emit no telemetry. | The first three are operator tools, not user devices sending to a public endpoint; the broker is a server-side process not yet instrumented. | #423 (broker); the rest — deliberate |
 | The web UI sends logs only, no spans; its trace context reaches the server as `traceparent`, and its records carry the action's ids. So every web UI trace in Tempo has a missing root: the server span's parent is the action span, never exported. | The scope of #376. The ingest already accepts `/v1/traces`. | A card adding client spans, a client change alone |
 | The web UI's OTLP is hand-built OTLP/JSON over `fetch`, not an SDK. | No OpenTelemetry SDK builds for `wasm32`; binding the JavaScript SDK is larger than the few hundred lines needed. | An SDK for `wasm32` |

@@ -225,8 +225,7 @@ steps:
         export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
         export OTEL_LOGS_EXPORTER=otlp
         export OTEL_TRACES_EXPORTER=otlp
-        # Until OTLP metrics (#421) exist.
-        export OTEL_METRICS_EXPORTER=none
+        export OTEL_METRICS_EXPORTER=otlp
         printf 'telemetry: %s\n' "$$OTEL_RESOURCE_ATTRIBUTES"
         ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
         # Exported rather than prefixed, because two Compose runs read them.

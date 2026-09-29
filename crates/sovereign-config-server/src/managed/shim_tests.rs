@@ -85,7 +85,7 @@ async fn an_empty_permission_selection_is_refused_by_v4_before_anything_else() {
 
     // A refusal in the shim is counted exactly as one in the shared
     // implementation would be: the operation metric cannot tell them apart.
-    let rendered = metrics.render();
+    let rendered = metrics.series();
     for (result, count) in [("invalid_request", 1), ("unauthenticated", 1)] {
         let series = format!(
             "sovereign_config_managed_connection_operations_total{{operation=\"create\",result=\"{result}\"}} {count}"

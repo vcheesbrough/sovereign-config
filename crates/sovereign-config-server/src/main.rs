@@ -13,7 +13,12 @@ mod system;
 mod values;
 mod web;
 
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    env,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
@@ -39,7 +44,11 @@ use handshake::HandshakeService;
 use managed::{
     ManagedConnectionsService, ManagedSettings, V3ManagedConnections, V4ManagedConnections,
 };
-use metrics::{AuditMetrics, AuthenticationMetrics, ManagedConnectionMetrics, ProtocolMetrics};
+use metrics::{
+    AuditMetrics, AuthenticationMetrics, JobMetrics, ManagedConnectionMetrics, ProtocolMetrics,
+    RequestMetrics,
+};
+use opentelemetry::metrics::Meter;
 use protocol::ProtocolVersionLayer;
 use sovereign_config_core::Secret;
 use sovereign_config_proto::sovereign::config::{
@@ -79,59 +88,8 @@ const fn application_revision(revision: Option<&str>) -> &str {
     }
 }
 
-#[derive(Clone)]
-struct AppState {
-    database: PgPool,
-    authentication_metrics: Arc<AuthenticationMetrics>,
-    managed_metrics: Arc<ManagedConnectionMetrics>,
-    protocol_metrics: Arc<ProtocolMetrics>,
-    audit_metrics: Arc<AuditMetrics>,
-}
-
-/// The whole `/metrics` exposition, assembled from the parts each family
-/// renders.
-///
-/// Free, and taking its inputs rather than reading them off [`AppState`], so a
-/// test can assert what the endpoint actually serves: `AppState` carries a
-/// `PgPool`, and a composition only reachable through one is a composition only
-/// a test with a database can check. What belongs in the exposition is not a
-/// database question.
-fn compose_metrics(up: u8, build_info: &str, families: [&str; 4]) -> String {
-    let [authentication, managed, protocol, audit] = families;
-    format!("sovereign_config_up {up}\n{build_info}{authentication}{managed}{protocol}{audit}")
-}
-
-impl AppState {
-    fn render_metrics(&self, up: u8) -> String {
-        compose_metrics(
-            up,
-            &metrics::render_build_info(
-                APPLICATION_VERSION,
-                APPLICATION_REVISION,
-                &SERVED_PROTOCOL_LABELS.join(","),
-            ),
-            [
-                &self.authentication_metrics.render(),
-                &self.managed_metrics.render(),
-                &self.protocol_metrics.render(),
-                &self.audit_metrics.render(),
-            ],
-        )
-    }
-}
-
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    match sqlx::query("SELECT 1").execute(&state.database).await {
-        Ok(_) => (StatusCode::OK, state.render_metrics(1)),
-        Err(error) => {
-            error!(error = %error, "database health probe failed");
-            (StatusCode::SERVICE_UNAVAILABLE, state.render_metrics(0))
-        }
-    }
-}
-
-async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    match sqlx::query("SELECT 1").execute(&state.database).await {
+async fn ready(State(database): State<PgPool>) -> impl IntoResponse {
+    match sqlx::query("SELECT 1").execute(&database).await {
         Ok(_) => StatusCode::OK,
         Err(error) => {
             error!(error = %error, "database readiness probe failed");
@@ -148,14 +106,14 @@ async fn main() -> Result<()> {
     // First, before anything logs: it installs the subscriber, and it fails
     // startup on a half-configured OTEL_* set rather than exporting nowhere.
     let mut telemetry = sovereign_config_telemetry::init(APPLICATION_VERSION)?;
-    let served = serve().await;
+    let served = serve(&telemetry.meter()).await;
     // Inside the runtime and after serving has stopped, so the records of the
     // shutdown itself are flushed. Bounded, and never able to fail the exit.
     telemetry.shutdown();
     served
 }
 
-async fn serve() -> Result<()> {
+async fn serve(meter: &Meter) -> Result<()> {
     let config = Config::from_env()?;
     let web_assets = WebAssetsLayer::new(&config.web);
     let authenticator = Authenticator::new(config.authentication)?;
@@ -169,38 +127,39 @@ async fn serve() -> Result<()> {
     let value_cipher = Arc::new(config.value_cipher);
     encrypt_stored_secrets(&database, &value_cipher).await?;
 
-    let state = AppState {
-        database,
-        authentication_metrics: Arc::clone(&authentication_metrics),
-        managed_metrics: Arc::clone(&managed_metrics),
-        protocol_metrics: Arc::clone(&protocol_metrics),
-        audit_metrics,
-    };
-    spawn_metrics_server(config.metrics_addr, state.clone()).await?;
+    register_metrics(
+        meter,
+        Families {
+            authentication: &authentication_metrics,
+            managed: &managed_metrics,
+            protocol: &protocol_metrics,
+            audit: &audit_metrics,
+        },
+        &database,
+    );
+    spawn_health_server(config.metrics_addr, database.clone()).await?;
     spawn_audit_retention_sweep(
-        state.database.clone(),
+        database.clone(),
         audit.clone(),
         config.audit.retention,
+        JobMetrics::new(meter),
     );
     let (_health_reporter, health_service) = serving_health_service().await;
     // One implementation of each service, whatever the number of protocol
     // versions served: every version registered below is a shim over these.
     let configuration = Arc::new(ConfigurationService::new(
-        state.database.clone(),
+        database.clone(),
         Arc::clone(&value_cipher),
         audit.clone(),
     ));
     let managed_connections = Arc::new(ManagedConnectionsService::new(
-        state.database.clone(),
+        database.clone(),
         managed_admin,
         managed_settings,
         managed_metrics,
         audit,
     ));
-    let audit_trail = Arc::new(AuditTrailService::new(
-        state.database.clone(),
-        config.audit.page_size,
-    ));
+    let audit_trail = Arc::new(AuditTrailService::new(database, config.audit.page_size));
 
     info!(
         grpc_addr = %config.grpc_addr,
@@ -211,8 +170,9 @@ async fn serve() -> Result<()> {
     Server::builder()
         .accept_http1(true)
         // Outermost of all: the request's span covers every layer below, and
-        // adopts an inbound `traceparent` before anything else runs.
-        .layer(TraceLayer)
+        // adopts an inbound `traceparent` before anything else runs. It
+        // starts the request's clock for RED as well.
+        .layer(TraceLayer::new(RequestMetrics::new(meter)))
         // Outermost of the rest, so every request is attributed to the protocol version its
         // route names — including one rejected by authentication, which still
         // counts as `attempted`. It must also stay outside the authentication
@@ -317,20 +277,52 @@ async fn connect_database(database_url: &str) -> Result<PgPool> {
     .await
 }
 
-/// Serves `/metrics` and `/readyz` on the internal metrics listener in the
-/// background. Binding happens before this returns, so a taken port fails
-/// startup.
-async fn spawn_metrics_server(address: SocketAddr, state: AppState) -> Result<()> {
-    let metrics_app = Router::new()
-        .route("/metrics", get(metrics))
+/// The counter families whose observable counters [`register_metrics`]
+/// registers.
+#[derive(Clone, Copy)]
+struct Families<'a> {
+    authentication: &'a Arc<AuthenticationMetrics>,
+    managed: &'a Arc<ManagedConnectionMetrics>,
+    protocol: &'a Arc<ProtocolMetrics>,
+    audit: &'a Arc<AuditMetrics>,
+}
+
+/// Registers every observable instrument on `meter`, once: the counter
+/// families, build identity and the pool's saturation. The request and sweep
+/// histograms are created by what records them.
+fn register_metrics(meter: &Meter, families: Families<'_>, database: &PgPool) {
+    metrics::register(meter, families.authentication);
+    metrics::register(meter, families.managed);
+    metrics::register(meter, families.protocol);
+    metrics::register(meter, families.audit);
+    metrics::register_build_info(
+        meter,
+        APPLICATION_VERSION,
+        APPLICATION_REVISION,
+        &SERVED_PROTOCOL_LABELS.join(","),
+    );
+    metrics::register_pool(meter, database);
+}
+
+/// The internal listener's routes: `/readyz` and nothing else. Metrics leave
+/// over OTLP, so there is no `/metrics` to scrape; the listener keeps its
+/// `SOVEREIGN_CONFIG_METRICS_ADDR` name because renaming an operator's
+/// variable would be churn for no gain.
+fn health_router(database: PgPool) -> Router {
+    Router::new()
         .route("/readyz", get(ready))
-        .with_state(state);
-    let metrics_listener = TcpListener::bind(address)
+        .with_state(database)
+}
+
+/// Serves `/readyz` on the internal listener in the background. Binding
+/// happens before this returns, so a taken port fails startup.
+async fn spawn_health_server(address: SocketAddr, database: PgPool) -> Result<()> {
+    let listener = TcpListener::bind(address)
         .await
-        .context("unable to bind metrics listener")?;
+        .context("unable to bind the internal health listener")?;
     tokio::spawn(async move {
-        if let Err(error) = axum::serve(metrics_listener, metrics_app).await {
-            error!(error = %error, "metrics server terminated");
+        if let Err(error) = axum::serve(listener, health_router(database)).await {
+            error!(error = %error, "internal health listener terminated");
         }
     });
     Ok(())
@@ -346,12 +338,17 @@ const AUDIT_SWEEP_INTERVAL: Duration = Duration::from_hours(1);
 /// still sweeps. A failed sweep is counted, logged and retried at the next
 /// interval: it must never take the server down, and nothing is lost by
 /// keeping an event an hour longer.
-fn spawn_audit_retention_sweep(database: PgPool, audit: AuditRecorder, retention: Duration) {
+fn spawn_audit_retention_sweep(
+    database: PgPool,
+    audit: AuditRecorder,
+    retention: Duration,
+    metrics: JobMetrics,
+) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(AUDIT_SWEEP_INTERVAL);
         loop {
             interval.tick().await;
-            sweep_audit_trail(&database, &audit, retention).await;
+            sweep_audit_trail(&database, &audit, retention, &metrics).await;
         }
     });
 }
@@ -359,21 +356,30 @@ fn spawn_audit_retention_sweep(database: PgPool, audit: AuditRecorder, retention
 /// One retention sweep, as a **root** span of its own: it is scheduled work,
 /// part of no request, and a child of whatever happened to be current would
 /// hang it off a trace it has nothing to do with.
-async fn sweep_audit_trail(database: &PgPool, audit: &AuditRecorder, retention: Duration) {
+async fn sweep_audit_trail(
+    database: &PgPool,
+    audit: &AuditRecorder,
+    retention: Duration,
+    metrics: &JobMetrics,
+) {
     async {
+        let started = Instant::now();
         let cutoff = time::OffsetDateTime::now_utc() - retention;
-        match audit.sweep_expired(database, cutoff).await {
+        let failure = match audit.sweep_expired(database, cutoff).await {
             Ok(swept) => {
                 tracing::Span::current().record("sovereign_config.audit.swept", swept);
                 if swept > 0 {
                     info!(swept, "expired audit events deleted");
                 }
+                None
             }
             Err(error) => {
                 spans::record_error("storage_unavailable");
                 error!(error = %error, "audit retention sweep failed; retrying at the next interval");
+                Some("storage_unavailable")
             }
-        }
+        };
+        metrics.record_sweep(started.elapsed(), failure);
     }
     .instrument(tracing::info_span!(
         parent: None,
@@ -469,13 +475,10 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        APPLICATION_REVISION, APPLICATION_VERSION, SYSTEM_SERVICE_NAME, application_revision,
-        application_version, compose_metrics,
+        APPLICATION_VERSION, SYSTEM_SERVICE_NAME, application_revision, application_version,
+        health_router,
     };
-    use crate::{
-        metrics::render_build_info,
-        system::{SERVED_PROTOCOL_LABELS, SERVED_PROTOCOL_VERSIONS},
-    };
+    use crate::system::SERVED_PROTOCOL_VERSIONS;
 
     #[test]
     fn configured_release_version_overrides_cargo_version() {
@@ -491,48 +494,31 @@ mod tests {
         assert_eq!(application_revision(Some("")), "unknown");
     }
 
-    /// What `/metrics` actually serves — the composition, not its parts.
-    ///
-    /// Asserting `render_build_info` alone would only restate that the renderer
-    /// renders; it is [`compose_metrics`] that decides build identity is in the
-    /// exposition at all. The families are stand-ins here: what is under test
-    /// is that every part reaches the output and that `up` stays the first
-    /// line, which is where a scrape looks for it.
-    #[test]
-    fn the_exposition_carries_build_identity_alongside_every_family() {
-        let rendered = compose_metrics(
-            1,
-            &render_build_info(
-                APPLICATION_VERSION,
-                APPLICATION_REVISION,
-                &SERVED_PROTOCOL_LABELS.join(","),
-            ),
-            ["auth\n", "managed\n", "protocol\n", "audit\n"],
-        );
+    /// The scrape endpoint is gone — metrics are pushed over OTLP — and the
+    /// internal listener keeps only `/readyz`, which still probes the database:
+    /// a pool that cannot reach Postgres is not ready.
+    #[tokio::test]
+    async fn the_internal_listener_serves_readyz_and_no_metrics() {
+        use axum::{body::Body, http::Request, http::StatusCode};
+        use tower::ServiceExt as _;
 
-        assert!(
-            rendered.starts_with("sovereign_config_up 1\n"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains(&format!(
-                "version=\"{APPLICATION_VERSION}\",revision=\"{APPLICATION_REVISION}\""
-            )),
-            "{rendered}"
-        );
-        for version in SERVED_PROTOCOL_LABELS {
-            assert!(
-                rendered.contains(version),
-                "{version} missing from {rendered}"
-            );
-        }
-        assert_eq!(rendered.matches("sovereign_config_build_info{").count(), 1);
-        for family in ["auth", "managed", "protocol", "audit"] {
-            assert!(
-                rendered.contains(family),
-                "{family} missing from {rendered}"
-            );
-        }
+        // Lazy: nothing listens on port 1, so every probe fails fast.
+        let database = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgresql://sovereign_config@127.0.0.1:1/sovereign_config")
+            .expect("a lazy pool needs no connection");
+
+        let metrics = health_router(database.clone())
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(metrics.status(), StatusCode::NOT_FOUND);
+
+        let ready = health_router(database)
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

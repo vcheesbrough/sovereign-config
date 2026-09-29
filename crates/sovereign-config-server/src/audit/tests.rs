@@ -203,11 +203,11 @@ async fn the_sweep_deletes_only_events_last_seen_before_the_cutoff() {
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].display_path, "/tests/audit-sweep/recent");
     assert!(
-        metrics.render().contains(&format!(
+        metrics.series().contains(&format!(
             "sovereign_config_audit_retention_swept_total {swept}"
         )),
         "{}",
-        metrics.render()
+        metrics.series()
     );
     clear_trail(&pool, "/tests/audit-sweep").await;
 }

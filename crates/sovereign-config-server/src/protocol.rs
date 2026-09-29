@@ -567,7 +567,7 @@ mod tests {
         // An unrecognised version has no authenticated series to land in.
         metrics.record_authenticated("v99");
 
-        let rendered = metrics.render();
+        let rendered = metrics.series();
 
         assert!(rendered.contains(
             "sovereign_config_protocol_requests_total{version=\"v3\",outcome=\"attempted\"} 2"
@@ -595,7 +595,7 @@ mod tests {
         metrics.record_offered("v3");
         metrics.record_offered("v9000");
 
-        let rendered = metrics.render();
+        let rendered = metrics.series();
 
         assert!(
             rendered.contains("sovereign_config_protocol_client_versions_total{version=\"v3\"} 1")

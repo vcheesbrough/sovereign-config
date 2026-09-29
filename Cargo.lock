@@ -2784,6 +2784,7 @@ dependencies = [
  "http",
  "http-body-util",
  "mime_guess",
+ "opentelemetry",
  "prost 0.13.5",
  "prost-types",
  "reqwest 0.12.28",

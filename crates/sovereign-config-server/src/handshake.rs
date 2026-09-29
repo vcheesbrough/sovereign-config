@@ -178,7 +178,7 @@ mod tests {
 
         negotiate_with(&service, &["v3", "v9000", "not-a-version", "v3"]).await;
 
-        let rendered = metrics.render();
+        let rendered = metrics.series();
         assert!(
             rendered.contains("sovereign_config_protocol_client_versions_total{version=\"v3\"} 2"),
             "{rendered}"
@@ -206,11 +206,11 @@ mod tests {
         negotiate_with(&service, &flood).await;
 
         assert!(
-            metrics.render().contains(&format!(
+            metrics.series().contains(&format!(
                 "sovereign_config_protocol_client_versions_total{{version=\"v3\"}} {CLIENT_LIST_LIMIT}"
             )),
             "{}",
-            metrics.render()
+            metrics.series()
         );
     }
 }
