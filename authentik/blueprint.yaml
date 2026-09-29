@@ -23,6 +23,23 @@ entries:
                     grants.append(grant)
         return {"sovereign_config_grants": grants}
 
+  # The web UI's permission to send telemetry to this environment's ingest
+  # (otlp-collector-oidc refuses a token without it). It adds no claim: being
+  # granted the scope is the permission. Authentik grants scopes per client,
+  # not per user, so this does not let one user be withdrawn; what it does is
+  # keep the CLI and MCP — same client id, never requesting it — out of the
+  # ingest. `preferred_username`, which the ingest also requires, comes with
+  # `profile` below.
+  - model: authentik_providers_oauth2.scopemapping
+    state: present
+    identifiers:
+      name: sovereign-config production telemetry
+    attrs:
+      name: sovereign-config production telemetry
+      scope_name: telemetry:write
+      description: "Send Sovereign Config web UI telemetry"
+      expression: return {}
+
   - model: authentik_core.group
     state: present
     identifiers:
@@ -89,6 +106,7 @@ entries:
         - !Find [authentik_providers_oauth2.scopemapping, [scope_name, email]]
         - !Find [authentik_providers_oauth2.scopemapping, [scope_name, offline_access]]
         - !Find [authentik_providers_oauth2.scopemapping, [name, sovereign-config production grants]]
+        - !Find [authentik_providers_oauth2.scopemapping, [name, sovereign-config production telemetry]]
       jwt_federation_providers:
         - !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config-introspection]]
 

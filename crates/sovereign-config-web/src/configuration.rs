@@ -1,6 +1,7 @@
 //! The Configuration view: loading a path, JSON mode, saving, deleting and
 //! aliasing values, and field validation.
 
+use crate::telemetry::spawn_local;
 use js_sys::Date;
 use sovereign_config_core::{
     ClientError, ConfigPath, ErrorKind, PlainValue, SecretInput, Timestamp, ValueListing,
@@ -8,7 +9,6 @@ use sovereign_config_core::{
 };
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::JsValue;
-use wasm_bindgen_futures::spawn_local;
 use web_sys::{Document, Event, HtmlDialogElement, HtmlInputElement, HtmlTextAreaElement};
 
 use crate::browser::{app_config, browser_error};

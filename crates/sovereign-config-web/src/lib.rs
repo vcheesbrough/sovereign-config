@@ -16,15 +16,16 @@ mod path_selector;
 mod route;
 mod session;
 mod shell;
+mod telemetry;
 mod transport;
 mod tree;
 mod value_rows;
 
+use crate::telemetry::spawn_local;
 use sovereign_config_core::ConfigPath;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::wasm_bindgen;
-use wasm_bindgen_futures::spawn_local;
 use web_sys::{Event, window};
 
 use crate::audit::{install_audit_actions, load_audit, reset_audit};
@@ -67,6 +68,7 @@ pub fn start() {
     spawn_local(async {
         match app_config() {
             Ok(config) => {
+                telemetry::init(config.telemetry.as_ref());
                 restore_tokens();
                 let callback_error =
                     if location_search().is_some_and(|search| search.contains("code=")) {

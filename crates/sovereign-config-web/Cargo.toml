@@ -32,6 +32,7 @@ wasm-bindgen-futures.workspace = true
 workspace = true
 features = [
   "Clipboard",
+  "console",
   "CssStyleDeclaration",
   "Crypto",
   "Document",

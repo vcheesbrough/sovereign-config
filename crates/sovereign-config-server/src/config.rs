@@ -71,6 +71,14 @@ pub(crate) struct WebConfig {
     /// Optional directory of prebuilt installer artifacts to serve under
     /// `/dist`. Absent in local runs that ship no installers.
     pub(crate) dist_dir: Option<PathBuf>,
+    /// Where the web UI sends its OTLP logs: the base endpoint of this
+    /// environment's client-telemetry ingest, handed to the SPA in
+    /// `/app-config.js`. `None` — the variable unset — is the product saying
+    /// "no client telemetry here", and the SPA then never initialises OTLP.
+    ///
+    /// Product configuration for the client, not a knob of the server's own
+    /// telemetry: that stays the `OTEL_*` family (README "Observability").
+    pub(crate) client_telemetry_endpoint: Option<String>,
 }
 
 pub(crate) struct AuthenticationConfig {
@@ -120,6 +128,10 @@ impl Config {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from);
+        let client_telemetry_endpoint = validated_client_telemetry_endpoint(
+            env::var(CLIENT_TELEMETRY_ENDPOINT).ok().as_deref(),
+            &public_origin,
+        )?;
         let grants_attribute = validated_grants_attribute(&required_env(
             "SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE",
         )?)?;
@@ -165,6 +177,7 @@ impl Config {
                 issuer: issuer.clone(),
                 client_id: audience.clone(),
                 dist_dir,
+                client_telemetry_endpoint,
             },
             managed: ManagedConnectionConfig {
                 public_origin,
@@ -226,6 +239,39 @@ fn validated_public_origin(value: &str) -> Result<String> {
         bail!("SOVEREIGN_CONFIG_PUBLIC_ORIGIN is not a permitted canonical origin");
     }
     Ok(canonical)
+}
+
+const CLIENT_TELEMETRY_ENDPOINT: &str = "SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT";
+
+/// Validates the client-telemetry endpoint handed to the web UI.
+///
+/// Unset or blank is "off", and is not an error. Set, it must be exactly this
+/// deployment's public origin: the ingest is same-origin with the app by
+/// design (the edge routes OTLP's own `/v1/` paths on the app's hostname to
+/// it), which is what keeps the access token off any other host and needs no
+/// CORS. A value naming anywhere else fails startup rather than sending
+/// operators' tokens there.
+fn validated_client_telemetry_endpoint(
+    value: Option<&str>,
+    public_origin: &str,
+) -> Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let url = value
+        .parse::<Url>()
+        .with_context(|| format!("{CLIENT_TELEMETRY_ENDPOINT} must be a valid URL"))?;
+    if url.path() != "/"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.origin().ascii_serialization() != public_origin
+        || value.trim_end_matches('/') != public_origin
+    {
+        bail!("{CLIENT_TELEMETRY_ENDPOINT} must be this deployment's public origin");
+    }
+    Ok(Some(public_origin.to_owned()))
 }
 
 /// Validates the environment-specific user attribute holding managed grants.
@@ -356,9 +402,50 @@ pub(crate) fn required_secret(name: &str) -> Result<String> {
 mod tests {
     use super::{
         audit_page_size, bounded_setting, issuer_api_origin, required_env,
-        validate_introspection_url, validate_issuer_url, validated_group_name,
-        validated_public_origin,
+        validate_introspection_url, validate_issuer_url, validated_client_telemetry_endpoint,
+        validated_group_name, validated_public_origin,
     };
+
+    /// Absent is off; present is the public origin and nothing else, because
+    /// the SPA sends the operator's access token wherever this points.
+    #[test]
+    fn client_telemetry_endpoint_is_off_or_this_origin() {
+        let origin = "https://config.example.test";
+        assert_eq!(
+            validated_client_telemetry_endpoint(None, origin).unwrap(),
+            None
+        );
+        assert_eq!(
+            validated_client_telemetry_endpoint(Some("  "), origin).unwrap(),
+            None
+        );
+        for accepted in [
+            "https://config.example.test",
+            "https://config.example.test/",
+        ] {
+            assert_eq!(
+                validated_client_telemetry_endpoint(Some(accepted), origin).unwrap(),
+                Some(origin.to_owned()),
+                "{accepted}"
+            );
+        }
+        for refused in [
+            "https://elsewhere.example.test",
+            "http://config.example.test",
+            "https://config.example.test/otlp",
+            "https://config.example.test/v1/logs",
+            "https://config.example.test:8443",
+            "https://user@config.example.test",
+            "https://config.example.test/?a=b",
+            "/v1/logs",
+            "not a url",
+        ] {
+            assert!(
+                validated_client_telemetry_endpoint(Some(refused), origin).is_err(),
+                "{refused}"
+            );
+        }
+    }
 
     #[test]
     fn required_env_rejects_missing_values() {

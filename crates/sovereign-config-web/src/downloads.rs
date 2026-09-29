@@ -3,7 +3,9 @@
 use js_sys::Reflect;
 use sovereign_config_core::ClientError;
 use wasm_bindgen::JsValue;
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+use wasm_bindgen_futures::JsFuture;
+
+use crate::telemetry::spawn_local;
 use web_sys::{Document, Element, Event, window};
 
 use crate::browser::{browser_error, string_property};

@@ -680,6 +680,65 @@ async fn grpc_web_authentication_failures_are_framed() {
     assert_eq!(server.state.calls.load(Ordering::Relaxed), 1);
 }
 
+/// With the client-telemetry ingest stopped, the edge sends the page's
+/// `POST /v1/logs` here. It is refused before authentication — no
+/// introspection, nothing below reached — and with a status the page does not
+/// mistake for delivery.
+#[tokio::test]
+async fn client_telemetry_paths_are_refused_before_authentication() {
+    let server = fake_server(
+        StatusCode::OK,
+        valid_response_json().to_string(),
+        Duration::ZERO,
+    )
+    .await;
+    let reached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for (method, path) in [
+        (Method::POST, "/v1/logs"),
+        (Method::POST, "/v1/traces"),
+        (Method::GET, "/v1/logs"),
+        (Method::POST, "/v1"),
+    ] {
+        let layer = grpc_service_layer(
+            authenticator(server.url.clone(), Duration::from_secs(1)),
+            Arc::new(AuthenticationMetrics::default()),
+            Arc::new(ProtocolMetrics::new(&["v3"])),
+            &["v3"],
+        );
+        let counter = Arc::clone(&reached);
+        let inner = service_fn(move |_: Request<BoxBody>| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            async { Ok::<_, Infallible>(Response::new(empty_body())) }
+        });
+        // HTTP/2, as Traefik speaks to the server (h2c): over HTTP/1.1 the
+        // gRPC-Web layer would answer 400 before authentication anyway.
+        let mut request = Request::builder()
+            .method(method.clone())
+            .version(http::Version::HTTP_2)
+            .uri(path)
+            .header(CONTENT_TYPE, "application/json")
+            .body(empty_body())
+            .unwrap();
+        request.headers_mut().extend(authenticated_headers());
+        let response = layer.layer(inner).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+    }
+    assert_eq!(
+        server.state.calls.load(Ordering::Relaxed),
+        0,
+        "no introspection"
+    );
+    assert_eq!(
+        reached.load(Ordering::Relaxed),
+        0,
+        "nothing below was reached"
+    );
+    assert!(!super::is_client_telemetry_path("/v10/logs"));
+    assert!(!super::is_client_telemetry_path(
+        "/sovereign.config.v4.System/GetVersion"
+    ));
+}
+
 async fn grpc_web_status(authenticator: Authenticator, headers: HeaderMap) -> u16 {
     let layer = grpc_service_layer(
         authenticator,

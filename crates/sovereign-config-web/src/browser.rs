@@ -12,6 +12,16 @@ use web_sys::window;
 pub(crate) struct AppConfig {
     pub(crate) issuer: String,
     pub(crate) client_id: String,
+    /// This deployment's client-telemetry ingest, when it has one.
+    pub(crate) telemetry: Option<TelemetryConfig>,
+}
+
+/// Where the page sends its telemetry and which build it is, as the server
+/// that served the page stated them.
+#[derive(Clone)]
+pub(crate) struct TelemetryConfig {
+    pub(crate) endpoint: String,
+    pub(crate) service_version: String,
 }
 
 pub(crate) fn app_config() -> Result<AppConfig, ClientError> {
@@ -21,6 +31,20 @@ pub(crate) fn app_config() -> Result<AppConfig, ClientError> {
     Ok(AppConfig {
         issuer: string_property(&config, "issuer")?,
         client_id: string_property(&config, "clientId")?,
+        telemetry: telemetry_config(&config),
+    })
+}
+
+/// A telemetry member that is absent or incomplete is "off": configuration
+/// the page cannot use is the same as none, never a reason to guess.
+fn telemetry_config(config: &JsValue) -> Option<TelemetryConfig> {
+    let telemetry = Reflect::get(config, &JsValue::from_str("telemetry")).ok()?;
+    if !telemetry.is_object() {
+        return None;
+    }
+    Some(TelemetryConfig {
+        endpoint: optional_string_property(&telemetry, "endpoint")?,
+        service_version: optional_string_property(&telemetry, "serviceVersion")?,
     })
 }
 

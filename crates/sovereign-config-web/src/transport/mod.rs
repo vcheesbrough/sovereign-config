@@ -42,6 +42,7 @@ use crate::session::{
     TOKENS, clear_persisted_refresh_token, negotiated_session, persist_refresh_token,
     refresh_tokens,
 };
+use crate::telemetry;
 
 /// The routes that speak `version`.
 ///
@@ -378,8 +379,25 @@ pub(crate) fn value_client(config: &AppConfig) -> Client<BrowserTransport, Memor
     )
 }
 
+/// One gRPC-Web call, carrying its action's `traceparent`, whose outcome is
+/// one telemetry record (by route and error kind; never its content).
 async fn grpc_unary<M, R>(
-    path: &str,
+    path: &'static str,
+    message: &M,
+    bearer: Option<&Secret>,
+) -> Result<R, ClientError>
+where
+    M: Message,
+    R: Message + Default,
+{
+    let started = Date::now();
+    let outcome = grpc_unary_call(path, message, bearer).await;
+    telemetry::record_rpc(path, started, outcome.as_ref().err());
+    outcome
+}
+
+async fn grpc_unary_call<M, R>(
+    path: &'static str,
     message: &M,
     bearer: Option<&Secret>,
 ) -> Result<R, ClientError>
@@ -398,6 +416,12 @@ where
         ("content-type", "application/grpc-web+proto"),
         ("x-grpc-web", "1"),
     ];
+    // The action's W3C context, so the server's request span is a child of
+    // it (#420). Transport metadata: no `sovereign.config` message changes.
+    let traceparent = telemetry::traceparent();
+    if let Some(traceparent) = traceparent.as_deref() {
+        headers.push(("traceparent", traceparent));
+    }
     let authorization;
     if let Some(bearer) = bearer {
         authorization = format!("Bearer {}", bearer.expose());
