@@ -28,9 +28,11 @@ thread_local! {
     static CURRENT: RefCell<Option<Rc<Action>>> = const { RefCell::new(None) };
 }
 
-/// The most call spans one action keeps for export. An action that makes
-/// more still counts them on its root span; the rest are dropped rather than
-/// letting one runaway action grow the page's memory.
+/// The most call spans one action exports. An action that makes more still
+/// counts them on its root span, and those further calls name the root as
+/// their `traceparent`'s parent, so their server spans hang under it rather
+/// than under a span that is never sent; one runaway action cannot grow the
+/// page's memory.
 pub(crate) const MAX_CALLS_PER_ACTION: usize = 64;
 
 /// A span's place in a trace: the trace id every span of an action shares,
@@ -111,6 +113,8 @@ pub(crate) struct Action {
     pub(crate) started_unix_ms: f64,
     calls: Cell<u32>,
     failed_calls: Cell<u32>,
+    /// Calls begun with a span of their own, at most [`MAX_CALLS_PER_ACTION`].
+    reserved: Cell<usize>,
     spans: RefCell<Vec<Span>>,
 }
 
@@ -122,21 +126,33 @@ impl Action {
             started_unix_ms,
             calls: Cell::new(0),
             failed_calls: Cell::new(0),
+            reserved: Cell::new(0),
             spans: RefCell::new(Vec::new()),
         })
     }
 
-    /// Adds one finished call to the action. Every call is counted; only the
-    /// first [`MAX_CALLS_PER_ACTION`] are kept as spans.
-    pub(crate) fn add_call(&self, span: Span) {
+    /// Whether a call beginning now gets a span of its own: the first
+    /// [`MAX_CALLS_PER_ACTION`] do, and every later one is parented on the
+    /// root instead.
+    pub(crate) fn reserve_span(&self) -> bool {
+        let reserved = self.reserved.get();
+        let granted = reserved < MAX_CALLS_PER_ACTION;
+        if granted {
+            self.reserved.set(reserved + 1);
+        }
+        granted
+    }
+
+    /// Adds one finished call to the action. Every call is counted; its span
+    /// is kept only when the call was granted one ([`Self::reserve_span`]).
+    pub(crate) fn add_call(&self, span: Span, own_span: bool) {
         self.calls.set(self.calls.get().saturating_add(1));
         if span.failed {
             self.failed_calls
                 .set(self.failed_calls.get().saturating_add(1));
         }
-        let mut spans = self.spans.borrow_mut();
-        if spans.len() < MAX_CALLS_PER_ACTION {
-            spans.push(span);
+        if own_span {
+            self.spans.borrow_mut().push(span);
         }
     }
 
@@ -277,8 +293,8 @@ mod tests {
         assert!(quiet.finish(5.0).is_empty(), "no call, no trace");
 
         let busy = action(2);
-        busy.add_call(call(&busy, 3, false));
-        busy.add_call(call(&busy, 4, true));
+        busy.add_call(call(&busy, 3, false), busy.reserve_span());
+        busy.add_call(call(&busy, 4, true), busy.reserve_span());
         let spans = busy.finish(5.0);
         assert_eq!(spans.len(), 3);
         let root = spans[0].to_otlp();
@@ -297,8 +313,16 @@ mod tests {
     fn an_actions_call_spans_are_bounded() {
         let busy = action(5);
         let extra = 10;
-        for seed in 0..MAX_CALLS_PER_ACTION + extra {
-            busy.add_call(call(&busy, u8::try_from(seed % 250).unwrap(), false));
+        let granted: Vec<bool> = (0..MAX_CALLS_PER_ACTION + extra)
+            .map(|_| busy.reserve_span())
+            .collect();
+        assert!(granted[..MAX_CALLS_PER_ACTION].iter().all(|own| *own));
+        assert!(
+            granted[MAX_CALLS_PER_ACTION..].iter().all(|own| !*own),
+            "calls past the bound are parented on the root"
+        );
+        for (seed, own) in granted.into_iter().enumerate() {
+            busy.add_call(call(&busy, u8::try_from(seed % 250).unwrap(), false), own);
         }
         let spans = busy.finish(5.0);
         assert_eq!(spans.len(), MAX_CALLS_PER_ACTION + 1);

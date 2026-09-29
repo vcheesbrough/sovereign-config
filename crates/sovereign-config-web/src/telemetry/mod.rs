@@ -123,6 +123,21 @@ struct Exporter {
 }
 
 impl Exporter {
+    fn new(endpoint: &str, service_version: &str) -> Self {
+        Self {
+            endpoint: endpoint.trim_end_matches('/').to_owned(),
+            service_version: service_version.to_owned(),
+            logs: Buffer::new(MAX_BUFFERED_ITEMS, MAX_BUFFERED_BYTES),
+            traces: Buffer::new(MAX_BUFFERED_ITEMS, MAX_BUFFERED_BYTES),
+            pending: None,
+            policy: Policy::default(),
+            flushing: false,
+            gathering_since_ms: 0.0,
+            last_item_ms: 0.0,
+            dropped: 0,
+        }
+    }
+
     const fn buffer(&mut self, signal: Signal) -> &mut Buffer {
         match signal {
             Signal::Logs => &mut self.logs,
@@ -150,18 +165,7 @@ pub(crate) fn init(config: Option<&TelemetryConfig>) {
         return;
     };
     EXPORTER.with_borrow_mut(|slot| {
-        *slot = Some(Exporter {
-            endpoint: config.endpoint.trim_end_matches('/').to_owned(),
-            service_version: config.service_version.clone(),
-            logs: Buffer::new(MAX_BUFFERED_ITEMS, MAX_BUFFERED_BYTES),
-            traces: Buffer::new(MAX_BUFFERED_ITEMS, MAX_BUFFERED_BYTES),
-            pending: None,
-            policy: Policy::default(),
-            flushing: false,
-            gathering_since_ms: 0.0,
-            last_item_ms: 0.0,
-            dropped: 0,
-        });
+        *slot = Some(Exporter::new(&config.endpoint, &config.service_version));
     });
     install_page_hide_flush();
 }
@@ -187,6 +191,9 @@ pub(crate) struct Call {
     started_ms: f64,
     action: Option<Rc<Action>>,
     context: Option<TraceContext>,
+    /// Whether `context` is a span of this call's own, or — past an
+    /// action's bound on call spans — the action's root.
+    own_span: bool,
 }
 
 impl Call {
@@ -201,14 +208,17 @@ impl Call {
 /// no trace to join, and the call carries no `traceparent`.
 pub(crate) fn begin_call(route: &'static str) -> Call {
     let action = context::current();
-    let context = action
-        .as_ref()
-        .map(|action| action.context.child(random_bytes()));
+    let (context, own_span) = match &action {
+        Some(action) if action.reserve_span() => (Some(action.context.child(random_bytes())), true),
+        Some(action) => (Some(action.context), false),
+        None => (None, false),
+    };
     Call {
         route,
         started_ms: Date::now(),
         action,
         context,
+        own_span,
     }
 }
 
@@ -229,15 +239,18 @@ pub(crate) fn end_call(call: Call, status: Option<u16>, error: Option<&ClientErr
         call.context,
     ));
     if let (Some(action), Some(context)) = (call.action, call.context) {
-        action.add_call(Span::rpc(
-            call.route,
-            context,
-            action.context,
-            call.started_ms,
-            now,
-            status,
-            kind,
-        ));
+        action.add_call(
+            Span::rpc(
+                call.route,
+                context,
+                action.context,
+                call.started_ms,
+                now,
+                status,
+                kind,
+            ),
+            call.own_span,
+        );
     }
 }
 
@@ -657,46 +670,7 @@ fn flush_on_exit() {
         if exporter.policy.stopped() {
             return None;
         }
-        // One budget for every `keepalive` body. A retried batch goes first
-        // if it fits; one that does not is left where it is rather than sent
-        // to certain failure.
-        let mut budget = MAX_UNLOAD_BATCH_BYTES;
-        let mut batches: Vec<(Signal, Vec<String>)> = Vec::new();
-        let pending_fits = exporter
-            .pending
-            .as_ref()
-            .is_some_and(|(_, pending)| pending.iter().map(String::len).sum::<usize>() <= budget);
-        if pending_fits && let Some((signal, pending)) = exporter.pending.take() {
-            budget -= pending.iter().map(String::len).sum::<usize>();
-            batches.push((signal, pending));
-        }
-        for signal in Signal::ALL {
-            let already = batches
-                .iter()
-                .filter(|(queued, _)| *queued == signal)
-                .map(|(_, batch)| batch.len())
-                .sum::<usize>();
-            if budget == 0 || already >= MAX_BATCH_ITEMS {
-                continue;
-            }
-            // `take_batch` always moves one item; only take when it fits.
-            let fits = exporter
-                .buffer(signal)
-                .front_len()
-                .is_some_and(|len| len <= budget);
-            if !fits {
-                continue;
-            }
-            let batch = exporter
-                .buffer(signal)
-                .take_batch(MAX_BATCH_ITEMS - already, budget);
-            budget -= batch.iter().map(String::len).sum::<usize>();
-            if let Some((_, queued)) = batches.iter_mut().find(|(queued, _)| *queued == signal) {
-                queued.extend(batch);
-            } else {
-                batches.push((signal, batch));
-            }
-        }
+        let batches = unload_batches(exporter);
         (!batches.is_empty()).then(|| {
             (
                 batches,
@@ -717,9 +691,58 @@ fn flush_on_exit() {
     }
 }
 
+/// What the page-hide flush sends: one budget of [`MAX_UNLOAD_BATCH_BYTES`]
+/// for every `keepalive` body together, at most [`MAX_BATCH_ITEMS`] per
+/// signal. A retried batch goes first if it fits; one that does not is left
+/// where it is rather than sent to certain failure. Then logs, then traces,
+/// each only as far as the budget reaches — never an item that would
+/// overrun it.
+fn unload_batches(exporter: &mut Exporter) -> Vec<(Signal, Vec<String>)> {
+    let mut budget = MAX_UNLOAD_BATCH_BYTES;
+    let mut batches: Vec<(Signal, Vec<String>)> = Vec::new();
+    let pending_fits = exporter
+        .pending
+        .as_ref()
+        .is_some_and(|(_, pending)| pending.iter().map(String::len).sum::<usize>() <= budget);
+    if pending_fits && let Some((signal, pending)) = exporter.pending.take() {
+        budget -= pending.iter().map(String::len).sum::<usize>();
+        batches.push((signal, pending));
+    }
+    for signal in Signal::ALL {
+        let already = batches
+            .iter()
+            .filter(|(queued, _)| *queued == signal)
+            .map(|(_, batch)| batch.len())
+            .sum::<usize>();
+        if budget == 0 || already >= MAX_BATCH_ITEMS {
+            continue;
+        }
+        // `take_batch` always moves one item; only take when it fits.
+        let fits = exporter
+            .buffer(signal)
+            .front_len()
+            .is_some_and(|len| len <= budget);
+        if !fits {
+            continue;
+        }
+        let batch = exporter
+            .buffer(signal)
+            .take_batch(MAX_BATCH_ITEMS - already, budget);
+        budget -= batch.iter().map(String::len).sum::<usize>();
+        if let Some((_, queued)) = batches.iter_mut().find(|(queued, _)| *queued == signal) {
+            queued.extend(batch);
+        } else {
+            batches.push((signal, batch));
+        }
+    }
+    batches
+}
+
 #[cfg(test)]
 mod tests {
-    use super::gather_wait_ms;
+    use super::{
+        Exporter, MAX_BATCH_ITEMS, MAX_UNLOAD_BATCH_BYTES, Signal, gather_wait_ms, unload_batches,
+    };
 
     /// An action whose calls straggle is still one request: the flush waits
     /// for a quiet second, but no more than five from the first record.
@@ -733,6 +756,82 @@ mod tests {
         assert_eq!(gather_wait_ms(4_800.0, 0.0, 4_700.0), Some(200));
         assert_eq!(gather_wait_ms(5_000.0, 0.0, 4_900.0), None);
     }
+    fn item(label: char, size: usize) -> String {
+        label.to_string().repeat(size)
+    }
+
+    fn sizes(batches: &[(Signal, Vec<String>)]) -> Vec<(Signal, usize, usize)> {
+        batches
+            .iter()
+            .map(|(signal, batch)| (*signal, batch.len(), batch.iter().map(String::len).sum()))
+            .collect()
+    }
+
+    /// Page hide: logs then traces, all within one keepalive budget.
+    #[test]
+    fn page_hide_sends_both_signals_within_one_budget() {
+        let mut exporter = Exporter::new("https://ingest.example.test/", "2.39.0");
+        assert_eq!(
+            exporter.url(Signal::Traces),
+            "https://ingest.example.test/v1/traces"
+        );
+        for _ in 0..3 {
+            exporter.logs.push(item('l', 10 * 1024));
+            exporter.traces.push(item('t', 10 * 1024));
+        }
+        let batches = unload_batches(&mut exporter);
+        // 48 KiB: three 10 KiB log records, then one 10 KiB span; the next
+        // span would overrun the budget and waits.
+        assert_eq!(
+            sizes(&batches),
+            [(Signal::Logs, 3, 30 * 1024), (Signal::Traces, 1, 10 * 1024)]
+        );
+        let total: usize = batches
+            .iter()
+            .flat_map(|(_, batch)| batch)
+            .map(String::len)
+            .sum();
+        assert!(total <= MAX_UNLOAD_BATCH_BYTES);
+        assert_eq!(exporter.traces.len(), 2, "what did not fit stays buffered");
+    }
+
+    /// A retried batch goes first when it fits, and joins its signal's
+    /// batch; one that does not fit is left pending, and the buffers still go.
+    #[test]
+    fn page_hide_sends_a_fitting_retry_first_and_leaves_one_that_does_not() {
+        let mut exporter = Exporter::new("https://ingest.example.test", "2.39.0");
+        exporter.pending = Some((Signal::Traces, vec![item('p', 1024)]));
+        exporter.traces.push(item('t', 1024));
+        exporter.logs.push(item('l', 1024));
+        let batches = unload_batches(&mut exporter);
+        assert_eq!(
+            sizes(&batches),
+            [(Signal::Traces, 2, 2 * 1024), (Signal::Logs, 1, 1024)]
+        );
+        assert!(exporter.pending.is_none());
+
+        let mut exporter = Exporter::new("https://ingest.example.test", "2.39.0");
+        exporter.pending = Some((Signal::Logs, vec![item('p', MAX_UNLOAD_BATCH_BYTES + 1)]));
+        exporter.traces.push(item('t', 1024));
+        let batches = unload_batches(&mut exporter);
+        assert_eq!(sizes(&batches), [(Signal::Traces, 1, 1024)]);
+        assert!(exporter.pending.is_some(), "too big for a keepalive body");
+    }
+
+    /// No more than one batch's worth of items per signal.
+    #[test]
+    fn page_hide_sends_at_most_one_batch_of_items_per_signal() {
+        let mut exporter = Exporter::new("https://ingest.example.test", "2.39.0");
+        for _ in 0..MAX_BATCH_ITEMS + 5 {
+            exporter.logs.push(item('l', 10));
+        }
+        let batches = unload_batches(&mut exporter);
+        assert_eq!(
+            sizes(&batches),
+            [(Signal::Logs, MAX_BATCH_ITEMS, MAX_BATCH_ITEMS * 10)]
+        );
+    }
+
     /// Every action gets its trace context from `telemetry::spawn_local`, so
     /// a view that spawned work any other way would send requests with no
     /// `traceparent` and records with no trace. Only this module, whose own
