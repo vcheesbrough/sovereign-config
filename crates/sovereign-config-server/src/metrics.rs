@@ -1,9 +1,48 @@
+//! The server's metrics (`observability` skill §1.5–1.6, §4), pushed over
+//! OTLP by `sovereign-config-telemetry` — nothing here scrapes, renders or
+//! names an SDK type.
+//!
+//! Every instrument is created **once**, at startup, on the meter
+//! `sovereign_config_telemetry::Telemetry::meter` hands out, and held by what
+//! records it: the counter families below by their `Arc`, the request
+//! histograms by the transport layer ([`RequestMetrics`]), the sweep
+//! histogram by the sweep ([`JobMetrics`]). Not in statics: every test
+//! assembles its own capture, and a static would make parallel tests share
+//! series.
+//!
+//! **Counters are atomics, reported by observable counters.** Each family
+//! counts in its own atomics and an observable counter reads them at every
+//! collection, reporting **every** label combination its enums allow —
+//! including those still at zero. That keeps what the scrape exposition
+//! gave: every series exists from startup, so `rate()` sees a series' first
+//! increment and the retirement gate can read a real zero rather than an
+//! absent series. The label sets come from exhaustive matches over enums, so
+//! no request can mint a label value.
+//!
+//! **Names survive the platform's translation.** An instrument named
+//! `sovereign_config.protocol.requests` is stored as
+//! `sovereign_config_protocol_requests_total` (dots to underscores, `_total`
+//! for a counter, a unit word for a unit), so every series the README and the
+//! retirement gate name keeps its stored name and labels. The table in this
+//! module's tests is the source of truth.
+
 use std::{
-    fmt::Write as _,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
-use crate::audit::EventKind;
+use opentelemetry::{
+    KeyValue,
+    metrics::{AsyncInstrument, Histogram, Meter},
+};
+use sovereign_config_telemetry::keys;
+use sqlx::PgPool;
+use tonic::Code;
+
+use crate::{audit::EventKind, spans};
 
 /// The bucket a request counts against when its route names a `sovereign.config`
 /// protocol version this server does not serve.
@@ -14,12 +53,115 @@ use crate::audit::EventKind;
 /// that something is addressing a protocol version this build does not know.
 pub(crate) const UNRECOGNISED_PROTOCOL_LABEL: &str = "unrecognised";
 
-/// The build identity of the running process, as the homelab's
-/// `<app>_build_info` convention: a gauge pinned at `1` whose labels carry the
-/// facts, so a dashboard joins it onto any other series with
-/// `… * on(instance) group_left(version, revision, protocol)` instead of
-/// stamping build identity onto every series — which would start a fresh series
-/// set on every deploy.
+/// Explicit histogram boundaries, in **seconds**: the semantic conventions'
+/// recommendation for `http.server.request.duration`, used for every duration
+/// here. The SDK's defaults suit milliseconds and would put every request in
+/// the first bucket.
+pub(crate) const DURATION_BOUNDARIES: [f64; 14] = [
+    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+];
+
+/// Instrument names. Each is stored under the name its comment gives.
+pub(crate) mod names {
+    /// `sovereign_config_authentication_total`
+    pub(crate) const AUTHENTICATION: &str = "sovereign_config.authentication";
+    /// `sovereign_config_protocol_requests_total`
+    pub(crate) const PROTOCOL_REQUESTS: &str = "sovereign_config.protocol.requests";
+    /// `sovereign_config_protocol_client_versions_total`
+    pub(crate) const PROTOCOL_CLIENT_VERSIONS: &str = "sovereign_config.protocol.client_versions";
+    /// `sovereign_config_managed_connection_operations_total`
+    pub(crate) const MANAGED_OPERATIONS: &str = "sovereign_config.managed_connection.operations";
+    /// `sovereign_config_managed_dependency_total`
+    pub(crate) const MANAGED_DEPENDENCY: &str = "sovereign_config.managed_dependency";
+    /// `sovereign_config_audit_events_total`
+    pub(crate) const AUDIT_EVENTS: &str = "sovereign_config.audit.events";
+    /// `sovereign_config_audit_retention_swept_total`
+    pub(crate) const AUDIT_SWEPT: &str = "sovereign_config.audit.retention.swept";
+    /// `sovereign_config_audit_retention_sweep_failures_total`
+    pub(crate) const AUDIT_SWEEP_FAILURES: &str = "sovereign_config.audit.retention.sweep_failures";
+    /// `sovereign_config_audit_sweep_duration_seconds`
+    pub(crate) const AUDIT_SWEEP_DURATION: &str = "sovereign_config.audit.sweep.duration";
+    /// `sovereign_config_build_info`
+    pub(crate) use sovereign_config_telemetry::keys::BUILD_INFO;
+    /// `rpc_server_call_duration_seconds`, `http_server_request_duration_seconds`,
+    /// `db_client_connection_count`, `db_client_connection_max`
+    pub(crate) use sovereign_config_telemetry::keys::{
+        DB_CLIENT_CONNECTION_COUNT, DB_CLIENT_CONNECTION_MAX, HTTP_SERVER_REQUEST_DURATION,
+        RPC_SERVER_CALL_DURATION,
+    };
+}
+
+/// One observable counter of a [`CounterFamily`].
+pub(crate) struct Instrument {
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+}
+
+/// Counters kept as atomics and reported, every label combination at every
+/// collection, by one observable counter per [`Instrument`].
+pub(crate) trait CounterFamily: Send + Sync + 'static {
+    const INSTRUMENTS: &'static [Instrument];
+
+    /// Reports every series of `instrument`, zeros included.
+    fn observe(&self, instrument: &'static str, emit: &mut dyn FnMut(u64, &[KeyValue]));
+}
+
+/// Registers one observable counter per instrument of `family`. The callbacks
+/// live as long as the meter provider; nothing needs holding.
+pub(crate) fn register<F: CounterFamily>(meter: &Meter, family: &Arc<F>) {
+    for instrument in F::INSTRUMENTS {
+        let family = Arc::clone(family);
+        let name = instrument.name;
+        let _ = meter
+            .u64_observable_counter(name)
+            .with_description(instrument.description)
+            .with_callback(move |observer: &dyn AsyncInstrument<u64>| {
+                family.observe(name, &mut |value, attributes| {
+                    observer.observe(value, attributes);
+                });
+            })
+            .build();
+    }
+}
+
+/// Every series a family reports, one `stored_name{label="value",…} value`
+/// line each — what the family's observable counters hand the exporter,
+/// under the names the platform stores. For tests; nothing serves it.
+#[cfg(test)]
+pub(crate) fn series<F: CounterFamily>(family: &F) -> String {
+    use std::fmt::Write as _;
+
+    use sovereign_config_telemetry::testing::{MetricKind, stored_name};
+
+    let mut output = String::new();
+    for instrument in F::INSTRUMENTS {
+        let stored = stored_name(instrument.name, "", MetricKind::Counter);
+        family.observe(instrument.name, &mut |value, attributes| {
+            let labels = attributes
+                .iter()
+                .map(|attribute| format!("{}=\"{}\"", attribute.key, attribute.value))
+                .collect::<Vec<_>>()
+                .join(",");
+            if labels.is_empty() {
+                writeln!(output, "{stored} {value}")
+            } else {
+                writeln!(output, "{stored}{{{labels}}} {value}")
+            }
+            .expect("writing to a String cannot fail");
+        });
+    }
+    output
+}
+
+/// The build identity of the running process, as the estate's
+/// `<app>.build.info` convention: a gauge pinned at `1` whose attributes carry
+/// the facts, stored as `sovereign_config_build_info`, so a query joins it
+/// onto any other series with
+/// `… * on(job, instance) group_left(version, revision, protocol)` instead of
+/// stamping build identity onto every series — which would start a fresh
+/// series set on every deploy. Under push, `job` is the platform's copy of
+/// `service.name` and `instance` of `service.instance.id`, which is stable
+/// across redeploys.
 ///
 /// **One series, never one per served version.** `protocol` carries the whole
 /// served set most-preferred-first (`v4,v3`), the same string startup logs as
@@ -29,29 +171,186 @@ pub(crate) const UNRECOGNISED_PROTOCOL_LABEL: &str = "unrecognised";
 /// versions it is still serving. Per-version traffic — and the retirement gate
 /// — is `sovereign_config_protocol_requests_total`; this label is descriptive.
 ///
-/// The values are compiled in, but `version` and `revision` reach the build
-/// from CI environment variables rather than from source, so they are escaped
-/// rather than trusted: an unescaped quote or newline in a label value does not
-/// corrupt one metric, it makes the whole exposition unparseable and takes the
-/// endpoint down.
-pub(crate) fn render_build_info(version: &str, revision: &str, protocol: &str) -> String {
-    format!(
-        "# HELP sovereign_config_build_info Build identity of the running server: always 1.\n\
-         # TYPE sovereign_config_build_info gauge\n\
-         sovereign_config_build_info{{version=\"{}\",revision=\"{}\",protocol=\"{}\"}} 1\n",
-        escape_label_value(version),
-        escape_label_value(revision),
-        escape_label_value(protocol),
-    )
+/// These are the only attributes that carry build identity; the capture's
+/// `finish` fails a test that exports them on anything else.
+pub(crate) fn register_build_info(meter: &Meter, version: &str, revision: &str, protocol: &str) {
+    let attributes = [
+        KeyValue::new("version", version.to_owned()),
+        KeyValue::new("revision", revision.to_owned()),
+        KeyValue::new("protocol", protocol.to_owned()),
+    ];
+    let _ = meter
+        .u64_observable_gauge(names::BUILD_INFO)
+        .with_description("Build identity of the running server: always 1.")
+        .with_callback(move |observer| observer.observe(1, &attributes))
+        .build();
 }
 
-/// The three escapes the Prometheus text exposition format defines for a label
-/// value: backslash, double quote, and line feed.
-fn escape_label_value(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+/// `db.client.connection.state`: whether a pooled connection is in use.
+#[derive(Clone, Copy, Debug)]
+enum ConnectionState {
+    Idle,
+    Used,
+}
+
+impl ConnectionState {
+    const ALL: [Self; 2] = [Self::Idle, Self::Used];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Used => "used",
+        }
+    }
+}
+
+/// `db.client.connection.pool.name`: the server has one pool, the store's.
+const POOL_NAME: &str = "postgres";
+
+/// The Postgres pool's saturation (skill §1.5), from the pool itself at each
+/// collection: `db.client.connection.count` by state, and
+/// `db.client.connection.max`. Both are up-down counters in the semantic
+/// conventions, stored as gauges (`db_client_connection_count`,
+/// `db_client_connection_max`; the `{connection}` unit is an annotation and
+/// adds no suffix). Used over max is how close the store is to making a
+/// request wait for a connection.
+pub(crate) fn register_pool(meter: &Meter, pool: &PgPool) {
+    let counted = pool.clone();
+    let _ = meter
+        .i64_observable_up_down_counter(names::DB_CLIENT_CONNECTION_COUNT)
+        .with_description("Connections in the Postgres pool, by state.")
+        .with_unit("{connection}")
+        .with_callback(move |observer| {
+            let size = i64::from(counted.size());
+            let idle = i64::try_from(counted.num_idle()).unwrap_or(i64::MAX);
+            for state in ConnectionState::ALL {
+                let value = match state {
+                    ConnectionState::Idle => idle,
+                    ConnectionState::Used => (size - idle).max(0),
+                };
+                observer.observe(
+                    value,
+                    &[
+                        KeyValue::new(keys::DB_CLIENT_CONNECTION_POOL_NAME, POOL_NAME),
+                        KeyValue::new(keys::DB_CLIENT_CONNECTION_STATE, state.as_str()),
+                    ],
+                );
+            }
+        })
+        .build();
+    let max = i64::from(pool.options().get_max_connections());
+    let _ = meter
+        .i64_observable_up_down_counter(names::DB_CLIENT_CONNECTION_MAX)
+        .with_description("The most connections the Postgres pool will open.")
+        .with_unit("{connection}")
+        .with_callback(move |observer| {
+            observer.observe(
+                max,
+                &[KeyValue::new(
+                    keys::DB_CLIENT_CONNECTION_POOL_NAME,
+                    POOL_NAME,
+                )],
+            );
+        })
+        .build();
+}
+
+fn duration_histogram(
+    meter: &Meter,
+    name: &'static str,
+    description: &'static str,
+) -> Histogram<f64> {
+    meter
+        .f64_histogram(name)
+        .with_description(description)
+        .with_unit("s")
+        .with_boundaries(DURATION_BOUNDARIES.to_vec())
+        .build()
+}
+
+/// RED for the public port's entry points (skill §1.5): one duration
+/// histogram per protocol, whose count is the rate and whose non-OK share is
+/// the errors. Recorded by the transport layer (`spans`), with the same
+/// attribute keys and values as the request's span, so a metric and a span
+/// agree. Health probes are not recorded, as they are not spanned.
+#[derive(Clone)]
+pub(crate) struct RequestMetrics {
+    rpc: Histogram<f64>,
+    http: Histogram<f64>,
+}
+
+impl RequestMetrics {
+    pub(crate) fn new(meter: &Meter) -> Self {
+        Self {
+            rpc: duration_histogram(
+                meter,
+                names::RPC_SERVER_CALL_DURATION,
+                "Duration of gRPC and gRPC-Web calls, by method and status.",
+            ),
+            http: duration_histogram(
+                meter,
+                names::HTTP_SERVER_REQUEST_DURATION,
+                "Duration of web UI asset requests.",
+            ),
+        }
+    }
+
+    /// One gRPC call on `method` — a compiled-in route or `_OTHER` — ending
+    /// with `code`. `error.type` is the status name for the codes the gRPC
+    /// conventions count as a server error, as on the span.
+    pub(crate) fn record_rpc(&self, method: &'static str, code: Code, elapsed: Duration) {
+        let status = spans::grpc_code_name(code);
+        let mut attributes = vec![
+            KeyValue::new(keys::RPC_SYSTEM_NAME, "grpc"),
+            KeyValue::new(keys::RPC_METHOD, method),
+            KeyValue::new(keys::RPC_RESPONSE_STATUS_CODE, status),
+        ];
+        if spans::is_server_error(code) {
+            attributes.push(KeyValue::new(keys::ERROR_TYPE, status));
+        }
+        self.rpc.record(elapsed.as_secs_f64(), &attributes);
+    }
+
+    /// One web asset request: `method` is already bounded to the standard
+    /// set or `_OTHER`, and a status code is a bounded number.
+    pub(crate) fn record_http(&self, method: &'static str, status: u16, elapsed: Duration) {
+        let mut attributes = vec![
+            KeyValue::new(keys::HTTP_REQUEST_METHOD, method),
+            KeyValue::new(keys::HTTP_RESPONSE_STATUS_CODE, i64::from(status)),
+        ];
+        if status >= 500 {
+            attributes.push(KeyValue::new(keys::ERROR_TYPE, status.to_string()));
+        }
+        self.http.record(elapsed.as_secs_f64(), &attributes);
+    }
+}
+
+/// RED for scheduled work: the audit retention sweep's duration, whose count
+/// is its rate and whose `error.type` marks a failed sweep.
+#[derive(Clone)]
+pub(crate) struct JobMetrics {
+    sweep: Histogram<f64>,
+}
+
+impl JobMetrics {
+    pub(crate) fn new(meter: &Meter) -> Self {
+        Self {
+            sweep: duration_histogram(
+                meter,
+                names::AUDIT_SWEEP_DURATION,
+                "Duration of audit retention sweeps.",
+            ),
+        }
+    }
+
+    /// One sweep; `failure` is its bounded classification, if it failed.
+    pub(crate) fn record_sweep(&self, elapsed: Duration, failure: Option<&'static str>) {
+        let attributes: Vec<KeyValue> = failure
+            .map(|classification| KeyValue::new(keys::ERROR_TYPE, classification))
+            .into_iter()
+            .collect();
+        self.sweep.record(elapsed.as_secs_f64(), &attributes);
+    }
 }
 
 /// Per-protocol-version request counts, in two series.
@@ -156,52 +455,63 @@ impl ProtocolMetrics {
         };
     }
 
-    pub(crate) fn render(&self) -> String {
-        let mut output = String::from(
-            "# HELP sovereign_config_protocol_requests_total gRPC requests by protocol version and outcome.\n\
-             # TYPE sovereign_config_protocol_requests_total counter\n",
-        );
-        for counters in &self.versions {
-            for (outcome, counter) in [
-                ("attempted", &counters.attempted),
-                ("authenticated", &counters.authenticated),
-            ] {
-                let value = counter.load(Ordering::Relaxed);
-                writeln!(
-                    output,
-                    "sovereign_config_protocol_requests_total{{version=\"{}\",outcome=\"{outcome}\"}} {value}",
-                    counters.label,
-                )
-                .expect("writing metrics to a String cannot fail");
-            }
-        }
-        let value = self.unrecognised.load(Ordering::Relaxed);
-        writeln!(
-            output,
-            "sovereign_config_protocol_requests_total{{version=\"{UNRECOGNISED_PROTOCOL_LABEL}\",outcome=\"attempted\"}} {value}",
-        )
-        .expect("writing metrics to a String cannot fail");
+    #[cfg(test)]
+    pub(crate) fn series(&self) -> String {
+        series(self)
+    }
+}
 
-        output.push_str(
-            "# HELP sovereign_config_protocol_client_versions_total Protocol versions named in handshake client lists.\n\
-             # TYPE sovereign_config_protocol_client_versions_total counter\n",
-        );
-        for counters in &self.versions {
-            let value = counters.offered.load(Ordering::Relaxed);
-            writeln!(
-                output,
-                "sovereign_config_protocol_client_versions_total{{version=\"{}\"}} {value}",
-                counters.label,
-            )
-            .expect("writing metrics to a String cannot fail");
+impl CounterFamily for ProtocolMetrics {
+    const INSTRUMENTS: &'static [Instrument] = &[
+        Instrument {
+            name: names::PROTOCOL_REQUESTS,
+            description: "gRPC requests by protocol version and outcome.",
+        },
+        Instrument {
+            name: names::PROTOCOL_CLIENT_VERSIONS,
+            description: "Protocol versions named in handshake client lists.",
+        },
+    ];
+
+    fn observe(&self, instrument: &'static str, emit: &mut dyn FnMut(u64, &[KeyValue])) {
+        match instrument {
+            names::PROTOCOL_REQUESTS => {
+                for counters in &self.versions {
+                    for (outcome, counter) in [
+                        ("attempted", &counters.attempted),
+                        ("authenticated", &counters.authenticated),
+                    ] {
+                        emit(
+                            counter.load(Ordering::Relaxed),
+                            &[
+                                KeyValue::new("version", counters.label),
+                                KeyValue::new("outcome", outcome),
+                            ],
+                        );
+                    }
+                }
+                emit(
+                    self.unrecognised.load(Ordering::Relaxed),
+                    &[
+                        KeyValue::new("version", UNRECOGNISED_PROTOCOL_LABEL),
+                        KeyValue::new("outcome", "attempted"),
+                    ],
+                );
+            }
+            names::PROTOCOL_CLIENT_VERSIONS => {
+                for counters in &self.versions {
+                    emit(
+                        counters.offered.load(Ordering::Relaxed),
+                        &[KeyValue::new("version", counters.label)],
+                    );
+                }
+                emit(
+                    self.offered_unrecognised.load(Ordering::Relaxed),
+                    &[KeyValue::new("version", UNRECOGNISED_PROTOCOL_LABEL)],
+                );
+            }
+            _ => {}
         }
-        let value = self.offered_unrecognised.load(Ordering::Relaxed);
-        writeln!(
-            output,
-            "sovereign_config_protocol_client_versions_total{{version=\"{UNRECOGNISED_PROTOCOL_LABEL}\"}} {value}",
-        )
-        .expect("writing metrics to a String cannot fail");
-        output
     }
 }
 
@@ -217,7 +527,7 @@ pub(crate) enum AuthenticationResult {
 }
 
 impl AuthenticationResult {
-    const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Success,
         Self::MissingBearer,
         Self::MalformedBearer,
@@ -261,22 +571,31 @@ impl AuthenticationMetrics {
         self.counters[result.index()].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn render(&self) -> String {
-        let mut output = String::from(
-            "# HELP sovereign_config_authentication_total Protected gRPC authentication results.\n\
-             # TYPE sovereign_config_authentication_total counter\n",
-        );
-        for result in AuthenticationResult::ALL {
-            let value = self.counters[result.index()].load(Ordering::Relaxed);
-            writeln!(
-                output,
-                "sovereign_config_authentication_total{{outcome=\"{}\",reason=\"{}\"}} {value}",
-                result.outcome(),
-                result.reason(),
-            )
-            .expect("writing metrics to a String cannot fail");
+    #[cfg(test)]
+    pub(crate) fn series(&self) -> String {
+        series(self)
+    }
+}
+
+impl CounterFamily for AuthenticationMetrics {
+    const INSTRUMENTS: &'static [Instrument] = &[Instrument {
+        name: names::AUTHENTICATION,
+        description: "Protected gRPC authentication results.",
+    }];
+
+    fn observe(&self, instrument: &'static str, emit: &mut dyn FnMut(u64, &[KeyValue])) {
+        if instrument != names::AUTHENTICATION {
+            return;
         }
-        output
+        for result in AuthenticationResult::ALL {
+            emit(
+                self.counters[result.index()].load(Ordering::Relaxed),
+                &[
+                    KeyValue::new("outcome", result.outcome()),
+                    KeyValue::new("reason", result.reason()),
+                ],
+            );
+        }
     }
 }
 
@@ -289,7 +608,7 @@ pub(crate) enum ManagedOperation {
 }
 
 impl ManagedOperation {
-    const ALL: [Self; 4] = [Self::List, Self::Create, Self::Rotate, Self::Revoke];
+    pub(crate) const ALL: [Self; 4] = [Self::List, Self::Create, Self::Rotate, Self::Revoke];
 
     const fn index(self) -> usize {
         self as usize
@@ -320,7 +639,7 @@ pub(crate) enum ManagedOperationResult {
 }
 
 impl ManagedOperationResult {
-    const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::Success,
         Self::InvalidRequest,
         Self::Unauthenticated,
@@ -366,7 +685,7 @@ pub(crate) enum ManagedDependencyCall {
 }
 
 impl ManagedDependencyCall {
-    const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::CreateAccount,
         Self::SetAttributes,
         Self::FindUser,
@@ -405,7 +724,7 @@ pub(crate) enum ManagedDependencyOutcome {
 }
 
 impl ManagedDependencyOutcome {
-    const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Ok,
         Self::NotFound,
         Self::Rejected,
@@ -458,42 +777,56 @@ impl ManagedConnectionMetrics {
         self.dependencies[call.index()][outcome.index()].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn render(&self) -> String {
-        let mut output = String::from(
-            "# HELP sovereign_config_managed_connection_operations_total Managed connection operation results.\n\
-             # TYPE sovereign_config_managed_connection_operations_total counter\n",
-        );
-        for operation in ManagedOperation::ALL {
-            for result in ManagedOperationResult::ALL {
-                let value =
-                    self.operations[operation.index()][result.index()].load(Ordering::Relaxed);
-                writeln!(
-                    output,
-                    "sovereign_config_managed_connection_operations_total{{operation=\"{}\",result=\"{}\"}} {value}",
-                    operation.as_str(),
-                    result.as_str(),
-                )
-                .expect("writing metrics to a String cannot fail");
+    #[cfg(test)]
+    pub(crate) fn series(&self) -> String {
+        series(self)
+    }
+}
+
+impl CounterFamily for ManagedConnectionMetrics {
+    const INSTRUMENTS: &'static [Instrument] = &[
+        Instrument {
+            name: names::MANAGED_OPERATIONS,
+            description: "Managed connection operation results.",
+        },
+        Instrument {
+            name: names::MANAGED_DEPENDENCY,
+            description: "Managed connection Authentik dependency outcomes.",
+        },
+    ];
+
+    fn observe(&self, instrument: &'static str, emit: &mut dyn FnMut(u64, &[KeyValue])) {
+        match instrument {
+            names::MANAGED_OPERATIONS => {
+                for operation in ManagedOperation::ALL {
+                    for result in ManagedOperationResult::ALL {
+                        emit(
+                            self.operations[operation.index()][result.index()]
+                                .load(Ordering::Relaxed),
+                            &[
+                                KeyValue::new("operation", operation.as_str()),
+                                KeyValue::new("result", result.as_str()),
+                            ],
+                        );
+                    }
+                }
             }
-        }
-        output.push_str(
-            "# HELP sovereign_config_managed_dependency_total Managed connection Authentik dependency outcomes.\n\
-             # TYPE sovereign_config_managed_dependency_total counter\n",
-        );
-        for call in ManagedDependencyCall::ALL {
-            for outcome in ManagedDependencyOutcome::ALL {
-                let value =
-                    self.dependencies[call.index()][outcome.index()].load(Ordering::Relaxed);
-                writeln!(
-                    output,
-                    "sovereign_config_managed_dependency_total{{call=\"{}\",outcome=\"{}\"}} {value}",
-                    call.as_str(),
-                    outcome.as_str(),
-                )
-                .expect("writing metrics to a String cannot fail");
+            names::MANAGED_DEPENDENCY => {
+                for call in ManagedDependencyCall::ALL {
+                    for outcome in ManagedDependencyOutcome::ALL {
+                        emit(
+                            self.dependencies[call.index()][outcome.index()]
+                                .load(Ordering::Relaxed),
+                            &[
+                                KeyValue::new("call", call.as_str()),
+                                KeyValue::new("outcome", outcome.as_str()),
+                            ],
+                        );
+                    }
+                }
             }
+            _ => {}
         }
-        output
     }
 }
 
@@ -505,7 +838,7 @@ pub(crate) enum AuditWriteOutcome {
 }
 
 impl AuditWriteOutcome {
-    const ALL: [Self; 2] = [Self::Recorded, Self::Failed];
+    pub(crate) const ALL: [Self; 2] = [Self::Recorded, Self::Failed];
 
     const fn index(self) -> usize {
         self as usize
@@ -545,117 +878,49 @@ impl AuditMetrics {
         self.sweep_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn render(&self) -> String {
-        let mut output = String::from(
-            "# HELP sovereign_config_audit_events_total Audit trail writes by event kind and outcome.\n\
-             # TYPE sovereign_config_audit_events_total counter\n",
-        );
-        for kind in EventKind::ALL {
-            for outcome in AuditWriteOutcome::ALL {
-                let value = self.writes[kind.index()][outcome.index()].load(Ordering::Relaxed);
-                writeln!(
-                    output,
-                    "sovereign_config_audit_events_total{{kind=\"{}\",outcome=\"{}\"}} {value}",
-                    kind.as_str(),
-                    outcome.as_str(),
-                )
-                .expect("writing metrics to a String cannot fail");
+    #[cfg(test)]
+    pub(crate) fn series(&self) -> String {
+        series(self)
+    }
+}
+
+impl CounterFamily for AuditMetrics {
+    const INSTRUMENTS: &'static [Instrument] = &[
+        Instrument {
+            name: names::AUDIT_EVENTS,
+            description: "Audit trail writes by event kind and outcome.",
+        },
+        Instrument {
+            name: names::AUDIT_SWEPT,
+            description: "Audit events deleted by the retention sweep.",
+        },
+        Instrument {
+            name: names::AUDIT_SWEEP_FAILURES,
+            description: "Retention sweeps that failed.",
+        },
+    ];
+
+    fn observe(&self, instrument: &'static str, emit: &mut dyn FnMut(u64, &[KeyValue])) {
+        match instrument {
+            names::AUDIT_EVENTS => {
+                for kind in EventKind::ALL {
+                    for outcome in AuditWriteOutcome::ALL {
+                        emit(
+                            self.writes[kind.index()][outcome.index()].load(Ordering::Relaxed),
+                            &[
+                                KeyValue::new("kind", kind.as_str()),
+                                KeyValue::new("outcome", outcome.as_str()),
+                            ],
+                        );
+                    }
+                }
             }
+            names::AUDIT_SWEPT => emit(self.swept.load(Ordering::Relaxed), &[]),
+            names::AUDIT_SWEEP_FAILURES => emit(self.sweep_failures.load(Ordering::Relaxed), &[]),
+            _ => {}
         }
-        writeln!(
-            output,
-            "# HELP sovereign_config_audit_retention_swept_total Audit events deleted by the retention sweep.\n\
-             # TYPE sovereign_config_audit_retention_swept_total counter\n\
-             sovereign_config_audit_retention_swept_total {}\n\
-             # HELP sovereign_config_audit_retention_sweep_failures_total Retention sweeps that failed.\n\
-             # TYPE sovereign_config_audit_retention_sweep_failures_total counter\n\
-             sovereign_config_audit_retention_sweep_failures_total {}",
-            self.swept.load(Ordering::Relaxed),
-            self.sweep_failures.load(Ordering::Relaxed),
-        )
-        .expect("writing metrics to a String cannot fail");
-        output
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        AuthenticationMetrics, AuthenticationResult, ManagedConnectionMetrics,
-        ManagedDependencyCall, ManagedDependencyOutcome, ManagedOperation, ManagedOperationResult,
-        render_build_info,
-    };
-
-    #[test]
-    fn build_info_is_one_gauge_at_one() {
-        let rendered = render_build_info("2.34.0", "a1b2c3d", "v4,v3");
-
-        assert!(rendered.contains("# TYPE sovereign_config_build_info gauge\n"));
-        assert!(rendered.ends_with(
-            "sovereign_config_build_info{version=\"2.34.0\",revision=\"a1b2c3d\",protocol=\"v4,v3\"} 1\n"
-        ));
-    }
-
-    /// The version and revision are stamped in from CI environment variables,
-    /// not written in the source. A quote or newline arriving that way must not
-    /// be able to end the label, the line, or the exposition.
-    #[test]
-    fn build_info_escapes_stamped_label_values() {
-        let rendered = render_build_info("2.34.0\" evil=\"", "sha\nup 0", "v4\\v3");
-
-        assert!(
-            rendered.contains(
-                "{version=\"2.34.0\\\" evil=\\\"\",revision=\"sha\\nup 0\",protocol=\"v4\\\\v3\"} 1"
-            ),
-            "{rendered}"
-        );
-        assert_eq!(rendered.lines().count(), 3);
-    }
-
-    #[test]
-    fn metrics_use_only_bounded_result_labels() {
-        let metrics = AuthenticationMetrics::default();
-        metrics.increment(AuthenticationResult::Success);
-        metrics.increment(AuthenticationResult::InvalidClaims);
-        let rendered = metrics.render();
-
-        assert!(rendered.contains("outcome=\"success\",reason=\"accepted\"} 1"));
-        assert!(rendered.contains("outcome=\"failure\",reason=\"invalid_claims\"} 1"));
-        assert_eq!(
-            rendered
-                .matches("sovereign_config_authentication_total{")
-                .count(),
-            7
-        );
-    }
-
-    #[test]
-    fn managed_metrics_use_only_bounded_fixed_labels() {
-        let metrics = ManagedConnectionMetrics::default();
-        metrics.record_operation(ManagedOperation::Create, ManagedOperationResult::Success);
-        metrics.record_dependency(
-            ManagedDependencyCall::SetCredential,
-            ManagedDependencyOutcome::Ambiguous,
-        );
-        let rendered = metrics.render();
-
-        assert!(rendered.contains(
-            "sovereign_config_managed_connection_operations_total{operation=\"create\",result=\"success\"} 1"
-        ));
-        assert!(rendered.contains(
-            "sovereign_config_managed_dependency_total{call=\"set_credential\",outcome=\"ambiguous\"} 1"
-        ));
-        assert_eq!(
-            rendered
-                .matches("sovereign_config_managed_connection_operations_total{")
-                .count(),
-            40
-        );
-        assert_eq!(
-            rendered
-                .matches("sovereign_config_managed_dependency_total{")
-                .count(),
-            42
-        );
-    }
-}
+mod tests;

@@ -33,7 +33,7 @@ fn deployed_telemetry(endpoint: &str) -> Vec<(&'static str, String)> {
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf".to_owned()),
         ("OTEL_LOGS_EXPORTER", "otlp".to_owned()),
         ("OTEL_TRACES_EXPORTER", "otlp".to_owned()),
-        ("OTEL_METRICS_EXPORTER", "none".to_owned()),
+        ("OTEL_METRICS_EXPORTER", "otlp".to_owned()),
     ]
 }
 
@@ -259,20 +259,23 @@ fn terminate(child: &std::process::Child) {
     .expect("SIGTERM must be deliverable");
 }
 
-fn ready(metrics_port: u16) -> bool {
-    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", metrics_port)) else {
-        return false;
-    };
+/// The status line of `GET path` on the internal listener, or `None`.
+fn internal_get(port: u16, path: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    if stream
-        .write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
-        return false;
-    }
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
-    response.starts_with("HTTP/1.1 200")
+    response.lines().next().map(str::to_owned)
+}
+
+fn ready(metrics_port: u16) -> bool {
+    internal_get(metrics_port, "/readyz").is_some_and(|status| status.starts_with("HTTP/1.1 200"))
 }
 
 /// A schema of the test database's own, so this server's migrations and its
@@ -340,6 +343,11 @@ fn serve_then_stop(
     for _ in 0..5 {
         assert!(ready(metrics_port));
     }
+    // Metrics are pushed over OTLP; there is nothing to scrape.
+    assert_eq!(
+        internal_get(metrics_port, "/metrics").as_deref(),
+        Some("HTTP/1.1 404 Not Found")
+    );
 
     let stopping = Instant::now();
     terminate(&child);

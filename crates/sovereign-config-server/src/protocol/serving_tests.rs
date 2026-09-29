@@ -202,12 +202,12 @@ impl Harness {
             "sovereign_config_protocol_requests_total{{version=\"{version}\",outcome=\"attempted\"}} "
         );
         self.metrics
-            .render()
+            .series()
             .lines()
             .find_map(|line| line.strip_prefix(needle.as_str()))
-            .unwrap_or_else(|| panic!("no counter rendered for {version}"))
+            .unwrap_or_else(|| panic!("no series reported for {version}"))
             .parse()
-            .expect("a counter renders as an integer")
+            .expect("a counter reports an integer")
     }
 }
 
@@ -360,7 +360,7 @@ async fn a_request_refused_beneath_the_layer_is_still_counted() {
         .expect_err("the rejecting layer must refuse the request");
     assert_eq!(refused.code(), tonic::Code::Unauthenticated);
 
-    let rendered = metrics.render();
+    let rendered = metrics.series();
     assert!(
         rendered.contains(
             "sovereign_config_protocol_requests_total{version=\"v3\",outcome=\"attempted\"} 1"
@@ -414,7 +414,7 @@ async fn a_versioned_route_this_build_does_not_serve_is_counted_as_unrecognised(
         unserved.is_err(),
         "an unregistered protocol package has no route to answer on"
     );
-    let rendered = metrics.render();
+    let rendered = metrics.series();
     assert!(
         rendered.contains(
             "sovereign_config_protocol_requests_total{version=\"unrecognised\",outcome=\"attempted\"} 1"
@@ -758,7 +758,7 @@ async fn the_handshake_answers_without_a_version_and_is_counted_under_none() {
     // per-version series nor the unrecognised bucket that exists to surface a
     // versioned call this build does not know. Otherwise every healthy connect
     // in the fleet would read as junk traffic.
-    let rendered = metrics.render();
+    let rendered = metrics.series();
     assert!(
         rendered.contains(
             "sovereign_config_protocol_requests_total{version=\"unrecognised\",outcome=\"attempted\"} 0"
@@ -841,7 +841,7 @@ async fn v4_serves_beside_v3_with_each_contract_and_label_its_own() {
         "the audit route must reach its own service"
     );
 
-    let rendered = metrics.render();
+    let rendered = metrics.series();
     for (version, count) in [("v3", 1), ("v4", 2)] {
         let series = format!(
             "sovereign_config_protocol_requests_total{{version=\"{version}\",outcome=\"attempted\"}} {count}"

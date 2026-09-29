@@ -18,13 +18,19 @@ use std::{
 };
 
 use opentelemetry::{
+    KeyValue,
     logs::AnyValue,
+    metrics::Meter,
     trace::{SpanId, SpanKind, Status},
 };
 use opentelemetry_sdk::{
     Resource,
     error::OTelSdkResult,
     logs::{BatchConfigBuilder as LogBatch, InMemoryLogExporter, LogBatch as Records, LogExporter},
+    metrics::{
+        InMemoryMetricExporter,
+        data::{AggregatedMetrics, MetricData, ScopeMetrics},
+    },
     trace::{BatchConfigBuilder as SpanBatch, SpanData, SpanExporter},
 };
 use tracing::{Dispatch, dispatcher::DefaultGuard};
@@ -35,7 +41,7 @@ use crate::{Assembly, Exporters, Identity, InitError, OtelEnv, Telemetry, config
 /// The build version every captured resource carries.
 pub const VERSION: &str = "0.0.0-capture";
 
-/// The variables of a deployment that exports logs and traces.
+/// The variables of a deployment that exports every signal.
 const EXPORTING: [(&str, &str); 7] = [
     ("OTEL_SERVICE_NAME", "sovereign-config"),
     (
@@ -48,7 +54,7 @@ const EXPORTING: [(&str, &str); 7] = [
     ),
     ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
     ("OTEL_LOGS_EXPORTER", "otlp"),
-    ("OTEL_METRICS_EXPORTER", "none"),
+    ("OTEL_METRICS_EXPORTER", "otlp"),
     ("OTEL_TRACES_EXPORTER", "otlp"),
 ];
 
@@ -133,10 +139,11 @@ pub struct Capture {
     telemetry: Telemetry,
     spans: SpanRecorder,
     logs: InMemoryLogExporter,
+    metrics: InMemoryMetricExporter,
 }
 
 impl Capture {
-    /// Telemetry on: logs and traces export, as on a deployment.
+    /// Telemetry on: every signal exports, as on a deployment.
     #[must_use]
     pub fn exporting() -> Self {
         Self::with_env(&OtelEnv::from_pairs(EXPORTING))
@@ -154,7 +161,9 @@ impl Capture {
         let plan = config::validate(env).expect("the capture's variables are valid");
         let spans = SpanRecorder::default();
         let logs = InMemoryLogExporter::default();
-        let (span_exporter, log_exporter) = (spans.clone(), LogRecorder(logs.clone()));
+        let metrics = InMemoryMetricExporter::default();
+        let (span_exporter, log_exporter, metric_exporter) =
+            (spans.clone(), LogRecorder(logs.clone()), metrics.clone());
         let Assembly {
             subscriber,
             telemetry,
@@ -177,6 +186,9 @@ impl Capture {
                 span_batch: SpanBatch::default()
                     .with_scheduled_delay(Duration::from_secs(3600))
                     .build(),
+                metrics: move || Ok::<_, InitError>(metric_exporter),
+                // Likewise: the one collection is the one shutdown makes.
+                metric_interval: Some(Duration::from_secs(3600)),
             },
         )
         .expect("the capture assembles");
@@ -194,7 +206,16 @@ impl Capture {
             telemetry,
             spans,
             logs,
+            metrics,
         }
+    }
+
+    /// The meter the capture's instruments are created on: its own provider,
+    /// never the global one, so parallel tests do not share series. A no-op
+    /// meter when the capture is [`Capture::off`].
+    #[must_use]
+    pub fn meter(&self) -> Meter {
+        self.telemetry.meter()
     }
 
     /// Installs the capture as this thread's subscriber until the guard drops.
@@ -277,13 +298,44 @@ impl Capture {
             duplicated.is_empty(),
             "spans exported with an attribute key recorded twice: {duplicated:?}"
         );
-        let exported = Exported { spans, logs };
+        // Cumulative, so the last collection — the one shutdown made — holds
+        // every series with its total.
+        let metrics = self
+            .metrics
+            .get_finished_metrics()
+            .expect("the metric recorder is readable")
+            .last()
+            .map(|collected| {
+                let resource = pairs_of(collected.resource());
+                collected
+                    .scope_metrics()
+                    .flat_map(ScopeMetrics::metrics)
+                    .map(|metric| ExportedMetric::from_sdk(metric, &resource))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let exported = Exported {
+            spans,
+            logs,
+            metrics,
+        };
         let unknown = exported.unknown_attribute_keys();
         assert!(
             unknown.is_empty(),
             "exported span attribute keys that are neither semantic-convention names nor \
              `{}`-prefixed: {unknown:?}",
             keys::PRODUCT_PREFIX
+        );
+        let forbidden = exported.forbidden_metric_keys();
+        assert!(
+            forbidden.is_empty(),
+            "exported metric series carrying a forbidden label key: {forbidden:?}"
+        );
+        let misplaced = exported.misplaced_build_identity();
+        assert!(
+            misplaced.is_empty(),
+            "build identity on a metric other than {}: {misplaced:?}",
+            keys::BUILD_INFO
         );
         exported
     }
@@ -293,6 +345,14 @@ fn pairs_of(resource: &Resource) -> BTreeMap<String, String> {
     resource
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+fn pairs_of_attributes<'a>(
+    attributes: impl Iterator<Item = &'a KeyValue>,
+) -> BTreeMap<String, String> {
+    attributes
+        .map(|attribute| (attribute.key.to_string(), attribute.value.to_string()))
         .collect()
 }
 
@@ -382,14 +442,287 @@ pub struct ExportedLog {
     pub attributes: BTreeMap<String, String>,
 }
 
+/// What kind of instrument a metric came from, as the platform's
+/// OTLP-to-Prometheus translation distinguishes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricKind {
+    /// A monotonic sum: a counter, stored with `_total`.
+    Counter,
+    /// A non-monotonic sum: an up-down counter, stored as a gauge.
+    UpDownCounter,
+    Gauge,
+    /// Stored as `_bucket`, `_sum` and `_count` series under one base name.
+    Histogram,
+}
+
+/// One exported data point, in plain types. `value` is the sum's or the
+/// gauge's value, or a histogram's sum; `count` and `bounds` are a
+/// histogram's only.
+#[derive(Debug, Clone)]
+pub struct ExportedPoint {
+    pub attributes: BTreeMap<String, String>,
+    pub value: f64,
+    pub count: u64,
+    pub bounds: Vec<f64>,
+}
+
+impl ExportedPoint {
+    /// Whether every `(key, value)` in `labels` is on this point.
+    #[must_use]
+    pub fn has(&self, labels: &[(&str, &str)]) -> bool {
+        labels
+            .iter()
+            .all(|(key, value)| self.attributes.get(*key).map(String::as_str) == Some(*value))
+    }
+}
+
+/// One exported metric, in plain types.
+#[derive(Debug, Clone)]
+pub struct ExportedMetric {
+    pub name: String,
+    pub unit: String,
+    pub kind: MetricKind,
+    pub points: Vec<ExportedPoint>,
+    pub resource: BTreeMap<String, String>,
+}
+
+impl ExportedMetric {
+    #[allow(clippy::cast_precision_loss)] // test counts, far below 2^52
+    fn from_sdk(
+        metric: &opentelemetry_sdk::metrics::data::Metric,
+        resource: &BTreeMap<String, String>,
+    ) -> Self {
+        fn points<T: Copy>(
+            data: &MetricData<T>,
+            value: impl Fn(T) -> f64,
+        ) -> (MetricKind, Vec<ExportedPoint>) {
+            let point = |attributes, value, count, bounds| ExportedPoint {
+                attributes,
+                value,
+                count,
+                bounds,
+            };
+            match data {
+                MetricData::Sum(sum) => (
+                    if sum.is_monotonic() {
+                        MetricKind::Counter
+                    } else {
+                        MetricKind::UpDownCounter
+                    },
+                    sum.data_points()
+                        .map(|p| {
+                            point(
+                                pairs_of_attributes(p.attributes()),
+                                value(p.value()),
+                                0,
+                                Vec::new(),
+                            )
+                        })
+                        .collect(),
+                ),
+                MetricData::Gauge(gauge) => (
+                    MetricKind::Gauge,
+                    gauge
+                        .data_points()
+                        .map(|p| {
+                            point(
+                                pairs_of_attributes(p.attributes()),
+                                value(p.value()),
+                                0,
+                                Vec::new(),
+                            )
+                        })
+                        .collect(),
+                ),
+                MetricData::Histogram(histogram) => (
+                    MetricKind::Histogram,
+                    histogram
+                        .data_points()
+                        .map(|p| {
+                            point(
+                                pairs_of_attributes(p.attributes()),
+                                value(p.sum()),
+                                p.count(),
+                                p.bounds().collect(),
+                            )
+                        })
+                        .collect(),
+                ),
+                MetricData::ExponentialHistogram(_) => {
+                    panic!("this product records no exponential histogram")
+                }
+            }
+        }
+        let (kind, points) = match metric.data() {
+            AggregatedMetrics::F64(data) => points(data, |v| v),
+            AggregatedMetrics::U64(data) => points(data, |v| v as f64),
+            AggregatedMetrics::I64(data) => points(data, |v| v as f64),
+        };
+        Self {
+            name: metric.name().to_owned(),
+            unit: metric.unit().to_owned(),
+            kind,
+            points,
+            resource: resource.clone(),
+        }
+    }
+
+    /// The name the platform stores this metric under (see [`stored_name`]).
+    #[must_use]
+    pub fn stored_name(&self) -> String {
+        stored_name(&self.name, &self.unit, self.kind)
+    }
+
+    /// The one point carrying every `(key, value)` in `labels`.
+    ///
+    /// # Panics
+    ///
+    /// When there is not exactly one.
+    #[must_use]
+    pub fn point(&self, labels: &[(&str, &str)]) -> &ExportedPoint {
+        let matching: Vec<_> = self.points.iter().filter(|p| p.has(labels)).collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected one {} point with {labels:?}; exported: {:?}",
+            self.name,
+            self.points
+        );
+        matching[0]
+    }
+}
+
+/// The name the estate's collector stores a metric under: its OTLP-to-
+/// Prometheus translation (`otelcol.exporter.prometheus` in `monitor-alloy`,
+/// suffixes on) — every character outside `[A-Za-z0-9_:]` becomes `_`, the
+/// unit is appended as a word unless it is an annotation in braces, and a
+/// counter gains `_total`. A histogram's name is the base of its `_bucket`,
+/// `_sum` and `_count` series.
+///
+/// A mirror, for tests: a rename that would move a stored name fails the
+/// test comparing against it, rather than the README's queries.
+///
+/// # Panics
+///
+/// On a unit the table below does not know: extend it deliberately.
+#[must_use]
+pub fn stored_name(name: &str, unit: &str, kind: MetricKind) -> String {
+    let mut stored: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == ':' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let unit = match unit {
+        "" => None,
+        annotation if annotation.starts_with('{') && annotation.ends_with('}') => None,
+        "s" => Some("seconds"),
+        "ms" => Some("milliseconds"),
+        "By" => Some("bytes"),
+        "1" if kind == MetricKind::Gauge => Some("ratio"),
+        "1" => None,
+        other => panic!("no Prometheus word for unit {other:?}: extend `stored_name`"),
+    };
+    if let Some(word) = unit
+        && !stored.ends_with(&format!("_{word}"))
+    {
+        stored.push('_');
+        stored.push_str(word);
+    }
+    if kind == MetricKind::Counter && !stored.ends_with("_total") {
+        stored.push_str("_total");
+    }
+    stored
+}
+
 /// Everything a [`Capture`] exported.
 #[derive(Debug, Clone)]
 pub struct Exported {
     pub spans: Vec<ExportedSpan>,
     pub logs: Vec<ExportedLog>,
+    pub metrics: Vec<ExportedMetric>,
 }
 
 impl Exported {
+    /// The only metric named `name`.
+    ///
+    /// # Panics
+    ///
+    /// When there is not exactly one.
+    #[must_use]
+    pub fn metric(&self, name: &str) -> &ExportedMetric {
+        let matching: Vec<_> = self.metrics.iter().filter(|m| m.name == name).collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one metric named {name:?}; exported: {:?}",
+            self.metrics.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+        matching[0]
+    }
+
+    /// `(metric, key)` for every exported series carrying a key from
+    /// [`keys::FORBIDDEN_METRIC_KEYS`].
+    #[must_use]
+    pub fn forbidden_metric_keys(&self) -> Vec<(String, String)> {
+        let mut found: Vec<(String, String)> = self
+            .metrics
+            .iter()
+            .flat_map(|metric| {
+                metric.points.iter().flat_map(move |point| {
+                    point
+                        .attributes
+                        .keys()
+                        .filter(|key| keys::FORBIDDEN_METRIC_KEYS.contains(&key.as_str()))
+                        .map(move |key| (metric.name.clone(), key.clone()))
+                })
+            })
+            .collect();
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    /// `(metric, key)` for build identity found anywhere but
+    /// [`keys::BUILD_INFO`]: a `revision` or `protocol` key, or any attribute
+    /// whose value is the build's version (which is how the build's version
+    /// is caught while the protocol-version label keeps the key `version`).
+    #[must_use]
+    pub fn misplaced_build_identity(&self) -> Vec<(String, String)> {
+        let build_versions: Vec<&str> = self
+            .metrics
+            .iter()
+            .filter(|metric| metric.name == keys::BUILD_INFO)
+            .flat_map(|metric| &metric.points)
+            .filter_map(|point| point.attributes.get("version").map(String::as_str))
+            .collect();
+        let mut found: Vec<(String, String)> = self
+            .metrics
+            .iter()
+            .filter(|metric| metric.name != keys::BUILD_INFO)
+            .flat_map(|metric| {
+                let build_versions = &build_versions;
+                metric.points.iter().flat_map(move |point| {
+                    point
+                        .attributes
+                        .iter()
+                        .filter(|(key, value)| {
+                            keys::BUILD_IDENTITY[1..].contains(&key.as_str())
+                                || build_versions.contains(&value.as_str())
+                        })
+                        .map(move |(key, _)| (metric.name.clone(), key.clone()))
+                })
+            })
+            .collect();
+        found.sort();
+        found.dedup();
+        found
+    }
+
     /// The only span named `name`.
     ///
     /// # Panics

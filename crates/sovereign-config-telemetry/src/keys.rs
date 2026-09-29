@@ -69,6 +69,59 @@ pub fn is_known(key: &str) -> bool {
             .is_some_and(|rest| !rest.is_empty())
 }
 
+/// Metric attribute keys from the semantic conventions, for the pool gauges.
+pub use opentelemetry_semantic_conventions::attribute::{
+    DB_CLIENT_CONNECTION_POOL_NAME, DB_CLIENT_CONNECTION_STATE,
+};
+
+/// Semantic-convention instrument names this product records.
+pub use opentelemetry_semantic_conventions::metric::{
+    DB_CLIENT_CONNECTION_COUNT, DB_CLIENT_CONNECTION_MAX, HTTP_SERVER_REQUEST_DURATION,
+    RPC_SERVER_CALL_DURATION,
+};
+
+/// The build-identity info metric (`observability` skill §1.6): a gauge at
+/// `1` whose attributes are the build's facts. The only instrument that may
+/// carry them.
+pub const BUILD_INFO: &str = "sovereign_config.build.info";
+
+/// The attribute keys that carry build identity on [`BUILD_INFO`], and on
+/// nothing else. `version` is also the key of the protocol-version label on
+/// `sovereign_config.protocol.*` — a name kept because the retirement gate
+/// is written against it — so for that key the check is on values: no other
+/// metric may carry the build's own version string.
+pub const BUILD_IDENTITY: [&str; 3] = ["version", "revision", "protocol"];
+
+/// Keys no metric series may carry (skill §4): identifiers, request-derived
+/// values and build identity as a resource fact. Listed as keys, not per
+/// metric, so a new instrument is checked without being named here. Each is
+/// unbounded, or changes on every deploy; any of them on a series is a
+/// cardinality incident, and the ids are personal data besides.
+pub const FORBIDDEN_METRIC_KEYS: [&str; 22] = [
+    USER_ID,
+    USER_NAME,
+    "user.email",
+    "enduser.id",
+    "session.id",
+    "client.address",
+    "connection_id",
+    "content_id",
+    "path",
+    URL_PATH,
+    "url.full",
+    "url.query",
+    RPC_METHOD_ORIGINAL,
+    SERVER_ADDRESS,
+    "trace_id",
+    "span_id",
+    "request_id",
+    "correlation_id",
+    "service.version",
+    "service.instance.id",
+    "sovereign_config.connection.id",
+    "sovereign_config.path",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -13,15 +13,19 @@
 //!   and CI all run this way.
 //! - **`OTEL_SDK_DISABLED=true`** — the same, for a deployment that carries
 //!   the variables and wants them silent.
-//! - **anything else** — the whole set is validated first, then log records
-//!   and spans leave over OTLP (`http/protobuf`) to the one configured
-//!   collector; log records also reach stdout.
+//! - **anything else** — the whole set is validated first, then log records,
+//!   spans and metrics leave over OTLP (`http/protobuf`) to the one
+//!   configured collector; log records also reach stdout.
 //!
 //! In every state the span layer is installed and the W3C propagator is used
 //! by [`context`], so inbound trace context still reaches outbound requests
-//! when nothing exports (skill §2). Metrics (#421) will be added here, as a
-//! further provider on the same [`resource`]; nothing outside this crate
-//! changes when they are.
+//! when nothing exports (skill §2).
+//!
+//! Metrics are pushed, never scraped (skill §2): a periodic reader on the same
+//! [`resource`] collects cumulative totals and exports them every
+//! `OTEL_METRIC_EXPORT_INTERVAL` (60 s by default). Product code creates its
+//! instruments once, on the `opentelemetry` API's [`Meter`] that
+//! [`Telemetry::meter`] hands out, and never sees an SDK type.
 
 pub mod config;
 pub mod context;
@@ -32,10 +36,14 @@ pub mod testing;
 
 use std::time::Duration;
 
-use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::{
+    metrics::{Meter, MeterProvider as _, noop::NoopMeterProvider},
+    trace::TracerProvider as _,
+};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_sdk::{
     logs::{self, BatchLogProcessor, LogExporter, SdkLoggerProvider},
+    metrics::{PeriodicReader, SdkMeterProvider, exporter::PushMetricExporter},
     propagation::TraceContextPropagator,
     trace::{self, BatchSpanProcessor, SdkTracerProvider, SpanExporter},
 };
@@ -110,6 +118,7 @@ pub struct Identity {
 pub struct Telemetry {
     plan: Plan,
     logs: Option<SdkLoggerProvider>,
+    metrics: Option<SdkMeterProvider>,
     traces: Option<SdkTracerProvider>,
 }
 
@@ -118,7 +127,18 @@ impl Telemetry {
     /// exporter and no background thread exist.
     #[must_use]
     pub fn is_exporting(&self) -> bool {
-        self.logs.is_some() || self.traces.is_some()
+        self.logs.is_some() || self.metrics.is_some() || self.traces.is_some()
+    }
+
+    /// The meter product code creates its instruments on — once, at startup.
+    /// With metrics off it is a no-op meter: instruments built on it cost
+    /// nothing, and an observable instrument's callback is never run.
+    #[must_use]
+    pub fn meter(&self) -> Meter {
+        match &self.metrics {
+            Some(provider) => provider.meter(METER_NAME),
+            None => NoopMeterProvider::new().meter(METER_NAME),
+        }
     }
 
     /// Says once, at startup, which state telemetry is in — so "why are there
@@ -152,12 +172,24 @@ impl Telemetry {
     /// be exported through is the thing that just stopped.
     pub fn shutdown(&mut self) {
         let traces = self.traces.take();
+        let metrics = self.metrics.take();
         let logs = self.logs.take();
         std::thread::scope(|scope| {
             if let Some(traces) = traces {
                 scope.spawn(move || {
                     if let Err(error) = traces.shutdown_with_timeout(SHUTDOWN_TIMEOUT) {
                         warn!(target: SHUTDOWN_TARGET, signal = "traces", error = %error, "telemetry did not flush cleanly");
+                    }
+                });
+            }
+            // The meter provider ignores the timeout it is given; its periodic
+            // reader waits a fixed 5 s (= SHUTDOWN_TIMEOUT) for the final
+            // collect-and-export, so running it beside the others keeps the
+            // one bound.
+            if let Some(metrics) = metrics {
+                scope.spawn(move || {
+                    if let Err(error) = metrics.shutdown_with_timeout(SHUTDOWN_TIMEOUT) {
+                        warn!(target: SHUTDOWN_TARGET, signal = "metrics", error = %error, "telemetry did not flush cleanly");
                     }
                 });
             }
@@ -186,15 +218,22 @@ pub struct Assembly {
 /// The exporters and batch settings [`assemble`] builds providers around.
 /// Parameters so that tests assemble exactly what production does around
 /// in-memory exporters; each exporter is built only when its signal exports.
-pub struct Exporters<L, S> {
+pub struct Exporters<L, S, M> {
     pub logs: L,
     pub log_batch: logs::BatchConfig,
     pub spans: S,
     pub span_batch: trace::BatchConfig,
+    pub metrics: M,
+    /// How often the periodic reader collects and exports. `None` leaves it
+    /// to `OTEL_METRIC_EXPORT_INTERVAL` (validated by [`config`]), else 60 s.
+    pub metric_interval: Option<Duration>,
 }
 
 /// The instrumentation scope every span is recorded under.
 const TRACER_NAME: &str = "sovereign-config";
+
+/// The instrumentation scope every instrument is created under.
+const METER_NAME: &str = "sovereign-config";
 
 /// Builds the layers for `plan`.
 ///
@@ -218,7 +257,7 @@ const TRACER_NAME: &str = "sovereign-config";
 /// # Errors
 ///
 /// An exporter could not be built.
-pub fn assemble<LE, SE, W>(
+pub fn assemble<LE, SE, ME, W>(
     plan: Plan,
     identity: &Identity,
     log_filter: &str,
@@ -226,11 +265,13 @@ pub fn assemble<LE, SE, W>(
     exporters: Exporters<
         impl FnOnce() -> Result<LE, InitError>,
         impl FnOnce() -> Result<SE, InitError>,
+        impl FnOnce() -> Result<ME, InitError>,
     >,
 ) -> Result<Assembly, InitError>
 where
     LE: LogExporter + 'static,
     SE: SpanExporter + 'static,
+    ME: PushMetricExporter,
     W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
     let Exporters {
@@ -238,6 +279,8 @@ where
         log_batch,
         spans: span_exporter,
         span_batch,
+        metrics: metric_exporter,
+        metric_interval,
     } = exporters;
     let (signals, resource) = match &plan {
         Plan::Export {
@@ -251,13 +294,7 @@ where
                 identity.hostname.as_deref(),
             )),
         ),
-        Plan::Off(_) => (
-            Exported {
-                logs: false,
-                traces: false,
-            },
-            None,
-        ),
+        Plan::Off(_) => (Exported::NONE, None),
     };
 
     let traces = match &resource {
@@ -271,6 +308,24 @@ where
                 )
                 .build(),
         ),
+        _ => None,
+    };
+    // Cumulative temporality, the exporter's default: delta, where a backend
+    // wants it, is the collector's business (skill §2).
+    let metrics = match &resource {
+        Some(resource) if signals.metrics => {
+            let reader = PeriodicReader::builder(metric_exporter()?);
+            let reader = match metric_interval {
+                Some(interval) => reader.with_interval(interval),
+                None => reader,
+            };
+            Some(
+                SdkMeterProvider::builder()
+                    .with_resource(resource.clone())
+                    .with_reader(reader.build())
+                    .build(),
+            )
+        }
         _ => None,
     };
     let logs = match resource {
@@ -306,7 +361,12 @@ where
     let subscriber = Registry::default().with(spans).with(stdout).with(bridge);
     Ok(Assembly {
         subscriber: Box::new(subscriber),
-        telemetry: Telemetry { plan, logs, traces },
+        telemetry: Telemetry {
+            plan,
+            logs,
+            metrics,
+            traces,
+        },
     })
 }
 
@@ -424,12 +484,20 @@ pub fn init(version: &str) -> Result<Telemetry, InitError> {
             spans: otlp_span_exporter,
             // Reads the OTEL_BSP_* variables, likewise.
             span_batch: trace::BatchConfigBuilder::default().build(),
+            metrics: otlp_metric_exporter,
+            // The reader reads OTEL_METRIC_EXPORT_INTERVAL, likewise.
+            metric_interval: None,
         },
     )?;
 
     // Propagation runs whether or not anything exports: a silent service
     // must still pass a trace through (skill §2).
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+    // The global meter too, for anything that reaches for it rather than
+    // being handed [`Telemetry::meter`]; the server itself is handed it.
+    if let Some(provider) = &assembly.telemetry.metrics {
+        opentelemetry::global::set_meter_provider(provider.clone());
+    }
     tracing::subscriber::set_global_default(assembly.subscriber)
         .map_err(|_| InitError::AlreadyInstalled)?;
     assembly.telemetry.announce();
@@ -447,6 +515,18 @@ fn otlp_log_exporter() -> Result<opentelemetry_otlp::LogExporter, InitError> {
         .with_protocol(Protocol::HttpBinary)
         .build()
         .map_err(|_| InitError::Exporter("log"))
+}
+
+/// The OTLP metric exporter, configured exactly as the log exporter is;
+/// cumulative, its default.
+fn otlp_metric_exporter() -> Result<opentelemetry_otlp::MetricExporter, InitError> {
+    use opentelemetry_otlp::{Protocol, WithExportConfig};
+
+    opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .with_protocol(Protocol::HttpBinary)
+        .build()
+        .map_err(|_| InitError::Exporter("metric"))
 }
 
 /// The OTLP span exporter, configured exactly as the log exporter is. The

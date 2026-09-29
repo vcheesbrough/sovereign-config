@@ -292,8 +292,8 @@ fn fake_collector() -> (String, Received) {
 }
 
 /// Exported telemetry is published, not private: none of the startup
-/// secrets may reach a span or a log record that leaves the process. The
-/// server runs with every secret configured and both signals exporting to a
+/// secrets may reach a span, a log record or a metric that leaves the
+/// process. The server runs with every secret configured and every signal exporting to a
 /// collector stand-in, spans its startup, fails on the unreachable database
 /// (whose URL carries one of the secrets), and flushes on the way out; the
 /// test then searches what the collector received.
@@ -311,7 +311,7 @@ fn no_startup_secret_reaches_an_exported_span_or_log_record() {
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf".to_owned()),
         ("OTEL_LOGS_EXPORTER", "otlp".to_owned()),
         ("OTEL_TRACES_EXPORTER", "otlp".to_owned()),
-        ("OTEL_METRICS_EXPORTER", "none".to_owned()),
+        ("OTEL_METRICS_EXPORTER", "otlp".to_owned()),
         ("RUST_LOG", "debug".to_owned()),
     ]);
     let output = run_server(&environment);
@@ -338,7 +338,9 @@ fn no_startup_secret_reaches_an_exported_span_or_log_record() {
         received.iter().map(|(path, _)| path).collect::<Vec<_>>()
     );
     assert!(!logs.is_empty(), "log records must have been exported");
-    for body in traces.iter().chain(&logs) {
+    // Whatever metrics left before the failed start are searched too.
+    let metrics = bodies("/v1/metrics");
+    for body in traces.iter().chain(&logs).chain(&metrics) {
         for secret in [
             SECRET,
             INTROSPECTION_SECRET,

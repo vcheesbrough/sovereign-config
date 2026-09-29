@@ -21,8 +21,8 @@ services:
       - sovereign_config_private
     # Without these the database's stdout reaches Loki under its container name,
     # so dev and prod look like two unrelated services and neither answers to
-    # `deployment_environment`. No metrics labels: Postgres exposes no
-    # Prometheus endpoint for Alloy to scrape.
+    # `deployment_environment`. Nothing here is scraped: the server pushes its
+    # metrics over OTLP, and Postgres exposes none.
     labels:
       - "observability.service.name=sovereign-config-postgres"
       - "observability.deployment.environment=${SOVEREIGN_CONFIG_ENV:-dev}"
@@ -35,6 +35,8 @@ services:
       SOVEREIGN_CONFIG_DATABASE_URL: ${SOVEREIGN_CONFIG_DATABASE_URL:-}
       SOVEREIGN_CONFIG_DATABASE_URL_FILE: ${SOVEREIGN_CONFIG_DATABASE_URL_FILE-/run/secrets/database_url}
       SOVEREIGN_CONFIG_GRPC_ADDR: 0.0.0.0:50051
+      # The internal health listener (`/readyz`); the name predates metrics
+      # moving to OTLP, and is kept rather than churn an operator variable.
       SOVEREIGN_CONFIG_METRICS_ADDR: 0.0.0.0:9090
       SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL: ${SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL:?Set SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL}
       SOVEREIGN_CONFIG_OIDC_ISSUER: ${SOVEREIGN_CONFIG_OIDC_ISSUER:?Set SOVEREIGN_CONFIG_OIDC_ISSUER}
@@ -88,10 +90,6 @@ services:
       - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.service=${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}"
       - "traefik.http.services.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.loadbalancer.server.port=50051"
       - "traefik.http.services.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.loadbalancer.server.scheme=h2c"
-      - "observability.metrics.scrape=true"
-      - "observability.metrics.port=9090"
-      - "observability.metrics.path=/metrics"
-      - "observability.metrics.scheme=http"
       - "observability.service.name=sovereign-config"
       - "observability.deployment.environment=${SOVEREIGN_CONFIG_ENV:-dev}"
     restart: unless-stopped
