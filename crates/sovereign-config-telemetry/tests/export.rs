@@ -85,6 +85,23 @@ impl LogExporter for Kept {
     }
 }
 
+/// A dispatch for one test that is never dropped.
+///
+/// Parallel tests each install their own scoped dispatch, and tracing-core
+/// holds its dispatcher registry's read lock while it walks every live
+/// dispatch to rebuild callsite interest. If that walk holds the *last*
+/// reference to another test's finished subscriber, dropping it drops the
+/// SDK providers, whose `Drop` logs through a callsite registering for the
+/// first time — which takes the same read lock again behind a waiting
+/// writer, and every test deadlocks. Keeping one reference forever means no
+/// subscriber is ever dropped there. Production installs one global
+/// subscriber for the life of the process, so it cannot meet this.
+fn kept(subscriber: Box<dyn tracing::Subscriber + Send + Sync>) -> tracing::Dispatch {
+    let dispatch = tracing::Dispatch::new(subscriber);
+    std::mem::forget(dispatch.clone());
+    dispatch
+}
+
 fn identity(hostname: Option<&str>) -> Identity {
     Identity {
         version: VERSION.to_owned(),
@@ -150,7 +167,7 @@ fn every_exported_record_carries_the_resource_identity() {
         mut telemetry,
     } = assemble_with(plan, &exporter, &stdout, Some("sovereign-config-dev"));
 
-    tracing::subscriber::with_default(subscriber, || {
+    tracing::dispatcher::with_default(&kept(subscriber), || {
         telemetry.announce();
         tracing::info!(answer = 42, "first");
         tracing::warn!("second");
@@ -201,7 +218,7 @@ fn the_instance_id_is_identical_across_two_inits_on_one_hostname() {
                 subscriber,
                 mut telemetry,
             } = assemble_with(plan, &exporter, &Captured::default(), Some("host-a"));
-            tracing::subscriber::with_default(subscriber, || {
+            tracing::dispatcher::with_default(&kept(subscriber), || {
                 tracing::info!("one");
                 telemetry.shutdown();
             });
@@ -250,7 +267,7 @@ fn off_builds_no_provider_and_says_so_once() {
 
         assert!(!telemetry.is_exporting());
         assert!(!*built.lock().unwrap(), "no exporter may be built when off");
-        tracing::subscriber::with_default(subscriber, || {
+        tracing::dispatcher::with_default(&kept(subscriber), || {
             telemetry.announce();
             tracing::info!("served");
             telemetry.shutdown();
@@ -277,7 +294,7 @@ fn shutdown_flushes_pending_records_within_its_timeout() {
         mut telemetry,
     } = assemble_with(plan, &exporter, &Captured::default(), None);
 
-    tracing::subscriber::with_default(subscriber, || {
+    tracing::dispatcher::with_default(&kept(subscriber), || {
         for n in 0..100 {
             tracing::info!(n, "pending");
         }
@@ -302,7 +319,7 @@ fn the_sdk_s_own_diagnostics_never_reach_the_log_bridge() {
         mut telemetry,
     } = assemble_with(plan, &exporter, &stdout, None);
 
-    tracing::subscriber::with_default(subscriber, || {
+    tracing::dispatcher::with_default(&kept(subscriber), || {
         tracing::warn!(target: "opentelemetry_sdk", "export failed");
         tracing::debug!(target: "opentelemetry_otlp", url = "http://collector", "detail");
         tracing::warn!(target: "reqwest::blocking", "connection refused");
@@ -370,7 +387,7 @@ fn an_unreachable_collector_costs_nothing_and_shutdown_stays_bounded() {
     .unwrap();
 
     let started = Instant::now();
-    tracing::subscriber::with_default(subscriber, || {
+    tracing::dispatcher::with_default(&kept(subscriber), || {
         for n in 0..50 {
             tracing::info!(n, "served while the collector is down");
         }
@@ -405,7 +422,7 @@ fn stdout_lines_carry_no_span_fields() {
         mut telemetry,
     } = assemble_with(plan, &exporter, &stdout, None);
 
-    tracing::subscriber::with_default(subscriber, || {
+    tracing::dispatcher::with_default(&kept(subscriber), || {
         let span = tracing::info_span!(
             target: "sovereign_config_server::spans",
             "rpc",
@@ -493,7 +510,7 @@ fn a_hung_collector_costs_one_shutdown_bound_for_both_signals() {
     )
     .unwrap();
 
-    tracing::subscriber::with_default(subscriber, || {
+    tracing::dispatcher::with_default(&kept(subscriber), || {
         let span = tracing::info_span!(target: "sovereign_config_test", "work");
         let _entered = span.enter();
         tracing::info!("pending");

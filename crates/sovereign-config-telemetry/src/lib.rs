@@ -39,13 +39,9 @@ use opentelemetry_sdk::{
     propagation::TraceContextPropagator,
     trace::{self, BatchSpanProcessor, SdkTracerProvider, SpanExporter},
 };
-use tracing::{Metadata, Subscriber, info, warn};
+use tracing::{Metadata, Subscriber, info, subscriber::Interest, warn};
 use tracing_subscriber::{
-    EnvFilter, Layer,
-    filter::{FilterFn, filter_fn},
-    fmt::MakeWriter,
-    layer::SubscriberExt,
-    registry::Registry,
+    EnvFilter, Layer, fmt::MakeWriter, layer::Filter, layer::SubscriberExt, registry::Registry,
 };
 
 pub use config::{ConfigError, Exported, Off, OtelEnv, Plan};
@@ -336,8 +332,41 @@ where
 }
 
 /// Spans from this product's own crates, and nothing else.
-fn span_filter() -> FilterFn<fn(&Metadata<'_>) -> bool> {
-    filter_fn(|metadata| metadata.is_span() && metadata.target().starts_with("sovereign_config"))
+///
+/// The callsite answer is "sometimes", never "always", so the filter is asked
+/// for every span. A per-layer filter that lets `tracing` cache "always" for a
+/// callsite is skipped on later spans from it, and the layer's per-span
+/// enablement is then read from state another callsite left on the thread —
+/// which dropped the introspection span from a test capture about one run in
+/// ten.
+struct OwnSpans;
+
+impl OwnSpans {
+    fn matches(metadata: &Metadata<'_>) -> bool {
+        metadata.is_span() && metadata.target().starts_with("sovereign_config")
+    }
+}
+
+impl<S> Filter<S> for OwnSpans {
+    fn enabled(
+        &self,
+        metadata: &Metadata<'_>,
+        _: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        Self::matches(metadata)
+    }
+
+    fn callsite_enabled(&self, metadata: &'static Metadata<'static>) -> Interest {
+        if Self::matches(metadata) {
+            Interest::sometimes()
+        } else {
+            Interest::never()
+        }
+    }
+}
+
+fn span_filter() -> OwnSpans {
+    OwnSpans
 }
 
 /// `RUST_LOG`, or `info` when it is unset or does not parse.
