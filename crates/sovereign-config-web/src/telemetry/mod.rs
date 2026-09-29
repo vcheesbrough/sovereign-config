@@ -50,8 +50,11 @@ const MAX_BUFFERED_BYTES: usize = 256 * 1024;
 const MAX_BATCH_RECORDS: usize = 100;
 const MAX_BATCH_BYTES: usize = 128 * 1024;
 const MAX_UNLOAD_BATCH_BYTES: usize = 48 * 1024;
-/// How long records gather before a request, so one action is one request.
+/// Records gather until the page has been quiet this long, so one action —
+/// however many calls it makes, however slowly — is one request.
 const FLUSH_DELAY_MS: u32 = 1_000;
+/// ...but never longer than this, so a busy page still sends.
+const MAX_GATHER_MS: u32 = 5_000;
 /// How often an export waiting for a current token looks again.
 const TOKEN_WAIT_MS: u32 = 5_000;
 /// A token this close to expiry is left for the page to refresh first.
@@ -70,6 +73,10 @@ struct Exporter {
     policy: Policy,
     /// A flush is scheduled or running; at most one of either exists.
     flushing: bool,
+    /// When records began gathering for the next request, and when the
+    /// latest arrived.
+    gathering_since_ms: f64,
+    last_record_ms: f64,
     dropped: u64,
 }
 
@@ -89,6 +96,8 @@ pub(crate) fn init(config: Option<&TelemetryConfig>) {
             pending: None,
             policy: Policy::default(),
             flushing: false,
+            gathering_since_ms: 0.0,
+            last_record_ms: 0.0,
             dropped: 0,
         });
     });
@@ -163,7 +172,13 @@ fn emit(record: &Record) {
             return false;
         };
         exporter.buffer.push(encoded);
-        !std::mem::replace(&mut exporter.flushing, true)
+        let now = Date::now();
+        exporter.last_record_ms = now;
+        let start = !std::mem::replace(&mut exporter.flushing, true);
+        if start {
+            exporter.gathering_since_ms = now;
+        }
+        start
     });
     if start {
         schedule_flush(FLUSH_DELAY_MS);
@@ -207,6 +222,23 @@ fn schedule_flush(delay_ms: u32) {
 /// has stopped. Runs outside every action: it is not a user's doing, and its
 /// requests carry no `traceparent`.
 async fn flush() {
+    // Still gathering: records are arriving, and the cap is not reached. A
+    // batch waiting to be retried is not gathering and goes as scheduled.
+    let gathering = EXPORTER.with_borrow(|slot| {
+        slot.as_ref()
+            .filter(|exporter| exporter.pending.is_none())
+            .and_then(|exporter| {
+                gather_wait_ms(
+                    Date::now(),
+                    exporter.gathering_since_ms,
+                    exporter.last_record_ms,
+                )
+            })
+    });
+    if let Some(wait) = gathering {
+        schedule_flush(wait);
+        return;
+    }
     loop {
         let Some((batch, url, version)) = EXPORTER.with_borrow_mut(|slot| {
             let exporter = slot.as_mut()?;
@@ -275,6 +307,18 @@ async fn flush() {
             }
         }
     }
+}
+
+/// How much longer to wait before sending what has gathered, or `None` to
+/// send now: until the page has been quiet for [`FLUSH_DELAY_MS`], and never
+/// past [`MAX_GATHER_MS`] from the first record.
+fn gather_wait_ms(now_ms: f64, gathering_since_ms: f64, last_record_ms: f64) -> Option<u32> {
+    let quiet_at = last_record_ms + f64::from(FLUSH_DELAY_MS);
+    let deadline = gathering_since_ms + f64::from(MAX_GATHER_MS);
+    let wait = quiet_at.min(deadline) - now_ms;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let wait = (wait >= 1.0).then(|| wait.ceil() as u32);
+    wait
 }
 
 fn park(batch: Vec<String>, delay_ms: u32) {
@@ -510,6 +554,20 @@ fn flush_on_exit() {
 
 #[cfg(test)]
 mod tests {
+    use super::gather_wait_ms;
+
+    /// An action whose calls straggle is still one request: the flush waits
+    /// for a quiet second, but no more than five from the first record.
+    #[test]
+    fn records_gather_until_quiet_or_the_cap() {
+        // First record at 0, latest at 900: quiet at 1 900.
+        assert_eq!(gather_wait_ms(1_000.0, 0.0, 900.0), Some(900));
+        // Quiet for a second: send.
+        assert_eq!(gather_wait_ms(2_000.0, 0.0, 900.0), None);
+        // Records still arriving at 4 800: the 5 000 cap wins.
+        assert_eq!(gather_wait_ms(4_800.0, 0.0, 4_700.0), Some(200));
+        assert_eq!(gather_wait_ms(5_000.0, 0.0, 4_900.0), None);
+    }
     /// Every action gets its trace context from `telemetry::spawn_local`, so
     /// a view that spawned work any other way would send requests with no
     /// `traceparent` and records with no trace. Only this module, whose own
