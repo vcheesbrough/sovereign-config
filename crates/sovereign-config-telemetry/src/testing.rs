@@ -13,7 +13,7 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Once},
     time::Duration,
 };
 
@@ -108,6 +108,25 @@ impl<'a> MakeWriter<'a> for Silent {
     }
 }
 
+/// Registers one inert dispatch for the life of the process, before the first
+/// capture's.
+///
+/// While exactly one dispatch is registered, tracing-core assumes it is the
+/// global default: a callsite first reached on *another* thread takes its
+/// interest from that thread's default — none, in a parallel test — and
+/// caches `never` for every thread. With the first capture the only
+/// registered dispatch, a parallel test that reached a callsite first (the
+/// Authentik introspection's `client_span`, say) switched that span off in the
+/// capture too: it went missing, and `Span::current().record(..)` landed on
+/// its parent instead. A second registration makes every rebuild consult each
+/// live dispatch.
+fn never_the_only_dispatch() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::mem::forget(Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    });
+}
+
 /// The production assembly around recording exporters.
 pub struct Capture {
     dispatch: Dispatch,
@@ -131,6 +150,7 @@ impl Capture {
     }
 
     fn with_env(env: &OtelEnv) -> Self {
+        never_the_only_dispatch();
         let plan = config::validate(env).expect("the capture's variables are valid");
         let spans = SpanRecorder::default();
         let logs = InMemoryLogExporter::default();
