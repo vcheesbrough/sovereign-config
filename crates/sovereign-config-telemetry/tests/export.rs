@@ -14,6 +14,7 @@ use opentelemetry_sdk::{
     Resource,
     error::OTelSdkResult,
     logs::{BatchConfig, BatchConfigBuilder, InMemoryLogExporter, LogBatch, LogExporter},
+    metrics::{InMemoryMetricExporter, data::AggregatedMetrics},
     trace::{self, InMemorySpanExporter},
 };
 use sovereign_config_telemetry::{
@@ -110,14 +111,17 @@ fn slow_batches() -> BatchConfig {
         .build()
 }
 
-/// Exporters around `logs`, and a span exporter that must never be built
-/// (these tests' deployment has `OTEL_TRACES_EXPORTER=none`).
+/// Exporters around `logs`, and span and metric exporters that must never
+/// be built (these tests' deployment has `OTEL_TRACES_EXPORTER=none` and
+/// `OTEL_METRICS_EXPORTER=none`).
+#[allow(clippy::type_complexity)] // one opaque constructor per signal
 fn exporters<L>(
     logs: impl FnOnce() -> Result<L, InitError>,
     log_batch: BatchConfig,
 ) -> Exporters<
     impl FnOnce() -> Result<L, InitError>,
     impl FnOnce() -> Result<InMemorySpanExporter, InitError>,
+    impl FnOnce() -> Result<InMemoryMetricExporter, InitError>,
 > {
     Exporters {
         logs,
@@ -126,6 +130,10 @@ fn exporters<L>(
             panic!("no span exporter may be built while traces are off")
         },
         span_batch: trace::BatchConfigBuilder::default().build(),
+        metrics: || -> Result<InMemoryMetricExporter, InitError> {
+            panic!("no metric exporter may be built while metrics are off")
+        },
+        metric_interval: None,
     }
 }
 
@@ -446,11 +454,117 @@ fn stdout_lines_carry_no_span_fields() {
     }
 }
 
-/// A collector that accepts connections and never answers — the worst case
-/// for a flush — costs one shutdown bound, not one per signal: both signals
-/// flush at once, inside Docker's default stop grace.
+/// Metrics leave with the same resource identity as every other signal, and
+/// cumulative: the one collection shutdown makes carries the totals.
 #[test]
-fn a_hung_collector_costs_one_shutdown_bound_for_both_signals() {
+fn exported_metrics_carry_the_resource_identity() {
+    let exporter = InMemoryMetricExporter::default();
+    let recorder = exporter.clone();
+    let plan = validate(&OtelEnv::from_pairs(
+        DEPLOYED
+            .into_iter()
+            .chain([("OTEL_METRICS_EXPORTER", "otlp")]),
+    ))
+    .unwrap();
+    let Assembly {
+        subscriber,
+        mut telemetry,
+    } = assemble(
+        plan,
+        &identity(Some("sovereign-config-dev")),
+        "info",
+        Captured::default(),
+        Exporters {
+            logs: || Ok::<_, InitError>(InMemoryLogExporter::default()),
+            log_batch: slow_batches(),
+            spans: || -> Result<InMemorySpanExporter, InitError> {
+                panic!("no span exporter may be built while traces are off")
+            },
+            span_batch: trace::BatchConfigBuilder::default().build(),
+            metrics: move || Ok::<_, InitError>(recorder),
+            metric_interval: Some(Duration::from_secs(3600)),
+        },
+    )
+    .unwrap();
+    // Never installed, but kept like every other: its drop would drop SDK
+    // providers (see `kept`).
+    let _ = kept(subscriber);
+    assert!(telemetry.is_exporting());
+
+    let counter = telemetry
+        .meter()
+        .u64_counter("sovereign_config.test")
+        .build();
+    counter.add(2, &[]);
+    counter.add(3, &[]);
+    telemetry.shutdown();
+
+    let collected = exporter.get_finished_metrics().unwrap();
+    let last = collected.last().expect("shutdown collects once");
+    let get = |key: &'static str| {
+        last.resource()
+            .get(&Key::from_static_str(key))
+            .map(|value| attribute(&value))
+    };
+    assert_eq!(get("service.name").as_deref(), Some("sovereign-config"));
+    assert_eq!(get("deployment.environment.name").as_deref(), Some("dev"));
+    assert_eq!(get("service.version").as_deref(), Some(VERSION));
+    assert!(get("service.instance.id").is_some());
+    let metric = last
+        .scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .find(|metric| metric.name() == "sovereign_config.test")
+        .expect("the counter was exported");
+    let AggregatedMetrics::U64(opentelemetry_sdk::metrics::data::MetricData::Sum(sum)) =
+        metric.data()
+    else {
+        panic!("a u64 counter is a u64 sum");
+    };
+    assert!(sum.is_monotonic());
+    assert_eq!(
+        sum.temporality(),
+        opentelemetry_sdk::metrics::Temporality::Cumulative
+    );
+    assert_eq!(
+        sum.data_points()
+            .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+            .sum::<u64>(),
+        5
+    );
+}
+
+/// With metrics off, the meter handed out is a no-op: instruments cost
+/// nothing and nothing is built.
+#[test]
+fn with_metrics_off_the_meter_is_a_no_op() {
+    let plan = validate(&OtelEnv::from_pairs(DEPLOYED)).unwrap();
+    let Assembly {
+        subscriber,
+        mut telemetry,
+    } = assemble_with(
+        plan,
+        &InMemoryLogExporter::default(),
+        &Captured::default(),
+        None,
+    );
+    // Never installed, but kept like every other: its drop would drop SDK
+    // providers (see `kept`).
+    let _ = kept(subscriber);
+    let meter = telemetry.meter();
+    // Recording on it neither fails nor builds an exporter: `exporters`'
+    // metric closure panics if it is ever called.
+    meter
+        .u64_counter("sovereign_config.test")
+        .build()
+        .add(1, &[]);
+    telemetry.shutdown();
+}
+
+/// A collector that accepts connections and never answers — the worst case
+/// for a flush — costs one shutdown bound, not one per signal: every signal
+/// flushes at once, inside Docker's default stop grace.
+#[test]
+fn a_hung_collector_costs_one_shutdown_bound_for_every_signal() {
     use opentelemetry_otlp::{Protocol, WithExportConfig};
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -462,11 +576,10 @@ fn a_hung_collector_costs_one_shutdown_bound_for_both_signals() {
             holder.lock().unwrap().push(stream);
         }
     });
-    let plan = validate(&OtelEnv::from_pairs(
-        DEPLOYED
-            .into_iter()
-            .chain([("OTEL_TRACES_EXPORTER", "otlp")]),
-    ))
+    let plan = validate(&OtelEnv::from_pairs(DEPLOYED.into_iter().chain([
+        ("OTEL_TRACES_EXPORTER", "otlp"),
+        ("OTEL_METRICS_EXPORTER", "otlp"),
+    ])))
     .unwrap();
     let Assembly {
         subscriber,
@@ -499,9 +612,24 @@ fn a_hung_collector_costs_one_shutdown_bound_for_both_signals() {
             span_batch: trace::BatchConfigBuilder::default()
                 .with_scheduled_delay(Duration::from_secs(3600))
                 .build(),
+            metrics: move || {
+                opentelemetry_otlp::MetricExporter::builder()
+                    .with_http()
+                    .with_protocol(Protocol::HttpBinary)
+                    .with_endpoint(format!("http://{address}/v1/metrics"))
+                    .with_timeout(Duration::from_secs(30))
+                    .build()
+                    .map_err(|_| InitError::Exporter("metric"))
+            },
+            metric_interval: Some(Duration::from_secs(3600)),
         },
     )
     .unwrap();
+    telemetry
+        .meter()
+        .u64_counter("sovereign_config.test")
+        .build()
+        .add(1, &[]);
 
     tracing::dispatcher::with_default(&kept(subscriber), || {
         let span = tracing::info_span!(target: "sovereign_config_test", "work");

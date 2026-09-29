@@ -177,26 +177,45 @@ pub enum Off {
     /// `OTEL_SDK_DISABLED=true`: a deployment that carries the variables and
     /// wants them silent.
     Disabled,
-    /// Validated, but every signal this build exports is set to `none`.
+    /// Validated, but every signal is set to `none`.
     NothingExported,
 }
 
-/// Which of the signals this build carries a provider for are exported.
+/// Which signals are exported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // one flag per signal, named as the variables name them
 pub struct Exported {
     pub logs: bool,
+    pub metrics: bool,
     pub traces: bool,
 }
 
 impl Exported {
+    /// Nothing exported.
+    pub const NONE: Self = Self {
+        logs: false,
+        metrics: false,
+        traces: false,
+    };
+
+    /// Whether any signal is exported.
+    #[must_use]
+    pub const fn any(self) -> bool {
+        self.logs || self.metrics || self.traces
+    }
+
     /// The exported signals, as the startup line names them.
     #[must_use]
     pub fn names(self) -> String {
-        [(self.logs, "logs"), (self.traces, "traces")]
-            .into_iter()
-            .filter_map(|(on, name)| on.then_some(name))
-            .collect::<Vec<_>>()
-            .join(",")
+        [
+            (self.logs, "logs"),
+            (self.metrics, "metrics"),
+            (self.traces, "traces"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect::<Vec<_>>()
+        .join(",")
     }
 }
 
@@ -250,21 +269,14 @@ pub fn validate(env: &OtelEnv) -> Result<Plan, ConfigError> {
     // Identity is required of anything that exports, whichever signal it is.
     let attributes = resource_attributes(env)?;
 
-    // Metrics are validated like every other signal — their variables are
-    // part of the contract — but this build has no provider for them yet
-    // (#421), so only logs and traces decide whether anything starts.
-    let signals = Exported {
-        logs: exporting.contains(&Signal::Logs),
-        traces: exporting.contains(&Signal::Traces),
-    };
-    if signals.logs || signals.traces {
-        Ok(Plan::Export {
-            attributes,
-            signals,
-        })
-    } else {
-        Ok(Plan::Off(Off::NothingExported))
-    }
+    Ok(Plan::Export {
+        attributes,
+        signals: Exported {
+            logs: exporting.contains(&Signal::Logs),
+            metrics: exporting.contains(&Signal::Metrics),
+            traces: exporting.contains(&Signal::Traces),
+        },
+    })
 }
 
 fn sdk_disabled(env: &OtelEnv) -> Result<bool, ConfigError> {
@@ -432,7 +444,7 @@ mod tests {
         ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://monitor-alloy:4318"),
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
         ("OTEL_LOGS_EXPORTER", "otlp"),
-        ("OTEL_METRICS_EXPORTER", "none"),
+        ("OTEL_METRICS_EXPORTER", "otlp"),
         ("OTEL_TRACES_EXPORTER", "otlp"),
     ];
 
@@ -488,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn the_deployed_set_exports_logs_and_traces_with_its_attributes() {
+    fn the_deployed_set_exports_every_signal_with_its_attributes() {
         let Ok(Plan::Export {
             attributes,
             signals,
@@ -500,10 +512,11 @@ mod tests {
             signals,
             Exported {
                 logs: true,
+                metrics: true,
                 traces: true
             }
         );
-        assert_eq!(signals.names(), "logs,traces");
+        assert_eq!(signals.names(), "logs,metrics,traces");
         assert_eq!(
             attributes,
             [
@@ -554,6 +567,7 @@ mod tests {
                         "http://collector:4318/v1/logs",
                     ),
                     ("OTEL_TRACES_EXPORTER", "none"),
+                    ("OTEL_METRICS_EXPORTER", "none"),
                 ]),
         );
         assert!(matches!(validate(&env), Ok(Plan::Export { .. })));
@@ -570,6 +584,7 @@ mod tests {
             signals,
             Exported {
                 logs: true,
+                metrics: true,
                 traces: false
             }
         );
@@ -578,10 +593,25 @@ mod tests {
         else {
             panic!("traces still export");
         };
-        assert_eq!(signals.names(), "traces");
+        assert_eq!(signals.names(), "metrics,traces");
+        let Ok(Plan::Export { signals, .. }) =
+            validate(&deployed_with(&[("OTEL_METRICS_EXPORTER", "none")]))
+        else {
+            panic!("logs and traces still export");
+        };
+        assert_eq!(signals.names(), "logs,traces");
+        // Metrics alone are a reason to start: they have a provider now.
+        let Ok(Plan::Export { signals, .. }) = validate(&deployed_with(&[
+            ("OTEL_LOGS_EXPORTER", "none"),
+            ("OTEL_TRACES_EXPORTER", "none"),
+        ])) else {
+            panic!("metrics still export");
+        };
+        assert_eq!(signals.names(), "metrics");
         assert_eq!(
             validate(&deployed_with(&[
                 ("OTEL_LOGS_EXPORTER", "none"),
+                ("OTEL_METRICS_EXPORTER", "none"),
                 ("OTEL_TRACES_EXPORTER", "none"),
             ])),
             Ok(Plan::Off(Off::NothingExported))

@@ -20,7 +20,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.36.1"
+version = "2.37.0"
 edition = "2024"
 rust-version = "1.94"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -82,19 +82,21 @@ uuid = { version = "1.26.1", features = ["v5"] }
 # the source side). `-http` is the header carrier for inject and extract,
 # wrapped by the telemetry crate's `context` module. Not in the set, deliberately: `prometheus`, `metrics`,
 # `axum-tracing-opentelemetry`, `reqwest-tracing`.
-opentelemetry = { version = "0.33.0", default-features = false, features = ["trace", "logs"] }
-opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["trace", "logs"] }
+opentelemetry = { version = "0.33.0", default-features = false, features = ["trace", "logs", "metrics"] }
+opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["trace", "logs", "metrics"] }
 # http/protobuf only, over the blocking reqwest client the SDK's batch thread
 # drives. This path already brings second majors of prost (0.14, via
 # `opentelemetry-proto`) and reqwest (0.13) beside the server's 0.13 and 0.12;
 # that was accepted. `grpc-tonic` is left out because it would add a second
 # tonic as well, and needs an async-runtime batch processor, for a transport
 # this estate's collector does not need.
-opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "logs", "trace", "internal-logs"] }
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "logs", "trace", "metrics", "internal-logs"] }
 opentelemetry-appender-tracing = { version = "0.33.0", default-features = false }
 opentelemetry-semantic-conventions = "0.33.0"
 opentelemetry-http = { version = "0.33.0", default-features = false }
-# Spans only: its `metrics` feature is #421's to decide, and `tracing-log`
+# Spans only. Its `metrics` feature (metrics from `tracing` events) is left
+# out: instruments are created on the `opentelemetry` API's meter (#421), so
+# a metric is never a side effect of a log line (skill §3). `tracing-log`
 # would turn `log` records into a second path for the same events.
 tracing-opentelemetry = { version = "0.34.0", default-features = false }
 

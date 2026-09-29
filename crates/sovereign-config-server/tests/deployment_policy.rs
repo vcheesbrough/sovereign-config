@@ -46,9 +46,10 @@ fn compose_delivers_the_value_encryption_key_like_every_other_secret() {
 /// container still ships logs, so nothing fails — Loki just files them under
 /// the container name, and `{deployment_environment="prod"}` quietly misses the
 /// database. The failure mode is an absence, which only a test asserting the
-/// presence catches.
+/// presence catches. The labels serve the stdout path only: metrics are
+/// pushed over OTLP with the process's own identity.
 #[test]
-fn every_container_is_labelled_for_log_and_metric_discovery() {
+fn every_container_is_labelled_for_log_discovery() {
     let compose = include_str!("../../../compose.yaml");
 
     for (service, expected) in [
@@ -75,6 +76,19 @@ fn every_container_is_labelled_for_log_and_metric_discovery() {
 /// configuration that still reads as the supported way to report a release —
 /// and the release they carried was a per-deploy value that started a fresh
 /// series set each time.
+/// Metrics leave over OTLP (#421): nothing may ask the platform to scrape the
+/// server any more, or Alloy would keep a target whose `/metrics` answers 404.
+#[test]
+fn compose_asks_for_no_metrics_scrape() {
+    let compose = include_str!("../../../compose.yaml");
+
+    assert!(
+        !compose.contains("observability.metrics"),
+        "no scrape labels"
+    );
+    assert!(!compose.contains("/metrics"), "no scrape path");
+}
+
 #[test]
 fn compose_does_not_stamp_build_identity_onto_discovery_labels() {
     let compose = include_str!("../../../compose.yaml");
@@ -198,6 +212,7 @@ fn deploys_set_the_telemetry_values_for_their_environment() {
             "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf\n".to_owned(),
             "export OTEL_LOGS_EXPORTER=otlp\n".to_owned(),
             "export OTEL_TRACES_EXPORTER=otlp\n".to_owned(),
+            "export OTEL_METRICS_EXPORTER=otlp\n".to_owned(),
         ] {
             assert!(text.contains(&expected), "{workflow} must set `{expected}`");
         }

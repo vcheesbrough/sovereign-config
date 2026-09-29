@@ -9,15 +9,20 @@
 //! current span's context into an outbound request. Business code inherits
 //! the ambient span and never passes a trace id around.
 //!
-//! **Not spanned, deliberately:** the internal listener (`/readyz`,
-//! `/metrics`) and the gRPC health service on the public port. Health is
-//! separate from telemetry, and a span per probe — the container health check
+//! RED is recorded here too (`observability` skill §1.5): every spanned
+//! request's duration goes into [`RequestMetrics`], with the same attribute
+//! keys and values as its span, where the span's status is known.
+//!
+//! **Not spanned or timed, deliberately:** the internal listener (`/readyz`)
+//! and the gRPC health service on the public port. Health is separate from
+//! telemetry, and a span or data point per probe — the container health check
 //! calls `grpc.health.v1.Health/Check` every few seconds — is noise.
 
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use http::{HeaderMap, Method, Request, Response};
@@ -28,7 +33,7 @@ use tonic::{Code, body::BoxBody};
 use tower::{Layer, Service};
 use tracing::{Instrument, Span, field::Empty};
 
-use crate::auth::AuthenticatedPrincipal;
+use crate::{auth::AuthenticatedPrincipal, metrics::RequestMetrics};
 
 /// Every gRPC route this build serves, as `/<package>.<Service>/<Method>`:
 /// the handshake, then each served protocol version's services. The set a
@@ -129,8 +134,13 @@ fn route(method: &Method, path: &str) -> Route {
 pub(crate) struct RequestSpan(pub(crate) Span);
 
 /// Opens the server span for a request, or `None` for a health probe.
+#[cfg(test)]
 pub(crate) fn server_span(method: &Method, path: &str) -> Option<Span> {
-    let span = match route(method, path) {
+    server_span_for(route(method, path), method, path)
+}
+
+fn server_span_for(route: Route, method: &Method, path: &str) -> Option<Span> {
+    let span = match route {
         Route::Health => return None,
         Route::Rpc {
             method: rpc,
@@ -222,24 +232,67 @@ pub(crate) fn stamp_user(span: &Span, principal: &AuthenticatedPrincipal) {
     }
 }
 
+/// When a gRPC call started, and the `rpc.method` it is recorded under, for
+/// [`GrpcStatusLayer`] to time the call once its status is known. Carried on
+/// the request by [`TraceLayer`], which alone sees the call start.
+#[derive(Clone)]
+pub(crate) struct CallTiming {
+    started: Instant,
+    method: &'static str,
+    metrics: RequestMetrics,
+}
+
+/// Records a call's duration exactly once: with its status when the status is
+/// seen, or as `CANCELLED` if the response is dropped first — the client went
+/// away before the trailers, which the server sees as a cancellation.
+struct CallRecorder(Option<CallTiming>);
+
+impl CallRecorder {
+    fn finish(&mut self, code: Code) {
+        if let Some(timing) = self.0.take() {
+            timing
+                .metrics
+                .record_rpc(timing.method, code, timing.started.elapsed());
+        }
+    }
+}
+
+impl Drop for CallRecorder {
+    fn drop(&mut self) {
+        self.finish(Code::Cancelled);
+    }
+}
+
 /// The server span layer. **Outermost** on the public port, so the span
 /// covers everything the request meets: the protocol-version layer, gRPC-Web,
 /// the version-not-served catch-all, authentication (and its introspection
-/// call) and the handler.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct TraceLayer;
+/// call) and the handler. It starts the request's clock for RED, too.
+#[derive(Clone)]
+pub(crate) struct TraceLayer {
+    metrics: RequestMetrics,
+}
+
+impl TraceLayer {
+    pub(crate) const fn new(metrics: RequestMetrics) -> Self {
+        Self { metrics }
+    }
+}
 
 impl<S> Layer<S> for TraceLayer {
     type Service = TraceService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        TraceService { inner }
+        TraceService {
+            inner,
+            metrics: self.metrics.clone(),
+        }
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct TraceService<S> {
     inner: S,
+    metrics: RequestMetrics,
 }
 
 impl<S, B> Service<Request<B>> for TraceService<S>
@@ -258,13 +311,38 @@ where
     }
 
     fn call(&mut self, mut request: Request<B>) -> Self::Future {
+        let started = Instant::now();
         let replacement = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, replacement);
-        let Some(span) = server_span(request.method(), request.uri().path()) else {
+        let route = route(request.method(), request.uri().path());
+        let Some(span) = server_span_for(route, request.method(), request.uri().path()) else {
             return Box::pin(async move { inner.call(request).await });
         };
         context::adopt_parent(&span, request.headers());
         request.extensions_mut().insert(RequestSpan(span.clone()));
+        // A gRPC call's status arrives further in, often after the handler
+        // has returned; it is timed where the status is read.
+        let http_method = match route {
+            Route::Rpc { method, .. } => {
+                request.extensions_mut().insert(CallTiming {
+                    started,
+                    method,
+                    metrics: self.metrics.clone(),
+                });
+                None
+            }
+            Route::OtherRpc => {
+                request.extensions_mut().insert(CallTiming {
+                    started,
+                    method: OTHER,
+                    metrics: self.metrics.clone(),
+                });
+                None
+            }
+            Route::Http => Some(http_method(request.method()).1),
+            Route::Health => None,
+        };
+        let metrics = self.metrics.clone();
 
         let recorder = span.clone();
         Box::pin(
@@ -277,6 +355,9 @@ where
                 if response.status().is_server_error() {
                     recorder.record("otel.status_code", "error");
                     recorder.record("error.type", tracing::field::display(status));
+                }
+                if let Some(method) = http_method {
+                    metrics.record_http(method, status, started.elapsed());
                 }
                 Ok(response)
             }
@@ -327,22 +408,32 @@ where
             .extensions()
             .get::<RequestSpan>()
             .map(|RequestSpan(span)| span.clone());
+        let timing = request.extensions().get::<CallTiming>().cloned();
         Box::pin(async move {
+            // Dropped unfinished — a failed call, or a body abandoned before
+            // its trailers — it records the call as cancelled.
+            let mut recorder = CallRecorder(timing);
             let response = inner.call(request).await?;
-            let Some(span) = span else {
+            if span.is_none() && recorder.0.is_none() {
                 return Ok(response);
-            };
+            }
             if let Some(code) = grpc_status(response.headers()) {
-                record_grpc_status(&span, code);
+                if let Some(span) = &span {
+                    record_grpc_status(span, code);
+                }
+                recorder.finish(code);
                 return Ok(response);
             }
             // The status arrives with the trailers, after the handler has
             // returned; the body holds the span open until then, so the span's
-            // duration is the whole exchange.
+            // duration is the whole exchange, and so is the recorded one.
             Ok(response.map(|body| {
                 body.map_frame(move |frame| {
                     if let Some(code) = frame.trailers_ref().and_then(grpc_status) {
-                        record_grpc_status(&span, code);
+                        if let Some(span) = &span {
+                            record_grpc_status(span, code);
+                        }
+                        recorder.finish(code);
                     }
                     frame
                 })
@@ -364,7 +455,16 @@ fn grpc_status(headers: &HeaderMap) -> Option<Code> {
 fn record_grpc_status(span: &Span, code: Code) {
     let name = grpc_code_name(code);
     span.record("rpc.response.status_code", name);
-    if matches!(
+    if is_server_error(code) {
+        span.record("otel.status_code", "error");
+        span.record("error.type", name);
+    }
+}
+
+/// The codes the gRPC semantic conventions count as a server error: the
+/// span is failed and carries `error.type`, and so does the call's duration.
+pub(crate) const fn is_server_error(code: Code) -> bool {
+    matches!(
         code,
         Code::Unknown
             | Code::DeadlineExceeded
@@ -372,10 +472,7 @@ fn record_grpc_status(span: &Span, code: Code) {
             | Code::Internal
             | Code::Unavailable
             | Code::DataLoss
-    ) {
-        span.record("otel.status_code", "error");
-        span.record("error.type", name);
-    }
+    )
 }
 
 pub(crate) const fn grpc_code_name(code: Code) -> &'static str {

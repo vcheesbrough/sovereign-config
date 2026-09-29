@@ -31,6 +31,8 @@ tonic-health.workspace = true
 tonic-web.workspace = true
 tower.workspace = true
 tracing.workspace = true
+# The metrics façade: instruments and attributes, never an SDK type.
+opentelemetry.workspace = true
 zeroize.workspace = true
 sovereign-config-proto = { path = "../sovereign-config-proto" }
 sovereign-config-core = { path = "../sovereign-config-core" }

@@ -1150,7 +1150,7 @@ async fn unreadable_app_password_rolls_back_and_is_visible_in_metrics() {
 
     // The failure must be attributable from metrics alone, which is what
     // made the production incident diagnosable.
-    let rendered = metrics.render();
+    let rendered = metrics.series();
     assert!(
         rendered.contains(
             "sovereign_config_managed_dependency_total{call=\"find_credentials\",outcome=\"invalid\"} 1"
