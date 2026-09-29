@@ -117,6 +117,7 @@ async fn serve(meter: &Meter) -> Result<()> {
     let config = Config::from_env()?;
     let web_assets = WebAssetsLayer::new(&config.web);
     let authenticator = Authenticator::new(config.authentication)?;
+    authenticator.spawn_key_refresh();
     let authentication_metrics = Arc::new(AuthenticationMetrics::default());
     let managed_metrics = Arc::new(ManagedConnectionMetrics::default());
     let protocol_metrics = Arc::new(ProtocolMetrics::new(SERVED_PROTOCOL_LABELS));

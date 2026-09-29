@@ -424,8 +424,9 @@ fn metrics_use_only_bounded_result_labels() {
         rendered
             .matches("sovereign_config_authentication_total{")
             .count(),
-        7
+        AuthenticationResult::ALL.len()
     );
+    assert!(rendered.contains("outcome=\"failure\",reason=\"bad_signature\"} 0"));
 }
 
 #[test]

@@ -81,7 +81,7 @@ RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/carg
         test "$("/tmp/verify-$label/$name" --version | awk '{print $NF}')" = "$version"; \
     done
 
-# The server makes outbound HTTPS calls (OIDC token introspection, Authentik
+# The server makes outbound HTTPS calls (the issuer's signing keys, Authentik
 # admin API calls), so it needs a trusted root store — a bare debian image
 # ships none.
 FROM docker.io/library/debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS server-runtime

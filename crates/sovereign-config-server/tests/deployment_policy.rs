@@ -142,12 +142,63 @@ fn readme_lists_every_production_secret_the_deployment_consumes() {
     // pipeline.
     for secret in [
         "sovereign_config_prod_postgres_password",
-        "sovereign_config_prod_oidc_introspection_client_secret",
         "sovereign_config_prod_manager_api_token",
         "sovereign_config_prod_value_encryption_key",
     ] {
         assert!(pipeline.contains(secret), "{secret} missing from pipeline");
         assert!(readme.contains(secret), "{secret} missing from README");
+    }
+}
+
+/// Access tokens are verified against the issuer's JWKS (#450), so nothing
+/// deploys an introspection endpoint, client or secret any more. A leftover
+/// would be a credential provisioned for nothing — or a sign that something
+/// started introspecting again without the README saying so.
+#[test]
+fn nothing_deploys_introspection_configuration() {
+    for (file, text) in [
+        ("compose.yaml", include_str!("../../../compose.yaml")),
+        (
+            ".woodpecker/deploy-dev.yml",
+            include_str!("../../../.woodpecker/deploy-dev.yml"),
+        ),
+        (
+            ".woodpecker/deploy-prod.yml",
+            include_str!("../../../.woodpecker/deploy-prod.yml"),
+        ),
+    ] {
+        assert!(
+            !text.to_ascii_lowercase().contains("introspect"),
+            "{file} still carries introspection configuration"
+        );
+    }
+    // The blueprints name each retired provider once more, to delete it: a
+    // blueprint that merely stopped mentioning it would leave it in Authentik.
+    for (file, text, provider) in [
+        (
+            "authentik/blueprint.yaml",
+            include_str!("../../../authentik/blueprint.yaml"),
+            "sovereign-config-introspection",
+        ),
+        (
+            "authentik/blueprint-dev.yaml",
+            include_str!("../../../authentik/blueprint-dev.yaml"),
+            "sovereign-config-introspection-dev",
+        ),
+    ] {
+        let retirement = format!(
+            "  - model: authentik_providers_oauth2.oauth2provider\n    state: absent\n    \
+             identifiers:\n      name: {provider}\n"
+        );
+        assert!(
+            text.contains(&retirement),
+            "{file} does not delete {provider}"
+        );
+        assert_eq!(
+            text.matches(provider).count(),
+            1,
+            "{file} names {provider} anywhere but its deletion"
+        );
     }
 }
 

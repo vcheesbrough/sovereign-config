@@ -6,7 +6,6 @@ use std::{
 };
 
 const SECRET: &str = "startup-redaction-sentinel-4d9a9fd8";
-const INTROSPECTION_SECRET: &str = "introspection-redaction-sentinel-a91c5e72";
 const MANAGER_SECRET: &str = "manager-redaction-sentinel-e3b7c1f4";
 // A real 32-byte key, base64-encoded, so the server gets past key validation
 // on the paths that are meant to fail somewhere else.
@@ -34,10 +33,6 @@ fn assert_secret_is_redacted(output: &Output) {
         "startup output exposed the database credential: {output}"
     );
     assert!(
-        !output.contains(INTROSPECTION_SECRET),
-        "startup output exposed the introspection credential: {output}"
-    );
-    assert!(
         !output.contains(MANAGER_SECRET),
         "startup output exposed the manager credential: {output}"
     );
@@ -51,12 +46,8 @@ fn database_url() -> String {
     format!("postgresql://sovereign_config:{SECRET}@127.0.0.1:1/sovereign_config")
 }
 
-fn authentication_environment() -> [(&'static str, String); 5] {
+fn authentication_environment() -> [(&'static str, String); 2] {
     [
-        (
-            "SOVEREIGN_CONFIG_OIDC_INTROSPECTION_URL",
-            "https://auth.example.test/application/o/introspect/".to_owned(),
-        ),
         (
             "SOVEREIGN_CONFIG_OIDC_ISSUER",
             "https://auth.example.test/application/o/sovereign-config/".to_owned(),
@@ -64,14 +55,6 @@ fn authentication_environment() -> [(&'static str, String); 5] {
         (
             "SOVEREIGN_CONFIG_OIDC_AUDIENCE",
             "sovereign-config".to_owned(),
-        ),
-        (
-            "SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_ID",
-            "sovereign-config-introspection".to_owned(),
-        ),
-        (
-            "SOVEREIGN_CONFIG_OIDC_INTROSPECTION_CLIENT_SECRET",
-            INTROSPECTION_SECRET.to_owned(),
         ),
     ]
 }
@@ -341,12 +324,7 @@ fn no_startup_secret_reaches_an_exported_span_or_log_record() {
     // Whatever metrics left before the failed start are searched too.
     let metrics = bodies("/v1/metrics");
     for body in traces.iter().chain(&logs).chain(&metrics) {
-        for secret in [
-            SECRET,
-            INTROSPECTION_SECRET,
-            MANAGER_SECRET,
-            VALUE_ENCRYPTION_KEY,
-        ] {
+        for secret in [SECRET, MANAGER_SECRET, VALUE_ENCRYPTION_KEY] {
             assert!(
                 !contains(body, secret),
                 "an exported span or log record carries a startup secret"

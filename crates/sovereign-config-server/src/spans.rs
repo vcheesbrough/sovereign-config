@@ -266,8 +266,8 @@ impl Drop for CallRecorder {
 
 /// The server span layer. **Outermost** on the public port, so the span
 /// covers everything the request meets: the protocol-version layer, gRPC-Web,
-/// the version-not-served catch-all, authentication (and its introspection
-/// call) and the handler. It starts the request's clock for RED, too.
+/// the version-not-served catch-all, authentication (and, on a cold key cache,
+/// its JWKS fetch) and the handler. It starts the request's clock for RED, too.
 #[derive(Clone)]
 pub(crate) struct TraceLayer {
     metrics: RequestMetrics,
@@ -519,8 +519,8 @@ pub(crate) const fn grpc_code_name(code: Code) -> &'static str {
 /// A client span for one outbound HTTP call. `template` is the route with its
 /// identifiers left as placeholders (`/api/v3/core/users/{id}/`) — never the
 /// URL actually called, which would put an Authentik primary key in a span
-/// name. `None` when the route is configuration rather than code (the
-/// introspection endpoint), which leaves the span named by its method.
+/// name. `None` when the route is configuration rather than code (an
+/// issuer's JWKS), which leaves the span named by its method.
 /// Records the host only: no scheme, port, path, query or credential.
 pub(crate) fn client_span(method: &Method, template: Option<&'static str>, origin: &Url) -> Span {
     let (method_name, recorded) = http_method(method);
