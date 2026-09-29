@@ -462,3 +462,71 @@ fn otlp_span_exporter() -> Result<opentelemetry_otlp::SpanExporter, InitError> {
         .build()
         .map_err(|_| InitError::Exporter("span"))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tracing::{Metadata, Subscriber, subscriber::Interest};
+    use tracing_subscriber::{Layer, layer::Filter, layer::SubscriberExt, registry::Registry};
+
+    use super::OwnSpans;
+
+    /// Records every callsite registered while it is the default subscriber.
+    #[derive(Clone, Default)]
+    struct Callsites(Arc<Mutex<Vec<&'static Metadata<'static>>>>);
+
+    impl<S: Subscriber> Layer<S> for Callsites {
+        fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+            self.0.lock().unwrap().push(metadata);
+            Interest::always()
+        }
+    }
+
+    fn registered(name: &str, callsites: &Callsites) -> &'static Metadata<'static> {
+        callsites
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|metadata| metadata.name() == name)
+            .unwrap_or_else(|| panic!("callsite {name} registered"))
+    }
+
+    #[test]
+    fn own_spans_are_asked_about_every_time_and_nothing_else_passes() {
+        let callsites = Callsites::default();
+        let dispatch = tracing::Dispatch::new(Registry::default().with(callsites.clone()));
+        // Kept for the reason `testing::Capture::new` gives.
+        std::mem::forget(dispatch.clone());
+        tracing::dispatcher::with_default(&dispatch, || {
+            let _own = tracing::info_span!(target: "sovereign_config_server::spans", "own_span");
+            let _foreign = tracing::info_span!(target: "h2::proto", "foreign_span");
+            tracing::info!(target: "sovereign_config_server::spans", "own_event");
+        });
+
+        let own = registered("own_span", &callsites);
+        let foreign = registered("foreign_span", &callsites);
+        let event = callsites
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|metadata| {
+                metadata.is_event() && metadata.target() == "sovereign_config_server::spans"
+            })
+            .expect("the event's callsite registered");
+
+        // "sometimes", never "always": a cached "always" skips the per-layer
+        // filter on later spans from the callsite (see `OwnSpans`).
+        let filter = OwnSpans;
+        assert!(Filter::<Registry>::callsite_enabled(&filter, own).is_sometimes());
+        assert!(Filter::<Registry>::callsite_enabled(&filter, foreign).is_never());
+        assert!(Filter::<Registry>::callsite_enabled(&filter, event).is_never());
+        assert!(OwnSpans::matches(own));
+        assert!(!OwnSpans::matches(foreign));
+        assert!(!OwnSpans::matches(event));
+    }
+}

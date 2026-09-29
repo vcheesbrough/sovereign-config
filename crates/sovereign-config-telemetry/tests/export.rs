@@ -85,17 +85,10 @@ impl LogExporter for Kept {
     }
 }
 
-/// A dispatch for one test that is never dropped.
-///
-/// Parallel tests each install their own scoped dispatch, and tracing-core
-/// holds its dispatcher registry's read lock while it walks every live
-/// dispatch to rebuild callsite interest. If that walk holds the *last*
-/// reference to another test's finished subscriber, dropping it drops the
-/// SDK providers, whose `Drop` logs through a callsite registering for the
-/// first time — which takes the same read lock again behind a waiting
-/// writer, and every test deadlocks. Keeping one reference forever means no
-/// subscriber is ever dropped there. Production installs one global
-/// subscriber for the life of the process, so it cannot meet this.
+/// A dispatch for one test that is never dropped, so parallel tests cannot
+/// deadlock in tracing-core's dispatcher registry. `testing::Capture::new`
+/// explains the deadlock; this file cannot reach that feature-gated module,
+/// so it keeps its own copy of the one-line workaround.
 fn kept(subscriber: Box<dyn tracing::Subscriber + Send + Sync>) -> tracing::Dispatch {
     let dispatch = tracing::Dispatch::new(subscriber);
     std::mem::forget(dispatch.clone());
