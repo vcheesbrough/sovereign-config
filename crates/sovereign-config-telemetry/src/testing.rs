@@ -160,8 +160,17 @@ impl Capture {
             },
         )
         .expect("the capture assembles");
+        let dispatch = Dispatch::new(subscriber);
+        // Never dropped. Parallel tests each install a scoped dispatch, and
+        // tracing-core walks every live one under its registry's read lock
+        // when a new one registers; if that walk held the last reference to
+        // a finished capture, dropping it would drop the SDK providers, whose
+        // `Drop` logs through a callsite registering for the first time — the
+        // same read lock, re-taken behind a waiting writer: a deadlock of the
+        // whole test binary. One leaked reference per capture rules it out.
+        std::mem::forget(dispatch.clone());
         Self {
-            dispatch: Dispatch::new(subscriber),
+            dispatch,
             telemetry,
             spans,
             logs,
@@ -171,7 +180,14 @@ impl Capture {
     /// Installs the capture as this thread's subscriber until the guard drops.
     #[must_use]
     pub fn enter(&self) -> DefaultGuard {
-        tracing::dispatcher::set_default(&self.dispatch)
+        let guard = tracing::dispatcher::set_default(&self.dispatch);
+        // Every callsite's cached interest is recomputed now that this
+        // dispatch is live. A callsite first reached by another test while
+        // this one's dispatch was registering can otherwise keep the
+        // `never` it computed without it, and its spans silently vanish
+        // from this capture.
+        tracing::callsite::rebuild_interest_cache();
+        guard
     }
 
     /// Flushes, and returns everything exported. Every exported span's
