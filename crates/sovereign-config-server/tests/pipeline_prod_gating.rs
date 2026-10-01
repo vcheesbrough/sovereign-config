@@ -162,6 +162,7 @@ fn build_and_publish_steps_never_run_on_a_deployment() {
         "build-server",
         "build-broker",
         "build-cli",
+        "verify-local-images",
         "tag-release",
         "publish-image",
     ] {
@@ -178,8 +179,9 @@ fn build_and_publish_steps_never_run_on_a_deployment() {
     }
 }
 
-/// A push never deploys: no workflow that runs on a push runs Compose, applies
-/// a blueprint, or exercises the live Authentik manager (card #466).
+/// A push never deploys: no step that runs on a push runs Compose, names a
+/// deployed environment, applies a blueprint, or exercises the live Authentik
+/// manager (card #466).
 #[test]
 fn a_push_never_deploys() {
     let pipeline = pipeline();
@@ -190,7 +192,14 @@ fn a_push_never_deploys() {
         }
         // The parsed step, so comments describing the pipeline do not count.
         let text = serde_yaml::to_string(step).expect("step serialises");
-        for forbidden in ["docker-compose", "authentik-blueprint", "live_"] {
+        // Keyed on what a deploy targets, not on one way of spelling it.
+        for forbidden in [
+            "compose",
+            "authentik-blueprint",
+            "live_",
+            "sovereign-config-dev",
+            "sovereign-config-prod",
+        ] {
             assert!(
                 !text.contains(forbidden),
                 "{name} in {workflow} runs on a push and must not deploy ({forbidden})"
@@ -201,11 +210,13 @@ fn a_push_never_deploys() {
     assert!(checked > 0, "no push step was found to check");
 }
 
-/// The git tag is pushed before any image, so two pushes that allocated the
-/// same version race for the tag — which the release-versions plugin refuses
-/// on a second commit — and the loser never overwrites the winner's images.
+/// The local images' labels are checked before anything is tagged, so a build
+/// that lost its version to another push fails untagged. The git tag is pushed
+/// before any image, so two publishes that compute the same version race for
+/// the tag — which the release-versions plugin refuses on a second commit — and
+/// the loser never overwrites the winner's images.
 #[test]
-fn the_tag_is_pushed_before_the_images() {
+fn labels_are_checked_then_tagged_then_published() {
     let pipeline = pipeline();
     let depends_on = |name: &str| -> Vec<String> {
         pipeline
@@ -217,7 +228,8 @@ fn the_tag_is_pushed_before_the_images() {
             .map(|dependency| dependency.as_str().expect("step name").to_owned())
             .collect()
     };
-    assert_eq!(depends_on("tag-release"), ["compute-version"]);
+    assert_eq!(depends_on("verify-local-images"), ["compute-version"]);
+    assert_eq!(depends_on("tag-release"), ["verify-local-images"]);
     assert_eq!(depends_on("publish-image"), ["tag-release"]);
     assert_eq!(
         pipeline
@@ -771,7 +783,12 @@ fn every_step_sits_in_its_workflow() {
         ),
         (
             "publish",
-            &["compute-version", "tag-release", "publish-image"],
+            &[
+                "compute-version",
+                "verify-local-images",
+                "tag-release",
+                "publish-image",
+            ],
         ),
         (
             "deploy-dev",
@@ -966,9 +983,10 @@ fn prod_authentik_check_is_gated_like_every_prod_step() {
 }
 
 /// build and publish each compute the release tag, because workflows share
-/// nothing. publish-image must therefore refuse images that were not built
-/// from this commit for exactly its own tag, and build must label them so the
-/// check can see both.
+/// nothing. verify-local-images must therefore refuse images that were not
+/// built from this commit for exactly its own tag, and build must label them so
+/// the check can see both. Its place before any tag or push is pinned by
+/// `labels_are_checked_then_tagged_then_published`.
 #[test]
 fn publish_only_ships_images_built_for_this_commit_and_tag() {
     let pipeline = pipeline();
@@ -991,16 +1009,10 @@ fn publish_only_ships_images_built_for_this_commit_and_tag() {
             "{build} must tag the local image {local}"
         );
     }
-    let publish = commands_text(pipeline.step_in("publish", "publish-image"));
-    let guard = publish
-        .find("docker image inspect")
-        .expect("publish-image must inspect the local images");
-    let first_push = publish
-        .find("docker push")
-        .expect("publish-image must push");
+    let check = commands_text(pipeline.step_in("publish", "verify-local-images"));
     assert!(
-        guard < first_push,
-        "the label check must run before any push"
+        check.contains("docker image inspect") && !check.contains("docker push"),
+        "verify-local-images inspects the local images and pushes nothing"
     );
     for expected in [
         "sovereign-config-ci:$$CI_COMMIT_SHA",
@@ -1011,8 +1023,8 @@ fn publish_only_ships_images_built_for_this_commit_and_tag() {
         "\"$$RELEASE_TAG $$CI_COMMIT_SHA\"",
     ] {
         assert!(
-            publish.contains(expected),
-            "publish-image's label check must cover {expected}"
+            check.contains(expected),
+            "verify-local-images's label check must cover {expected}"
         );
     }
 }

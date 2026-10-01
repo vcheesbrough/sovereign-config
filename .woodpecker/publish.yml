@@ -4,13 +4,18 @@
 #
 # Workflows share nothing, so this workflow computes the release tag again.
 # compute-version reuses the tag already on this commit or allocates highest
-# remote patch + 1, so it normally matches the tag build used; publish-image
-# refuses to publish if it does not.
+# remote patch + 1, so it normally matches the tag build used;
+# verify-local-images refuses to go on if it does not, before anything is
+# tagged — so a commit whose build lost its version to another push is never
+# tagged with a version its images do not carry. Re-running it rebuilds and
+# allocates afresh.
 #
-# The tag is pushed before any image. Two pushes that allocate the same version
-# race for the tag, and the release-versions plugin refuses a tag that already
-# sits on another commit — so the loser fails here and never overwrites the
-# winner's images in the registry. Re-running the loser allocates afresh.
+# The tag is pushed before any image. Two publishes that compute the same
+# version at once race for the tag, and the release-versions plugin refuses a
+# tag that already sits on another commit — so the loser fails at tag-release
+# and never overwrites the winner's images in the registry. If publish-image
+# fails after the tag is pushed (the registry is down), a re-run reuses the
+# commit's tag and publishes under it.
 # See checks.yml for how the workflows fit together.
 
 when:
@@ -40,11 +45,38 @@ steps:
       github_token:
         from_secret: github_token
 
+  # The build workflow made all three images on this Docker host and computed
+  # its own release tag. Go on only with images built from this commit for
+  # exactly this tag: if another pipeline tagged a release in between, the two
+  # tags differ and a binary would ship under another version's name. Runs
+  # before tag-release, so a mismatch fails with nothing tagged.
+  verify-local-images:
+    depends_on:
+      - compute-version
+    when:
+      - event: [push, manual]
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - |
+        RELEASE_TAG=$$(cat .release-tag)
+        for LOCAL in sovereign-config-ci:$$CI_COMMIT_SHA sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA sovereign-config-cli-ci:$$CI_COMMIT_SHA; do
+          LABELS=$$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }} {{ index .Config.Labels "org.opencontainers.image.revision" }}' "$$LOCAL") || {
+            echo "ERROR: $$LOCAL was not built on this host" >&2
+            exit 1
+          }
+          if [ "$$LABELS" != "$$RELEASE_TAG $$CI_COMMIT_SHA" ]; then
+            echo "ERROR: $$LOCAL is labelled '$$LABELS', expected '$$RELEASE_TAG $$CI_COMMIT_SHA'" >&2
+            exit 1
+          fi
+        done
+
   tag-release:
     when:
       - event: [push, manual]
     depends_on:
-      - compute-version
+      - verify-local-images
     pull: true
     image: *version-plugin
     settings:
@@ -72,20 +104,8 @@ steps:
         IMAGE=registry.desync.link/sovereign-config:$$RELEASE_TAG
         BROKER_IMAGE=registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG
         CLI_IMAGE=registry.desync.link/sovereign-config-cli:$$RELEASE_TAG
-        # The build workflow made all three images on this Docker host and computed its
-        # own release tag. Publish only images built from this commit for exactly
-        # this tag: if another pipeline tagged a release in between, the two tags
-        # differ and a binary would ship under another version's name.
-        for LOCAL in sovereign-config-ci:$$CI_COMMIT_SHA sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA sovereign-config-cli-ci:$$CI_COMMIT_SHA; do
-          LABELS=$$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }} {{ index .Config.Labels "org.opencontainers.image.revision" }}' "$$LOCAL") || {
-            echo "ERROR: $$LOCAL was not built on this host" >&2
-            exit 1
-          }
-          if [ "$$LABELS" != "$$RELEASE_TAG $$CI_COMMIT_SHA" ]; then
-            echo "ERROR: $$LOCAL is labelled '$$LABELS', expected '$$RELEASE_TAG $$CI_COMMIT_SHA'" >&2
-            exit 1
-          fi
-        done
+        # verify-local-images has proved these are this commit's images for
+        # exactly this tag.
         echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
         docker tag sovereign-config-ci:$$CI_COMMIT_SHA "$$IMAGE"
         docker push "$$IMAGE"

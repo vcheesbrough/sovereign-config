@@ -10,7 +10,7 @@
 #   checks       script-validation, unit-test, client-playwright   (+ postgres-test)
 #   build        compute-version ∥ prune-build-cache
 #                → build-server ∥ build-broker ∥ build-cli
-#   publish      compute-version → tag-release → publish-image
+#   publish      compute-version → verify-local-images → tag-release → publish-image
 #   deploy-dev   resolve-release-tag ∥ validate-authentik-version
 #                → verify-image ∥ apply-authentik-blueprint-dev
 #                → validate-authentik-manager-live → deploy-dev
