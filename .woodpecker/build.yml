@@ -1,10 +1,10 @@
 # Build workflow: compute the release tag and build all three images, in
-# parallel with checks. Nothing here publishes: deploy-dev pushes these images
+# parallel with checks. Nothing here publishes: publish pushes these images
 # only after checks has passed.
 #
 # Three images, one semver — each built from its own docker/<image>.Dockerfile,
 # which builds only what that image ships. Each is tagged locally as <name>-ci:<commit> and labelled with the
-# release tag and commit, which deploy-dev checks before it publishes.
+# release tag and commit, which publish checks before it pushes them.
 # See checks.yml for how the workflows fit together.
 
 when:

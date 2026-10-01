@@ -1,47 +1,27 @@
-# Deploy-dev workflow: publish the three images the build workflow made, apply the
-# dev Authentik blueprint, prove the connection manager against live Authentik,
-# deploy dev, then push the git tag.
-#
-# Workflows share nothing, so this workflow computes the release tag again.
-# compute-version reuses the tag already on this commit or allocates highest
-# remote patch + 1, so it normally matches the tag build used; publish-dev-image
-# refuses to publish if it does not.
+# Deploy-dev workflow: development is a manual deployment of the exact images
+# the push pipeline already built, published and git-tagged for this commit —
+# triggered by Woodpecker's Deploy feature, a `deployment` event targeting dev,
+# from any branch. A push never deploys (card #466), so pushes from several
+# branches no longer queue behind each other's deploys or fight over the one
+# dev environment. Like deploy-prod, nothing here rebuilds, republishes, or
+# mints a version: resolve-release-tag reads the semver the push tagged onto
+# this commit (NEVER allocates — bored card #254), verify-image proves the
+# published images exist, and deploy-dev deploys them.
 # See checks.yml for how the workflows fit together.
 
 when:
-  - event: [push, manual]
-
-# Nothing here starts until every check has passed and all three images are built.
-# All three workflows run on push and manual alike, so neither dependency is optional.
-depends_on:
-  - checks
-  - build
+  - event: deployment
+    evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "dev"'
 
 steps:
-  # Allocates ONE semver per commit — ONLY on a push or manual run, the single
-  # place a version is minted. A deployment must NOT run this: it would allocate
-  # the *next* patch (an unbuilt tag) and deploy-prod would pull an image that
-  # was never published. Deployments resolve the commit's existing tag via
-  # resolve-release-tag instead (mirrors bored card #254).
-  compute-version:
-    when:
-      - event: [push, manual]
-    depends_on: []
-    pull: true
-    image: &version-plugin ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.1.1@sha256:cf74d9706cb42b6d27c8d185789cd814ed061c8c88e06452d33ce3aed0bf9a22
-    settings:
-      mode: compute
-      major_minor_source: cargo
-      github_token:
-        from_secret: github_token
-
   # A cheap, dependency-free curl gate: live Authentik must be new enough and
   # expose every API surface managed connections need, before this workflow
   # applies its blueprint. It needs no build artifact, so it depends on nothing.
   validate-authentik-version:
     depends_on: []
     when:
-      - event: [push, manual]
+      - event: deployment
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "dev"'
     image: docker.io/curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
     environment:
       AUTHENTIK_API_TOKEN:
@@ -61,13 +41,50 @@ steps:
         grep -q 'initial_permissions' /tmp/authentik-schema.json
         echo "Validated compatible Authentik $$VERSION"
 
-  publish-dev-image:
-    # The checks and build workflows gate this through the workflow-level
-    # depends_on: nothing is published until every check has passed.
-    depends_on:
-      - compute-version
+  # Resolve the semver the push already allocated and tagged onto this commit —
+  # a deployment must NEVER allocate (that mints an unbuilt tag; see bored card
+  # #254). Fail closed if the commit was never published by a push (no tag on
+  # the commit).
+  resolve-release-tag:
+    depends_on: []
     when:
-      - event: [push, manual]
+      - event: deployment
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "dev"'
+    # Digest-pinned image that already ships git — no runtime package install on
+    # the deploy path (repo policy: pin by digest, no undeclared outbound fetch).
+    image: docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
+    environment:
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      - |
+        git config --global --add safe.directory '*'
+        # Fast path: a semver tag already on HEAD from the clone.
+        RELEASE_TAG=$$(git tag --points-at HEAD 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$$' | sort -V | tail -1)
+        # Fallback (private repo): query the remote without fetching objects;
+        # annotated tags carry the commit sha on the dereferenced (^{}) line.
+        if [ -z "$$RELEASE_TAG" ]; then
+          RELEASE_TAG=$$(git ls-remote --tags "https://x-access-token:$$GITHUB_TOKEN@github.com/$$CI_REPO" \
+            | awk -v sha="$$CI_COMMIT_SHA" '{ ref=$$2; sub("refs/tags/","",ref); sub(/\^\{\}$$/,"",ref) } $$1==sha && ref ~ /^[0-9]+\.[0-9]+\.[0-9]+$$/ { print ref }' \
+            | sort -V | tail -1)
+        fi
+        if [ -z "$$RELEASE_TAG" ]; then
+          echo "ERROR: commit $$CI_COMMIT_SHA has no release tag." >&2
+          echo "A commit must finish its push pipeline (checks + build + publish -> git tag) before it can be deployed." >&2
+          exit 1
+        fi
+        printf '%s' "$$RELEASE_TAG" > .release-tag
+        echo "Deploying release $$RELEASE_TAG (resolved from the push publish; no re-allocation)."
+
+  # Deploy the artifact the push pipeline already built and published for this
+  # commit — do NOT rebuild. Pull the exact tag and fail closed if it is absent,
+  # which means this commit never completed its push publish.
+  verify-image:
+    depends_on:
+      - resolve-release-tag
+    when:
+      - event: deployment
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "dev"'
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -79,39 +96,28 @@ steps:
     commands:
       - |
         RELEASE_TAG=$$(cat .release-tag)
-        IMAGE=registry.desync.link/sovereign-config:$$RELEASE_TAG
-        BROKER_IMAGE=registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG
-        CLI_IMAGE=registry.desync.link/sovereign-config-cli:$$RELEASE_TAG
-        # The build workflow made all three images on this Docker host and computed its
-        # own release tag. Publish only images built from this commit for exactly
-        # this tag: if another pipeline tagged a release in between, the two tags
-        # differ and a binary would ship under another version's name.
-        for LOCAL in sovereign-config-ci:$$CI_COMMIT_SHA sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA sovereign-config-cli-ci:$$CI_COMMIT_SHA; do
-          LABELS=$$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }} {{ index .Config.Labels "org.opencontainers.image.revision" }}' "$$LOCAL") || {
-            echo "ERROR: $$LOCAL was not built on this host" >&2
-            exit 1
-          }
-          if [ "$$LABELS" != "$$RELEASE_TAG $$CI_COMMIT_SHA" ]; then
-            echo "ERROR: $$LOCAL is labelled '$$LABELS', expected '$$RELEASE_TAG $$CI_COMMIT_SHA'" >&2
+        echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
+        # Fail closed if any image is missing: a promotion that shipped the
+        # server without its matching broker would leave CI resolving secrets
+        # against a stale extension, and a tag without its CLI image is not a
+        # whole release for the pipelines that pin it.
+        for IMAGE in \
+          registry.desync.link/sovereign-config:$$RELEASE_TAG \
+          registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG \
+          registry.desync.link/sovereign-config-cli:$$RELEASE_TAG; do
+          if ! docker pull "$$IMAGE"; then
+            echo "ERROR: $$IMAGE not found in the registry." >&2
+            echo "The push pipeline (checks + build + publish) must succeed for this commit before it can be deployed." >&2
             exit 1
           fi
         done
-        echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
-        docker tag sovereign-config-ci:$$CI_COMMIT_SHA "$$IMAGE"
-        docker push "$$IMAGE"
-        # All three images carry the same semver, so server, broker and CLI are
-        # always protocol-matched by construction.
-        docker tag sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA "$$BROKER_IMAGE"
-        docker push "$$BROKER_IMAGE"
-        docker tag sovereign-config-cli-ci:$$CI_COMMIT_SHA "$$CLI_IMAGE"
-        docker push "$$CLI_IMAGE"
 
-  apply-authentik-blueprint-auto-dev:
+  apply-authentik-blueprint-dev:
     depends_on:
       - validate-authentik-version
-      - publish-dev-image
     when:
-      - event: [push, manual]
+      - event: deployment
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "dev"'
     pull: true
     image: ghcr.io/vcheesbrough/woodpecker-plugin-authentik-blueprint:v0.2.0@sha256:9f262c4390205b5629e9af7560f4e492f0155395a429153703ba351206d9d975
     settings:
@@ -133,9 +139,10 @@ steps:
   # cannot reach the running service.
   validate-authentik-manager-live:
     depends_on:
-      - apply-authentik-blueprint-auto-dev
+      - apply-authentik-blueprint-dev
     when:
-      - event: [push, manual]
+      - event: deployment
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "dev"'
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
     environment:
       CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
@@ -162,15 +169,21 @@ steps:
       - scripts/ci-prune-cargo-target.sh
       - cargo test --package sovereign-config-server live_ -- --ignored --test-threads=1
 
-  auto-deploy-dev:
+  deploy-dev:
     depends_on:
       - validate-authentik-manager-live
+      - verify-image
     when:
-      - event: [push, manual]
+      - event: deployment
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "dev"'
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
+      REGISTRY_USER:
+        from_secret: zot_ci_user
+      REGISTRY_PASSWORD:
+        from_secret: zot_ci_password
       POSTGRES_PASSWORD:
         from_secret: sovereign_config_dev_postgres_password
       OIDC_ISSUER: https://auth.desync.link/application/o/sovereign-config-dev/
@@ -179,6 +192,7 @@ steps:
       VALUE_ENCRYPTION_KEY:
         from_secret: sovereign_config_dev_value_encryption_key
     commands:
+      - echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
       - |
         # Telemetry (README "Observability"): non-secret, so kept here with the
         # deploy rather than in the store this deploy would have to read itself
@@ -200,7 +214,7 @@ steps:
         ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
         # Exported rather than prefixed, because two Compose runs read them.
         export SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config-dev/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-dev SOVEREIGN_CONFIG_PUBLIC_ORIGIN=https://sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT=https://sovereign-config-dev.desync.link SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE=sovereign_config_dev_grants SOVEREIGN_CONFIG_MANAGER_GROUP=sovereign-config-dev-connections SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE= SOVEREIGN_CONFIG_MANAGER_API_TOKEN="$$MANAGER_API_TOKEN" SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE= SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY="$$VALUE_ENCRYPTION_KEY"
-        "$$COMPOSE" -p sovereign-config-dev up -d --wait --wait-timeout 90 || {
+        "$$COMPOSE" -p sovereign-config-dev up -d --pull always --wait --wait-timeout 90 || {
           "$$COMPOSE" -p sovereign-config-dev logs --tail 200
           exit 1
         }
@@ -208,16 +222,3 @@ steps:
         # started after the gate above and never part of it: its failure is a
         # warning, not a failed deploy (README "Observability").
         "$$COMPOSE" -p sovereign-config-dev --profile client-telemetry up -d --no-deps otlp-ingest || echo "WARNING: the client-telemetry ingest did not start; the deploy continues without it" >&2
-
-  tag-release-auto-dev:
-    when:
-      - event: [push, manual]
-    depends_on:
-      - auto-deploy-dev
-    pull: true
-    image: *version-plugin
-    settings:
-      mode: push-tag
-      major_minor_source: cargo
-      github_token:
-        from_secret: github_token

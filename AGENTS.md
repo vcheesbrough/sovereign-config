@@ -37,6 +37,11 @@ After initialization, follow the baseline feature-branch workflow (§2–§3).
 Run the **`ci-watch`** skill (baseline §4) with `OWNER=vcheesbrough`,
 `REPO=sovereign-config`. Repo specifics:
 
+- **A push never deploys** (#466). A push pipeline is green once checks,
+  build and publish pass; it has tagged the commit and published its images.
+  Dev is deployed only by a Woodpecker Deploy targeting `dev` (any branch), and
+  the one dev environment runs whichever branch was deployed last — so trigger
+  a dev deployment only when the user asks for one.
 - **Deployment smoke check** (post-pipeline, not part of `ci-watch`): for a
   successful development deployment, directly
   call its public native gRPC `System.GetVersion` endpoint **after** the

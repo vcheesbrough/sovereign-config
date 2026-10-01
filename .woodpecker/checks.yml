@@ -3,33 +3,38 @@
 #
 # The pipeline is split into workflows, one file each, in the style of v-note:
 #
-#   push/manual: checks ∥ build → deploy-dev   (a manual run is identical to a push)
-#   deployment:  deploy-prod   (prod target, from main only)
+#   push/manual: checks ∥ build → publish   (a manual run is identical to a push)
+#   deployment:  deploy-dev    (dev target, from any branch)
+#                deploy-prod   (prod target, from main only)
 #
 #   checks       script-validation, unit-test, client-playwright   (+ postgres-test)
 #   build        compute-version ∥ prune-build-cache
 #                → build-server ∥ build-broker ∥ build-cli
-#   deploy-dev   compute-version ∥ validate-authentik-version → publish-dev-image
-#                → apply-authentik-blueprint-auto-dev → validate-authentik-manager-live
-#                → auto-deploy-dev → tag-release-auto-dev
+#   publish      compute-version → tag-release → publish-image
+#   deploy-dev   resolve-release-tag ∥ validate-authentik-version
+#                → verify-image ∥ apply-authentik-blueprint-dev
+#                → validate-authentik-manager-live → deploy-dev
 #   deploy-prod  resolve-release-tag ∥ validate-authentik-version
 #                → verify-image ∥ apply-authentik-blueprint-prod
 #                → validate-authentik-manager-live-prod → deploy-prod
+#
+# A push never deploys (card #466): it tags and publishes, and a deployment —
+# dev or prod — promotes what a push published, by the commit's tag.
 #
 # Why workflows and not one file of `depends_on` steps: Woodpecker runs step
 # dependencies as whole stages, so a step starts only when every step of the
 # previous dependency level has finished, not just the ones it names. Workflows
 # share nothing — no workspace, no `.release-tag` — so each value a step reads is
-# produced inside its own workflow. deploy-dev depends on checks and build, so an
-# image is never published before every check passes.
+# produced inside its own workflow. publish depends on checks and build, so a
+# commit is never tagged or published before every check passes.
 #
-# validate-authentik-version appears in both deploy workflows: it guards the
-# blueprint apply in each, and workflows cannot share a step.
+# validate-authentik-version, resolve-release-tag and verify-image appear in
+# both deploy workflows, and workflows cannot share a step.
 #
-# Every build, publish, version-allocation and dev-deploy step runs on push and
-# manual only, and
-# every production step is deployment-only; each step also carries its own
-# `when`, which crates/sovereign-config-server/tests/pipeline_prod_gating.rs pins.
+# Every build, publish, version-allocation and tag step runs on push and manual
+# only, and every deploy step is deployment-only, guarded by its target; each
+# step also carries its own `when`, which
+# crates/sovereign-config-server/tests/pipeline_prod_gating.rs pins.
 
 when:
   - event: [push, manual]

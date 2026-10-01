@@ -1,4 +1,4 @@
-# Deploy-prod workflow: production is a promotion of the exact image the dev
+# Deploy-prod workflow: production is a promotion of the exact image the
 # push already built, published, and git-tagged for this commit — triggered by
 # Woodpecker's Deploy feature, a `deployment` event targeting prod, only from
 # main. Nothing here rebuilds, republishes, or mints a new version:
@@ -41,9 +41,9 @@ steps:
         grep -q 'initial_permissions' /tmp/authentik-schema.json
         echo "Validated compatible Authentik $$VERSION"
 
-  # Resolve the semver the dev push already allocated and tagged onto this
+  # Resolve the semver the push already allocated and tagged onto this
   # commit — a deployment must NEVER allocate (that mints an unbuilt tag; see
-  # bored card #254). Fail closed if the commit was never built/dev-deployed on
+  # bored card #254). Fail closed if the commit was never published by
   # a push (no tag on the commit).
   resolve-release-tag:
     depends_on: []
@@ -71,11 +71,11 @@ steps:
         fi
         if [ -z "$$RELEASE_TAG" ]; then
           echo "ERROR: commit $$CI_COMMIT_SHA has no release tag." >&2
-          echo "A commit must finish its push pipeline (build + dev deploy -> git tag) before it can be promoted to production." >&2
+          echo "A commit must finish its push pipeline (checks + build + publish -> git tag) before it can be deployed." >&2
           exit 1
         fi
         printf '%s' "$$RELEASE_TAG" > .release-tag
-        echo "Promoting release $$RELEASE_TAG (resolved from the push build/dev-deploy; no re-allocation)."
+        echo "Deploying release $$RELEASE_TAG (resolved from the push publish; no re-allocation)."
 
   # Promote the artifact the push pipeline already built and published for this
   # commit — do NOT rebuild. Pull the exact tag and fail closed if it is absent,
@@ -109,7 +109,7 @@ steps:
           registry.desync.link/sovereign-config-cli:$$RELEASE_TAG; do
           if ! docker pull "$$IMAGE"; then
             echo "ERROR: $$IMAGE not found in the registry." >&2
-            echo "The push pipeline (build + publish) must succeed for this commit before it can be promoted." >&2
+            echo "The push pipeline (checks + build + publish) must succeed for this commit before it can be deployed." >&2
             exit 1
           fi
         done
