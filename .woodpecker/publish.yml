@@ -3,19 +3,16 @@
 # here deploys: a dev deployment is a manual Woodpecker Deploy (deploy-dev.yml).
 #
 # Workflows share nothing, so this workflow computes the release tag again.
-# compute-version reuses the tag already on this commit or allocates highest
-# remote patch + 1, so it normally matches the tag build used;
-# verify-local-images refuses to go on if it does not, before anything is
-# tagged — so a commit whose build lost its version to another push is never
-# tagged with a version its images do not carry. Re-running it rebuilds and
-# allocates afresh.
+# The patch is the pipeline number, so it is the tag build used.
+# verify-local-images still checks that, before anything is tagged: the local
+# images are named by commit, so two pipelines building one commit at once
+# could leave another pipeline's images under that name.
 #
-# The tag is pushed before any image. Two publishes that compute the same
-# version at once race for the tag, and the release-versions plugin refuses a
-# tag that already sits on another commit — so the loser fails at tag-release
-# and never overwrites the winner's images in the registry. If publish-image
-# fails after the tag is pushed (the registry is down), a re-run reuses the
-# commit's tag and publishes under it.
+# Pipeline numbers are unique, so no two pipelines ever push the same tag, and
+# no tag is ever reused. A re-run is a new pipeline: it tags the same commit
+# again under its own number, and deployments take the commit's highest tag.
+# The tag is pushed before any image, so a published image always has its tag;
+# if publish-image fails (the registry is down), re-run the pipeline.
 # See checks.yml for how the workflows fit together.
 
 when:
@@ -28,28 +25,26 @@ depends_on:
   - build
 
 steps:
-  # Allocates ONE semver per commit — ONLY on a push or manual run, the single
-  # place a version is minted. A deployment must NOT run this: it would allocate
-  # the *next* patch (an unbuilt tag) and the deploy would pull an image that
-  # was never published. Deployments resolve the commit's existing tag via
+  # The release tag is Cargo's major.minor plus this pipeline's number as the
+  # patch (scripts/ci-release-tag.sh): nothing to allocate, nothing to race,
+  # and build and publish derive the same tag. ONLY on a push or manual run: a
+  # deployment is its own pipeline, so computing there would name a version
+  # that was never built. Deployments resolve the commit's existing tag via
   # resolve-release-tag instead (mirrors bored card #254).
   compute-version:
     when:
       - event: [push, manual]
     depends_on: []
-    pull: true
-    image: &version-plugin ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.1.1@sha256:cf74d9706cb42b6d27c8d185789cd814ed061c8c88e06452d33ce3aed0bf9a22
-    settings:
-      mode: compute
-      major_minor_source: cargo
-      github_token:
-        from_secret: github_token
+    image: docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
+    commands:
+      - sh scripts/ci-release-tag.sh Cargo.toml > .release-tag
+      - echo "Release $$(cat .release-tag)"
 
   # The build workflow made all three images on this Docker host and computed
   # its own release tag. Go on only with images built from this commit for
-  # exactly this tag: if another pipeline tagged a release in between, the two
-  # tags differ and a binary would ship under another version's name. Runs
-  # before tag-release, so a mismatch fails with nothing tagged.
+  # exactly this tag: if another pipeline rebuilt this commit in between, the
+  # labels name its version and a binary would ship under another version's
+  # name. Runs before tag-release, so a mismatch fails with nothing tagged.
   verify-local-images:
     depends_on:
       - compute-version
@@ -72,18 +67,25 @@ steps:
           fi
         done
 
+  # A lightweight tag on this commit. The push fails if the tag already exists,
+  # which a unique pipeline number rules out unless Cargo's major.minor went
+  # backwards.
   tag-release:
     when:
       - event: [push, manual]
     depends_on:
       - verify-local-images
-    pull: true
-    image: *version-plugin
-    settings:
-      mode: push-tag
-      major_minor_source: cargo
-      github_token:
+    image: docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
+    environment:
+      GITHUB_TOKEN:
         from_secret: github_token
+    commands:
+      - |
+        git config --global --add safe.directory '*'
+        RELEASE_TAG=$$(cat .release-tag)
+        git tag "$$RELEASE_TAG" "$$CI_COMMIT_SHA"
+        git push "https://x-access-token:$$GITHUB_TOKEN@github.com/$$CI_REPO" "refs/tags/$$RELEASE_TAG"
+        echo "Tagged $$CI_COMMIT_SHA as $$RELEASE_TAG"
 
   publish-image:
     depends_on:

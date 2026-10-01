@@ -11,22 +11,20 @@ when:
   - event: [push, manual]
 
 steps:
-  # Allocates ONE semver per commit — ONLY on a push or manual run, the single
-  # place a version is minted. A deployment must NOT run this: it would allocate
-  # the *next* patch (an unbuilt tag) and deploy-prod would pull an image that
-  # was never published. Deployments resolve the commit's existing tag via
+  # The release tag is Cargo's major.minor plus this pipeline's number as the
+  # patch (scripts/ci-release-tag.sh): nothing to allocate, nothing to race,
+  # and build and publish derive the same tag. ONLY on a push or manual run: a
+  # deployment is its own pipeline, so computing there would name a version
+  # that was never built. Deployments resolve the commit's existing tag via
   # resolve-release-tag instead (mirrors bored card #254).
   compute-version:
     when:
       - event: [push, manual]
     depends_on: []
-    pull: true
-    image: &version-plugin ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.1.1@sha256:cf74d9706cb42b6d27c8d185789cd814ed061c8c88e06452d33ce3aed0bf9a22
-    settings:
-      mode: compute
-      major_minor_source: cargo
-      github_token:
-        from_secret: github_token
+    image: docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
+    commands:
+      - sh scripts/ci-release-tag.sh Cargo.toml > .release-tag
+      - echo "Release $$(cat .release-tag)"
 
   # Bounds this repository's BuildKit cargo target cache mount, which the image
   # builds compile into and nothing else on the host prunes. Only the

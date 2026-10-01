@@ -46,9 +46,10 @@ steps:
       - event: [push, manual]
     image: docker.io/koalaman/shellcheck-alpine@sha256:e19ed93c22423970d56568e171b4512c9244fc75dd9114045016b4a0073ac4b7
     commands:
-      - shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh scripts/migrate-openbao-woodpecker-secrets.sh scripts/ci-prune-cargo-target.sh scripts/ci-prune-cargo-target-test.sh scripts/ci-prune-buildkit-cache.sh scripts/ci-prune-buildkit-cache-test.sh
+      - shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh scripts/migrate-openbao-woodpecker-secrets.sh scripts/ci-prune-cargo-target.sh scripts/ci-prune-cargo-target-test.sh scripts/ci-prune-buildkit-cache.sh scripts/ci-prune-buildkit-cache-test.sh scripts/ci-release-tag.sh scripts/ci-release-tag-test.sh
       - sh scripts/ci-prune-cargo-target-test.sh
       - sh scripts/ci-prune-buildkit-cache-test.sh
+      - sh scripts/ci-release-tag-test.sh
 
   unit-test:
     depends_on: []

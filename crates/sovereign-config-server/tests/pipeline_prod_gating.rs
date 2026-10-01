@@ -210,11 +210,10 @@ fn a_push_never_deploys() {
     assert!(checked > 0, "no push step was found to check");
 }
 
-/// The local images' labels are checked before anything is tagged, so a build
-/// that lost its version to another push fails untagged. The git tag is pushed
-/// before any image, so two publishes that compute the same version race for
-/// the tag — which the release-versions plugin refuses on a second commit — and
-/// the loser never overwrites the winner's images.
+/// The local images' labels are checked before anything is tagged, so images
+/// another pipeline rebuilt under this commit's name fail untagged. The git tag
+/// is pushed before any image, so a published image always has its tag; the
+/// push is a plain `git push` of a new tag, which refuses an existing one.
 #[test]
 fn labels_are_checked_then_tagged_then_published() {
     let pipeline = pipeline();
@@ -231,13 +230,13 @@ fn labels_are_checked_then_tagged_then_published() {
     assert_eq!(depends_on("verify-local-images"), ["compute-version"]);
     assert_eq!(depends_on("tag-release"), ["verify-local-images"]);
     assert_eq!(depends_on("publish-image"), ["tag-release"]);
-    assert_eq!(
-        pipeline
-            .step_in("publish", "tag-release")
-            .get("settings")
-            .and_then(|settings| settings.get("mode"))
-            .and_then(Value::as_str),
-        Some("push-tag")
+    let tag = commands_text(pipeline.step_in("publish", "tag-release"));
+    assert!(
+        tag.contains("git tag \"$$RELEASE_TAG\" \"$$CI_COMMIT_SHA\"")
+            && tag.contains("\"refs/tags/$$RELEASE_TAG\"")
+            && !tag.contains("--force")
+            && !tag.contains(" -f "),
+        "tag-release must push this commit's release tag and never overwrite one"
     );
     assert_eq!(pipeline.workflows_of("tag-release"), ["publish"]);
 }
@@ -567,22 +566,21 @@ fn the_release_publishes_every_image_under_one_semver() {
 #[test]
 fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
     let pipeline = pipeline();
-    // compute-version (mode compute) allocates the next semver; it must be
-    // push/manual-only. On a deployment it would mint the *next* patch — an unbuilt tag
-    // — and the deploy would pull an image that was never published.
+    // compute-version names the version after the running pipeline; it must be
+    // push/manual-only. A deployment is its own pipeline, so there it would name
+    // a version that was never built and the deploy would pull an image that
+    // was never published.
     assert_eq!(
         pipeline.workflows_of("compute-version"),
         ["build", "publish"]
     );
     for workflow in ["build", "publish"] {
         assert_eq!(
-            pipeline
-                .step_in(workflow, "compute-version")
-                .get("settings")
-                .and_then(|settings| settings.get("mode"))
-                .and_then(Value::as_str),
-            Some("compute"),
-            "compute-version allocates, so it must stay off the deployment event (asserted above)"
+            commands_text(pipeline.step_in(workflow, "compute-version"))
+                .lines()
+                .next(),
+            Some("sh scripts/ci-release-tag.sh Cargo.toml > .release-tag"),
+            "both workflows of a pipeline must derive the tag the same way"
         );
     }
     // The deployment resolves the commit's already-built tag instead of
