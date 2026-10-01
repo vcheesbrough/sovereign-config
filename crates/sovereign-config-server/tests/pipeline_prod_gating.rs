@@ -162,9 +162,7 @@ fn build_and_publish_steps_never_run_on_a_deployment() {
         "build-server",
         "build-broker",
         "build-cli",
-        "verify-local-images",
         "tag-release",
-        "publish-image",
     ] {
         let pipeline = pipeline();
         let workflows = pipeline.workflows_of(name);
@@ -210,26 +208,33 @@ fn a_push_never_deploys() {
     assert!(checked > 0, "no push step was found to check");
 }
 
-/// The local images' labels are checked before anything is tagged, so images
-/// another pipeline rebuilt under this commit's name fail untagged. The git tag
-/// is pushed before any image, so a published image always has its tag; the
-/// push is a plain `git push` of a new tag, which refuses an existing one.
+/// The git tag is the release, so publish only tags: it pushes no image, and
+/// the tag push is a plain `git push` of a new tag, which refuses an existing
+/// one. It runs only after checks and build (`publish_waits_for_checks_and_build`).
 #[test]
-fn labels_are_checked_then_tagged_then_published() {
+fn publish_releases_by_tagging_only() {
     let pipeline = pipeline();
-    let depends_on = |name: &str| -> Vec<String> {
+    assert_eq!(
         pipeline
-            .step_in("publish", name)
+            .step_in("publish", "tag-release")
             .get("depends_on")
             .and_then(Value::as_sequence)
-            .expect("publish steps list their dependencies")
+            .expect("tag-release lists its dependencies")
             .iter()
-            .map(|dependency| dependency.as_str().expect("step name").to_owned())
-            .collect()
-    };
-    assert_eq!(depends_on("verify-local-images"), ["compute-version"]);
-    assert_eq!(depends_on("tag-release"), ["verify-local-images"]);
-    assert_eq!(depends_on("publish-image"), ["tag-release"]);
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>(),
+        ["compute-version"]
+    );
+    for (workflow, name, step) in pipeline.steps() {
+        if workflow == "publish" {
+            let text = serde_yaml::to_string(step).expect("step serialises");
+            // `docker.io/…` images are fine; the Docker socket and CLI are not.
+            assert!(
+                !text.contains("docker.sock") && !text.contains("docker push"),
+                "publish's {name} must not touch an image; build pushes them"
+            );
+        }
+    }
     let tag = commands_text(pipeline.step_in("publish", "tag-release"));
     assert!(
         tag.contains("git tag \"$$RELEASE_TAG\" \"$$CI_COMMIT_SHA\"")
@@ -528,39 +533,49 @@ fn the_cli_image_is_the_pipeline_docker_image_plus_the_cli() {
 }
 
 /// Server, broker and CLI ship as one release: the same commit, the same
-/// semver, the same publish step. A tag that carries only some of them is not a
-/// release.
+/// semver. Each build step builds its image straight under the release tag and
+/// pushes exactly that image — nothing re-reads a local image name another
+/// pipeline could have replaced. The tag that releases them is publish's.
 #[test]
-fn the_release_publishes_every_image_under_one_semver() {
-    let publish = commands_text(step(&pipeline(), "publish-image"));
-    for (local, published) in [
+fn every_image_is_pushed_under_the_release_tag_as_it_is_built() {
+    let pipeline = pipeline();
+    for (build, published) in [
         (
-            "sovereign-config-ci:$$CI_COMMIT_SHA",
+            "build-server",
             "registry.desync.link/sovereign-config:$$RELEASE_TAG",
         ),
         (
-            "sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA",
+            "build-broker",
             "registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG",
         ),
         (
-            "sovereign-config-cli-ci:$$CI_COMMIT_SHA",
+            "build-cli",
             "registry.desync.link/sovereign-config-cli:$$RELEASE_TAG",
         ),
     ] {
+        let commands = commands_text(pipeline.step_in("build", build));
         assert!(
-            publish.contains(published),
-            "publish-image must push {published} at the allocated release tag"
+            commands.contains(&format!("IMAGE={published}\n")),
+            "{build} must build {published}"
         );
         assert!(
-            publish.contains(&format!("docker tag {local} ")),
-            "publish-image must publish {published} from the local build {local}"
+            commands.contains("--tag \"$$IMAGE\""),
+            "{build} must tag its build as the published image"
+        );
+        assert_eq!(
+            commands.matches("docker push").count(),
+            1,
+            "{build} must push exactly its own image"
+        );
+        let built = commands.find("docker build").expect("builds");
+        let pushed = commands.find("docker push \"$$IMAGE\"").expect("pushes");
+        assert!(built < pushed, "{build} pushes what it just built");
+        assert!(
+            commands.contains("org.opencontainers.image.version=\"$$RELEASE_TAG\"")
+                && commands.contains("org.opencontainers.image.revision=\"$$CI_COMMIT_SHA\""),
+            "{build} must label its image with the release tag and commit"
         );
     }
-    assert_eq!(
-        publish.matches("docker push").count(),
-        3,
-        "publish-image must push exactly the three release images"
-    );
 }
 
 #[test]
@@ -779,15 +794,7 @@ fn every_step_sits_in_its_workflow() {
                 "build-cli",
             ],
         ),
-        (
-            "publish",
-            &[
-                "compute-version",
-                "verify-local-images",
-                "tag-release",
-                "publish-image",
-            ],
-        ),
+        ("publish", &["compute-version", "tag-release"]),
         (
             "deploy-dev",
             &[
@@ -977,53 +984,6 @@ fn prod_authentik_check_is_gated_like_every_prod_step() {
                 .collect()
         );
         assert_eq!(condition.evaluate.as_deref(), Some(PROD_TARGET));
-    }
-}
-
-/// build and publish each compute the release tag, because workflows share
-/// nothing. verify-local-images must therefore refuse images that were not
-/// built from this commit for exactly its own tag, and build must label them so
-/// the check can see both. Its place before any tag or push is pinned by
-/// `labels_are_checked_then_tagged_then_published`.
-#[test]
-fn publish_only_ships_images_built_for_this_commit_and_tag() {
-    let pipeline = pipeline();
-    for (build, local) in [
-        ("build-server", "sovereign-config-ci:$$CI_COMMIT_SHA"),
-        (
-            "build-broker",
-            "sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA",
-        ),
-        ("build-cli", "sovereign-config-cli-ci:$$CI_COMMIT_SHA"),
-    ] {
-        let commands = commands_text(pipeline.step_in("build", build));
-        assert!(
-            commands.contains("org.opencontainers.image.version=\"$$RELEASE_TAG\"")
-                && commands.contains("org.opencontainers.image.revision=\"$$CI_COMMIT_SHA\""),
-            "{build} must label its image with the release tag and commit"
-        );
-        assert!(
-            commands.contains(&format!("IMAGE={local}")),
-            "{build} must tag the local image {local}"
-        );
-    }
-    let check = commands_text(pipeline.step_in("publish", "verify-local-images"));
-    assert!(
-        check.contains("docker image inspect") && !check.contains("docker push"),
-        "verify-local-images inspects the local images and pushes nothing"
-    );
-    for expected in [
-        "sovereign-config-ci:$$CI_COMMIT_SHA",
-        "sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA",
-        "sovereign-config-cli-ci:$$CI_COMMIT_SHA",
-        "org.opencontainers.image.version",
-        "org.opencontainers.image.revision",
-        "\"$$RELEASE_TAG $$CI_COMMIT_SHA\"",
-    ] {
-        assert!(
-            check.contains(expected),
-            "verify-local-images's label check must cover {expected}"
-        );
     }
 }
 

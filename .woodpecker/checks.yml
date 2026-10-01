@@ -9,8 +9,8 @@
 #
 #   checks       script-validation, unit-test, client-playwright   (+ postgres-test)
 #   build        compute-version ∥ prune-build-cache
-#                → build-server ∥ build-broker ∥ build-cli
-#   publish      compute-version → verify-local-images → tag-release → publish-image
+#                → build-server ∥ build-broker ∥ build-cli   (each pushes its image)
+#   publish      compute-version → tag-release
 #   deploy-dev   resolve-release-tag ∥ validate-authentik-version
 #                → verify-image ∥ apply-authentik-blueprint-dev
 #                → validate-authentik-manager-live → deploy-dev
@@ -18,15 +18,16 @@
 #                → verify-image ∥ apply-authentik-blueprint-prod
 #                → validate-authentik-manager-live-prod → deploy-prod
 #
-# A push never deploys (card #466): it tags and publishes, and a deployment —
-# dev or prod — promotes what a push published, by the commit's tag.
+# A push never deploys (card #466): it pushes its images and, once every check
+# has passed, releases them with a git tag; a deployment — dev or prod —
+# promotes a released version, by the commit's tag.
 #
 # Why workflows and not one file of `depends_on` steps: Woodpecker runs step
 # dependencies as whole stages, so a step starts only when every step of the
 # previous dependency level has finished, not just the ones it names. Workflows
 # share nothing — no workspace, no `.release-tag` — so each value a step reads is
 # produced inside its own workflow. publish depends on checks and build, so a
-# commit is never tagged or published before every check passes.
+# commit is never tagged — released — before every check passes.
 #
 # validate-authentik-version, resolve-release-tag and verify-image appear in
 # both deploy workflows, and workflows cannot share a step.

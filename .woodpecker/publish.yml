@@ -1,25 +1,24 @@
-# Publish workflow: once every check has passed and all three images are built,
-# push the commit's git tag, then publish the three images under it. Nothing
-# here deploys: a dev deployment is a manual Woodpecker Deploy (deploy-dev.yml).
+# Publish workflow: once every check has passed and all three images are built
+# and pushed, release them by pushing the commit's git tag. A version is
+# released only by its git tag: every deployment resolves the commit's tag
+# before it pulls anything, so an image the build pushed for a pipeline whose
+# checks failed is never deployed. Nothing here deploys: a dev deployment is a
+# manual Woodpecker Deploy (deploy-dev.yml).
 #
 # Workflows share nothing, so this workflow computes the release tag again.
-# The patch is the pipeline number, so it is the tag build used.
-# verify-local-images still checks that, before anything is tagged: the local
-# images are named by commit, so two pipelines building one commit at once
-# could leave another pipeline's images under that name.
-#
-# Pipeline numbers are unique, so no two pipelines ever push the same tag, and
-# no tag is ever reused. A re-run is a new pipeline: it tags the same commit
-# again under its own number, and deployments take the commit's highest tag.
-# The tag is pushed before any image, so a published image always has its tag;
-# if publish-image fails (the registry is down), re-run the pipeline.
+# The patch is the pipeline number, so it is the tag build pushed the images
+# under. Pipeline numbers are unique, so no two pipelines ever push the same
+# tag, and no tag is ever reused. A re-run is a new pipeline: it tags the same
+# commit again under its own number, and deployments take the commit's highest
+# tag.
 # See checks.yml for how the workflows fit together.
 
 when:
   - event: [push, manual]
 
-# Nothing here starts until every check has passed and all three images are built.
-# All three workflows run on push and manual alike, so neither dependency is optional.
+# Nothing is released until every check has passed and all three images are
+# pushed. All three workflows run on push and manual alike, so neither
+# dependency is optional.
 depends_on:
   - checks
   - build
@@ -40,33 +39,6 @@ steps:
       - sh scripts/ci-release-tag.sh Cargo.toml > .release-tag
       - echo "Release $$(cat .release-tag)"
 
-  # The build workflow made all three images on this Docker host and computed
-  # its own release tag. Go on only with images built from this commit for
-  # exactly this tag: if another pipeline rebuilt this commit in between, the
-  # labels name its version and a binary would ship under another version's
-  # name. Runs before tag-release, so a mismatch fails with nothing tagged.
-  verify-local-images:
-    depends_on:
-      - compute-version
-    when:
-      - event: [push, manual]
-    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    commands:
-      - |
-        RELEASE_TAG=$$(cat .release-tag)
-        for LOCAL in sovereign-config-ci:$$CI_COMMIT_SHA sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA sovereign-config-cli-ci:$$CI_COMMIT_SHA; do
-          LABELS=$$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }} {{ index .Config.Labels "org.opencontainers.image.revision" }}' "$$LOCAL") || {
-            echo "ERROR: $$LOCAL was not built on this host" >&2
-            exit 1
-          }
-          if [ "$$LABELS" != "$$RELEASE_TAG $$CI_COMMIT_SHA" ]; then
-            echo "ERROR: $$LOCAL is labelled '$$LABELS', expected '$$RELEASE_TAG $$CI_COMMIT_SHA'" >&2
-            exit 1
-          fi
-        done
-
   # A lightweight tag on this commit. The push fails if the tag already exists,
   # which a unique pipeline number rules out unless Cargo's major.minor went
   # backwards.
@@ -74,7 +46,7 @@ steps:
     when:
       - event: [push, manual]
     depends_on:
-      - verify-local-images
+      - compute-version
     image: docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
     environment:
       GITHUB_TOKEN:
@@ -86,34 +58,3 @@ steps:
         git tag "$$RELEASE_TAG" "$$CI_COMMIT_SHA"
         git push "https://x-access-token:$$GITHUB_TOKEN@github.com/$$CI_REPO" "refs/tags/$$RELEASE_TAG"
         echo "Tagged $$CI_COMMIT_SHA as $$RELEASE_TAG"
-
-  publish-image:
-    depends_on:
-      - tag-release
-    when:
-      - event: [push, manual]
-    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      REGISTRY_USER:
-        from_secret: zot_ci_user
-      REGISTRY_PASSWORD:
-        from_secret: zot_ci_password
-    commands:
-      - |
-        RELEASE_TAG=$$(cat .release-tag)
-        IMAGE=registry.desync.link/sovereign-config:$$RELEASE_TAG
-        BROKER_IMAGE=registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG
-        CLI_IMAGE=registry.desync.link/sovereign-config-cli:$$RELEASE_TAG
-        # verify-local-images has proved these are this commit's images for
-        # exactly this tag.
-        echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
-        docker tag sovereign-config-ci:$$CI_COMMIT_SHA "$$IMAGE"
-        docker push "$$IMAGE"
-        # All three images carry the same semver, so server, broker and CLI are
-        # always protocol-matched by construction.
-        docker tag sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA "$$BROKER_IMAGE"
-        docker push "$$BROKER_IMAGE"
-        docker tag sovereign-config-cli-ci:$$CI_COMMIT_SHA "$$CLI_IMAGE"
-        docker push "$$CLI_IMAGE"

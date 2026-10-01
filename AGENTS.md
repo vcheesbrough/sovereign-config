@@ -37,8 +37,14 @@ After initialization, follow the baseline feature-branch workflow (§2–§3).
 Run the **`ci-watch`** skill (baseline §4) with `OWNER=vcheesbrough`,
 `REPO=sovereign-config`. Repo specifics:
 
+- **Release patch = Woodpecker pipeline number** (#466), overriding baseline
+  §2's patch rule. `Cargo.toml` supplies only `major.minor` (bump the minor at
+  iteration start, keep patch `0` in the manifest); the published release is
+  `major.minor.<CI_PIPELINE_NUMBER>` (`scripts/ci-release-tag.sh`), sparse and
+  shared across branches. A card's **Version** records the `major.minor`.
 - **A push never deploys** (#466). A push pipeline is green once checks,
-  build and publish pass; it has tagged the commit and published its images.
+  build and publish pass; its images are in the registry and its git tag —
+  the release — is pushed.
   Dev is deployed only by a Woodpecker Deploy targeting `dev` (any branch), and
   the one dev environment runs whichever branch was deployed last — so trigger
   a dev deployment only when the user asks for one.
