@@ -112,9 +112,13 @@ steps:
           fi
         done
 
+  # Waits for verify-image as well, so a commit that was never released — its
+  # checks failed or have not finished — fails before anything touches
+  # Authentik, and its blueprint and live tests never run.
   apply-authentik-blueprint-dev:
     depends_on:
       - validate-authentik-version
+      - verify-image
     when:
       - event: deployment
         evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "dev"'

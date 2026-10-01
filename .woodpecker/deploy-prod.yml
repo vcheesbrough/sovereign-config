@@ -114,9 +114,13 @@ steps:
           fi
         done
 
+  # Waits for verify-image as well, so a commit that was never released — its
+  # checks failed or have not finished — fails before anything touches
+  # Authentik, and its blueprint and live tests never run.
   apply-authentik-blueprint-prod:
     depends_on:
       - validate-authentik-version
+      - verify-image
     # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
     # the `prod` environment, only from main.
     when:

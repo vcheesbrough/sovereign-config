@@ -5,7 +5,7 @@
 # is not a release: publish copies it to the release name, by digest, only
 # after every check has passed, so a release name only ever holds a checked
 # build. Candidates of failed pipelines stay in the `-ci` repositories, which
-# hold nothing else and can be pruned freely.
+# hold nothing else; nothing prunes them yet (bored #468).
 #
 # Three images, one semver — each built from its own docker/<image>.Dockerfile,
 # which builds only what that image ships, and labelled with the release tag

@@ -957,8 +957,8 @@ fn prod_workflow_is_gated_as_a_whole() {
     }
 }
 
-/// Each deploy workflow checks Authentik compatibility itself before applying
-/// its blueprint: workflows cannot share a step, so the check is defined in
+/// Each deploy workflow checks Authentik compatibility, and that the commit is
+/// released, before applying its blueprint: workflows cannot share a step, so the check is defined in
 /// both and runs only with the deploy it guards (and
 /// `deploy_workflows_share_their_promotion_steps` holds the copies identical).
 #[test]
@@ -979,6 +979,12 @@ fn each_blueprint_apply_waits_for_the_authentik_version_check() {
         assert!(
             dependencies.contains(&"validate-authentik-version"),
             "{apply} must wait for validate-authentik-version"
+        );
+        // verify-image follows resolve-release-tag, so an unreleased commit
+        // fails before its blueprint or live tests touch Authentik.
+        assert!(
+            dependencies.contains(&"verify-image"),
+            "{apply} must wait for the release check (verify-image)"
         );
         let check = pipeline.step_in(workflow, "validate-authentik-version");
         assert!(
