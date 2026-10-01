@@ -1,32 +1,35 @@
-# Build workflow: compute the release tag and build all three images, in
-# parallel with checks. Nothing here publishes: deploy-dev pushes these images
-# only after checks has passed.
+# Build workflow: compute the release tag, then build all three images and push
+# each the moment it is built — as a candidate, to its `-ci` repository
+# (registry.desync.link/<image>-ci:<version>), in parallel with checks. No step
+# ever re-reads a local image another pipeline could have replaced. A candidate
+# is not a release: publish copies it to the release name, by digest, only
+# after every check has passed, so a release name only ever holds a checked
+# build. Candidates of failed pipelines stay in the `-ci` repositories, which
+# hold nothing else; nothing prunes them yet (bored #468).
 #
 # Three images, one semver — each built from its own docker/<image>.Dockerfile,
-# which builds only what that image ships. Each is tagged locally as <name>-ci:<commit> and labelled with the
-# release tag and commit, which deploy-dev checks before it publishes.
+# which builds only what that image ships, and labelled with the release tag
+# and commit.
 # See checks.yml for how the workflows fit together.
 
 when:
   - event: [push, manual]
 
 steps:
-  # Allocates ONE semver per commit — ONLY on a push or manual run, the single
-  # place a version is minted. A deployment must NOT run this: it would allocate
-  # the *next* patch (an unbuilt tag) and deploy-prod would pull an image that
-  # was never published. Deployments resolve the commit's existing tag via
+  # The release tag is Cargo's major.minor plus this pipeline's number as the
+  # patch (scripts/ci-release-tag.sh): nothing to allocate, nothing to race,
+  # and build and publish derive the same tag. ONLY on a push or manual run: a
+  # deployment is its own pipeline, so computing there would name a version
+  # that was never built. Deployments resolve the commit's existing tag via
   # resolve-release-tag instead (mirrors bored card #254).
   compute-version:
     when:
       - event: [push, manual]
     depends_on: []
-    pull: true
-    image: &version-plugin ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.1.1@sha256:cf74d9706cb42b6d27c8d185789cd814ed061c8c88e06452d33ce3aed0bf9a22
-    settings:
-      mode: compute
-      major_minor_source: cargo
-      github_token:
-        from_secret: github_token
+    image: docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
+    commands:
+      - sh scripts/ci-release-tag.sh Cargo.toml > .release-tag
+      - echo "Release $$(cat .release-tag)"
 
   # Bounds this repository's BuildKit cargo target cache mount, which the image
   # builds compile into and nothing else on the host prunes. Only the
@@ -51,12 +54,19 @@ steps:
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      REGISTRY_USER:
+        from_secret: zot_ci_user
+      REGISTRY_PASSWORD:
+        from_secret: zot_ci_password
     commands:
       - |
         RELEASE_TAG=$$(cat .release-tag)
-        IMAGE=sovereign-config-ci:$$CI_COMMIT_SHA
+        IMAGE=registry.desync.link/sovereign-config-ci:$$RELEASE_TAG
         docker build --platform linux/amd64 -f docker/server.Dockerfile --build-arg RELEASE_VERSION="$$RELEASE_TAG" --build-arg REVISION="$$CI_COMMIT_SHA" --label org.opencontainers.image.title=sovereign-config --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
         docker image inspect "$$IMAGE" >/dev/null
+        echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
+        docker push "$$IMAGE"
 
   # The Woodpecker CI secrets extension, published as a second image under the
   # same semver. It compiles only the broker, with no web bundle or server.
@@ -69,12 +79,19 @@ steps:
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      REGISTRY_USER:
+        from_secret: zot_ci_user
+      REGISTRY_PASSWORD:
+        from_secret: zot_ci_password
     commands:
       - |
         RELEASE_TAG=$$(cat .release-tag)
-        IMAGE=sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA
+        IMAGE=registry.desync.link/sovereign-config-woodpecker-broker-ci:$$RELEASE_TAG
         docker build --platform linux/amd64 -f docker/broker.Dockerfile --build-arg RELEASE_VERSION="$$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config-woodpecker-broker --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/crates/sovereign-config-woodpecker-broker/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
         docker image inspect "$$IMAGE" >/dev/null
+        echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
+        docker push "$$IMAGE"
 
   # The CLI on the docker CLI base, for other repositories' Woodpecker steps
   # (`sovereign-config render -- docker compose …`). The third image of the
@@ -88,9 +105,16 @@ steps:
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      REGISTRY_USER:
+        from_secret: zot_ci_user
+      REGISTRY_PASSWORD:
+        from_secret: zot_ci_password
     commands:
       - |
         RELEASE_TAG=$$(cat .release-tag)
-        IMAGE=sovereign-config-cli-ci:$$CI_COMMIT_SHA
+        IMAGE=registry.desync.link/sovereign-config-cli-ci:$$RELEASE_TAG
         docker build --platform linux/amd64 -f docker/cli.Dockerfile --build-arg RELEASE_VERSION="$$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config-cli --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
         docker image inspect "$$IMAGE" >/dev/null
+        echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
+        docker push "$$IMAGE"

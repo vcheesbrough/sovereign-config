@@ -9,8 +9,9 @@ use std::path::Path;
 
 use serde_yaml::Value;
 
-/// Every workflow file, in the order the pipeline reads: gates, then deploys.
-pub const WORKFLOWS: [&str; 4] = ["checks", "build", "deploy-dev", "deploy-prod"];
+/// Every workflow file, in the order the pipeline reads: gates, the publish
+/// they guard, then the deploys.
+pub const WORKFLOWS: [&str; 5] = ["checks", "build", "publish", "deploy-dev", "deploy-prod"];
 
 pub struct Pipeline {
     workflows: Vec<(&'static str, Value)>,

@@ -1,8 +1,8 @@
 //! Guards the deployment-trigger policy encoded in the `.woodpecker/` workflows:
-//! production runs only on a `deployment` event (Woodpecker's Deploy/promote to
-//! prod), never on push; development deploys only on push, so a production
-//! promotion never also redeploys it. This is the lowest-layer check for card
-//! #262 — the pipeline file is not otherwise exercised by any test.
+//! a push (or manual run) checks, builds, tags and publishes, and never deploys;
+//! each environment deploys only on a `deployment` event (Woodpecker's Deploy)
+//! targeting it — production from main only (card #262), development from any
+//! branch (card #466). The pipeline file is not otherwise exercised by any test.
 
 mod support;
 
@@ -11,14 +11,21 @@ use std::collections::BTreeSet;
 use serde_yaml::Value;
 use support::{Pipeline, pipeline};
 
-/// The events that build, publish and deploy dev. A manual run from the
-/// Woodpecker UI does exactly what a push does.
+/// The events that build, tag and publish. A manual run from the Woodpecker UI
+/// does exactly what a push does.
 fn push_events() -> BTreeSet<String> {
     BTreeSet::from(["push".to_owned(), "manual".to_owned()])
 }
 
 /// The only branch permitted to trigger a production promotion.
 const PROD_BRANCHES: &[&str] = &["main"];
+
+const PROD_TARGET: &str = "CI_PIPELINE_DEPLOY_TARGET == \"prod\"";
+const DEV_TARGET: &str = "CI_PIPELINE_DEPLOY_TARGET == \"dev\"";
+
+fn deployment_event() -> BTreeSet<String> {
+    BTreeSet::from(["deployment".to_owned()])
+}
 
 fn step<'a>(pipeline: &'a Pipeline, name: &str) -> &'a Value {
     pipeline.step(name)
@@ -84,11 +91,9 @@ fn production_steps_deploy_to_prod_from_permitted_branches() {
         "validate-authentik-manager-live-prod",
         "deploy-prod",
     ] {
-        let conditions = when_conditions(step(&pipeline(), name));
+        let conditions = when_conditions(pipeline().step_in("deploy-prod", name));
         assert!(
-            conditions
-                .iter()
-                .all(|c| c.events == BTreeSet::from(["deployment".to_owned()])),
+            conditions.iter().all(|c| c.events == deployment_event()),
             "{name} must only ever run on a deployment event, never on push"
         );
         // Restrict to the prod deploy target so a deployment with any other
@@ -96,7 +101,7 @@ fn production_steps_deploy_to_prod_from_permitted_branches() {
         assert!(
             conditions
                 .iter()
-                .all(|c| c.evaluate.as_deref() == Some("CI_PIPELINE_DEPLOY_TARGET == \"prod\"")),
+                .all(|c| c.evaluate.as_deref() == Some(PROD_TARGET)),
             "{name} must be guarded by the prod deploy-target evaluate expression"
         );
         let branches: BTreeSet<String> = conditions
@@ -110,12 +115,44 @@ fn production_steps_deploy_to_prod_from_permitted_branches() {
     }
 }
 
+/// Every step of the dev deploy runs only on a deployment targeting dev, from
+/// any branch, so a push never deploys and a prod promotion never touches dev.
 #[test]
-fn build_and_dev_deploy_steps_never_run_on_a_deployment() {
-    // Everything that allocates a version, builds, publishes, tags, or deploys
-    // dev runs on push and manual only, so a production promotion (a deployment event) never
-    // mints a new version, never rebuilds or republishes the image, and never
-    // touches development.
+fn development_steps_deploy_to_dev_only_on_a_dev_deployment() {
+    let pipeline = pipeline();
+    let mut checked = 0;
+    for (workflow, name, step) in pipeline.steps() {
+        if workflow != "deploy-dev" {
+            continue;
+        }
+        let conditions = when_conditions(step);
+        assert!(!conditions.is_empty());
+        for condition in conditions {
+            assert_eq!(
+                condition.events,
+                deployment_event(),
+                "{name} must only ever run on a deployment event, never on push"
+            );
+            assert_eq!(
+                condition.evaluate.as_deref(),
+                Some(DEV_TARGET),
+                "{name} must be guarded by the dev deploy-target evaluate expression"
+            );
+            assert!(
+                condition.branches.is_empty(),
+                "{name} must deploy dev from any branch"
+            );
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 6, "a deploy-dev step was added or removed");
+}
+
+#[test]
+fn build_and_publish_steps_never_run_on_a_deployment() {
+    // Everything that allocates a version, builds, tags or publishes runs on
+    // push and manual only, so a deployment never mints a new version and never
+    // rebuilds or republishes an image.
     for name in [
         "compute-version",
         "script-validation",
@@ -125,21 +162,108 @@ fn build_and_dev_deploy_steps_never_run_on_a_deployment() {
         "build-server",
         "build-broker",
         "build-cli",
-        "publish-dev-image",
-        "apply-authentik-blueprint-auto-dev",
-        "validate-authentik-manager-live",
-        "auto-deploy-dev",
-        "tag-release-auto-dev",
+        "promote-images",
+        "tag-release",
     ] {
         let pipeline = pipeline();
-        for workflow in pipeline.workflows_of(name) {
+        let workflows = pipeline.workflows_of(name);
+        assert!(!workflows.is_empty(), "step {name} should exist");
+        for workflow in workflows {
             let conditions = when_conditions(pipeline.step_in(workflow, name));
             assert!(
                 !conditions.is_empty() && conditions.iter().all(|c| c.events == push_events()),
-                "{name} in {workflow} must run on push and manual only, so a production promotion never touches it"
+                "{name} in {workflow} must run on push and manual only, so a deployment never touches it"
             );
         }
     }
+}
+
+/// A push never deploys: no step that runs on a push runs Compose, names a
+/// deployed environment, applies a blueprint, or exercises the live Authentik
+/// manager (card #466).
+#[test]
+fn a_push_never_deploys() {
+    let pipeline = pipeline();
+    let mut checked = 0;
+    for (workflow, name, step) in pipeline.steps() {
+        if !workflow_events(&pipeline, workflow).contains("push") {
+            continue;
+        }
+        // The parsed step, so comments describing the pipeline do not count.
+        let text = serde_yaml::to_string(step).expect("step serialises");
+        // Keyed on what a deploy targets, not on one way of spelling it.
+        for forbidden in [
+            "compose",
+            "authentik-blueprint",
+            "live_",
+            "sovereign-config-dev",
+            "sovereign-config-prod",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{name} in {workflow} runs on a push and must not deploy ({forbidden})"
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "no push step was found to check");
+}
+
+/// Publish releases a checked build: promote-images copies each candidate to
+/// its release name inside the registry — never building, pushing from this
+/// host, or overwriting a release — and only then does tag-release push the
+/// git tag, a plain `git push` of a new tag, which refuses an existing one. It
+/// runs only after checks and build (`publish_waits_for_checks_and_build`).
+#[test]
+fn publish_promotes_the_candidates_then_tags() {
+    let pipeline = pipeline();
+    let depends_on = |name: &str| -> Vec<String> {
+        pipeline
+            .step_in("publish", name)
+            .get("depends_on")
+            .and_then(Value::as_sequence)
+            .expect("publish steps list their dependencies")
+            .iter()
+            .map(|dependency| dependency.as_str().expect("step name").to_owned())
+            .collect()
+    };
+    assert_eq!(depends_on("promote-images"), ["compute-version"]);
+    assert_eq!(depends_on("tag-release"), ["promote-images"]);
+
+    let promote = commands_text(pipeline.step_in("publish", "promote-images"));
+    for expected in [
+        "for NAME in sovereign-config sovereign-config-woodpecker-broker sovereign-config-cli; do",
+        "CANDIDATE=registry.desync.link/$$NAME-ci:$$RELEASE_TAG",
+        "RELEASE=registry.desync.link/$$NAME:$$RELEASE_TAG",
+        "docker buildx imagetools create --prefer-index=false --tag \"$$RELEASE\" \"$$CANDIDATE\"",
+    ] {
+        assert!(
+            promote.contains(expected),
+            "promote-images must contain `{expected}`"
+        );
+    }
+    let refusal = promote
+        .find("docker buildx imagetools inspect \"$$RELEASE\"")
+        .expect("promote-images must check for an existing release");
+    let copy = promote.find("imagetools create").expect("copies");
+    assert!(refusal < copy, "the existing-release check comes first");
+    for forbidden in ["docker build ", "docker push", "docker tag "] {
+        assert!(
+            !promote.contains(forbidden),
+            "promote-images copies inside the registry and must not run `{forbidden}`"
+        );
+    }
+
+    let tag = commands_text(pipeline.step_in("publish", "tag-release"));
+    assert!(
+        tag.contains("git tag \"$$RELEASE_TAG\" \"$$CI_COMMIT_SHA\"")
+            && tag.contains("\"refs/tags/$$RELEASE_TAG\"")
+            && !tag.contains("--force")
+            && !tag.contains(" -f "),
+        "tag-release must push this commit's release tag and never overwrite one"
+    );
+    assert_eq!(pipeline.workflows_of("tag-release"), ["publish"]);
+    assert_eq!(pipeline.workflows_of("promote-images"), ["publish"]);
 }
 
 /// The repository root, where the `docker/` build files live.
@@ -429,67 +553,79 @@ fn the_cli_image_is_the_pipeline_docker_image_plus_the_cli() {
 }
 
 /// Server, broker and CLI ship as one release: the same commit, the same
-/// semver, the same publish step. A tag that carries only some of them is not a
-/// release.
+/// semver. Each build step builds its image straight to its `-ci` candidate
+/// name and pushes exactly that image — nothing re-reads a local image name
+/// another pipeline could have replaced, and nothing in build writes a release
+/// name; publish promotes candidates only after checks.
 #[test]
-fn the_release_publishes_every_image_under_one_semver() {
-    let publish = commands_text(step(&pipeline(), "publish-dev-image"));
-    for (local, published) in [
+fn every_image_is_pushed_as_a_candidate_as_it_is_built() {
+    let pipeline = pipeline();
+    for (build, published) in [
         (
-            "sovereign-config-ci:$$CI_COMMIT_SHA",
-            "registry.desync.link/sovereign-config:$$RELEASE_TAG",
+            "build-server",
+            "registry.desync.link/sovereign-config-ci:$$RELEASE_TAG",
         ),
         (
-            "sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA",
-            "registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG",
+            "build-broker",
+            "registry.desync.link/sovereign-config-woodpecker-broker-ci:$$RELEASE_TAG",
         ),
         (
-            "sovereign-config-cli-ci:$$CI_COMMIT_SHA",
-            "registry.desync.link/sovereign-config-cli:$$RELEASE_TAG",
+            "build-cli",
+            "registry.desync.link/sovereign-config-cli-ci:$$RELEASE_TAG",
         ),
     ] {
+        let commands = commands_text(pipeline.step_in("build", build));
         assert!(
-            publish.contains(published),
-            "publish-dev-image must push {published} at the allocated release tag"
+            commands.contains(&format!("IMAGE={published}\n")),
+            "{build} must build {published}"
         );
         assert!(
-            publish.contains(&format!("docker tag {local} ")),
-            "publish-dev-image must publish {published} from the local build {local}"
+            commands.contains("--tag \"$$IMAGE\""),
+            "{build} must tag its build as the published image"
+        );
+        assert_eq!(
+            commands.matches("docker push").count(),
+            1,
+            "{build} must push exactly its own image"
+        );
+        let built = commands.find("docker build").expect("builds");
+        let pushed = commands.find("docker push \"$$IMAGE\"").expect("pushes");
+        assert!(built < pushed, "{build} pushes what it just built");
+        assert!(
+            commands.contains("org.opencontainers.image.version=\"$$RELEASE_TAG\"")
+                && commands.contains("org.opencontainers.image.revision=\"$$CI_COMMIT_SHA\""),
+            "{build} must label its image with the release tag and commit"
         );
     }
-    assert_eq!(
-        publish.matches("docker push").count(),
-        3,
-        "publish-dev-image must push exactly the three release images"
-    );
 }
 
 #[test]
 fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
     let pipeline = pipeline();
-    // compute-version (mode compute) allocates the next semver; it must be
-    // push/manual-only. On a deployment it would mint the *next* patch — an unbuilt tag
-    // — and deploy-prod would pull an image that was never published.
+    // compute-version names the version after the running pipeline; it must be
+    // push/manual-only. A deployment is its own pipeline, so there it would name
+    // a version that was never built and the deploy would pull an image that
+    // was never published.
     assert_eq!(
         pipeline.workflows_of("compute-version"),
-        ["build", "deploy-dev"]
+        ["build", "publish"]
     );
-    for workflow in ["build", "deploy-dev"] {
+    for workflow in ["build", "publish"] {
         assert_eq!(
-            pipeline
-                .step_in(workflow, "compute-version")
-                .get("settings")
-                .and_then(|settings| settings.get("mode"))
-                .and_then(Value::as_str),
-            Some("compute"),
-            "compute-version allocates, so it must stay off the deployment event (asserted above)"
+            commands_text(pipeline.step_in(workflow, "compute-version"))
+                .lines()
+                .next(),
+            Some("sh scripts/ci-release-tag.sh Cargo.toml > .release-tag"),
+            "both workflows of a pipeline must derive the tag the same way"
         );
     }
     // The deployment resolves the commit's already-built tag instead of
     // allocating, and verify-image proves the artifact exists rather than
-    // rebuilding — so deploy-prod deploys the exact image the push already
+    // rebuilding — so a deploy ships the exact image the push already
     // published. Guard that both read/write `.release-tag` on the deploy path.
-    let resolve = step(&pipeline, "resolve-release-tag");
+    // Both deploy workflows carry the two steps;
+    // deploy_workflows_share_their_promotion_steps holds the dev copy to these.
+    let resolve = pipeline.step_in("deploy-prod", "resolve-release-tag");
     let resolve_cmd = commands_text(resolve);
     assert!(
         resolve_cmd.contains("git tag --points-at HEAD") && resolve_cmd.contains("> .release-tag"),
@@ -508,7 +644,7 @@ fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
             .is_some_and(|image| image.contains("alpine/git:") && image.contains("@sha256:")),
         "resolve-release-tag must use a digest-pinned git image"
     );
-    let verify_cmd = commands_text(step(&pipeline, "verify-image"));
+    let verify_cmd = commands_text(pipeline.step_in("deploy-prod", "verify-image"));
     assert!(
         verify_cmd.contains("docker pull")
             && verify_cmd.contains("registry.desync.link/sovereign-config:")
@@ -547,6 +683,36 @@ fn production_blueprint_applies_the_production_environment() {
 }
 
 #[test]
+fn development_blueprint_applies_the_development_environment() {
+    let pipeline = pipeline();
+    let settings = step(&pipeline, "apply-authentik-blueprint-dev")
+        .get("settings")
+        .expect("blueprint step needs settings");
+    assert_eq!(
+        settings.get("file").and_then(Value::as_str),
+        Some("authentik/blueprint-dev.yaml")
+    );
+    assert_eq!(
+        settings.get("instance_name").and_then(Value::as_str),
+        Some("sovereign-config-dev")
+    );
+}
+
+#[test]
+fn development_deploy_targets_the_development_environment() {
+    let pipeline = pipeline();
+    let command = commands_text(step(&pipeline, "deploy-dev"));
+    assert!(command.contains("SOVEREIGN_CONFIG_ENV=dev"));
+    assert!(command.contains("SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link"));
+    assert!(command.contains("\"$$COMPOSE\" -p sovereign-config-dev"));
+    // Nothing on the deploy path builds, so it pulls the resolved tag.
+    assert!(command.contains("SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag)"));
+    assert!(command.contains("--pull always"));
+    assert!(!command.contains("sovereign-config-prod"));
+    assert!(!command.contains("sovereign-config-production"));
+}
+
+#[test]
 fn production_deploy_targets_the_production_environment() {
     let pipeline = pipeline();
     let command = commands_text(step(&pipeline, "deploy-prod"));
@@ -568,7 +734,7 @@ fn production_deploy_targets_the_production_environment() {
 #[test]
 fn no_deploy_gates_on_the_client_telemetry_ingest() {
     let pipeline = pipeline();
-    for deploy in ["auto-deploy-dev", "deploy-prod"] {
+    for deploy in ["deploy-dev", "deploy-prod"] {
         let command = commands_text(step(&pipeline, deploy));
         let lines: Vec<&str> = command.lines().map(str::trim).collect();
         let gated: Vec<&&str> = lines
@@ -634,7 +800,7 @@ fn workflow_events(pipeline: &Pipeline, workflow: &str) -> BTreeSet<String> {
 #[test]
 fn every_step_sits_in_its_workflow() {
     let pipeline = pipeline();
-    let expected: [(&str, &[&str]); 4] = [
+    let expected: [(&str, &[&str]); 5] = [
         (
             "checks",
             &["script-validation", "unit-test", "client-playwright"],
@@ -650,15 +816,18 @@ fn every_step_sits_in_its_workflow() {
             ],
         ),
         (
+            "publish",
+            &["compute-version", "promote-images", "tag-release"],
+        ),
+        (
             "deploy-dev",
             &[
-                "compute-version",
                 "validate-authentik-version",
-                "publish-dev-image",
-                "apply-authentik-blueprint-auto-dev",
+                "resolve-release-tag",
+                "verify-image",
+                "apply-authentik-blueprint-dev",
                 "validate-authentik-manager-live",
-                "auto-deploy-dev",
-                "tag-release-auto-dev",
+                "deploy-dev",
             ],
         ),
         (
@@ -688,29 +857,78 @@ fn every_step_sits_in_its_workflow() {
     );
 }
 
-/// Nothing is published or deployed to dev unless every check passed — the
-/// tests, the browser suite, and the script checks — and both images are built.
+/// Nothing is tagged or published unless every check passed — the tests, the
+/// browser suite, and the script checks — and all three images are built.
 #[test]
-fn dev_deploy_waits_for_checks_and_build() {
+fn publish_waits_for_checks_and_build() {
     let pipeline = pipeline();
     let dependencies: Vec<&str> = pipeline
-        .workflow("deploy-dev")
+        .workflow("publish")
         .get("depends_on")
         .and_then(Value::as_sequence)
-        .expect("deploy-dev should depend on checks and build")
+        .expect("publish should depend on checks and build")
         .iter()
         .map(|dependency| {
             dependency
                 .as_str()
-                .expect("deploy-dev's dependencies must be required, not optional")
+                .expect("publish's dependencies must be required, not optional")
         })
         .collect();
     assert_eq!(dependencies, ["checks", "build"]);
-    for workflow in ["checks", "build", "deploy-dev"] {
+    for workflow in ["checks", "build", "publish"] {
         assert_eq!(
             workflow_events(&pipeline, workflow),
             push_events(),
-            "{workflow} must run on push and manual alike, so deploy-dev's required dependencies always run with it"
+            "{workflow} must run on push and manual alike, so publish's required dependencies always run with it"
+        );
+    }
+}
+
+/// The dev workflow is itself restricted to a dev deployment, from any branch.
+/// It depends on no other workflow, because nothing else runs on a deployment.
+#[test]
+fn dev_workflow_is_gated_as_a_whole() {
+    let pipeline = pipeline();
+    assert!(
+        pipeline.workflow("deploy-dev").get("depends_on").is_none(),
+        "deploy-dev must not wait for a workflow that never runs on a deployment"
+    );
+    let conditions = when_conditions(pipeline.workflow("deploy-dev"));
+    assert!(!conditions.is_empty());
+    for condition in conditions {
+        assert_eq!(condition.events, deployment_event());
+        assert!(condition.branches.is_empty(), "dev deploys from any branch");
+        assert_eq!(condition.evaluate.as_deref(), Some(DEV_TARGET));
+    }
+}
+
+/// Both deploy workflows promote the same way — resolve the commit's tag,
+/// prove its images exist — and check Authentik the same way. Workflows cannot
+/// share a step, so each is defined in both and identical but for its `when`.
+#[test]
+fn deploy_workflows_share_their_promotion_steps() {
+    let pipeline = pipeline();
+    for name in [
+        "validate-authentik-version",
+        "resolve-release-tag",
+        "verify-image",
+    ] {
+        assert_eq!(pipeline.workflows_of(name), ["deploy-dev", "deploy-prod"]);
+        let copies: Vec<_> = ["deploy-dev", "deploy-prod"]
+            .iter()
+            .map(|workflow| {
+                let mut copy = pipeline
+                    .step_in(workflow, name)
+                    .as_mapping()
+                    .expect("step is a mapping")
+                    .clone();
+                copy.remove("when");
+                copy
+            })
+            .collect();
+        assert_eq!(
+            copies[0], copies[1],
+            "both copies of {name} must do the same thing"
         );
     }
 }
@@ -727,7 +945,7 @@ fn prod_workflow_is_gated_as_a_whole() {
     let conditions = when_conditions(pipeline.workflow("deploy-prod"));
     assert!(!conditions.is_empty());
     for condition in conditions {
-        assert_eq!(condition.events, BTreeSet::from(["deployment".to_owned()]));
+        assert_eq!(condition.events, deployment_event());
         assert_eq!(
             condition.branches,
             PROD_BRANCHES
@@ -735,35 +953,20 @@ fn prod_workflow_is_gated_as_a_whole() {
                 .map(|&branch| branch.to_owned())
                 .collect()
         );
-        assert_eq!(
-            condition.evaluate.as_deref(),
-            Some("CI_PIPELINE_DEPLOY_TARGET == \"prod\"")
-        );
+        assert_eq!(condition.evaluate.as_deref(), Some(PROD_TARGET));
     }
 }
 
-/// Each deploy workflow checks Authentik compatibility itself before applying
-/// its blueprint: workflows cannot share a step, so the check is defined in
-/// both, runs only with the deploy it guards, and is otherwise identical.
+/// Each deploy workflow checks Authentik compatibility, and that the commit is
+/// released, before applying its blueprint: workflows cannot share a step, so the check is defined in
+/// both and runs only with the deploy it guards (and
+/// `deploy_workflows_share_their_promotion_steps` holds the copies identical).
 #[test]
 fn each_blueprint_apply_waits_for_the_authentik_version_check() {
     let pipeline = pipeline();
-    assert_eq!(
-        pipeline.workflows_of("validate-authentik-version"),
-        ["deploy-dev", "deploy-prod"]
-    );
-    let mut copies = Vec::new();
-    for (workflow, apply, events) in [
-        (
-            "deploy-dev",
-            "apply-authentik-blueprint-auto-dev",
-            push_events(),
-        ),
-        (
-            "deploy-prod",
-            "apply-authentik-blueprint-prod",
-            BTreeSet::from(["deployment".to_owned()]),
-        ),
+    for (workflow, apply, target) in [
+        ("deploy-dev", "apply-authentik-blueprint-dev", DEV_TARGET),
+        ("deploy-prod", "apply-authentik-blueprint-prod", PROD_TARGET),
     ] {
         let dependencies: Vec<&str> = pipeline
             .step_in(workflow, apply)
@@ -777,21 +980,21 @@ fn each_blueprint_apply_waits_for_the_authentik_version_check() {
             dependencies.contains(&"validate-authentik-version"),
             "{apply} must wait for validate-authentik-version"
         );
+        // verify-image follows resolve-release-tag, so an unreleased commit
+        // fails before its blueprint or live tests touch Authentik.
+        assert!(
+            dependencies.contains(&"verify-image"),
+            "{apply} must wait for the release check (verify-image)"
+        );
         let check = pipeline.step_in(workflow, "validate-authentik-version");
         assert!(
-            when_conditions(check)
-                .iter()
-                .all(|condition| condition.events == events),
-            "the {workflow} copy of validate-authentik-version must run only on {events:?}"
+            when_conditions(check).iter().all(|condition| {
+                condition.events == deployment_event()
+                    && condition.evaluate.as_deref() == Some(target)
+            }),
+            "the {workflow} copy of validate-authentik-version must run only on its own deployment"
         );
-        let mut copy = check.as_mapping().expect("step is a mapping").clone();
-        copy.remove("when");
-        copies.push(copy);
     }
-    assert_eq!(
-        copies[0], copies[1],
-        "both copies of validate-authentik-version must check the same thing"
-    );
 }
 
 /// The prod copy of the Authentik check carries the same prod-only guard as
@@ -802,7 +1005,7 @@ fn prod_authentik_check_is_gated_like_every_prod_step() {
     let conditions = when_conditions(pipeline.step_in("deploy-prod", "validate-authentik-version"));
     assert!(!conditions.is_empty());
     for condition in conditions {
-        assert_eq!(condition.events, BTreeSet::from(["deployment".to_owned()]));
+        assert_eq!(condition.events, deployment_event());
         assert_eq!(
             condition.branches,
             PROD_BRANCHES
@@ -810,62 +1013,7 @@ fn prod_authentik_check_is_gated_like_every_prod_step() {
                 .map(|&branch| branch.to_owned())
                 .collect()
         );
-        assert_eq!(
-            condition.evaluate.as_deref(),
-            Some("CI_PIPELINE_DEPLOY_TARGET == \"prod\"")
-        );
-    }
-}
-
-/// build and deploy-dev each compute the release tag, because workflows share
-/// nothing. publish-dev-image must therefore refuse images that were not built
-/// from this commit for exactly its own tag, and build must label them so the
-/// check can see both.
-#[test]
-fn publish_only_ships_images_built_for_this_commit_and_tag() {
-    let pipeline = pipeline();
-    for (build, local) in [
-        ("build-server", "sovereign-config-ci:$$CI_COMMIT_SHA"),
-        (
-            "build-broker",
-            "sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA",
-        ),
-        ("build-cli", "sovereign-config-cli-ci:$$CI_COMMIT_SHA"),
-    ] {
-        let commands = commands_text(pipeline.step_in("build", build));
-        assert!(
-            commands.contains("org.opencontainers.image.version=\"$$RELEASE_TAG\"")
-                && commands.contains("org.opencontainers.image.revision=\"$$CI_COMMIT_SHA\""),
-            "{build} must label its image with the release tag and commit"
-        );
-        assert!(
-            commands.contains(&format!("IMAGE={local}")),
-            "{build} must tag the local image {local}"
-        );
-    }
-    let publish = commands_text(pipeline.step_in("deploy-dev", "publish-dev-image"));
-    let guard = publish
-        .find("docker image inspect")
-        .expect("publish-dev-image must inspect the local images");
-    let first_push = publish
-        .find("docker push")
-        .expect("publish-dev-image must push");
-    assert!(
-        guard < first_push,
-        "the label check must run before any push"
-    );
-    for expected in [
-        "sovereign-config-ci:$$CI_COMMIT_SHA",
-        "sovereign-config-woodpecker-broker-ci:$$CI_COMMIT_SHA",
-        "sovereign-config-cli-ci:$$CI_COMMIT_SHA",
-        "org.opencontainers.image.version",
-        "org.opencontainers.image.revision",
-        "\"$$RELEASE_TAG $$CI_COMMIT_SHA\"",
-    ] {
-        assert!(
-            publish.contains(expected),
-            "publish-dev-image's label check must cover {expected}"
-        );
+        assert_eq!(condition.evaluate.as_deref(), Some(PROD_TARGET));
     }
 }
 
