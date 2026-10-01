@@ -1,10 +1,11 @@
-# Build workflow: compute the release tag, then build and push all three
-# images under it, in parallel with checks. An image is pushed the moment it is
-# built, so no step ever re-reads a local image another pipeline could have
-# replaced. Pushing an image does not release it: nothing deploys an image
-# whose version is not a git tag, and publish pushes that tag only after every
-# check has passed. An image from a pipeline whose checks failed stays in the
-# registry, unreleased.
+# Build workflow: compute the release tag, then build all three images and push
+# each the moment it is built — as a candidate, to its `-ci` repository
+# (registry.desync.link/<image>-ci:<version>), in parallel with checks. No step
+# ever re-reads a local image another pipeline could have replaced. A candidate
+# is not a release: publish copies it to the release name, by digest, only
+# after every check has passed, so a release name only ever holds a checked
+# build. Candidates of failed pipelines stay in the `-ci` repositories, which
+# hold nothing else and can be pruned freely.
 #
 # Three images, one semver — each built from its own docker/<image>.Dockerfile,
 # which builds only what that image ships, and labelled with the release tag
@@ -61,7 +62,7 @@ steps:
     commands:
       - |
         RELEASE_TAG=$$(cat .release-tag)
-        IMAGE=registry.desync.link/sovereign-config:$$RELEASE_TAG
+        IMAGE=registry.desync.link/sovereign-config-ci:$$RELEASE_TAG
         docker build --platform linux/amd64 -f docker/server.Dockerfile --build-arg RELEASE_VERSION="$$RELEASE_TAG" --build-arg REVISION="$$CI_COMMIT_SHA" --label org.opencontainers.image.title=sovereign-config --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
         docker image inspect "$$IMAGE" >/dev/null
         echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
@@ -86,7 +87,7 @@ steps:
     commands:
       - |
         RELEASE_TAG=$$(cat .release-tag)
-        IMAGE=registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG
+        IMAGE=registry.desync.link/sovereign-config-woodpecker-broker-ci:$$RELEASE_TAG
         docker build --platform linux/amd64 -f docker/broker.Dockerfile --build-arg RELEASE_VERSION="$$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config-woodpecker-broker --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/crates/sovereign-config-woodpecker-broker/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
         docker image inspect "$$IMAGE" >/dev/null
         echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
@@ -112,7 +113,7 @@ steps:
     commands:
       - |
         RELEASE_TAG=$$(cat .release-tag)
-        IMAGE=registry.desync.link/sovereign-config-cli:$$RELEASE_TAG
+        IMAGE=registry.desync.link/sovereign-config-cli-ci:$$RELEASE_TAG
         docker build --platform linux/amd64 -f docker/cli.Dockerfile --build-arg RELEASE_VERSION="$$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config-cli --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/README.md --label org.opencontainers.image.version="$$RELEASE_TAG" --label org.opencontainers.image.revision="$$CI_COMMIT_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$$IMAGE" .
         docker image inspect "$$IMAGE" >/dev/null
         echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin

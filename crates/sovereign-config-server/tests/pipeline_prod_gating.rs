@@ -162,6 +162,7 @@ fn build_and_publish_steps_never_run_on_a_deployment() {
         "build-server",
         "build-broker",
         "build-cli",
+        "promote-images",
         "tag-release",
     ] {
         let pipeline = pipeline();
@@ -208,33 +209,51 @@ fn a_push_never_deploys() {
     assert!(checked > 0, "no push step was found to check");
 }
 
-/// The git tag is the release, so publish only tags: it pushes no image, and
-/// the tag push is a plain `git push` of a new tag, which refuses an existing
-/// one. It runs only after checks and build (`publish_waits_for_checks_and_build`).
+/// Publish releases a checked build: promote-images copies each candidate to
+/// its release name inside the registry — never building, pushing from this
+/// host, or overwriting a release — and only then does tag-release push the
+/// git tag, a plain `git push` of a new tag, which refuses an existing one. It
+/// runs only after checks and build (`publish_waits_for_checks_and_build`).
 #[test]
-fn publish_releases_by_tagging_only() {
+fn publish_promotes_the_candidates_then_tags() {
     let pipeline = pipeline();
-    assert_eq!(
+    let depends_on = |name: &str| -> Vec<String> {
         pipeline
-            .step_in("publish", "tag-release")
+            .step_in("publish", name)
             .get("depends_on")
             .and_then(Value::as_sequence)
-            .expect("tag-release lists its dependencies")
+            .expect("publish steps list their dependencies")
             .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>(),
-        ["compute-version"]
-    );
-    for (workflow, name, step) in pipeline.steps() {
-        if workflow == "publish" {
-            let text = serde_yaml::to_string(step).expect("step serialises");
-            // `docker.io/…` images are fine; the Docker socket and CLI are not.
-            assert!(
-                !text.contains("docker.sock") && !text.contains("docker push"),
-                "publish's {name} must not touch an image; build pushes them"
-            );
-        }
+            .map(|dependency| dependency.as_str().expect("step name").to_owned())
+            .collect()
+    };
+    assert_eq!(depends_on("promote-images"), ["compute-version"]);
+    assert_eq!(depends_on("tag-release"), ["promote-images"]);
+
+    let promote = commands_text(pipeline.step_in("publish", "promote-images"));
+    for expected in [
+        "for NAME in sovereign-config sovereign-config-woodpecker-broker sovereign-config-cli; do",
+        "CANDIDATE=registry.desync.link/$$NAME-ci:$$RELEASE_TAG",
+        "RELEASE=registry.desync.link/$$NAME:$$RELEASE_TAG",
+        "docker buildx imagetools create --prefer-index=false --tag \"$$RELEASE\" \"$$CANDIDATE\"",
+    ] {
+        assert!(
+            promote.contains(expected),
+            "promote-images must contain `{expected}`"
+        );
     }
+    let refusal = promote
+        .find("docker buildx imagetools inspect \"$$RELEASE\"")
+        .expect("promote-images must check for an existing release");
+    let copy = promote.find("imagetools create").expect("copies");
+    assert!(refusal < copy, "the existing-release check comes first");
+    for forbidden in ["docker build ", "docker push", "docker tag "] {
+        assert!(
+            !promote.contains(forbidden),
+            "promote-images copies inside the registry and must not run `{forbidden}`"
+        );
+    }
+
     let tag = commands_text(pipeline.step_in("publish", "tag-release"));
     assert!(
         tag.contains("git tag \"$$RELEASE_TAG\" \"$$CI_COMMIT_SHA\"")
@@ -244,6 +263,7 @@ fn publish_releases_by_tagging_only() {
         "tag-release must push this commit's release tag and never overwrite one"
     );
     assert_eq!(pipeline.workflows_of("tag-release"), ["publish"]);
+    assert_eq!(pipeline.workflows_of("promote-images"), ["publish"]);
 }
 
 /// The repository root, where the `docker/` build files live.
@@ -533,24 +553,25 @@ fn the_cli_image_is_the_pipeline_docker_image_plus_the_cli() {
 }
 
 /// Server, broker and CLI ship as one release: the same commit, the same
-/// semver. Each build step builds its image straight under the release tag and
-/// pushes exactly that image — nothing re-reads a local image name another
-/// pipeline could have replaced. The tag that releases them is publish's.
+/// semver. Each build step builds its image straight to its `-ci` candidate
+/// name and pushes exactly that image — nothing re-reads a local image name
+/// another pipeline could have replaced, and nothing in build writes a release
+/// name; publish promotes candidates only after checks.
 #[test]
-fn every_image_is_pushed_under_the_release_tag_as_it_is_built() {
+fn every_image_is_pushed_as_a_candidate_as_it_is_built() {
     let pipeline = pipeline();
     for (build, published) in [
         (
             "build-server",
-            "registry.desync.link/sovereign-config:$$RELEASE_TAG",
+            "registry.desync.link/sovereign-config-ci:$$RELEASE_TAG",
         ),
         (
             "build-broker",
-            "registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG",
+            "registry.desync.link/sovereign-config-woodpecker-broker-ci:$$RELEASE_TAG",
         ),
         (
             "build-cli",
-            "registry.desync.link/sovereign-config-cli:$$RELEASE_TAG",
+            "registry.desync.link/sovereign-config-cli-ci:$$RELEASE_TAG",
         ),
     ] {
         let commands = commands_text(pipeline.step_in("build", build));
@@ -794,7 +815,10 @@ fn every_step_sits_in_its_workflow() {
                 "build-cli",
             ],
         ),
-        ("publish", &["compute-version", "tag-release"]),
+        (
+            "publish",
+            &["compute-version", "promote-images", "tag-release"],
+        ),
         (
             "deploy-dev",
             &[
