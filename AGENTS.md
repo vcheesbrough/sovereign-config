@@ -48,6 +48,10 @@ Run the **`ci-watch`** skill (baseline §4) with `OWNER=vcheesbrough`,
   Dev is deployed only by a Woodpecker Deploy targeting `dev` (any branch), and
   the one dev environment runs whichever branch was deployed last — so trigger
   a dev deployment only when the user asks for one.
+- **Deploy a main commit to dev before promoting it to prod.** This is an
+  operator rule; the pipeline does not enforce it. A release tag means only
+  that checks passed, so only a dev deploy proves a release against the
+  long-lived database and live Authentik (README, deployment section).
 - **Deployment smoke check** (post-pipeline, not part of `ci-watch`): for a
   successful development deployment, directly
   call its public native gRPC `System.GetVersion` endpoint **after** the
