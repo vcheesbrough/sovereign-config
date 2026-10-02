@@ -25,6 +25,7 @@ use super::identity::managed_username;
 use super::provisioning::dependency_outcome;
 use super::store::AccountRow;
 use crate::audit::{self, ActorRename};
+use crate::authentik::AdminError;
 use crate::metrics::{ManagedDependencyCall, ManagedDependencyOutcome};
 use crate::spans;
 
@@ -103,7 +104,9 @@ impl ManagedConnectionsService {
             return false;
         };
         let mut renamed = 0_u64;
-        let mut failed = false;
+        // The last failure holding the repair open, which marks this run's
+        // span failed so Tempo does not show an incomplete repair as clean.
+        let mut holding_open: Option<&'static str> = None;
         for account in accounts.iter().filter(|account| is_live(account)) {
             let Some(user_id) = account.provider_user_id else {
                 continue;
@@ -114,7 +117,11 @@ impl ManagedConnectionsService {
                     ManagedDependencyOutcome::Ok
                 }
                 Err(error) => {
-                    failed = true;
+                    // A deleted account has nothing left to name; only a
+                    // failure a later start could fix keeps the repair open.
+                    if !matches!(error, AdminError::NotFound) {
+                        holding_open = Some(error.label());
+                    }
                     warn!(
                         connection_id = account.connection_id.as_str(),
                         outcome = error.label(),
@@ -130,7 +137,10 @@ impl ManagedConnectionsService {
         if renamed > 0 {
             info!(renamed, "managed connections' accounts named after them");
         }
-        !failed
+        if let Some(classification) = holding_open {
+            spans::record_error(classification);
+        }
+        holding_open.is_none()
     }
 
     /// Gives every connection's account its current name in past events,

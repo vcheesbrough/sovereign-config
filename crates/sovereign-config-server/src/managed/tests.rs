@@ -2063,7 +2063,16 @@ async fn a_failed_rename_leaves_the_name_repair_to_the_next_start() {
         script.set_attributes = Behavior::Status(StatusCode::INTERNAL_SERVER_ERROR);
     });
 
-    service.shared.repair_actor_names(Duration::ZERO).await;
+    let capture = sovereign_config_telemetry::testing::Capture::exporting();
+    {
+        let _guard = capture.enter();
+        service.shared.repair_actor_names(Duration::ZERO).await;
+    }
+    // The run's root span shows the repair is incomplete, not just its
+    // Authentik child.
+    let exported = capture.finish();
+    let run = exported.span("sovereign_config.managed.rename_accounts");
+    assert_eq!(run.attribute("error.type"), Some("ambiguous"), "{run:?}");
 
     assert_eq!(mock.patched_attributes().len(), patched_before);
     let rendered = metrics.series();
@@ -2097,4 +2106,34 @@ async fn a_failed_rename_leaves_the_name_repair_to_the_next_start() {
     assert!(name_repair_completed(&pool).await);
 
     clear_trail(&pool, PATH).await;
+}
+
+/// An account deleted outside the product has nothing left to name, so it
+/// does not hold the repair open: it is counted, and the repair completes.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn a_deleted_account_does_not_hold_the_name_repair_open() {
+    let mock = mock_authentik().await;
+    let metrics = Arc::new(ManagedConnectionMetrics::default());
+    let Some(service) = service_with_metrics(&mock, Arc::clone(&metrics)).await else {
+        return;
+    };
+    let pool = test_pool().await.expect("the pool must be reachable");
+    create(
+        &service,
+        "Orphaned reader",
+        "/apps/repairgone",
+        &operator("/"),
+    )
+    .await
+    .expect("create must succeed");
+    clear_trail(&pool, "/apps/repairgone").await;
+    mock.script(|script| script.set_attributes = Behavior::Status(StatusCode::NOT_FOUND));
+
+    service.shared.repair_actor_names(Duration::ZERO).await;
+
+    assert!(metrics.series().contains(
+        "sovereign_config_managed_dependency_total{call=\"rename_account\",outcome=\"not_found\"} 1"
+    ));
+    assert!(name_repair_completed(&pool).await);
 }
