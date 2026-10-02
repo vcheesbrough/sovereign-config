@@ -20,7 +20,7 @@ use tonic::Status;
 use tracing::{info, warn};
 
 use super::identity::{generate_app_password, generate_connection_id, managed_username};
-use super::provisioning::{CLEANUP_MESSAGE, dependency_outcome};
+use super::provisioning::{AccountName, CLEANUP_MESSAGE, dependency_outcome};
 use super::store::{ConnectionRow, commit, mark_revoking, mark_rotation_unknown};
 use super::wire::{
     ConnectionMetadata, ProvisionedConnection, conflict_error, dependency_error, internal_error,
@@ -231,7 +231,10 @@ impl ManagedConnectionsService {
         let provisioned = self
             .provision_inserted(
                 &connection_id,
-                &username,
+                AccountName {
+                    username: &username,
+                    display_name: display_name.as_str(),
+                },
                 &root,
                 &permissions,
                 (&actor, event),

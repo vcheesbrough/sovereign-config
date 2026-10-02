@@ -23,6 +23,9 @@ const TEST_USERNAME: &str = "sc-managed-0123456789abcdefghijklmnopqrst";
 /// Every request the mock received as `(path_with_query, authorization)`.
 type RecordedRequests = Arc<Mutex<Vec<(String, Option<String>)>>>;
 
+/// Every request body the mock received, in order.
+type RecordedBodies = Arc<Mutex<Vec<Vec<u8>>>>;
+
 #[derive(Clone)]
 struct MockState {
     status: StatusCode,
@@ -30,11 +33,13 @@ struct MockState {
     delay: Duration,
     location: Option<&'static str>,
     hits: RecordedRequests,
+    bodies: RecordedBodies,
 }
 
 struct MockServer {
     origin: Url,
     hits: RecordedRequests,
+    bodies: RecordedBodies,
     task: JoinHandle<()>,
 }
 
@@ -55,6 +60,10 @@ async fn handle(State(state): State<MockState>, request: Request) -> Response {
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     state.hits.lock().unwrap().push((path, authorization));
+    let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    state.bodies.lock().unwrap().push(body.to_vec());
     sleep(state.delay).await;
     let mut response = Response::builder()
         .status(state.status)
@@ -72,12 +81,14 @@ async fn server(
     location: Option<&'static str>,
 ) -> MockServer {
     let hits = Arc::new(Mutex::new(Vec::new()));
+    let bodies = Arc::new(Mutex::new(Vec::new()));
     let state = MockState {
         status,
         body: body.into(),
         delay,
         location,
         hits: Arc::clone(&hits),
+        bodies: Arc::clone(&bodies),
     };
     let app = Router::new().fallback(handle).with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -88,6 +99,7 @@ async fn server(
     MockServer {
         origin: format!("http://{address}/").parse().unwrap(),
         hits,
+        bodies,
         task,
     }
 }
@@ -340,6 +352,41 @@ async fn group_assignment_patches_the_exact_user_with_the_exact_group() {
     let hits = server.hits.lock().unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0, "/api/v3/core/users/42/");
+}
+
+/// The account is named after its connection, because the blueprint signs
+/// that name into its tokens as `preferred_username` and the audit trail shows
+/// it in place of the opaque subject (#440).
+#[tokio::test]
+async fn managed_attributes_name_the_account_after_its_connection() {
+    let server = ok_server("{}").await;
+
+    client(&server)
+        .set_managed_attributes(
+            42,
+            "0123456789abcdefghijklmnopqrstuv",
+            "Pipeline reader",
+            "sovereign_config_test_grants",
+            "/apps/api",
+            &["read"],
+        )
+        .await
+        .unwrap();
+
+    let hits = server.hits.lock().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, "/api/v3/core/users/42/");
+    let bodies = server.bodies.lock().unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+    assert_eq!(body["name"], serde_json::json!("Pipeline reader"));
+    assert_eq!(
+        body["attributes"]["sovereign_config_managed"],
+        serde_json::json!("0123456789abcdefghijklmnopqrstuv")
+    );
+    assert_eq!(
+        body["attributes"]["sovereign_config_test_grants"],
+        serde_json::json!([{ "prefix": "/apps/api", "permissions": ["read"] }])
+    );
 }
 
 /// A failed admin call is a failed client span, classified by the bounded

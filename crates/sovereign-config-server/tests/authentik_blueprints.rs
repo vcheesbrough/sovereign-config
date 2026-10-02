@@ -94,7 +94,13 @@ fn assert_environment(environment: &Environment<'_>) {
     let expression = string(field(mapping(field(scope_mapping, "attrs")), "expression"));
     assert!(expression.contains(environment.source_attribute));
     assert!(!expression.contains(environment.other_attribute));
-    assert!(expression.contains("return {\"sovereign_config_grants\": grants}"));
+    assert!(expression.contains("claims = {\"sovereign_config_grants\": grants}"));
+    assert!(expression.contains("return claims"));
+    // A managed connection's account is named in its tokens, and only a
+    // managed one: a person's `preferred_username` comes from `profile` (#440).
+    assert!(expression.contains(
+        "if request.user.attributes.get(\"sovereign_config_managed\"):\n    claims[\"preferred_username\"] = request.user.name"
+    ));
     assert!(!expression.contains("config-contributor"));
 
     let group = present_entry(entries, "authentik_core.group", environment.group);

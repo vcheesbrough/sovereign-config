@@ -689,6 +689,9 @@ async fn create_provisions_exactly_one_read_only_grant_and_returns_one_url() {
 
     let patched = mock.patched_attributes();
     assert_eq!(patched.len(), 1);
+    // The account is named after the connection, so the audit trail shows
+    // that name for it rather than its opaque subject (#440).
+    assert_eq!(patched[0]["name"], json!("Pipeline reader"));
     let attributes = &patched[0]["attributes"];
     assert_eq!(
         attributes[GRANTS_ATTRIBUTE],
