@@ -1905,3 +1905,97 @@ async fn an_unrecordable_revocation_leaves_the_connection_retryable() {
 
     clear_trail(&pool, "/apps/api").await;
 }
+
+/// Inserts one read event at `path` attributed to `subject` under `name`,
+/// with the narrative the recorder would have rendered for it.
+async fn insert_read(pool: &sqlx::PgPool, path: &str, subject: &str, name: Option<&str>) {
+    sqlx::query(
+        r"
+        INSERT INTO audit_events
+            (occurred_at, first_occurred_at, kind, display_path, actor_subject,
+             actor_name, protocol_version, narrative)
+        VALUES (now(), now(), 'subtree.read', $1, $2, $3, 'v4', $4)
+        ",
+    )
+    .bind(path)
+    .bind(subject)
+    .bind(name)
+    .bind(format!(
+        "{} read subtree {path} (1 value)",
+        name.unwrap_or(subject)
+    ))
+    .execute(pool)
+    .await
+    .expect("an event must be insertable");
+}
+
+/// #440: an existing connection's account is named after it, and its past
+/// events — recorded by subject alone, or under its generated username — read
+/// as if it had always carried that name. Nothing else changes, and running
+/// the repair again changes nothing.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn the_name_repair_renames_accounts_and_past_events() {
+    const PATH: &str = "/apps/repair";
+    let mock = mock_authentik().await;
+    let service = service_or_skip!(&mock);
+    let pool = test_pool().await.expect("the pool must be reachable");
+    clear_trail(&pool, PATH).await;
+    let (connection_id, _) = create(&service, "Pipeline reader", PATH, &operator("/"))
+        .await
+        .expect("create must succeed");
+    let subject: String = sqlx::query_scalar(
+        "SELECT provider_user_uid FROM managed_connections WHERE connection_id = $1",
+    )
+    .bind(&connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the account's subject must be recorded");
+    let username = managed_username(
+        &sovereign_config_core::ConnectionId::parse(connection_id.clone()).unwrap(),
+        "Pipeline reader",
+    );
+    clear_trail(&pool, PATH).await;
+    insert_read(&pool, PATH, &subject, None).await;
+    insert_read(&pool, PATH, &subject, Some(&username)).await;
+    insert_read(
+        &pool,
+        PATH,
+        &subject,
+        Some(&format!("{username} (access URL)")),
+    )
+    .await;
+    insert_read(&pool, PATH, &subject, Some("Somebody else")).await;
+    insert_read(&pool, PATH, "another-subject", None).await;
+    let patched_before = mock.patched_attributes().len();
+
+    for _ in 0..2 {
+        service.shared.repair_actor_names(Duration::ZERO).await;
+    }
+
+    let renames: Vec<Value> = mock.patched_attributes()[patched_before..].to_vec();
+    let rename = json!({ "name": "Pipeline reader" });
+    assert_eq!(renames, [rename.clone(), rename]);
+    let rows = trail(&pool, PATH).await;
+    let shown: Vec<(Option<&str>, &str)> = rows
+        .iter()
+        .map(|row| (row.actor_name.as_deref(), row.narrative.as_str()))
+        .collect();
+    let repaired = "Pipeline reader (access URL) read subtree /apps/repair (1 value)";
+    assert_eq!(
+        shown,
+        [
+            (Some("Pipeline reader (access URL)"), repaired),
+            (Some("Pipeline reader (access URL)"), repaired),
+            (Some("Pipeline reader (access URL)"), repaired),
+            (
+                Some("Somebody else"),
+                "Somebody else read subtree /apps/repair (1 value)"
+            ),
+            (None, "another-subject read subtree /apps/repair (1 value)"),
+        ]
+    );
+    assert!(rows[..3].iter().all(|row| row.actor_subject == subject));
+
+    clear_trail(&pool, PATH).await;
+}

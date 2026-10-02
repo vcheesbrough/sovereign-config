@@ -256,6 +256,20 @@ impl AuthentikAdminClient {
         .map(|_| ())
     }
 
+    /// Names an existing managed service account after its connection, as
+    /// [`Self::set_managed_attributes`] does for a new one. Only the name is
+    /// patched, so the account's credential and grants are untouched.
+    pub(crate) async fn rename_user(&self, user_id: i64, name: &str) -> Result<(), AdminError> {
+        self.call(
+            Method::PATCH,
+            USER_ROUTE,
+            self.endpoint(&format!("/api/v3/core/users/{user_id}/"))?,
+            Some(json!({ "name": name })),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Locates a user by exact generated username for reconciliation only.
     ///
     /// Only usable while the manager can still see at least one managed
