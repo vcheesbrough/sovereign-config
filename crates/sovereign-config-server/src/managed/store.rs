@@ -260,6 +260,35 @@ impl ManagedConnectionsService {
         .map_err(|_| store_unavailable())
     }
 
+    /// Whether the one-time name repair (#440) has completed.
+    #[instrument(
+        name = "name_repair_completed managed_name_repair",
+        skip_all,
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "name_repair_completed", db.collection.name = "managed_name_repair")
+    )]
+    pub(super) async fn name_repair_completed(&self) -> Result<bool, Status> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM managed_name_repair)")
+            .fetch_one(&self.database)
+            .await
+            .map_err(|_| store_unavailable())
+    }
+
+    /// Records that the one-time name repair (#440) has completed.
+    #[instrument(
+        name = "complete_name_repair managed_name_repair",
+        skip_all,
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "complete_name_repair", db.collection.name = "managed_name_repair")
+    )]
+    pub(super) async fn complete_name_repair(&self) -> Result<(), Status> {
+        sqlx::query(
+            "INSERT INTO managed_name_repair (completed_at) VALUES (now()) ON CONFLICT DO NOTHING",
+        )
+        .execute(&self.database)
+        .await
+        .map(|_| ())
+        .map_err(|_| store_unavailable())
+    }
+
     /// Inserts a new connection in `provisioning`, before any external call.
     #[instrument(
         name = "insert_provisioning managed_connections",

@@ -5,8 +5,11 @@
 //! The repair names every existing account after its connection, as
 //! provisioning now does for a new one, then — once every token minted under
 //! the old name has expired — gives each of those accounts its current name
-//! in every past event. It runs at every start and is idempotent, so a start
-//! interrupted halfway is finished by the next. It never fails startup.
+//! in every past event. It rewrites recorded history once: when every step
+//! has succeeded it records that it is done (`managed_name_repair`), and every
+//! later start skips it. A start interrupted halfway, or one where any step
+//! failed, records nothing, and the next start runs it again — each step is
+//! idempotent. It never fails startup.
 //!
 //! What it cannot repair: an event by a connection revoked before it ran. The
 //! revocation deleted the only record linking that account's subject to a
@@ -43,10 +46,22 @@ pub(super) fn marked(name: &str) -> String {
 }
 
 impl ManagedConnectionsService {
-    /// Runs the whole repair; `delay` separates renaming the accounts from
-    /// repairing the trail ([`TRAIL_REPAIR_DELAY`] outside tests).
+    /// Runs the whole repair, unless it has already completed; `delay`
+    /// separates renaming the accounts from repairing the trail
+    /// ([`TRAIL_REPAIR_DELAY`] outside tests).
     pub(crate) async fn repair_actor_names(&self, delay: Duration) {
-        self.rename_accounts()
+        match self.name_repair_completed().await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(_) => {
+                warn!(
+                    "whether the name repair has completed could not be read; retrying at the next start"
+                );
+                return;
+            }
+        }
+        let accounts_named = self
+            .rename_accounts()
             .instrument(tracing::info_span!(
                 parent: None,
                 "sovereign_config.managed.rename_accounts",
@@ -57,7 +72,8 @@ impl ManagedConnectionsService {
             ))
             .await;
         tokio::time::sleep(delay).await;
-        self.rename_actors_in_trail()
+        let trail_repaired = self
+            .rename_actors_in_trail()
             .instrument(tracing::info_span!(
                 parent: None,
                 "sovereign_config.audit.rename_actors",
@@ -67,16 +83,27 @@ impl ManagedConnectionsService {
                 sovereign_config.audit.renamed = Empty,
             ))
             .await;
+        if !(accounts_named && trail_repaired) {
+            return;
+        }
+        if self.complete_name_repair().await.is_ok() {
+            info!("the managed connections' name repair is complete");
+        } else {
+            warn!(
+                "the name repair could not be recorded as complete; it runs again at the next start"
+            );
+        }
     }
 
-    /// Names every live connection's account after the connection. One
-    /// account failing is counted and logged, and the rest are still named;
-    /// the next start retries it.
-    async fn rename_accounts(&self) {
+    /// Names every live connection's account after the connection, returning
+    /// whether every one was. One account failing is counted and logged, and
+    /// the rest are still named.
+    async fn rename_accounts(&self) -> bool {
         let Some(accounts) = self.accounts_or_log().await else {
-            return;
+            return false;
         };
         let mut renamed = 0_u64;
+        let mut failed = false;
         for account in accounts.iter().filter(|account| is_live(account)) {
             let Some(user_id) = account.provider_user_id else {
                 continue;
@@ -87,6 +114,7 @@ impl ManagedConnectionsService {
                     ManagedDependencyOutcome::Ok
                 }
                 Err(error) => {
+                    failed = true;
                     warn!(
                         connection_id = account.connection_id.as_str(),
                         outcome = error.label(),
@@ -102,21 +130,23 @@ impl ManagedConnectionsService {
         if renamed > 0 {
             info!(renamed, "managed connections' accounts named after them");
         }
+        !failed
     }
 
-    /// Gives every connection's account its current name in past events.
-    async fn rename_actors_in_trail(&self) {
+    /// Gives every connection's account its current name in past events,
+    /// returning whether that succeeded.
+    async fn rename_actors_in_trail(&self) -> bool {
         let Some(accounts) = self.accounts_or_log().await else {
-            return;
+            return false;
         };
         let names: Vec<ActorRename> = accounts.iter().filter_map(actor_rename).collect();
         if names.is_empty() {
-            return;
+            return true;
         }
         let Ok(renamed) = audit::rename_actors(&self.database, &names).await else {
             spans::record_error("storage_unavailable");
             warn!("past audit events could not be renamed; retrying at the next start");
-            return;
+            return false;
         };
         tracing::Span::current().record("sovereign_config.audit.renamed", renamed);
         if renamed > 0 {
@@ -125,6 +155,7 @@ impl ManagedConnectionsService {
                 "past audit events by managed connections now name them"
             );
         }
+        true
     }
 
     async fn accounts_or_log(&self) -> Option<Vec<AccountRow>> {

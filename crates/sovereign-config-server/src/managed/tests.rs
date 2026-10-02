@@ -479,6 +479,10 @@ async fn service_with_metrics(
         .execute(&database)
         .await
         .expect("managed connection table must be clearable");
+    sqlx::query("DELETE FROM managed_name_repair")
+        .execute(&database)
+        .await
+        .expect("the name repair marker must be clearable");
     let admin = AuthentikAdminClient::new(
         mock.origin.clone(),
         Secret::new("manager-api-token-sentinel"),
@@ -1929,10 +1933,19 @@ async fn insert_read(pool: &sqlx::PgPool, path: &str, subject: &str, name: Optio
     .expect("an event must be insertable");
 }
 
+/// Whether the one-time name repair has recorded itself complete.
+async fn name_repair_completed(pool: &sqlx::PgPool) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM managed_name_repair)")
+        .fetch_one(pool)
+        .await
+        .expect("the name repair marker must be readable")
+}
+
 /// #440: an existing connection's account is named after it, and its past
 /// events — recorded by subject alone, or under its generated username — read
-/// as if it had always carried that name. Nothing else changes, and running
-/// the repair again changes nothing.
+/// as if it had always carried that name. Nothing else changes. Once it has
+/// completed it never runs again: a later nameless event is left as recorded,
+/// and no account is renamed.
 #[tokio::test]
 #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
 async fn the_name_repair_renames_accounts_and_past_events() {
@@ -1969,13 +1982,11 @@ async fn the_name_repair_renames_accounts_and_past_events() {
     insert_read(&pool, PATH, "another-subject", None).await;
     let patched_before = mock.patched_attributes().len();
 
-    for _ in 0..2 {
-        service.shared.repair_actor_names(Duration::ZERO).await;
-    }
+    service.shared.repair_actor_names(Duration::ZERO).await;
 
     let renames: Vec<Value> = mock.patched_attributes()[patched_before..].to_vec();
-    let rename = json!({ "name": "Pipeline reader" });
-    assert_eq!(renames, [rename.clone(), rename]);
+    assert_eq!(renames, [json!({ "name": "Pipeline reader" })]);
+    assert!(name_repair_completed(&pool).await);
     let rows = trail(&pool, PATH).await;
     let shown: Vec<(Option<&str>, &str)> = rows
         .iter()
@@ -1996,6 +2007,94 @@ async fn the_name_repair_renames_accounts_and_past_events() {
         ]
     );
     assert!(rows[..3].iter().all(|row| row.actor_subject == subject));
+
+    insert_read(&pool, "/apps/repair/later", &subject, None).await;
+    service.shared.repair_actor_names(Duration::ZERO).await;
+    assert_eq!(mock.patched_attributes().len(), patched_before + 1);
+    let later = trail(&pool, "/apps/repair/later").await;
+    assert_eq!(later[0].actor_name, None);
+
+    clear_trail(&pool, PATH).await;
+}
+
+/// A live connection whose account cannot be renamed is counted and logged,
+/// the trail is still repaired for every connection — including one being
+/// revoked, whose account is never touched — and the repair records nothing,
+/// so the next start runs it again and finishes it.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn a_failed_rename_leaves_the_name_repair_to_the_next_start() {
+    const PATH: &str = "/apps/repairfail";
+    let mock = mock_authentik().await;
+    let metrics = Arc::new(ManagedConnectionMetrics::default());
+    let Some(service) = service_with_metrics(&mock, Arc::clone(&metrics)).await else {
+        return;
+    };
+    let pool = test_pool().await.expect("the pool must be reachable");
+    clear_trail(&pool, PATH).await;
+    let (live, _) = create(&service, "Live reader", PATH, &operator("/"))
+        .await
+        .expect("create must succeed");
+    let (revoking, _) = create(&service, "Leaving reader", PATH, &operator("/"))
+        .await
+        .expect("create must succeed");
+    sqlx::query("UPDATE managed_connections SET state = 'revoking' WHERE connection_id = $1")
+        .bind(&revoking)
+        .execute(&pool)
+        .await
+        .expect("the connection must be markable as revoking");
+    let mut subjects = Vec::new();
+    for connection_id in [&live, &revoking] {
+        let subject: String = sqlx::query_scalar(
+            "SELECT provider_user_uid FROM managed_connections WHERE connection_id = $1",
+        )
+        .bind(connection_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the account's subject must be recorded");
+        subjects.push(subject);
+    }
+    clear_trail(&pool, PATH).await;
+    for subject in &subjects {
+        insert_read(&pool, PATH, subject, None).await;
+    }
+    let patched_before = mock.patched_attributes().len();
+    mock.script(|script| {
+        script.set_attributes = Behavior::Status(StatusCode::INTERNAL_SERVER_ERROR);
+    });
+
+    service.shared.repair_actor_names(Duration::ZERO).await;
+
+    assert_eq!(mock.patched_attributes().len(), patched_before);
+    let rendered = metrics.series();
+    assert!(
+        rendered.contains(
+            "sovereign_config_managed_dependency_total{call=\"rename_account\",outcome=\"ambiguous\"} 1"
+        ),
+        "{rendered}"
+    );
+    let names: Vec<Option<String>> = trail(&pool, PATH)
+        .await
+        .into_iter()
+        .map(|row| row.actor_name)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            Some("Live reader (access URL)".to_owned()),
+            Some("Leaving reader (access URL)".to_owned())
+        ]
+    );
+    assert!(!name_repair_completed(&pool).await);
+
+    // The next start renames the live account — only it — and completes.
+    mock.script(|script| script.set_attributes = Behavior::Ok);
+    service.shared.repair_actor_names(Duration::ZERO).await;
+    assert_eq!(
+        mock.patched_attributes()[patched_before..],
+        [json!({ "name": "Live reader" })]
+    );
+    assert!(name_repair_completed(&pool).await);
 
     clear_trail(&pool, PATH).await;
 }
