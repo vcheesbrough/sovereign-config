@@ -1913,6 +1913,18 @@ async fn an_unrecordable_revocation_leaves_the_connection_retryable() {
 /// Inserts one read event at `path` attributed to `subject` under `name`,
 /// with the narrative the recorder would have rendered for it.
 async fn insert_read(pool: &sqlx::PgPool, path: &str, subject: &str, name: Option<&str>) {
+    let narrative = format!("{} read subtree {path} (1 value)", name.unwrap_or(subject));
+    insert_event(pool, path, subject, name, &narrative).await;
+}
+
+/// Inserts one read event with exactly `narrative`.
+async fn insert_event(
+    pool: &sqlx::PgPool,
+    path: &str,
+    subject: &str,
+    name: Option<&str>,
+    narrative: &str,
+) {
     sqlx::query(
         r"
         INSERT INTO audit_events
@@ -1924,10 +1936,7 @@ async fn insert_read(pool: &sqlx::PgPool, path: &str, subject: &str, name: Optio
     .bind(path)
     .bind(subject)
     .bind(name)
-    .bind(format!(
-        "{} read subtree {path} (1 value)",
-        name.unwrap_or(subject)
-    ))
+    .bind(narrative)
     .execute(pool)
     .await
     .expect("an event must be insertable");
@@ -1980,6 +1989,17 @@ async fn the_name_repair_renames_accounts_and_past_events() {
     .await;
     insert_read(&pool, PATH, &subject, Some("Somebody else")).await;
     insert_read(&pool, PATH, "another-subject", None).await;
+    // The narrative's head is spliced only when it is the recorded name and a
+    // space: a sentence that does not start that way is never cut.
+    insert_event(
+        &pool,
+        PATH,
+        &subject,
+        None,
+        "someone read subtree /apps/repair",
+    )
+    .await;
+    insert_event(&pool, PATH, &subject, None, &subject).await;
     let patched_before = mock.patched_attributes().len();
 
     service.shared.repair_actor_names(Duration::ZERO).await;
@@ -2004,6 +2024,8 @@ async fn the_name_repair_renames_accounts_and_past_events() {
                 "Somebody else read subtree /apps/repair (1 value)"
             ),
             (None, "another-subject read subtree /apps/repair (1 value)"),
+            (None, "someone read subtree /apps/repair"),
+            (None, subject.as_str()),
         ]
     );
     assert!(rows[..3].iter().all(|row| row.actor_subject == subject));

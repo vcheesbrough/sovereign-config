@@ -28,7 +28,7 @@ async fn reset_schema(pool: &PgPool, context: &str) {
     sqlx::query(
         // Every table the migrations create, so a reset leaves nothing for the
         // next `run` to collide with. A new migration adds its table here.
-        "DROP TABLE IF EXISTS audit_events, configuration_paths, configuration_value_contents, configuration_values, managed_connections, schema_metadata, _sqlx_migrations CASCADE",
+        "DROP TABLE IF EXISTS audit_events, configuration_paths, configuration_value_contents, configuration_values, managed_connections, managed_name_repair, schema_metadata, _sqlx_migrations CASCADE",
     )
     .execute(pool)
     .await
@@ -523,7 +523,7 @@ async fn migrations_are_repeatable_against_postgresql() {
     .fetch_all(&pool)
     .await
     .expect("audit index inventory must be readable");
-    assert_eq!(applied_migrations, 12);
+    assert_eq!(applied_migrations, 13);
     assert_eq!(
         audit_indexes,
         [
