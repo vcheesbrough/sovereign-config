@@ -30,18 +30,31 @@ const CREATE_RECONCILIATION_DELAY: Duration = Duration::from_millis(500);
 
 pub(super) const CLEANUP_MESSAGE: &str = "managed connection requires cleanup";
 
+/// What a connection's service account is called: the generated username
+/// that identifies it, and the connection's display name that the account is
+/// named after, so its tokens and the audit trail carry that name.
+#[derive(Clone, Copy)]
+pub(super) struct AccountName<'a> {
+    pub(super) username: &'a str,
+    pub(super) display_name: &'a str,
+}
+
 impl ManagedConnectionsService {
     /// Runs the external provisioning steps for a freshly inserted row and
     /// compensates on every failure path.
     pub(super) async fn provision_inserted(
         &self,
         connection_id: &ConnectionId,
-        username: &str,
+        account_name: AccountName<'_>,
         root: &ConfigPath,
         permissions: &ManagedPermissions,
         created: (&Actor<'_>, AuditEvent<'_>),
     ) -> Result<ProvisionedConnection, Status> {
-        let account = match self.admin.create_service_account(username).await {
+        let account = match self
+            .admin
+            .create_service_account(account_name.username)
+            .await
+        {
             Ok(account) => {
                 self.metrics.record_dependency(
                     ManagedDependencyCall::CreateAccount,
@@ -55,7 +68,7 @@ impl ManagedConnectionsService {
                     dependency_outcome(error),
                 );
                 return Err(self
-                    .recover_ambiguous_create(connection_id, username, error)
+                    .recover_ambiguous_create(connection_id, account_name.username, error)
                     .await);
             }
         };
@@ -63,7 +76,7 @@ impl ManagedConnectionsService {
         let (row, connection_url) = match self
             .complete_provisioning(
                 connection_id,
-                username,
+                account_name,
                 root,
                 permissions,
                 &account,
@@ -90,7 +103,7 @@ impl ManagedConnectionsService {
     async fn complete_provisioning(
         &self,
         connection_id: &ConnectionId,
-        username: &str,
+        account_name: AccountName<'_>,
         root: &ConfigPath,
         permissions: &ManagedPermissions,
         account: &CreatedServiceAccount,
@@ -99,14 +112,14 @@ impl ManagedConnectionsService {
         // Record the external identity immediately so a crash from here on
         // leaves a row that revocation can reconcile and clean up.
         self.record_provider_user(connection_id, account).await?;
-        self.configure_account(connection_id, username, root, permissions, account)
+        self.configure_account(connection_id, account_name, root, permissions, account)
             .await?;
         let connection_url = ConnectionUrl::managed(
             &self.settings.public_origin,
             root,
             &self.settings.issuer,
             &self.settings.client_id,
-            username,
+            account_name.username,
             &account.app_password,
         )
         .map_err(|_| internal_error())?;
@@ -128,16 +141,21 @@ impl ManagedConnectionsService {
     }
 
     /// Discovers the single app-password credential, records its identifier,
-    /// and patches the exact selected grant plus managed marker.
+    /// and patches the exact selected grant plus managed marker, naming the
+    /// account after the connection's display name.
     pub(super) async fn configure_account(
         &self,
         connection_id: &ConnectionId,
-        username: &str,
+        account_name: AccountName<'_>,
         root: &ConfigPath,
         permissions: &ManagedPermissions,
         account: &CreatedServiceAccount,
     ) -> Result<(), Status> {
-        let identifiers = match self.admin.find_app_password_identifiers(username).await {
+        let identifiers = match self
+            .admin
+            .find_app_password_identifiers(account_name.username)
+            .await
+        {
             Ok(identifiers) => identifiers,
             Err(error) => {
                 self.metrics.record_dependency(
@@ -170,6 +188,7 @@ impl ManagedConnectionsService {
             .set_managed_attributes(
                 account.user_id,
                 connection_id.as_str(),
+                account_name.display_name,
                 &self.settings.grants_attribute,
                 root.as_str(),
                 &permissions.grant_tokens(),

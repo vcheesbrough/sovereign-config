@@ -16,6 +16,17 @@ use crate::auth::{AuthenticatedPrincipal, Permission};
 use crate::authentik::CreatedServiceAccount;
 use crate::rpc::store_unavailable;
 
+/// A connection whose service account exists or did, as the name repair
+/// (#440) reads it.
+#[derive(FromRow)]
+pub(super) struct AccountRow {
+    pub(super) connection_id: String,
+    pub(super) display_name: String,
+    pub(super) provider_user_id: Option<i64>,
+    pub(super) provider_user_uid: String,
+    pub(super) state: String,
+}
+
 #[derive(FromRow)]
 pub(super) struct ConnectionRow {
     pub(super) connection_id: String,
@@ -225,6 +236,56 @@ impl ManagedConnectionsService {
         )
         .fetch_all(&self.database)
         .await
+        .map_err(|_| store_unavailable())
+    }
+
+    /// Every connection whose service account's subject is recorded, oldest
+    /// first.
+    #[instrument(
+        name = "list_accounts managed_connections",
+        skip_all,
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "list_accounts", db.collection.name = "managed_connections")
+    )]
+    pub(super) async fn list_accounts(&self) -> Result<Vec<AccountRow>, Status> {
+        sqlx::query_as::<_, AccountRow>(
+            r"
+            SELECT connection_id, display_name, provider_user_id, provider_user_uid, state
+            FROM managed_connections
+            WHERE provider_user_uid IS NOT NULL
+            ORDER BY created_at, connection_id
+            ",
+        )
+        .fetch_all(&self.database)
+        .await
+        .map_err(|_| store_unavailable())
+    }
+
+    /// Whether the one-time name repair (#440) has completed.
+    #[instrument(
+        name = "name_repair_completed managed_name_repair",
+        skip_all,
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "name_repair_completed", db.collection.name = "managed_name_repair")
+    )]
+    pub(super) async fn name_repair_completed(&self) -> Result<bool, Status> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM managed_name_repair)")
+            .fetch_one(&self.database)
+            .await
+            .map_err(|_| store_unavailable())
+    }
+
+    /// Records that the one-time name repair (#440) has completed.
+    #[instrument(
+        name = "complete_name_repair managed_name_repair",
+        skip_all,
+        fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "complete_name_repair", db.collection.name = "managed_name_repair")
+    )]
+    pub(super) async fn complete_name_repair(&self) -> Result<(), Status> {
+        sqlx::query(
+            "INSERT INTO managed_name_repair (completed_at) VALUES (now()) ON CONFLICT DO NOTHING",
+        )
+        .execute(&self.database)
+        .await
+        .map(|_| ())
         .map_err(|_| store_unavailable())
     }
 

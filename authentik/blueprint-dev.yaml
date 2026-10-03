@@ -21,7 +21,16 @@ entries:
             for grant in attributes.get("sovereign_config_dev_grants", []):
                 if grant not in grants:
                     grants.append(grant)
-        return {"sovereign_config_grants": grants}
+        claims = {"sovereign_config_grants": grants}
+        # A managed connection's service account requests only this scope, so
+        # it has no profile claims. The connection manager names the account
+        # after its connection; signing that name here is what lets the audit
+        # trail show it instead of the account's opaque subject. Whoever
+        # creates a connection chooses its name, so it is marked as an access
+        # URL's: a connection named after a person must not read as them.
+        if request.user.attributes.get("sovereign_config_managed"):
+            claims["preferred_username"] = f"{request.user.name} (access URL)"
+        return claims
 
   # The web UI's permission to send telemetry to this environment's ingest
   # (otlp-collector-oidc refuses a token without it). It adds no claim: being

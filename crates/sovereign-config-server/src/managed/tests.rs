@@ -479,6 +479,10 @@ async fn service_with_metrics(
         .execute(&database)
         .await
         .expect("managed connection table must be clearable");
+    sqlx::query("DELETE FROM managed_name_repair")
+        .execute(&database)
+        .await
+        .expect("the name repair marker must be clearable");
     let admin = AuthentikAdminClient::new(
         mock.origin.clone(),
         Secret::new("manager-api-token-sentinel"),
@@ -689,6 +693,9 @@ async fn create_provisions_exactly_one_read_only_grant_and_returns_one_url() {
 
     let patched = mock.patched_attributes();
     assert_eq!(patched.len(), 1);
+    // The account is named after the connection, so the audit trail shows
+    // that name for it rather than its opaque subject (#440).
+    assert_eq!(patched[0]["name"], json!("Pipeline reader"));
     let attributes = &patched[0]["attributes"];
     assert_eq!(
         attributes[GRANTS_ATTRIBUTE],
@@ -1901,4 +1908,254 @@ async fn an_unrecordable_revocation_leaves_the_connection_retryable() {
     );
 
     clear_trail(&pool, "/apps/api").await;
+}
+
+/// Inserts one read event at `path` attributed to `subject` under `name`,
+/// with the narrative the recorder would have rendered for it.
+async fn insert_read(pool: &sqlx::PgPool, path: &str, subject: &str, name: Option<&str>) {
+    let narrative = format!("{} read subtree {path} (1 value)", name.unwrap_or(subject));
+    insert_event(pool, path, subject, name, &narrative).await;
+}
+
+/// Inserts one read event with exactly `narrative`.
+async fn insert_event(
+    pool: &sqlx::PgPool,
+    path: &str,
+    subject: &str,
+    name: Option<&str>,
+    narrative: &str,
+) {
+    sqlx::query(
+        r"
+        INSERT INTO audit_events
+            (occurred_at, first_occurred_at, kind, display_path, actor_subject,
+             actor_name, protocol_version, narrative)
+        VALUES (now(), now(), 'subtree.read', $1, $2, $3, 'v4', $4)
+        ",
+    )
+    .bind(path)
+    .bind(subject)
+    .bind(name)
+    .bind(narrative)
+    .execute(pool)
+    .await
+    .expect("an event must be insertable");
+}
+
+/// Whether the one-time name repair has recorded itself complete.
+async fn name_repair_completed(pool: &sqlx::PgPool) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM managed_name_repair)")
+        .fetch_one(pool)
+        .await
+        .expect("the name repair marker must be readable")
+}
+
+/// #440: an existing connection's account is named after it, and its past
+/// events — recorded by subject alone, or under its generated username — read
+/// as if it had always carried that name. Nothing else changes. Once it has
+/// completed it never runs again: a later nameless event is left as recorded,
+/// and no account is renamed.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn the_name_repair_renames_accounts_and_past_events() {
+    const PATH: &str = "/apps/repair";
+    let mock = mock_authentik().await;
+    let service = service_or_skip!(&mock);
+    let pool = test_pool().await.expect("the pool must be reachable");
+    clear_trail(&pool, PATH).await;
+    let (connection_id, _) = create(&service, "Pipeline reader", PATH, &operator("/"))
+        .await
+        .expect("create must succeed");
+    let subject: String = sqlx::query_scalar(
+        "SELECT provider_user_uid FROM managed_connections WHERE connection_id = $1",
+    )
+    .bind(&connection_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the account's subject must be recorded");
+    let username = managed_username(
+        &sovereign_config_core::ConnectionId::parse(connection_id.clone()).unwrap(),
+        "Pipeline reader",
+    );
+    clear_trail(&pool, PATH).await;
+    insert_read(&pool, PATH, &subject, None).await;
+    insert_read(&pool, PATH, &subject, Some(&username)).await;
+    insert_read(
+        &pool,
+        PATH,
+        &subject,
+        Some(&format!("{username} (access URL)")),
+    )
+    .await;
+    insert_read(&pool, PATH, &subject, Some("Somebody else")).await;
+    insert_read(&pool, PATH, "another-subject", None).await;
+    // The narrative's head is spliced only when it is the recorded name and a
+    // space: a sentence that does not start that way is never cut.
+    insert_event(
+        &pool,
+        PATH,
+        &subject,
+        None,
+        "someone read subtree /apps/repair",
+    )
+    .await;
+    insert_event(&pool, PATH, &subject, None, &subject).await;
+    let patched_before = mock.patched_attributes().len();
+
+    service.shared.repair_actor_names(Duration::ZERO).await;
+
+    let renames: Vec<Value> = mock.patched_attributes()[patched_before..].to_vec();
+    assert_eq!(renames, [json!({ "name": "Pipeline reader" })]);
+    assert!(name_repair_completed(&pool).await);
+    let rows = trail(&pool, PATH).await;
+    let shown: Vec<(Option<&str>, &str)> = rows
+        .iter()
+        .map(|row| (row.actor_name.as_deref(), row.narrative.as_str()))
+        .collect();
+    let repaired = "Pipeline reader (access URL) read subtree /apps/repair (1 value)";
+    assert_eq!(
+        shown,
+        [
+            (Some("Pipeline reader (access URL)"), repaired),
+            (Some("Pipeline reader (access URL)"), repaired),
+            (Some("Pipeline reader (access URL)"), repaired),
+            (
+                Some("Somebody else"),
+                "Somebody else read subtree /apps/repair (1 value)"
+            ),
+            (None, "another-subject read subtree /apps/repair (1 value)"),
+            (None, "someone read subtree /apps/repair"),
+            (None, subject.as_str()),
+        ]
+    );
+    assert!(rows[..3].iter().all(|row| row.actor_subject == subject));
+
+    insert_read(&pool, "/apps/repair/later", &subject, None).await;
+    service.shared.repair_actor_names(Duration::ZERO).await;
+    assert_eq!(mock.patched_attributes().len(), patched_before + 1);
+    let later = trail(&pool, "/apps/repair/later").await;
+    assert_eq!(later[0].actor_name, None);
+
+    clear_trail(&pool, PATH).await;
+}
+
+/// A live connection whose account cannot be renamed is counted and logged,
+/// the trail is still repaired for every connection — including one being
+/// revoked, whose account is never touched — and the repair records nothing,
+/// so the next start runs it again and finishes it.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn a_failed_rename_leaves_the_name_repair_to_the_next_start() {
+    const PATH: &str = "/apps/repairfail";
+    let mock = mock_authentik().await;
+    let metrics = Arc::new(ManagedConnectionMetrics::default());
+    let Some(service) = service_with_metrics(&mock, Arc::clone(&metrics)).await else {
+        return;
+    };
+    let pool = test_pool().await.expect("the pool must be reachable");
+    clear_trail(&pool, PATH).await;
+    let (live, _) = create(&service, "Live reader", PATH, &operator("/"))
+        .await
+        .expect("create must succeed");
+    let (revoking, _) = create(&service, "Leaving reader", PATH, &operator("/"))
+        .await
+        .expect("create must succeed");
+    sqlx::query("UPDATE managed_connections SET state = 'revoking' WHERE connection_id = $1")
+        .bind(&revoking)
+        .execute(&pool)
+        .await
+        .expect("the connection must be markable as revoking");
+    let mut subjects = Vec::new();
+    for connection_id in [&live, &revoking] {
+        let subject: String = sqlx::query_scalar(
+            "SELECT provider_user_uid FROM managed_connections WHERE connection_id = $1",
+        )
+        .bind(connection_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the account's subject must be recorded");
+        subjects.push(subject);
+    }
+    clear_trail(&pool, PATH).await;
+    for subject in &subjects {
+        insert_read(&pool, PATH, subject, None).await;
+    }
+    let patched_before = mock.patched_attributes().len();
+    mock.script(|script| {
+        script.set_attributes = Behavior::Status(StatusCode::INTERNAL_SERVER_ERROR);
+    });
+
+    let capture = sovereign_config_telemetry::testing::Capture::exporting();
+    {
+        let _guard = capture.enter();
+        service.shared.repair_actor_names(Duration::ZERO).await;
+    }
+    // The run's root span shows the repair is incomplete, not just its
+    // Authentik child.
+    let exported = capture.finish();
+    let run = exported.span("sovereign_config.managed.rename_accounts");
+    assert_eq!(run.attribute("error.type"), Some("ambiguous"), "{run:?}");
+
+    assert_eq!(mock.patched_attributes().len(), patched_before);
+    let rendered = metrics.series();
+    assert!(
+        rendered.contains(
+            "sovereign_config_managed_dependency_total{call=\"rename_account\",outcome=\"ambiguous\"} 1"
+        ),
+        "{rendered}"
+    );
+    let names: Vec<Option<String>> = trail(&pool, PATH)
+        .await
+        .into_iter()
+        .map(|row| row.actor_name)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            Some("Live reader (access URL)".to_owned()),
+            Some("Leaving reader (access URL)".to_owned())
+        ]
+    );
+    assert!(!name_repair_completed(&pool).await);
+
+    // The next start renames the live account — only it — and completes.
+    mock.script(|script| script.set_attributes = Behavior::Ok);
+    service.shared.repair_actor_names(Duration::ZERO).await;
+    assert_eq!(
+        mock.patched_attributes()[patched_before..],
+        [json!({ "name": "Live reader" })]
+    );
+    assert!(name_repair_completed(&pool).await);
+
+    clear_trail(&pool, PATH).await;
+}
+
+/// An account deleted outside the product has nothing left to name, so it
+/// does not hold the repair open: it is counted, and the repair completes.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn a_deleted_account_does_not_hold_the_name_repair_open() {
+    let mock = mock_authentik().await;
+    let metrics = Arc::new(ManagedConnectionMetrics::default());
+    let Some(service) = service_with_metrics(&mock, Arc::clone(&metrics)).await else {
+        return;
+    };
+    let pool = test_pool().await.expect("the pool must be reachable");
+    create(
+        &service,
+        "Orphaned reader",
+        "/apps/repairgone",
+        &operator("/"),
+    )
+    .await
+    .expect("create must succeed");
+    clear_trail(&pool, "/apps/repairgone").await;
+    mock.script(|script| script.set_attributes = Behavior::Status(StatusCode::NOT_FOUND));
+
+    service.shared.repair_actor_names(Duration::ZERO).await;
+
+    assert!(metrics.series().contains(
+        "sovereign_config_managed_dependency_total{call=\"rename_account\",outcome=\"not_found\"} 1"
+    ));
+    assert!(name_repair_completed(&pool).await);
 }

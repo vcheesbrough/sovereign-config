@@ -155,6 +155,29 @@ impl Actor<'_> {
     }
 }
 
+/// What a managed connection's account is called in the trail, and what it
+/// was called before it was named after its connection (#440).
+pub(crate) struct ActorRename {
+    /// The account's token subject.
+    pub(crate) subject: String,
+    /// The name its tokens carry now.
+    pub(crate) name: String,
+    /// Its generated username, which its tokens carried as its name before.
+    pub(crate) superseded: String,
+    /// The same, as the marking scope mapping signed it.
+    pub(crate) superseded_marked: String,
+}
+
+/// Gives each account in `names` its current name in every past event that
+/// recorded it by subject alone or by a superseded name, returning how many
+/// events changed. Idempotent: a renamed event no longer matches.
+pub(crate) async fn rename_actors(
+    database: &PgPool,
+    names: &[ActorRename],
+) -> Result<u64, sqlx::Error> {
+    store::rename_actors(database, names).await
+}
+
 /// One thing that happened, ready to store.
 pub(crate) struct AuditEvent<'a> {
     kind: EventKind,
