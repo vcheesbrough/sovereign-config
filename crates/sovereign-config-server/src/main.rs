@@ -25,7 +25,7 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::{net::TcpListener, signal};
 use tonic::{
     Request,
-    transport::{Endpoint, Server},
+    transport::{Endpoint, Server, server::Router as GrpcRouter},
 };
 use tonic_health::pb::{
     HealthCheckRequest, health_check_response,
@@ -174,7 +174,7 @@ async fn serve(meter: &Meter) -> Result<()> {
         protocol_versions = SERVED_PROTOCOL_LABELS.join(","),
         "sovereign-config started"
     );
-    Server::builder()
+    let router = Server::builder()
         .accept_http1(true)
         // Outermost of all: the request's span covers every layer below, and
         // adopts an inbound `traceparent` before anything else runs. It
@@ -202,45 +202,66 @@ async fn serve(meter: &Meter) -> Result<()> {
         // it belongs to no version.
         .add_service(HandshakeServer::new(HandshakeService::new(
             protocol_metrics,
-        )))
+        )));
+    add_versioned_services(
+        router,
+        &Implementations {
+            configuration,
+            managed_connections,
+            audit_trail,
+        },
+    )
+    .serve_with_shutdown(config.grpc_addr, shutdown_signal())
+    .await
+    .context("gRPC server terminated")
+}
+
+/// The one implementation of each service that every protocol version's
+/// shims are built over.
+struct Implementations {
+    configuration: Arc<ConfigurationService>,
+    managed_connections: Arc<ManagedConnectionsService>,
+    audit_trail: Arc<AuditTrailService>,
+}
+
+/// Every protocol version's services, each a shim over `shared`.
+fn add_versioned_services<L>(router: GrpcRouter<L>, shared: &Implementations) -> GrpcRouter<L> {
+    router
         .add_service(SystemServer::new(SystemService))
         .add_service(ConfigurationServer::new(V3Configuration::new(Arc::clone(
-            &configuration,
+            &shared.configuration,
         ))))
         .add_service(ManagedConnectionsServer::new(V3ManagedConnections::new(
-            Arc::clone(&managed_connections),
+            Arc::clone(&shared.managed_connections),
         )))
         // `v4`: the same implementations again, plus the audit trail, which
         // `v3` has no service for.
         .add_service(v4::system_server::SystemServer::new(V4System))
         .add_service(v4::configuration_server::ConfigurationServer::new(
-            V4Configuration::new(Arc::clone(&configuration)),
+            V4Configuration::new(Arc::clone(&shared.configuration)),
         ))
         .add_service(
             v4::managed_connections_server::ManagedConnectionsServer::new(
-                V4ManagedConnections::new(Arc::clone(&managed_connections)),
+                V4ManagedConnections::new(Arc::clone(&shared.managed_connections)),
             ),
         )
         .add_service(v4::audit_server::AuditServer::new(V4Audit::new(
-            Arc::clone(&audit_trail),
+            Arc::clone(&shared.audit_trail),
         )))
         // `v5`: the same implementations again; its audit shim adds the actor
         // filter and the counts.
         .add_service(v5::system_server::SystemServer::new(V5System))
         .add_service(v5::configuration_server::ConfigurationServer::new(
-            V5Configuration::new(Arc::clone(&configuration)),
+            V5Configuration::new(Arc::clone(&shared.configuration)),
         ))
         .add_service(
             v5::managed_connections_server::ManagedConnectionsServer::new(
-                V5ManagedConnections::new(Arc::clone(&managed_connections)),
+                V5ManagedConnections::new(Arc::clone(&shared.managed_connections)),
             ),
         )
         .add_service(v5::audit_server::AuditServer::new(V5Audit::new(
-            audit_trail,
+            Arc::clone(&shared.audit_trail),
         )))
-        .serve_with_shutdown(config.grpc_addr, shutdown_signal())
-        .await
-        .context("gRPC server terminated")
 }
 
 /// The identity provider and the non-secret settings the managed connection
