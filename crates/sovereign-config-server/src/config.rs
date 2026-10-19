@@ -132,6 +132,7 @@ impl Config {
             &issuer_url,
             Secret::new(required_secret("SOVEREIGN_CONFIG_MANAGER_API_TOKEN")?),
             &manager_client_id,
+            &audience,
             &required_env("SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE")?,
             &required_env("SOVEREIGN_CONFIG_MANAGER_GROUP")?,
             MANAGER_TIMEOUT,

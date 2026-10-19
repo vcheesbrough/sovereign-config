@@ -633,6 +633,7 @@ mod provider_account_round_trip {
                 &issuer,
                 Secret::new("migration-test-token"),
                 "sovereign-config",
+                "sovereign-config",
                 "sovereign_config_grants",
                 "Connections",
                 Duration::from_secs(2),

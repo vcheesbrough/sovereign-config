@@ -281,6 +281,7 @@ async fn target() -> Target {
         &issuer,
         Secret::new("conformance-api-token"),
         "sovereign-config",
+        "sovereign-config",
         "sovereign_config_conformance_grants",
         GROUP_NAME,
         Duration::from_secs(2),

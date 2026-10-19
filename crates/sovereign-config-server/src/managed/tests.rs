@@ -505,6 +505,7 @@ async fn service_with_metrics(
             &issuer,
             Secret::new("manager-api-token-sentinel"),
             "sovereign-config",
+            "sovereign-config",
             GRANTS_ATTRIBUTE,
             MANAGED_GROUP,
             Duration::from_millis(400),

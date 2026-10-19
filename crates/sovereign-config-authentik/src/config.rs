@@ -27,18 +27,24 @@ impl AuthentikConfig {
     /// `issuer` is the OIDC issuer the server already validated; the
     /// administration API is served from its exact origin. `client_id` is the
     /// OAuth client managed accounts authenticate through, which every
-    /// connection URL names.
+    /// connection URL names; `audience` is the `aud` the server requires.
+    ///
+    /// They must be equal. Authentik gives a token minted through a client
+    /// that client's id as its `aud`, so a URL naming any other client would
+    /// carry credentials whose tokens the server refuses: every managed create
+    /// and rotate would hand out a URL that cannot authenticate.
     ///
     /// # Errors
     ///
-    /// The client id, grants attribute or group name is not permitted, or the
-    /// issuer has no usable origin. No message quotes a value; the server,
-    /// which knows where the client id came from, checks it first and names
-    /// its variable.
+    /// The client id differs from the audience, the client id, grants
+    /// attribute or group name is not permitted, or the issuer has no usable
+    /// origin. No message quotes a value; the server, which knows where the
+    /// client id came from, checks its form first and names its variable.
     pub fn new(
         issuer: &Url,
         api_token: Secret,
         client_id: &str,
+        audience: &str,
         grants_attribute: &str,
         managed_group: &str,
         timeout: Duration,
@@ -46,7 +52,7 @@ impl AuthentikConfig {
         Ok(Self {
             api_origin: issuer_api_origin(issuer)?,
             api_token,
-            client_id: validated_client_id(client_id)?,
+            client_id: client_id_for(client_id, audience)?,
             grants_attribute: validated_grants_attribute(grants_attribute)?,
             managed_group: validated_group_name(managed_group)?,
             timeout,
@@ -62,6 +68,18 @@ impl AuthentikConfig {
 
 /// Validates the client id a connection URL carries, by the grammar the URL
 /// itself admits.
+/// The client id, provided it is the audience (see [`AuthentikConfig::new`]).
+fn client_id_for(client_id: &str, audience: &str) -> Result<String> {
+    let client_id = validated_client_id(client_id)?;
+    if client_id != audience {
+        bail!(
+            "with Authentik, the access URLs' OAuth client id must be the token audience: \
+             a token minted through any other client carries that client's id as its audience"
+        );
+    }
+    Ok(client_id)
+}
+
 fn validated_client_id(value: &str) -> Result<String> {
     if !ClientCredential::admits_client_id(value) {
         bail!("the managed accounts' OAuth client id is not one a connection URL admits");
@@ -118,6 +136,7 @@ mod tests {
             &ISSUER.parse().unwrap(),
             Secret::new(TOKEN_SENTINEL),
             "sovereign-config",
+            "sovereign-config",
             grants_attribute,
             group,
             Duration::from_secs(5),
@@ -160,6 +179,23 @@ mod tests {
         for invalid in ["", "with space", "slash/ed", "q?uery"] {
             assert!(validated_client_id(invalid).is_err(), "{invalid:?}");
         }
+    }
+
+    /// A client id that is not the audience would mint tokens this server
+    /// refuses, so it fails startup rather than every access URL; the message
+    /// quotes neither value.
+    #[test]
+    fn the_client_id_must_be_the_audience() {
+        assert_eq!(
+            client_id_for("sovereign-config", "sovereign-config").unwrap(),
+            "sovereign-config"
+        );
+        let message = format!(
+            "{:#}",
+            client_id_for("other-sentinel", "audience-sentinel").unwrap_err()
+        );
+        assert!(message.contains("must be the token audience"), "{message}");
+        assert!(!message.contains("sentinel"), "{message}");
     }
 
     #[test]

@@ -599,6 +599,7 @@ async fn lookup_during_a_request(origin: reqwest::Url) {
             &issuer,
             Secret::new(ADMIN_TOKEN),
             "sovereign-config",
+            "sovereign-config",
             "sovereign_config_grants",
             "Connections",
             Duration::from_secs(5),
