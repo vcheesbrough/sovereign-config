@@ -169,12 +169,13 @@ pub(crate) struct ActorRename {
 }
 
 /// Gives each account in `names` its current name in every past event that
-/// recorded it by subject alone or by a superseded name, returning how many
-/// events changed. Idempotent: a renamed event no longer matches.
+/// recorded it by subject alone or by a superseded name, keeping what it
+/// overwrote beside it, and returns how many events changed per subject.
+/// Idempotent: a renamed event no longer matches.
 pub(crate) async fn rename_actors(
     database: &PgPool,
     names: &[ActorRename],
-) -> Result<u64, sqlx::Error> {
+) -> Result<Vec<(String, i64)>, sqlx::Error> {
     store::rename_actors(database, names).await
 }
 

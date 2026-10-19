@@ -2029,6 +2029,29 @@ async fn the_name_repair_renames_accounts_and_past_events() {
         ]
     );
     assert!(rows[..3].iter().all(|row| row.actor_subject == subject));
+    // What each repaired row recorded is kept beside it; an untouched row
+    // keeps nothing.
+    let recorded: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT recorded_actor_name, recorded_narrative FROM audit_events WHERE path_fold = $1 ORDER BY id",
+    )
+    .bind(PATH)
+    .fetch_all(&pool)
+    .await
+    .expect("the recorded values must be readable");
+    let read = |actor: &str| Some(format!("{actor} read subtree /apps/repair (1 value)"));
+    let marked_username = format!("{username} (access URL)");
+    assert_eq!(
+        recorded,
+        [
+            (None, read(&subject)),
+            (Some(username.clone()), read(&username)),
+            (Some(marked_username.clone()), read(&marked_username)),
+            (None, None),
+            (None, None),
+            (None, None),
+            (None, None),
+        ]
+    );
 
     insert_read(&pool, "/apps/repair/later", &subject, None).await;
     service.shared.repair_actor_names(Duration::ZERO).await;

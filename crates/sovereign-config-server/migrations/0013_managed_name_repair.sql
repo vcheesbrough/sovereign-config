@@ -12,3 +12,16 @@ CREATE TABLE managed_name_repair (
         CHECK (singleton),
     completed_at TIMESTAMPTZ NOT NULL
 );
+
+-- What the repair overwrote, kept beside it so the rewrite stays auditable
+-- and reversible. This supersedes, for repaired rows only, 0010's "the name
+-- is captured rather than joined so a later rename cannot rewrite history":
+-- the repair is the one rewrite the trail allows, and these columns are its
+-- record. `recorded_narrative` is set on exactly the repaired rows (a
+-- narrative is never empty), with `recorded_actor_name` the name the row
+-- carried before, NULL when it carried none. Neither is ever served: the
+-- trail shows the repaired values.
+ALTER TABLE audit_events
+    ADD COLUMN recorded_actor_name TEXT,
+    ADD COLUMN recorded_narrative TEXT,
+    ADD CHECK (recorded_narrative IS NOT NULL OR recorded_actor_name IS NULL);

@@ -158,13 +158,23 @@ impl ManagedConnectionsService {
             warn!("past audit events could not be renamed; retrying at the next start");
             return false;
         };
-        tracing::Span::current().record("sovereign_config.audit.renamed", renamed);
-        if renamed > 0 {
-            info!(
-                renamed,
-                "past audit events by managed connections now name them"
-            );
+        // One line per connection, so which history was rewritten is on
+        // record beside the overwritten values the rows keep.
+        let mut total = 0_i64;
+        for (subject, count) in &renamed {
+            total += count;
+            if let Some(account) = accounts
+                .iter()
+                .find(|account| &account.provider_user_uid == subject)
+            {
+                info!(
+                    connection_id = account.connection_id.as_str(),
+                    renamed = count,
+                    "past audit events by a managed connection now name it; what they recorded is kept beside them"
+                );
+            }
         }
+        tracing::Span::current().record("sovereign_config.audit.renamed", total);
         true
     }
 
