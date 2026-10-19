@@ -353,9 +353,11 @@ message QueryAuditTrailResponse {
   // `total_count`: every event the caller may see in the query's scope — the
   // whole trail, or for an `element_path` query that value's history —
   // whatever the other filters say. `match_count`: how many of those match
-  // every filter, which is how many events the pages of this query hold
-  // between them. Both are as of the first page; events recorded while
-  // scrolling are not counted.
+  // every filter. Both are counted when the first page is read, in a
+  // statement of their own, so they are a close guide rather than an exact
+  // tally of the pages: an event recorded or pruned by retention while the
+  // first page is read, or while later pages are, can make them differ by
+  // that many.
   optional uint64 total_count = 3;
   optional uint64 match_count = 4;
 }

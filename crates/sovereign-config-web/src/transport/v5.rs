@@ -16,7 +16,7 @@ version_dialer!(ProtocolVersion::V5, "v5");
 
 const QUERY_AUDIT_TRAIL: &str = "/sovereign.config.v5.Audit/QueryAuditTrail";
 
-/// The routes `v4` dials beyond the surface every version shares.
+/// The routes `v5` dials beyond the surface every version shares.
 #[cfg(test)]
 pub(super) const AUDIT_ROUTES: &[&str] = &[QUERY_AUDIT_TRAIL];
 
