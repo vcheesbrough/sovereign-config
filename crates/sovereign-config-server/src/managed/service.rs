@@ -320,9 +320,9 @@ impl ManagedConnectionsService {
             &self.settings.public_origin,
             &root,
             &self.settings.issuer,
-            &replacement.client_id,
+            replacement.client_id(),
             &username,
-            &replacement.secret,
+            replacement.secret(),
         )
         .map_err(|_| internal_error())?;
         // If a concurrent revoke already claimed the row (it is no longer

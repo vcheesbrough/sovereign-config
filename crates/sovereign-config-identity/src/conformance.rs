@@ -119,7 +119,7 @@ async fn lifecycle(target: &impl ConformanceTarget) {
         "the account's subject is a bounded, non-empty identifier"
     );
     assert!(
-        !created.credential.secret.expose().is_empty(),
+        !created.credential.secret().expose().is_empty(),
         "the account's credential is not empty"
     );
     assert!(
@@ -166,12 +166,13 @@ async fn lifecycle(target: &impl ConformanceTarget) {
         .await
         .expect("replace_credential succeeds on an existing credential");
     assert!(
-        !replacement.secret.expose().is_empty()
-            && replacement.secret.expose() != created.credential.secret.expose(),
+        !replacement.secret().expose().is_empty()
+            && replacement.secret().expose() != created.credential.secret().expose(),
         "a replaced credential has a new, non-empty value"
     );
     assert_eq!(
-        replacement.client_id, created.credential.client_id,
+        replacement.client_id(),
+        created.credential.client_id(),
         "a replaced credential authenticates as the same client"
     );
     assert!(
@@ -208,9 +209,9 @@ fn forms_a_connection_url(credential: &ClientCredential) -> bool {
         "https://config.example.test",
         &ConfigPath::parse("/").expect("the root is a path"),
         "https://auth.example.test/application/o/sovereign-config/",
-        &credential.client_id,
+        credential.client_id(),
         USERNAME,
-        &credential.secret,
+        credential.secret(),
     )
     .is_ok()
 }

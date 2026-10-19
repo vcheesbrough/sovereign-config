@@ -159,12 +159,43 @@ opaque_identifier!(
 /// passwords through a shared client (Authentik) returns that client's id for
 /// every account; one that makes each account its own OAuth client
 /// (Keycloak) returns that client's id. The server puts it in the connection
-/// URL as given, so deployed clients need no change either way.
+/// URL as given, so deployed clients need no change either way — which is
+/// why it is checked here, when the provider builds it, rather than after the
+/// provider has already replaced a secret.
 pub struct ClientCredential {
-    /// Non-empty, and only ASCII letters, digits, `-`, `.`, `_` and `~`: what
-    /// a connection URL admits.
-    pub client_id: String,
-    pub secret: Secret,
+    client_id: String,
+    secret: Secret,
+}
+
+impl ClientCredential {
+    /// # Errors
+    ///
+    /// `client_id` is empty or holds anything but ASCII letters, digits,
+    /// `-`, `.`, `_` and `~` (what a connection URL admits), or `secret` is
+    /// empty or holds a control character.
+    pub fn new(client_id: impl Into<String>, secret: Secret) -> Result<Self, InvalidIdentifier> {
+        let client_id = client_id.into();
+        if client_id.is_empty()
+            || !client_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+            })
+            || secret.expose().is_empty()
+            || secret.expose().chars().any(char::is_control)
+        {
+            return Err(InvalidIdentifier);
+        }
+        Ok(Self { client_id, secret })
+    }
+
+    #[must_use]
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    #[must_use]
+    pub fn secret(&self) -> &Secret {
+        &self.secret
+    }
 }
 
 /// Redacts the secret by construction; the client id is not sensitive.
@@ -331,13 +362,27 @@ mod tests {
         let provisioned = ProvisionedAccount {
             account: account.clone(),
             subject: "subject-sentinel".to_owned(),
-            credential: ClientCredential {
-                client_id: "sovereign-config".to_owned(),
-                secret: Secret::new("secret-sentinel"),
-            },
+            credential: ClientCredential::new("sovereign-config", Secret::new("secret-sentinel"))
+                .unwrap(),
         };
         let printed = format!("{account:?} {credential:?} {provisioned:?}");
         assert!(!printed.contains("sentinel"), "{printed}");
+    }
+
+    #[test]
+    fn a_credential_is_only_what_a_connection_url_can_carry() {
+        let secret = || Secret::new("app-password");
+        assert!(ClientCredential::new("sovereign-config_2.x~", secret()).is_ok());
+        for client_id in ["", "with space", "slash/ed", "q?uery", "colon:ed"] {
+            assert_eq!(
+                ClientCredential::new(client_id, secret()).map(|_| ()),
+                Err(InvalidIdentifier),
+                "{client_id:?}"
+            );
+        }
+        for value in ["", "line\nbreak"] {
+            assert!(ClientCredential::new("sovereign-config", Secret::new(value)).is_err());
+        }
     }
 
     #[test]

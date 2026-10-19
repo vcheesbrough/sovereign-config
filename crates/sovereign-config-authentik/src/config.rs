@@ -62,7 +62,7 @@ fn validated_client_id(value: &str) -> Result<String> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
     {
-        bail!("SOVEREIGN_CONFIG_OIDC_AUDIENCE is not a permitted client id");
+        bail!("the managed accounts' OAuth client id is not one a connection URL admits");
     }
     Ok(value.to_owned())
 }

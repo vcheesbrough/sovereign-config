@@ -120,9 +120,9 @@ impl ManagedConnectionsService {
             &self.settings.public_origin,
             root,
             &self.settings.issuer,
-            &account.credential.client_id,
+            account.credential.client_id(),
             account_name.username,
-            &account.credential.secret,
+            account.credential.secret(),
         )
         .map_err(|_| internal_error())?;
         // The creation is recorded with the transition that completes it. If

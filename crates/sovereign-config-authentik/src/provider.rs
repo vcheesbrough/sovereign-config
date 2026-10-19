@@ -40,12 +40,12 @@ impl AuthentikProvider {
 
 impl AuthentikProvider {
     /// An app password, presented through the server's own client: every
-    /// account shares its client id.
-    fn credential(&self, app_password: Secret) -> ClientCredential {
-        ClientCredential {
-            client_id: self.client_id.clone(),
-            secret: app_password,
-        }
+    /// account shares its client id. The id was validated at startup, so a
+    /// refusal here can only be a password Authentik returned that a URL
+    /// cannot carry.
+    fn credential(&self, app_password: Secret) -> Result<ClientCredential, ProviderError> {
+        ClientCredential::new(self.client_id.clone(), app_password)
+            .map_err(|_| ProviderError::Invalid)
     }
 }
 
@@ -71,7 +71,7 @@ impl ManagedIdentityProvider for AuthentikProvider {
         Ok(ProvisionedAccount {
             account: account_id(created.user_id)?,
             subject: created.user_uid,
-            credential: self.credential(created.app_password),
+            credential: self.credential(created.app_password)?,
         })
     }
 
@@ -139,7 +139,7 @@ impl ManagedIdentityProvider for AuthentikProvider {
         self.client
             .set_credential_secret(credential.as_str(), &replacement)
             .await?;
-        Ok(self.credential(replacement))
+        self.credential(replacement)
     }
 
     async fn delete_account(&self, account: &AccountId) -> Result<(), ProviderError> {

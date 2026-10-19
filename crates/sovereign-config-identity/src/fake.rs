@@ -38,10 +38,8 @@ pub struct FakeAccount {
 
 impl FakeAccount {
     fn client_credential(&self) -> ClientCredential {
-        ClientCredential {
-            client_id: self.client_id.clone(),
-            secret: Secret::new(self.secret.clone()),
-        }
+        ClientCredential::new(self.client_id.clone(), Secret::new(self.secret.clone()))
+            .expect("the fake's credentials are always valid")
     }
 }
 
