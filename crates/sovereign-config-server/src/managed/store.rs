@@ -4,6 +4,7 @@
 use sovereign_config_core::{
     ConfigPath, ConnectionId, DisplayName, ManagedConnectionState, ManagedPermissions,
 };
+use sovereign_config_identity::{AccountId, CredentialId, ProvisionedAccount};
 use sqlx::{FromRow, Postgres, Transaction};
 use time::OffsetDateTime;
 use tonic::Status;
@@ -13,7 +14,6 @@ use super::ManagedConnectionsService;
 use super::wire::{internal_error, not_found};
 use crate::audit::{Actor, AuditEvent};
 use crate::auth::{AuthenticatedPrincipal, Permission};
-use crate::authentik::CreatedServiceAccount;
 use crate::rpc::store_unavailable;
 
 /// A connection whose service account exists or did, as the name repair
@@ -22,9 +22,17 @@ use crate::rpc::store_unavailable;
 pub(super) struct AccountRow {
     pub(super) connection_id: String,
     pub(super) display_name: String,
-    pub(super) provider_user_id: Option<i64>,
+    pub(super) provider_user_id: Option<String>,
     pub(super) provider_user_uid: String,
     pub(super) state: String,
+}
+
+impl AccountRow {
+    /// The identity provider's account, when one was recorded and the stored
+    /// identifier is still one the provider could have issued.
+    pub(super) fn account(&self) -> Option<AccountId> {
+        account_id(self.provider_user_id.as_deref())
+    }
 }
 
 #[derive(FromRow)]
@@ -32,12 +40,33 @@ pub(super) struct ConnectionRow {
     pub(super) connection_id: String,
     pub(super) display_name: String,
     pub(super) root: String,
-    pub(super) provider_user_id: Option<i64>,
+    pub(super) provider_user_id: Option<String>,
     pub(super) credential_identifier: Option<String>,
     pub(super) state: String,
     pub(super) permissions: String,
     pub(super) created_at: OffsetDateTime,
     pub(super) updated_at: OffsetDateTime,
+}
+
+impl ConnectionRow {
+    /// The identity provider's account, as for [`AccountRow::account`].
+    pub(super) fn account(&self) -> Option<AccountId> {
+        account_id(self.provider_user_id.as_deref())
+    }
+
+    /// The account's credential, when its identifier was recorded.
+    pub(super) fn credential(&self) -> Option<CredentialId> {
+        self.credential_identifier
+            .as_deref()
+            .and_then(|identifier| CredentialId::parse(identifier).ok())
+    }
+}
+
+/// A stored identifier the column's check bounds as the provider's are; one
+/// that no longer parses is treated as never recorded, so revocation falls
+/// back to looking the account up by its exact username.
+fn account_id(stored: Option<&str>) -> Option<AccountId> {
+    stored.and_then(|identifier| AccountId::parse(identifier).ok())
 }
 
 impl ManagedConnectionsService {
@@ -121,8 +150,8 @@ impl ManagedConnectionsService {
     /// [`Self::transition_state`] for the transition that *completes* an
     /// operation, recording `event` in the same transaction.
     ///
-    /// These flows call Authentik between their database steps, so there is no
-    /// one transaction to put the audit record in. The last step is the one
+    /// These flows call the identity provider between their database steps,
+    /// so there is no one transaction to put the audit record in. The last step is the one
     /// that makes the operation visible as done, so that is the one the record
     /// is atomic with: if the record cannot be written the row stays in the
     /// intermediate state it was already in, which is exactly the state the
@@ -329,7 +358,7 @@ impl ManagedConnectionsService {
     pub(super) async fn record_provider_user(
         &self,
         connection_id: &ConnectionId,
-        account: &CreatedServiceAccount,
+        account: &ProvisionedAccount,
     ) -> Result<(), Status> {
         sqlx::query(
             r"
@@ -339,8 +368,8 @@ impl ManagedConnectionsService {
             ",
         )
         .bind(connection_id.as_str())
-        .bind(account.user_id)
-        .bind(&account.user_uid)
+        .bind(account.account.as_str())
+        .bind(&account.subject)
         .bind(OffsetDateTime::now_utc())
         .execute(&self.database)
         .await
@@ -356,7 +385,7 @@ impl ManagedConnectionsService {
     pub(super) async fn record_credential_identifier(
         &self,
         connection_id: &ConnectionId,
-        credential_identifier: &str,
+        credential_identifier: &CredentialId,
     ) -> Result<(), Status> {
         sqlx::query(
             r"
@@ -366,7 +395,7 @@ impl ManagedConnectionsService {
             ",
         )
         .bind(connection_id.as_str())
-        .bind(credential_identifier)
+        .bind(credential_identifier.as_str())
         .bind(OffsetDateTime::now_utc())
         .execute(&self.database)
         .await

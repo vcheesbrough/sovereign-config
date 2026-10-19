@@ -28,10 +28,13 @@ use tonic::{
 use tower::{Layer, ServiceExt, service_fn};
 use tracing::Instrument;
 
+use sovereign_config_authentik::{AuthentikConfig, AuthentikProvider};
+use sovereign_config_identity::ManagedIdentityProvider as _;
+
 use super::{GrpcStatusLayer, RPC_ROUTES, Route, TraceLayer, route, server_span};
 use crate::{
-    audit::AuditRecorder, authentik::AuthentikAdminClient, metrics::RequestMetrics,
-    system::SERVED_PROTOCOL_LABELS, system::SystemService,
+    audit::AuditRecorder, metrics::RequestMetrics, system::SERVED_PROTOCOL_LABELS,
+    system::SystemService,
 };
 
 /// The trace layer recording its durations on `meter`.
@@ -590,9 +593,18 @@ const ADMIN_TOKEN: &str = "span-test-admin-token-sentinel";
 
 /// One Authentik lookup made while serving an inbound request.
 async fn lookup_during_a_request(origin: reqwest::Url) {
-    let client =
-        AuthentikAdminClient::new(origin, Secret::new(ADMIN_TOKEN), Duration::from_secs(5))
-            .unwrap();
+    let issuer = origin.join("application/o/sovereign-config/").unwrap();
+    let client = AuthentikProvider::new(
+        AuthentikConfig::new(
+            &issuer,
+            Secret::new(ADMIN_TOKEN),
+            "sovereign_config_grants",
+            "Connections",
+            Duration::from_secs(5),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let span = server_span(
         &Method::POST,
         "/sovereign.config.v4.ManagedConnections/RevokeManagedConnection",
@@ -605,7 +617,7 @@ async fn lookup_during_a_request(origin: reqwest::Url) {
     );
     sovereign_config_telemetry::context::adopt_parent(&span, &headers);
     client
-        .find_user_by_username("sc-managed-span-test")
+        .find_account("sc-managed-span-test")
         .instrument(span)
         .await
         .unwrap();

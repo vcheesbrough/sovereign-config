@@ -11,6 +11,10 @@
 //! know which one called them, so only a `vN.rs` shim may name a version's
 //! generated types. Review would let that erode one convenient import at a
 //! time; this does not.
+//!
+//! And it guards the identity-provider seam (bored card #381): managed
+//! connections depend on the `ManagedIdentityProvider` trait, and only the
+//! startup wiring may name the Authentik implementation behind it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,6 +40,14 @@ const PROTO_CRATE: &str = "sovereign_config_proto::";
 ///   naming here: the scan sees the proto crate, not which package of it, so
 ///   the module that is furthest from a version still has to be listed.
 const VERSION_AWARE: [&str; 3] = ["main.rs", "system.rs", "handshake.rs"];
+
+/// The one implementation of the identity-provider trait, as a path segment.
+const AUTHENTIK_CRATE: &str = "sovereign_config_authentik";
+
+/// Server sources, relative to `src/`, that may name it: `config.rs` parses
+/// the `SOVEREIGN_CONFIG_MANAGER_*` variables into its configuration, and
+/// `main.rs` builds it and hands the service the trait object.
+const BUILDS_THE_PROVIDER: [&str; 2] = ["main.rs", "config.rs"];
 
 /// The server modules split at the protocol seam. Each holds one shared
 /// implementation, `<module>/service.rs`, and a `<module>/vN.rs` shim per
@@ -68,6 +80,26 @@ fn uses_module(source: &str, module: &str) -> bool {
             && !after.first().is_some_and(|byte| is_identifier(*byte));
         whole_word && (before.ends_with(b"::") || after.starts_with(b"::"))
     })
+}
+
+/// Every product source under the server's `src/`, relative to it, with its
+/// contents.
+fn server_sources() -> Vec<(String, String)> {
+    let server = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut paths = Vec::new();
+    product_sources(&server, &mut paths);
+    paths
+        .iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(&server)
+                .expect("source should be under src/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let contents = fs::read_to_string(path).expect("source should be readable");
+            (relative, contents)
+        })
+        .collect()
 }
 
 fn workspace_root() -> PathBuf {
@@ -144,21 +176,7 @@ fn no_product_source_silences_the_line_count_lint() {
 
 #[test]
 fn only_version_shims_name_a_protocol_version() {
-    let server = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut paths = Vec::new();
-    product_sources(&server, &mut paths);
-    let sources: Vec<(String, String)> = paths
-        .iter()
-        .map(|path| {
-            let relative = path
-                .strip_prefix(&server)
-                .expect("source should be under src/")
-                .to_string_lossy()
-                .replace('\\', "/");
-            let contents = fs::read_to_string(path).expect("source should be readable");
-            (relative, contents)
-        })
-        .collect();
+    let sources = server_sources();
 
     for module in SEAM_MODULES {
         let shared = format!("{module}/service.rs");
@@ -228,5 +246,51 @@ fn only_version_shims_name_a_protocol_version() {
     assert!(
         dependants.is_empty(),
         "a shared implementation must not depend on a protocol version's shim: {dependants:?}"
+    );
+}
+
+#[test]
+fn only_startup_names_the_identity_provider_implementation() {
+    let sources = server_sources();
+    for builder in BUILDS_THE_PROVIDER {
+        let (_, contents) = sources
+            .iter()
+            .find(|(relative, _)| relative == builder)
+            .unwrap_or_else(|| panic!("{builder} is gone; point this guard at the wiring"));
+        assert!(
+            uses_module(contents, AUTHENTIK_CRATE),
+            "{builder} no longer names `{AUTHENTIK_CRATE}`; is that still how it is spelled?"
+        );
+    }
+
+    let offenders: Vec<&str> = sources
+        .iter()
+        .filter(|(relative, _)| !BUILDS_THE_PROVIDER.contains(&relative.as_str()))
+        .filter(|(_, contents)| uses_module(contents, AUTHENTIK_CRATE))
+        .map(|(relative, _)| relative.as_str())
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "only startup may name the Authentik implementation; depend on \
+         `sovereign_config_identity::ManagedIdentityProvider` instead: {offenders:?}"
+    );
+
+    // The managed service is provider-neutral in its prose too: a comment
+    // naming Authentik is a sign of an assumption the trait does not make.
+    // An in-file test module may still name it (the blueprint checks do).
+    let named: Vec<&str> = sources
+        .iter()
+        .filter(|(relative, _)| relative.starts_with("managed/"))
+        .filter(|(_, contents)| {
+            let product = contents
+                .split_once("#[cfg(test)]\nmod tests {")
+                .map_or(contents.as_str(), |(product, _)| product);
+            product.to_lowercase().contains("authentik")
+        })
+        .map(|(relative, _)| relative.as_str())
+        .collect();
+    assert!(
+        named.is_empty(),
+        "the managed service must not name a provider; say \"the identity provider\": {named:?}"
     );
 }

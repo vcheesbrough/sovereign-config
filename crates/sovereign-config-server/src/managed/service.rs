@@ -19,7 +19,9 @@ use time::OffsetDateTime;
 use tonic::Status;
 use tracing::{info, warn};
 
-use super::identity::{generate_app_password, generate_connection_id, managed_username};
+use sovereign_config_identity::{AccountId, ManagedIdentityProvider, ProviderError};
+
+use super::identity::{generate_connection_id, managed_username};
 use super::provisioning::{AccountName, CLEANUP_MESSAGE, dependency_outcome};
 use super::store::{ConnectionRow, commit, mark_revoking, mark_rotation_unknown};
 use super::wire::{
@@ -28,32 +30,26 @@ use super::wire::{
 };
 use crate::audit::{AuditEvent, AuditRecorder, ConnectionSubject};
 use crate::auth::Permission;
-use crate::authentik::{AdminError, AuthentikAdminClient};
 use crate::metrics::{
     ManagedConnectionMetrics, ManagedDependencyCall, ManagedDependencyOutcome, ManagedOperation,
     ManagedOperationResult,
 };
 use crate::rpc::{CallContext, STORAGE_UNAVAILABLE_MESSAGE};
 
-/// Non-secret settings used to build canonical connection URLs and grants.
+/// Non-secret settings used to build canonical connection URLs.
 pub(crate) struct ManagedSettings {
     pub(crate) public_origin: String,
     pub(crate) issuer: String,
     pub(crate) client_id: String,
-    pub(crate) grants_attribute: String,
-    /// Exact name of the Authentik group each managed service account is
-    /// added to, purely so an operator can browse them together. Best-effort:
-    /// a connection is fully functional whether or not this succeeds.
-    pub(crate) managed_group: String,
     /// How long a rotation marked `rotation_unknown` is assumed to still be in
-    /// flight. Must exceed the Authentik client timeout so an expired lease
-    /// proves the previous attempt has ended.
+    /// flight. Must exceed the identity provider's call timeout so an expired
+    /// lease proves the previous attempt has ended.
     pub(crate) rotation_lease: Duration,
 }
 
 pub(crate) struct ManagedConnectionsService {
     pub(super) database: PgPool,
-    pub(super) admin: AuthentikAdminClient,
+    pub(super) provider: Arc<dyn ManagedIdentityProvider>,
     pub(super) settings: ManagedSettings,
     pub(super) metrics: Arc<ManagedConnectionMetrics>,
     pub(super) audit: AuditRecorder,
@@ -134,14 +130,14 @@ impl ManagedConnectionsService {
 impl ManagedConnectionsService {
     pub(crate) fn new(
         database: PgPool,
-        admin: AuthentikAdminClient,
+        provider: Arc<dyn ManagedIdentityProvider>,
         settings: ManagedSettings,
         metrics: Arc<ManagedConnectionMetrics>,
         audit: AuditRecorder,
     ) -> Self {
         Self {
             database,
-            admin,
+            provider,
             settings,
             metrics,
             audit,
@@ -195,7 +191,7 @@ impl ManagedConnectionsService {
         // #294): `managed_connections.root` has no display column, and
         // `ConnectionUrl` requires an exactly-lowercase root to round-trip.
         // Fold immediately so every use below — the stored row, the
-        // Authentik grant attribute, the connection URL — sees only the fold,
+        // identity provider's grant, the connection URL — sees only the fold,
         // regardless of the case the caller requested it in.
         let root = ConfigPath::parse(root.fold()).expect("a fold of a valid path is valid");
         // A non-empty selection is required; an empty or malformed set is a
@@ -269,13 +265,13 @@ impl ManagedConnectionsService {
         // each other's key and both report a URL as current.
         //
         // Residual risk (accepted, not closed): the lease bounds how long
-        // our own client waits for a response, not how long Authentik may
+        // our own client waits for a response, not how long the provider may
         // keep processing a request whose response we already gave up on.
-        // If the original `set_key` call is slow enough to land after a
+        // If the original replacement is slow enough to land after a
         // later successful retry, it can silently overwrite the key again
         // and invalidate the URL just returned to the caller. Closing this
-        // fully would need a precondition or idempotency mechanism on
-        // Authentik's `set_key` endpoint that does not currently exist;
+        // fully would need a precondition or idempotency mechanism on the
+        // provider's credential replacement, which the provider does not offer;
         // until then this narrow race is a known, accepted gap rather than
         // a guarantee.
         let recoverable = state == ManagedConnectionState::RotationUnknown
@@ -300,21 +296,14 @@ impl ManagedConnectionsService {
         let (row, root) = self.begin_rotation(&connection_id, context).await?;
         let actor = context.actor()?;
 
-        let credential_identifier = row
-            .credential_identifier
-            .as_deref()
-            .ok_or_else(internal_error)?;
-        let replacement = generate_app_password()?;
-        match self
-            .admin
-            .set_credential_secret(credential_identifier, &replacement)
-            .await
-        {
-            Ok(()) => {
+        let credential = row.credential().ok_or_else(internal_error)?;
+        let replacement = match self.provider.replace_credential(&credential).await {
+            Ok(replacement) => {
                 self.metrics.record_dependency(
                     ManagedDependencyCall::SetCredential,
                     ManagedDependencyOutcome::Ok,
                 );
+                replacement
             }
             Err(error) => {
                 self.metrics.record_dependency(
@@ -324,7 +313,7 @@ impl ManagedConnectionsService {
                 self.settle_failed_rotation(&connection_id, error).await;
                 return Err(dependency_error());
             }
-        }
+        };
 
         let username = managed_username(&connection_id, &row.display_name);
         let connection_url = ConnectionUrl::managed(
@@ -390,8 +379,8 @@ impl ManagedConnectionsService {
         let row = self.claim_for_revocation(context, &connection_id).await?;
         let actor = context.actor()?;
         let username = managed_username(&connection_id, &row.display_name);
-        if let Some(user_id) = self.revocation_target(&row, &username).await? {
-            self.delete_account_confirmed(&connection_id, user_id, &username)
+        if let Some(account) = self.revocation_target(&row, &username).await? {
+            self.delete_account_confirmed(&connection_id, &account, &username)
                 .await?;
         }
         let event = AuditEvent::connection_revoked(
@@ -428,33 +417,33 @@ impl ManagedConnectionsService {
         Ok(row)
     }
 
-    /// The Authentik account to delete for a revocation, if one exists.
+    /// The identity provider's account to delete for a revocation, if one
+    /// exists.
     async fn revocation_target(
         &self,
         row: &ConnectionRow,
         username: &str,
-    ) -> Result<Option<i64>, Status> {
-        if let Some(user_id) = row.provider_user_id {
-            return Ok(Some(user_id));
+    ) -> Result<Option<AccountId>, Status> {
+        if let Some(account) = row.account() {
+            return Ok(Some(account));
         }
         // The account may never have been created; probe only the
         // exact generated username before declaring it absent.
-        match self.admin.find_user_by_username(username).await {
+        match self.provider.find_account(username).await {
             Ok(found) => {
                 self.metrics.record_dependency(
                     ManagedDependencyCall::FindUser,
                     ManagedDependencyOutcome::Ok,
                 );
-                Ok(found.map(|user| user.user_id))
+                Ok(found)
             }
             Err(error) => {
                 self.metrics
                     .record_dependency(ManagedDependencyCall::FindUser, dependency_outcome(error));
                 // The lookup may be refused for an account the manager
                 // can no longer see rather than reporting it missing.
-                // Settle it via the app password, which is authoritative
-                // because the token view is global and cascades with
-                // the account.
+                // Settle it via the credential, whose absence the provider
+                // contract makes authoritative.
                 if !self.credential_is_gone(username).await {
                     warn!(
                         connection_id = row.connection_id.as_str(),
@@ -473,10 +462,10 @@ impl ManagedConnectionsService {
     async fn delete_account_confirmed(
         &self,
         connection_id: &ConnectionId,
-        user_id: i64,
+        account: &AccountId,
         username: &str,
     ) -> Result<(), Status> {
-        match self.admin.delete_user(user_id).await {
+        match self.provider.delete_account(account).await {
             Ok(()) => {
                 self.metrics.record_dependency(
                     ManagedDependencyCall::DeleteUser,
@@ -488,15 +477,12 @@ impl ManagedConnectionsService {
                     ManagedDependencyCall::DeleteUser,
                     dependency_outcome(error),
                 );
-                // Deletion may already have happened: Authentik refuses,
-                // or reports "not found", rather than reporting "not
-                // found" consistently for an account the manager can no
-                // longer see (the live RBAC test exercises both), and a
-                // timeout is ambiguous by definition. Settle it by
-                // looking for the account's app password, which is
-                // authoritative because the token view is global and
-                // Authentik cascades the token with the user. Trusting
-                // `NotFound` on its own would let a lost delete
+                // Deletion may already have happened: a provider may refuse,
+                // or report "not found", for an account the manager can no
+                // longer see, and a timeout is ambiguous by definition.
+                // Settle it by looking for the account's credential, whose
+                // absence the provider contract makes authoritative.
+                // Trusting `NotFound` on its own would let a lost delete
                 // permission orphan a still-live credential.
                 if !self.credential_is_gone(username).await {
                     // The row stays `revoking`; revocation can be retried
@@ -514,11 +500,11 @@ impl ManagedConnectionsService {
 
     /// Settles a rotation whose credential write failed, according to whether
     /// the failure proves the previous credential is still current.
-    async fn settle_failed_rotation(&self, connection_id: &ConnectionId, error: AdminError) {
+    async fn settle_failed_rotation(&self, connection_id: &ConnectionId, error: ProviderError) {
         match error {
             // Definitive rejection before mutation: the previous
             // credential is still current.
-            AdminError::Rejected | AdminError::Unavailable => {
+            ProviderError::Rejected | ProviderError::Unavailable => {
                 warn!(
                     connection_id = connection_id.as_str(),
                     "rotation failed before the credential changed; the previous URL stays current"
@@ -532,7 +518,7 @@ impl ManagedConnectionsService {
                     .await;
             }
             // The token is gone; only revocation can clean this up.
-            AdminError::NotFound => {
+            ProviderError::NotFound => {
                 warn!(
                     connection_id = connection_id.as_str(),
                     "the credential to rotate no longer exists; the connection requires cleanup by revocation"
@@ -545,8 +531,8 @@ impl ManagedConnectionsService {
                     )
                     .await;
             }
-            // Ambiguous: Authentik may have applied the new key.
-            AdminError::Ambiguous | AdminError::Invalid => warn!(
+            // Ambiguous: the provider may have applied the new key.
+            ProviderError::Ambiguous | ProviderError::Invalid => warn!(
                 connection_id = connection_id.as_str(),
                 "rotation outcome is unknown; the connection stays rotation_unknown until its lease expires and a retry settles it"
             ),

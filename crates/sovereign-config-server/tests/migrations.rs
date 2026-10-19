@@ -523,7 +523,7 @@ async fn migrations_are_repeatable_against_postgresql() {
     .fetch_all(&pool)
     .await
     .expect("audit index inventory must be readable");
-    assert_eq!(applied_migrations, 13);
+    assert_eq!(applied_migrations, 14);
     assert_eq!(
         audit_indexes,
         [
@@ -546,4 +546,105 @@ async fn migrations_are_repeatable_against_postgresql() {
     path_constraint_and_parser_admit_the_same_grammar(&pool).await;
     classification_is_explicit_and_constrained(&pool).await;
     managed_connection_constraints_are_enforced(&pool).await;
+    numeric_provider_account_survives_the_text_retype(&pool, &migrator).await;
+}
+
+/// Card #381: 0014 retypes `provider_user_id` from Authentik's integer key to
+/// opaque text. A row written before it must keep its account, as text the
+/// Authentik implementation still resolves to the same user.
+async fn numeric_provider_account_survives_the_text_retype(pool: &PgPool, migrator: &Migrator) {
+    reset_schema(pool, "before the provider account retype").await;
+    let retype = migrator
+        .migrations
+        .iter()
+        .position(|migration| migration.version == 14)
+        .expect("0014 is the provider account retype");
+    Migrator {
+        migrations: Cow::Owned(migrator.migrations[..retype].to_vec()),
+        ..Migrator::DEFAULT
+    }
+    .run(pool)
+    .await
+    .expect("the schema before the retype must apply");
+    sqlx::query(
+        "INSERT INTO managed_connections (connection_id, display_name, root, state, provider_user_id, provider_user_uid, created_at, updated_at) VALUES ('abcdefghij0123456789abcdefghij07', 'Pipeline reader', '/apps/api', 'active', 4242, 'uid-4242', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .execute(pool)
+    .await
+    .expect("a numeric provider account must be insertable before the retype");
+    migrator.run(pool).await.expect("the retype must apply");
+
+    let stored: String = sqlx::query_scalar(
+        "SELECT provider_user_id FROM managed_connections WHERE connection_id = 'abcdefghij0123456789abcdefghij07'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the retyped account must be readable as text");
+    assert_eq!(stored, "4242");
+    for (invalid, length) in [("empty", 0), ("too long", 129)] {
+        let rejected = sqlx::query(
+            "INSERT INTO managed_connections (connection_id, display_name, root, state, provider_user_id, created_at, updated_at) VALUES ('abcdefghij0123456789abcdefghij08', 'Pipeline reader', '/', 'active', repeat('x', $1), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(length)
+        .execute(pool)
+        .await;
+        assert!(rejected.is_err(), "an {invalid} account must be rejected");
+    }
+
+    let deleted = provider_account_round_trip::delete_through_authentik(&stored).await;
+    assert_eq!(deleted, "/api/v3/core/users/4242/");
+
+    sqlx::query("DELETE FROM managed_connections")
+        .execute(pool)
+        .await
+        .expect("managed connection cleanup must succeed");
+}
+
+mod provider_account_round_trip {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use axum::{Router, extract::State, http::StatusCode, http::Uri};
+    use sovereign_config_authentik::{AuthentikConfig, AuthentikProvider};
+    use sovereign_config_core::Secret;
+    use sovereign_config_identity::{AccountId, ManagedIdentityProvider};
+    use tokio::net::TcpListener;
+
+    /// Deletes the stored account through the Authentik implementation and
+    /// returns the path Authentik was asked to delete.
+    pub(super) async fn delete_through_authentik(stored: &str) -> String {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let app = Router::new()
+            .fallback(
+                async |State(seen): State<Arc<Mutex<Vec<String>>>>, uri: Uri| {
+                    seen.lock().unwrap().push(uri.path().to_owned());
+                    StatusCode::NO_CONTENT
+                },
+            )
+            .with_state(Arc::clone(&seen));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let issuer = format!("http://{address}/application/o/sovereign-config/")
+            .parse()
+            .unwrap();
+        let provider = AuthentikProvider::new(
+            AuthentikConfig::new(
+                &issuer,
+                Secret::new("migration-test-token"),
+                "sovereign_config_grants",
+                "Connections",
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let account = AccountId::parse(stored).expect("a stored account is a valid identifier");
+        provider
+            .delete_account(&account)
+            .await
+            .expect("the stored account must resolve to an Authentik user");
+        server.abort();
+        seen.lock().unwrap().remove(0)
+    }
 }

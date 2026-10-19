@@ -4,9 +4,10 @@
 //! calls are spanned at the store functions (`#[instrument]` there), and
 //! detached work where it is spawned.
 //!
-//! Context propagation lives here, in the transport layer, and nowhere else:
-//! [`TraceLayer`] adopts an inbound W3C `traceparent`; [`send`] injects the
-//! current span's context into an outbound request. Business code inherits
+//! Context propagation lives in the transport layer, and nowhere else:
+//! [`TraceLayer`] adopts an inbound W3C `traceparent`; [`send`] (from
+//! `sovereign_config_telemetry::client`, shared with the identity provider's
+//! crate) injects the current span's context into an outbound request. Business code inherits
 //! the ambient span and never passes a trace id around.
 //!
 //! RED is recorded here too (`observability` skill §1.5): every spanned
@@ -27,8 +28,10 @@ use std::{
 
 use http::{HeaderMap, Method, Request, Response};
 use http_body_util::BodyExt;
-use reqwest::Url;
-use sovereign_config_telemetry::context;
+use sovereign_config_telemetry::{client::http_method, context};
+// Outbound calls are spanned by the telemetry crate, so every crate that
+// makes one opens the same span: `client_span`, then `send` inside it.
+pub(crate) use sovereign_config_telemetry::client::{client_span, record_error, send};
 use tonic::{Code, body::BoxBody};
 use tower::{Layer, Service};
 use tracing::{Instrument, Span, field::Empty};
@@ -83,7 +86,7 @@ const HEALTH_PREFIX: &str = "/grpc.health.v1.Health/";
 /// `rpc.method` for a gRPC call to a route this build does not serve, and
 /// `http.request.method` for a method outside the standard set, as the
 /// semantic conventions spell "something else".
-const OTHER: &str = "_OTHER";
+use sovereign_config_telemetry::client::OTHER;
 
 /// The longest `url.path` recorded on a span. A request path is
 /// request-derived; bounded, it cannot make a span arbitrarily large.
@@ -199,25 +202,6 @@ fn server_span_for(route: Route, method: &Method, path: &str) -> Option<Span> {
 /// request (skill §3); span *names* stay bounded.
 fn bounded_path(path: &str) -> String {
     path.chars().take(MAX_RECORDED_PATH).collect()
-}
-
-/// The span name and `http.request.method` for `method`: the method itself
-/// when it is a standard one, else `HTTP` and `_OTHER`, so a client cannot
-/// mint span names.
-fn http_method(method: &Method) -> (&'static str, &'static str) {
-    let standard = match method.as_str() {
-        "GET" => "GET",
-        "HEAD" => "HEAD",
-        "POST" => "POST",
-        "PUT" => "PUT",
-        "DELETE" => "DELETE",
-        "CONNECT" => "CONNECT",
-        "OPTIONS" => "OPTIONS",
-        "TRACE" => "TRACE",
-        "PATCH" => "PATCH",
-        _ => return ("HTTP", OTHER),
-    };
-    (standard, standard)
 }
 
 /// Stamps the authenticated caller on the request's span: `user.id` is the
@@ -516,62 +500,11 @@ pub(crate) const fn grpc_code_name(code: Code) -> &'static str {
     }
 }
 
-/// A client span for one outbound HTTP call. `template` is the route with its
-/// identifiers left as placeholders (`/api/v3/core/users/{id}/`) — never the
-/// URL actually called, which would put an Authentik primary key in a span
-/// name. `None` when the route is configuration rather than code (an
-/// issuer's JWKS), which leaves the span named by its method.
-/// Records the host only: no scheme, port, path, query or credential.
-pub(crate) fn client_span(method: &Method, template: Option<&'static str>, origin: &Url) -> Span {
-    let (method_name, recorded) = http_method(method);
-    let name = template.map_or_else(
-        || method_name.to_owned(),
-        |template| format!("{method_name} {template}"),
-    );
-    tracing::info_span!(
-        "http.client",
-        otel.name = name.as_str(),
-        otel.kind = "client",
-        otel.status_code = Empty,
-        http.request.method = recorded,
-        server.address = origin.host_str(),
-        url.template = template,
-        http.response.status_code = Empty,
-        error.type = Empty,
-    )
-}
-
-/// Sends `request` through `client` with the current span's trace context
-/// injected, and records the response status on the current span. Call it
-/// inside a [`client_span`].
-///
-/// # Errors
-///
-/// The request could not be built or sent.
-pub(crate) async fn send(
-    client: &reqwest::Client,
-    request: reqwest::RequestBuilder,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let mut request = request.build()?;
-    context::inject_current(request.headers_mut());
-    let response = client.execute(request).await?;
-    Span::current().record("http.response.status_code", response.status().as_u16());
-    Ok(response)
-}
-
 /// Marks the current store span failed, for a store function that returns
 /// `sqlx::Error` rather than going through [`crate::rpc::storage_unavailable`].
 /// Never records the error itself: its text can quote SQL or a value.
 pub(crate) fn record_storage_error(_: &sqlx::Error) {
     record_error(crate::rpc::STORAGE_UNAVAILABLE_TYPE);
-}
-
-/// Marks the current span failed, with a bounded classification as its
-/// `error.type`.
-pub(crate) fn record_error(classification: &'static str) {
-    let span = Span::current();
-    span.record("otel.status_code", "error");
-    span.record("error.type", classification);
 }
 
 #[cfg(test)]
