@@ -1,8 +1,9 @@
 //! Where an audit query goes, asserted on the route the server received.
 //!
-//! The audit trail exists only from `v4`. A `v4` session dials `v4`'s `Audit`
-//! route; a `v3` session has no such route and must not invent one — it answers
-//! with a bounded error and puts nothing on the wire.
+//! The audit trail exists only from `v4`. A `v4` or `v5` session dials its own
+//! version's `Audit` route; a `v3` session has no such route and must not
+//! invent one — it answers with a bounded error and puts nothing on the wire.
+//! Nor may a `v4` session send an actor filter it has no field for.
 
 use std::sync::{Arc, Mutex};
 
@@ -71,6 +72,51 @@ async fn an_audit_query_travels_on_v4s_audit_route() {
         recorder.take(),
         ["/sovereign.config.v4.Audit/QueryAuditTrail"]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_audit_query_travels_on_v5s_audit_route() {
+    let recorder = Recorder::default();
+    let channel = TonicChannel::connect(serve(recorder.clone()).await)
+        .await
+        .unwrap();
+
+    let _ = channel
+        .speaking(ProtocolVersion::V5)
+        .query_audit_trail(&AuditQuery::default(), &Secret::new("audit-token"))
+        .await;
+
+    assert_eq!(
+        recorder.take(),
+        ["/sovereign.config.v5.Audit/QueryAuditTrail"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_v4_session_refuses_an_actor_filter_and_dials_nothing() {
+    let recorder = Recorder::default();
+    let channel = TonicChannel::connect(serve(recorder.clone()).await)
+        .await
+        .unwrap();
+
+    let error = channel
+        .speaking(ProtocolVersion::V4)
+        .query_audit_trail(
+            &AuditQuery {
+                actor_filter: Some("ops".into()),
+                ..AuditQuery::default()
+            },
+            &Secret::new("audit-token"),
+        )
+        .await
+        .expect_err("v4 has no actor filter");
+
+    assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
+    assert_eq!(
+        error.message(),
+        "filtering the audit trail by actor is not available on protocol v4"
+    );
+    assert!(recorder.take().is_empty(), "nothing may reach the wire");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -198,5 +244,74 @@ async fn a_populated_query_and_page_survive_the_round_trip() {
         );
         assert_eq!(entry.actor_name, None);
         assert_eq!(entry.protocol_version, "v3");
+    }
+}
+
+mod v5_round_trip {
+    use std::sync::{Arc, Mutex};
+
+    use sovereign_config_client::AuditTransport;
+    use sovereign_config_core::{AuditCounts, AuditQuery, ProtocolVersion, Secret};
+    use sovereign_config_native::TonicChannel;
+    use sovereign_config_proto::sovereign::config::v5::{
+        QueryAuditTrailRequest, QueryAuditTrailResponse,
+        audit_server::{Audit, AuditServer},
+    };
+
+    /// A `v5` `Audit` service that records the request and answers an empty
+    /// first page with counts.
+    struct Counted(Arc<Mutex<Option<QueryAuditTrailRequest>>>);
+
+    #[tonic::async_trait]
+    impl Audit for Counted {
+        async fn query_audit_trail(
+            &self,
+            request: tonic::Request<QueryAuditTrailRequest>,
+        ) -> Result<tonic::Response<QueryAuditTrailResponse>, tonic::Status> {
+            *self.0.lock().unwrap() = Some(request.into_inner());
+            Ok(tonic::Response::new(QueryAuditTrailResponse {
+                events: Vec::new(),
+                next_cursor: String::new(),
+                total_count: Some(2345),
+                match_count: Some(0),
+            }))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_actor_filter_goes_out_and_the_counts_come_back() {
+        let seen = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(AuditServer::new(Counted(Arc::clone(&seen))))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let channel = TonicChannel::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+
+        let page = channel
+            .speaking(ProtocolVersion::V5)
+            .query_audit_trail(
+                &AuditQuery {
+                    actor_filter: Some("ops".into()),
+                    ..AuditQuery::default()
+                },
+                &Secret::new("audit-token"),
+            )
+            .await
+            .expect("the scripted page must decode");
+
+        let request = seen.lock().unwrap().take().expect("the request arrived");
+        assert_eq!(request.actor_filter, "ops");
+        assert_eq!(
+            page.counts,
+            Some(AuditCounts {
+                total: 2345,
+                matching: 0
+            })
+        );
     }
 }

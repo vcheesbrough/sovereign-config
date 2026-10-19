@@ -137,3 +137,19 @@ Release 2.44.0 moves the Authentik administration client behind a provider-neutr
 **Migration 0014 is one-way.** It changes `managed_connections.provider_user_id` from an integer to text, keeping every existing value as its decimal digits. Once it has run, a 2.43 server can't start against that database. Back up PostgreSQL before upgrading, as the [procedure](#upgrade-procedure) says. Rolling back means restoring that backup, not running an older image.
 
 **The access URL's client id is checked at startup.** Access URLs name an OAuth client: `SOVEREIGN_CONFIG_MANAGER_CLIENT_ID`, new and optional, which defaults to `SOVEREIGN_CONFIG_OIDC_AUDIENCE`. That client id must contain only ASCII letters, digits, `-`, `.`, `_` and `~`, or the server refuses to start and names the variable to fix. With Authentik it must also equal the audience, since tokens minted through any other client would be refused, so the server refuses to start on a mismatch. Before, an audience outside that set started the server and broke only managed create and rotate. Deployments whose audience is an Authentik client id such as `sovereign-config` need no change. With Authentik the audience is the application's client id, so leave `SOVEREIGN_CONFIG_MANAGER_CLIENT_ID` unset.
+
+### 2.46.0 introduces protocol `v5`
+
+Release 2.46.0 serves `sovereign.config.v5` beside `v4` and `v3`. It was approved explicitly before implementation. `v5` is `v4` with an actor filter on the audit query and the query's counts on its first page; `v3` and `v4` are untouched. `v5` is described under [Served versions](protocol-versioning.md#served-versions).
+
+**Deploying the server needs no client change.** Clients built from 2.46.0 negotiate `v5` automatically; everything older continues on the version it speaks. The browser UI is served by the same release, so it moves to `v5` with the server.
+
+Migration `0015` adds two trigram indexes on `audit_events`, for the actor filter. On a large trail it adds to the first start's migration time.
+
+It is **source-breaking for code that builds against the client crates**, the same class as 2.31.0. Nothing breaks until a consumer rebuilds against tag 2.46.0 or later:
+
+- `ProtocolVersion` gains `V5`, declared first, and `ProtocolVersion::PREFERRED` is now `V5`. An exhaustive `match` on `ProtocolVersion` must handle it.
+- `AuditQuery` gains `actor_filter` and `AuditPage` gains `counts`. Code that builds either with a struct literal must set them, or use `..Default::default()`.
+- On a `v4` session, a query with an `actor_filter` fails with an incompatible-protocol error rather than being sent without it.
+
+`sovereign-config-provider`'s own API is unchanged.

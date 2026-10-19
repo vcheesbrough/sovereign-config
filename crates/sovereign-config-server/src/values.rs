@@ -4,7 +4,7 @@
 //! - `service` — the shared implementation, in no protocol version's terms.
 //! - `shim` — the one adapter every version's shim instantiates, and the
 //!   validation policies a version chooses between.
-//! - `v3`, `v4` — each version's tonic impl: `shim` pointed at that version's
+//! - `v3`, `v4`, `v5` — each version's tonic impl: `shim` pointed at that version's
 //!   generated types.
 //! - `authz` — per-request path parsing and permission checks.
 //! - `store` — every `PostgreSQL` row type and query.
@@ -23,11 +23,13 @@ mod store;
 mod subtree;
 mod v3;
 mod v4;
+mod v5;
 
 pub(crate) use service::ConfigurationService;
 pub(crate) use startup::encrypt_stored_secrets;
 pub(crate) use v3::V3Configuration;
 pub(crate) use v4::V4Configuration;
+pub(crate) use v5::V5Configuration;
 
 /// Classification of a value the caller may read back in the clear — and the
 /// only classification whose values the audit trail will hold.

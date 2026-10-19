@@ -1,6 +1,6 @@
-//! Reading the trail back through `v4`'s `QueryAuditTrail`, end to end: the
-//! shim's translation, the shared implementation's validation and grant check,
-//! and the query against a real table.
+//! Reading the trail back through `v4`'s and `v5`'s `QueryAuditTrail`, end to
+//! end: each shim's translation, the shared implementation's validation and
+//! grant check, and the query against a real table.
 //!
 //! Every event here is written under [`ROOT`] and every caller's grants are
 //! confined to it, so the suites sharing this database cannot leak into a
@@ -12,12 +12,14 @@ use sovereign_config_core::AuditEventKind;
 use sovereign_config_proto::sovereign::config::v4::{
     self, QueryAuditTrailRequest, QueryAuditTrailResponse, audit_server::Audit,
 };
+use sovereign_config_proto::sovereign::config::v5;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use time::OffsetDateTime;
 use tonic::{Code, Request};
 
 use super::test_support::clear_trail;
 use super::v4::V4Audit;
+use super::v5::V5Audit;
 use super::{Actor, AuditEvent, AuditRecorder, AuditTrailService, EventKind, Recorded};
 use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
 
@@ -600,4 +602,160 @@ async fn connection_events_need_manage_and_value_events_need_read() {
     );
 
     clear_trail(&pool, ROOT).await;
+}
+
+/// Three events under [`ROOT`] by two actors, `Deploy_Bot` (`svc-7f3a`) at
+/// `first` and `third` and an unnamed `svc-9e1c` at `second`, plus one outside
+/// it that no caller here may see. Returns the three paths, oldest first.
+async fn seed_actors(pool: &PgPool) -> [String; 3] {
+    let paths = ["first", "second", "third"].map(|name| format!("{ROOT}/{name}"));
+    let bot = Actor {
+        subject: "svc-7f3a",
+        name: Some("Deploy_Bot"),
+        protocol_version: "v5",
+    };
+    let unnamed = Actor {
+        subject: "svc-9e1c",
+        name: None,
+        protocol_version: "v5",
+    };
+    let recorder = AuditRecorder::for_tests();
+    for (when, who, path) in [
+        (10, &bot, &paths[0]),
+        (20, &unnamed, &paths[1]),
+        (30, &bot, &paths[2]),
+    ] {
+        recorder
+            .record(
+                pool,
+                who,
+                at(when),
+                AuditEvent::value_created(who, path, Recorded::Plain("on")),
+            )
+            .await
+            .unwrap();
+    }
+    record(pool, 40, created(ELSEWHERE)).await;
+    paths
+}
+
+const ELSEWHERE: &str = "/tests/audit-query-elsewhere/x";
+
+fn v5_audit(pool: &PgPool, page_size: u32) -> V5Audit {
+    V5Audit::new(Arc::new(AuditTrailService::new(pool.clone(), page_size)))
+}
+
+async fn ask_v5(
+    service: &V5Audit,
+    principal: &AuthenticatedPrincipal,
+    message: v5::QueryAuditTrailRequest,
+) -> v5::QueryAuditTrailResponse {
+    let mut request = Request::new(message);
+    request.extensions_mut().insert(principal.clone());
+    v5::audit_server::Audit::query_audit_trail(service, request)
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+fn v5_paths(response: &v5::QueryAuditTrailResponse) -> Vec<&str> {
+    response
+        .events
+        .iter()
+        .map(|event| event.path.as_str())
+        .collect()
+}
+
+async fn clear_actors(pool: &PgPool) {
+    clear_trail(pool, ROOT).await;
+    clear_trail(pool, "/tests/audit-query-elsewhere").await;
+}
+
+/// `v5`'s actor filter matches the recorded name or the subject,
+/// case-insensitively and literally.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn v5_filters_by_actor_name_or_subject() {
+    let pool = pool().await;
+    let service = v5_audit(&pool, 100);
+    let reader = reader_of(ROOT);
+    let [first, second, third] = seed_actors(&pool).await;
+    let by = |fragment: &str| v5::QueryAuditTrailRequest {
+        actor_filter: fragment.into(),
+        ..v5::QueryAuditTrailRequest::default()
+    };
+
+    let by_name = ask_v5(&service, &reader, by("deploy_BOT")).await;
+    assert_eq!(v5_paths(&by_name), [third.as_str(), first.as_str()]);
+    assert_eq!(
+        (by_name.total_count, by_name.match_count),
+        (Some(3), Some(2))
+    );
+    let by_subject = ask_v5(&service, &reader, by("9E1C")).await;
+    assert_eq!(v5_paths(&by_subject), [second.as_str()]);
+    // A wildcard is only itself.
+    let literal = ask_v5(&service, &reader, by("deploy%bot")).await;
+    assert_eq!(literal.match_count, Some(0));
+
+    clear_actors(&pool).await;
+}
+
+/// `v5`'s first page carries the query's counts — its whole visible scope,
+/// and what in it matches — and later pages carry none.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn v5_counts_the_visible_scope_on_the_first_page_only() {
+    let pool = pool().await;
+    let service = v5_audit(&pool, 2);
+    let reader = reader_of(ROOT);
+    let [first, second, _] = seed_actors(&pool).await;
+
+    let page_one = ask_v5(&service, &reader, v5::QueryAuditTrailRequest::default()).await;
+    assert_eq!(
+        (page_one.total_count, page_one.match_count),
+        (Some(3), Some(3)),
+        "the event outside the caller's grant is not counted"
+    );
+    assert_eq!(page_one.events.len(), 2);
+    let page_two = ask_v5(
+        &service,
+        &reader,
+        v5::QueryAuditTrailRequest {
+            cursor: page_one.next_cursor.clone(),
+            ..v5::QueryAuditTrailRequest::default()
+        },
+    )
+    .await;
+    assert_eq!(v5_paths(&page_two), [first.as_str()]);
+    assert_eq!((page_two.total_count, page_two.match_count), (None, None));
+
+    // A value's history is the scope its total counts.
+    let history = ask_v5(
+        &service,
+        &reader,
+        v5::QueryAuditTrailRequest {
+            element_path: second.clone(),
+            actor_filter: "deploy".into(),
+            ..v5::QueryAuditTrailRequest::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        (history.total_count, history.match_count),
+        (Some(1), Some(0))
+    );
+
+    // A caller with no grants sees nothing, and is told so.
+    let nothing = ask_v5(
+        &service,
+        &caller(&[]),
+        v5::QueryAuditTrailRequest::default(),
+    )
+    .await;
+    assert_eq!(
+        (nothing.total_count, nothing.match_count),
+        (Some(0), Some(0))
+    );
+
+    clear_actors(&pool).await;
 }

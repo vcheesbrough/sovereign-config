@@ -35,13 +35,13 @@ use tonic_health::pb::{
 use tonic_health::server::HealthReporter;
 use tracing::{Instrument, error, info};
 
-use audit::{AuditRecorder, AuditTrailService, v4::V4Audit};
+use audit::{AuditRecorder, AuditTrailService, v4::V4Audit, v5::V5Audit};
 use auth::{Authenticator, grpc_service_layer};
 use config::{Config, ManagedConnectionConfig, required_env};
 use handshake::HandshakeService;
 use managed::{
     ManagedConnectionsService, ManagedSettings, TRAIL_REPAIR_DELAY, V3ManagedConnections,
-    V4ManagedConnections,
+    V4ManagedConnections, V5ManagedConnections,
 };
 use metrics::{
     AuditMetrics, AuthenticationMetrics, JobMetrics, ManagedConnectionMetrics, ProtocolMetrics,
@@ -57,11 +57,13 @@ use sovereign_config_proto::sovereign::config::{
         configuration_server::ConfigurationServer,
         managed_connections_server::ManagedConnectionsServer, system_server::SystemServer,
     },
-    v4,
+    v4, v5,
 };
 use spans::TraceLayer;
-use system::{SERVED_PROTOCOL_LABELS, SystemService, V4System};
-use values::{ConfigurationService, V3Configuration, V4Configuration, encrypt_stored_secrets};
+use system::{SERVED_PROTOCOL_LABELS, SystemService, V4System, V5System};
+use values::{
+    ConfigurationService, V3Configuration, V4Configuration, V5Configuration, encrypt_stored_secrets,
+};
 use web::WebAssetsLayer;
 
 const SYSTEM_SERVICE_NAME: &str = "sovereign.config.v3.System";
@@ -220,6 +222,20 @@ async fn serve(meter: &Meter) -> Result<()> {
             ),
         )
         .add_service(v4::audit_server::AuditServer::new(V4Audit::new(
+            Arc::clone(&audit_trail),
+        )))
+        // `v5`: the same implementations again; its audit shim adds the actor
+        // filter and the counts.
+        .add_service(v5::system_server::SystemServer::new(V5System))
+        .add_service(v5::configuration_server::ConfigurationServer::new(
+            V5Configuration::new(Arc::clone(&configuration)),
+        ))
+        .add_service(
+            v5::managed_connections_server::ManagedConnectionsServer::new(
+                V5ManagedConnections::new(Arc::clone(&managed_connections)),
+            ),
+        )
+        .add_service(v5::audit_server::AuditServer::new(V5Audit::new(
             audit_trail,
         )))
         .serve_with_shutdown(config.grpc_addr, shutdown_signal())
@@ -416,6 +432,18 @@ async fn serving_health_service() -> (HealthReporter, HealthServer<impl Health>)
         .await;
     health_reporter
         .set_serving::<v4::audit_server::AuditServer<V4Audit>>()
+        .await;
+    health_reporter
+        .set_serving::<v5::system_server::SystemServer<V5System>>()
+        .await;
+    health_reporter
+        .set_serving::<v5::configuration_server::ConfigurationServer<V5Configuration>>()
+        .await;
+    health_reporter
+        .set_serving::<v5::managed_connections_server::ManagedConnectionsServer<V5ManagedConnections>>()
+        .await;
+    health_reporter
+        .set_serving::<v5::audit_server::AuditServer<V5Audit>>()
         .await;
     (health_reporter, health_service)
 }

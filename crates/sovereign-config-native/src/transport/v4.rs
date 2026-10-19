@@ -8,6 +8,8 @@ use sovereign_config_core::{AuditEntry, AuditEventKind, Timestamp};
 use sovereign_config_proto::sovereign::config::v4 as proto;
 
 use super::adapter::version_dialer;
+use super::audit_wire::audit_wire;
+use sovereign_config_client::audit_actor_filter_not_available;
 
 version_dialer!(ProtocolVersion::V4);
 
@@ -24,6 +26,9 @@ impl AuditTransport for Dialer {
         query: &AuditQuery,
         bearer: &Secret,
     ) -> Result<AuditPage, ClientError> {
+        if query.actor_filter.is_some() {
+            return Err(audit_actor_filter_not_available(VERSION));
+        }
         let response = self
             .audit()
             .query_audit_trail(authenticated_request(audit_request(query), bearer)?)
@@ -37,6 +42,7 @@ impl AuditTransport for Dialer {
                 .map(audit_entry)
                 .collect::<Result<Vec<_>, ClientError>>()?,
             next_cursor: (!response.next_cursor.is_empty()).then_some(response.next_cursor),
+            counts: None,
         })
     }
 }
@@ -67,61 +73,7 @@ fn audit_request(query: &AuditQuery) -> proto::QueryAuditTrailRequest {
     }
 }
 
-const fn wire_kind(kind: AuditEventKind) -> proto::AuditEventKind {
-    use proto::AuditEventKind as Wire;
-    match kind {
-        AuditEventKind::ValueCreated => Wire::ValueCreated,
-        AuditEventKind::ValueUpdated => Wire::ValueUpdated,
-        AuditEventKind::ValueDeleted => Wire::ValueDeleted,
-        AuditEventKind::ValuePathAdded => Wire::ValuePathAdded,
-        AuditEventKind::SubtreeReplaced => Wire::SubtreeReplaced,
-        AuditEventKind::SubtreeDeleted => Wire::SubtreeDeleted,
-        AuditEventKind::SecretRevealed => Wire::SecretRevealed,
-        AuditEventKind::SubtreeRead => Wire::SubtreeRead,
-        AuditEventKind::ValuesListed => Wire::ValuesListed,
-        AuditEventKind::ConnectionCreated => Wire::ConnectionCreated,
-        AuditEventKind::ConnectionRotated => Wire::ConnectionRotated,
-        AuditEventKind::ConnectionRevoked => Wire::ConnectionRevoked,
-    }
-}
-
-fn audit_kind(tag: i32) -> Result<AuditEventKind, ClientError> {
-    use proto::AuditEventKind as Wire;
-    Ok(match Wire::try_from(tag).map_err(|_| invalid_response())? {
-        Wire::Unspecified => return Err(invalid_response()),
-        Wire::ValueCreated => AuditEventKind::ValueCreated,
-        Wire::ValueUpdated => AuditEventKind::ValueUpdated,
-        Wire::ValueDeleted => AuditEventKind::ValueDeleted,
-        Wire::ValuePathAdded => AuditEventKind::ValuePathAdded,
-        Wire::SubtreeReplaced => AuditEventKind::SubtreeReplaced,
-        Wire::SubtreeDeleted => AuditEventKind::SubtreeDeleted,
-        Wire::SecretRevealed => AuditEventKind::SecretRevealed,
-        Wire::SubtreeRead => AuditEventKind::SubtreeRead,
-        Wire::ValuesListed => AuditEventKind::ValuesListed,
-        Wire::ConnectionCreated => AuditEventKind::ConnectionCreated,
-        Wire::ConnectionRotated => AuditEventKind::ConnectionRotated,
-        Wire::ConnectionRevoked => AuditEventKind::ConnectionRevoked,
-    })
-}
-
-fn audit_entry(event: proto::AuditEvent) -> Result<AuditEntry, ClientError> {
-    let occurred_at = event.occurred_at.ok_or_else(invalid_response)?;
-    let first_occurred_at = event.first_occurred_at.ok_or_else(invalid_response)?;
-    Ok(AuditEntry {
-        id: event.id,
-        kind: audit_kind(event.kind)?,
-        path: ConfigPath::parse_selection(event.path).map_err(|_| invalid_response())?,
-        occurred_at: timestamp(occurred_at.seconds, occurred_at.nanos)?,
-        first_occurred_at: timestamp(first_occurred_at.seconds, first_occurred_at.nanos)?,
-        event_count: event.event_count,
-        actor_subject: event.actor_subject,
-        actor_name: event.actor_name,
-        protocol_version: event.protocol_version,
-        old_value: event.old_value,
-        new_value: event.new_value,
-        narrative: event.narrative,
-    })
-}
+audit_wire!();
 
 #[cfg(test)]
 mod tests {
@@ -163,6 +115,7 @@ mod tests {
             kinds: vec![AuditEventKind::SecretRevealed, AuditEventKind::ValueUpdated],
             page_size: 25,
             cursor: Some("cursor-sentinel".into()),
+            actor_filter: None,
         });
         assert_eq!(request.path_filter, "");
         assert_eq!(request.element_path, "/Apps/Key");

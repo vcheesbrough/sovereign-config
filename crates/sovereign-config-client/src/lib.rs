@@ -467,6 +467,20 @@ pub fn audit_not_available(version: ProtocolVersion) -> ClientError {
     )
 }
 
+/// What a dialer whose protocol version cannot filter the audit trail by actor
+/// answers a query carrying an actor filter with, rather than sending the
+/// query without it and showing every actor's events as though they matched.
+///
+/// [`ErrorKind::IncompatibleProtocol`], for the reason [`audit_not_available`]
+/// gives.
+#[must_use]
+pub fn audit_actor_filter_not_available(version: ProtocolVersion) -> ClientError {
+    ClientError::described(
+        ErrorKind::IncompatibleProtocol,
+        format!("filtering the audit trail by actor is not available on protocol {version}"),
+    )
+}
+
 /// Everything one protocol version's routes can carry.
 ///
 /// A transport holds the dialer for the version its session negotiated as a

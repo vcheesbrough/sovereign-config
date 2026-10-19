@@ -83,6 +83,8 @@ pub struct AuditQuery {
     pub page_size: u32,
     /// The previous page's [`AuditPage::next_cursor`], verbatim.
     pub cursor: Option<String>,
+    /// A case-insensitive fragment of the actor's name or subject. From `v5`.
+    pub actor_filter: Option<String>,
 }
 
 /// One event in the trail.
@@ -114,4 +116,17 @@ pub struct AuditPage {
     pub events: Vec<AuditEntry>,
     /// Pass as [`AuditQuery::cursor`] for the next page; `None` at the end.
     pub next_cursor: Option<String>,
+    /// The query's counts, on its first page from a version that reports
+    /// them (`v5` on); `None` on every later page and on older versions.
+    pub counts: Option<AuditCounts>,
+}
+
+/// How big the trail is, as of a query's first page.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AuditCounts {
+    /// Every event the caller may see in the query's scope — the whole trail,
+    /// or one value's history — whatever the other filters say.
+    pub total: u64,
+    /// How many of those match every filter.
+    pub matching: u64,
 }

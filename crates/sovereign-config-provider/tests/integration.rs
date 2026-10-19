@@ -624,8 +624,8 @@ async fn a_server_newer_than_this_build_still_connects() {
 async fn a_server_that_retired_this_version_is_incompatible() {
     let mut state = MockState::happy();
     // Every version this build speaks is gone.
-    state.protocol_version = "v6".to_owned();
-    state.supported_protocol_versions = vec!["v5".to_owned(), "v6".to_owned()];
+    state.protocol_version = "v7".to_owned();
+    state.supported_protocol_versions = vec!["v6".to_owned(), "v7".to_owned()];
     let harness = Harness::start(Arc::new(state)).await;
 
     match Provider::connect(&harness.url).await {

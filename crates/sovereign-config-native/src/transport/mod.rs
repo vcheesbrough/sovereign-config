@@ -12,8 +12,10 @@
 //! a version this transport cannot dial does not compile.
 
 mod adapter;
+mod audit_wire;
 mod v3;
 mod v4;
+mod v5;
 
 use std::{net::IpAddr, time::Duration};
 
@@ -54,6 +56,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// from the same module that owns the routes it dials.
 fn dialer(version: ProtocolVersion, channel: Channel) -> Box<dyn SessionTransport> {
     match version {
+        ProtocolVersion::V5 => Box::new(v5::Dialer::new(channel)),
         ProtocolVersion::V4 => Box::new(v4::Dialer::new(channel)),
         ProtocolVersion::V3 => Box::new(v3::Dialer::new(channel)),
     }
