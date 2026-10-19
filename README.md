@@ -32,7 +32,7 @@ Every component is released together from one source tag under one version.
 
 - **Docker with Compose** on linux/amd64. The reference stack is [`compose.yaml`](compose.yaml).
 - **PostgreSQL.** The reference stack runs its own, pinned by digest. A deployment needs `CREATE` on its database, which the bundled role has.
-- **Authentik 2026.5.2 or newer** as the identity provider. The repository ships Authentik blueprints that create everything the service needs (see [Authentication](docs/authentication.md)).
+- **Authentik 2026.5.2 or newer** as the identity provider. The repository ships Authentik blueprints that create everything the service needs (see [Authentication](docs/authentication.md)). Authentik is the only supported identity provider today; support for other OIDC providers is planned (see [Roadmap](#roadmap)).
 - **A TLS-terminating reverse proxy** that forwards HTTP/2 cleartext (h2c) to the service. The reference stack is labelled for Traefik, the supported and tested ingress.
 - **Encrypted storage** for the database volume and for every backup.
 
@@ -211,7 +211,7 @@ Its tools cover authentication status and device-flow `login`/`logout`, plus `ge
 
 ### Applications
 
-Rust applications can read their configuration with [`sovereign-config-provider`](crates/sovereign-config-provider/README.md). It takes an access URL, obtains a client-credentials token, reads the URL's subtree, reveals secret leaves and deserializes the result into a `serde` type. It negotiates a protocol version on connect, so a server upgrade does not require rebuilding its consumers. It deliberately caches nothing, so revealed secrets never outlive a load in memory.
+Rust applications can read their configuration with [`sovereign-config-provider`](crates/sovereign-config-provider/README.md). It takes an access URL, obtains a client-credentials token, reads the URL's subtree, reveals secret leaves and deserializes the result into a `serde` type. It negotiates a protocol version on connect, so a server upgrade does not require rebuilding its consumers. It deliberately caches nothing, so revealed secrets never outlive a load in memory. Rust is the only provider language today; providers for other languages, such as .NET, are planned (see [Roadmap](#roadmap)).
 
 Other deploy tooling can use `sovereign-config render` with an access URL in `SOVEREIGN_CONFIG_URL`, or the `sovereign-config-cli` image in a CI step (see [CLI](docs/cli.md#the-cli-image-for-woodpecker-pipelines)).
 
@@ -264,6 +264,13 @@ Stop traffic and the old server, back up the database, set `SOVEREIGN_CONFIG_IMA
 The API is served as versioned protobuf packages, currently `sovereign.config.v4` (preferred) and `sovereign.config.v3`, over native gRPC and gRPC-Web on one port. A client sends the versions it speaks to an unversioned handshake, and the server answers with every version it serves. The client then uses the best one both sides support. A client older than the server therefore keeps working, and upgrading the server alone is safe. A version is retired only after it is announced with a deprecation date and its authenticated traffic has dropped to zero.
 
 `v4` adds the audit-trail query to `v3`'s surface and validates a request's shape before authorizing it. Negotiation does not cover every change: some releases changed what older clients see without a protocol change, and [Upgrading](docs/upgrading.md) says how to sequence them. [Protocol versioning](docs/protocol-versioning.md) describes negotiation, the compatibility rules, and how versions are introduced and retired.
+
+## Roadmap
+
+The project intends to extend Sovereign Config in these directions. They are statements of intent, not commitments, and none has a release date.
+
+- **More identity providers.** Authentication is built on standard OIDC access tokens, verified locally against the issuer's published keys, but the setup, grant mapping and managed connections currently depend on Authentik. The intent is to support other OIDC identity providers as well.
+- **Providers for more languages.** Applications currently read configuration through the Rust `sovereign-config-provider` crate, or through `sovereign-config render` from any language. The intent is to offer native providers for other ecosystems, starting with .NET, with the same guarantees: a scoped access URL, protocol negotiation, and no caching of revealed secrets.
 
 ## Documentation
 
