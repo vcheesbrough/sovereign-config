@@ -198,7 +198,7 @@ steps:
     commands:
       - echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
       - |
-        # Telemetry (README "Observability"): non-secret, so kept here with the
+        # Telemetry (docs/project-deployment.md): non-secret, so kept here with the
         # deploy rather than in the store this deploy would have to read itself
         # from. compose.yaml passes the names through.
         #
@@ -224,5 +224,5 @@ steps:
         }
         # The web UI's telemetry ingest (compose profile `client-telemetry`),
         # started after the gate above and never part of it: its failure is a
-        # warning, not a failed deploy (README "Observability").
+        # warning, not a failed deploy (docs/observability.md).
         "$$COMPOSE" -p sovereign-config-dev --profile client-telemetry up -d --no-deps otlp-ingest || echo "WARNING: the client-telemetry ingest did not start; the deploy continues without it" >&2

@@ -13,7 +13,7 @@
 //! The endpoint is unauthenticated and therefore public. The client's version
 //! list is untrusted input: it is counted under compiled-in labels only, with
 //! a bound on how much of it is looked at, and it never influences the answer.
-//! See `## Protocol versioning` in `README.md`.
+//! See `docs/protocol-versioning.md`.
 
 use std::sync::Arc;
 

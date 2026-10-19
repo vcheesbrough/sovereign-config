@@ -1,5 +1,5 @@
 //! The issuers' signing keys, held in memory so a request is verified without
-//! a round-trip to Authentik (README "Request authentication").
+//! a round-trip to Authentik (docs/authentication.md, "Request authentication").
 //!
 //! Keys come from one place only: `<issuer>jwks/` for each configured issuer —
 //! the `jwks_uri` Authentik's discovery document names for a per-provider
@@ -43,7 +43,7 @@ pub(crate) const RETRY_INTERVAL: Duration = Duration::from_secs(15);
 /// retry do not, so they never delay picking up a newly rotated key. Inside
 /// the interval an unknown `kid` is refused as `bad_signature` without a
 /// fetch — which is also how a genuine token signed by a key rotated in during
-/// those seconds is answered (README "Credential rotation").
+/// those seconds is answered (docs/authentication.md, "Credential rotation").
 pub(crate) const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// What a lookup of one `kid` found.

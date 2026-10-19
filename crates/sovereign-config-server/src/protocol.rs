@@ -17,7 +17,7 @@
 //! consuming the body. The `authenticated` series is recorded by the
 //! authentication layer instead, which reads the extension this layer attached.
 //! See [`ProtocolMetrics`] for why the gate needs both, and
-//! `## Protocol versioning` in `README.md`.
+//! `docs/protocol-versioning.md`.
 //!
 //! [`UnservedVersionLayer`] is the other half: a route shaped like a call on a
 //! protocol version, naming one this build does not serve, gets a **distinct**

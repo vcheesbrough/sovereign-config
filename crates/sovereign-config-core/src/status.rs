@@ -6,7 +6,7 @@
 //! selects from the server's order. Clients are deployed independently of the
 //! server and are expected to lag it, so a server upgrade that adds a version
 //! must leave every already-deployed client negotiating exactly as before. See
-//! `## Protocol versioning` in `README.md`.
+//! `docs/protocol-versioning.md`.
 
 use crate::{ClientError, ErrorKind};
 

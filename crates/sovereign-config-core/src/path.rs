@@ -28,13 +28,13 @@ pub enum PathError {
 /// remain one value — resolution, uniqueness, and authorization all compare
 /// on the fold. Case retention was added in release 2.18.0; a client built
 /// before that release assumes every response path is already lowercase and
-/// fails the whole response it arrived in once one is not. See the `Upgrade`
-/// section of the repository README.
+/// fails the whole response it arrived in once one is not. See the release notes in
+/// `docs/upgrading.md`.
 ///
 /// `_` was added to the segment character set in release 2.15.0. It is a
 /// widening of the `v3` protocol's canonical path grammar: a client built before
 /// that release rejects a path containing `_` and fails the whole response it
-/// arrived in. See the `Upgrade` section of the repository README.
+/// arrived in. See the release notes in `docs/upgrading.md`.
 #[derive(Clone, Debug)]
 pub struct ConfigPath {
     path: String,

@@ -5,7 +5,7 @@ use reqwest::Url;
 
 use crate::encryption::{ValueCipher, decode_key};
 
-/// For one fetch of an issuer's signing keys (README "Request authentication").
+/// For one fetch of an issuer's signing keys (docs/authentication.md, "Request authentication").
 const JWKS_TIMEOUT: Duration = Duration::from_secs(3);
 const MANAGER_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -78,7 +78,7 @@ pub(crate) struct WebConfig {
     /// "no client telemetry here", and the SPA then never initialises OTLP.
     ///
     /// Product configuration for the client, not a knob of the server's own
-    /// telemetry: that stays the `OTEL_*` family (README "Observability").
+    /// telemetry: that stays the `OTEL_*` family (docs/observability.md).
     pub(crate) client_telemetry_endpoint: Option<String>,
 }
 

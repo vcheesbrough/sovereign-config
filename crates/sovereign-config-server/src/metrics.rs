@@ -22,7 +22,7 @@
 //! **Names survive the platform's translation.** An instrument named
 //! `sovereign_config.protocol.requests` is stored as
 //! `sovereign_config_protocol_requests_total` (dots to underscores, `_total`
-//! for a counter, a unit word for a unit), so every series the README and the
+//! for a counter, a unit word for a unit), so every series the docs and the
 //! retirement gate name keeps its stored name and labels. The table in this
 //! module's tests is the source of truth.
 

@@ -11,8 +11,10 @@ is specific to sovereign-config or overrides the baseline.
 If a sovereign-config rule changes, change it here — there is no parallel copy.
 Cross-repo rules change in `agent-shared`, not here.
 
-Project architecture, stack, and deployment details belong in `README.md` and
-project documentation; this file defines the repo-specific collaboration rules.
+User-facing documentation belongs in `README.md` and `docs/`; development
+workflow in `docs/development.md` and `docs/protocol-versioning.md`; the
+project's own infrastructure in `docs/project-deployment.md`, never the
+README; this file defines the repo-specific collaboration rules.
 
 ---
 
@@ -51,7 +53,7 @@ Run the **`ci-watch`** skill (baseline §4) with `OWNER=vcheesbrough`,
 - **Deploy a main commit to dev before promoting it to prod.** This is an
   operator rule; the pipeline does not enforce it. A release tag means only
   that checks passed, so only a dev deploy proves a release against the
-  long-lived database and live Authentik (README, deployment section).
+  long-lived database and live Authentik (`docs/project-deployment.md`).
 - **Deployment smoke check** (post-pipeline, not part of `ci-watch`): for a
   successful development deployment, directly
   call its public native gRPC `System.GetVersion` endpoint **after** the
@@ -85,7 +87,7 @@ an **earlier** protocol version than the server, and that is explicitly
 supported — a server upgrade alone must never break them.
 
 **The full procedure for introducing and retiring a protocol version is
-`## Protocol versioning` in `README.md`.** Read it before changing anything in
+`docs/protocol-versioning.md`.** Read it before changing anything in
 `proto/`. The rules below are the agent-facing summary, not a second copy.
 
 - **Any protocol change requires explicit permission, requested up front.**
@@ -105,7 +107,7 @@ supported — a server upgrade alone must never break them.
   carry** — a wider or narrower grammar, letter case, range, or a new enum
   member. Anything else is a new package served alongside the old one, never an
   edit in place. Exceptions are approved before implementation and recorded in
-  the README with their reason; there are three (2.25.0, 2.29.0 and 2.42.0).
+  `docs/protocol-versioning.md` with their reason; there are three (2.25.0, 2.29.0 and 2.42.0).
 - **The handshake's shape is fixed, forever**, because it can never itself be
   versioned. Do not add to it, and do not give it a version-shaped package name
   — `/sovereign.config.Handshake/…` has one dotted segment fewer than a
@@ -114,7 +116,7 @@ supported — a server upgrade alone must never break them.
 - **Never change the `GetVersionResponse.protocol_version` echo semantics.** It
   returns the version the client *requested*; echoing the server's preferred
   version instead would fail every already-deployed client the day a newer
-  version ships. Its regression tests are named in the README section, along
+  version ships. Its regression tests are named in `docs/protocol-versioning.md`, along
   with `v3`'s oldest-first advertised ordering, which is `v3` behaviour and is
   deliberately the reverse of the handshake's.
 - Breaking changes are a **last resort** and must be avoided wherever possible.
@@ -147,7 +149,7 @@ how this repo applies it and where it does not yet.
 - **The `OTEL_*` variables are the whole configuration interface.** Never add
   a `SOVEREIGN_CONFIG_*` name or a config field for a telemetry knob.
   `compose.yaml` passes names only (`deployment_policy.rs` enforces it); the
-  values live in the deploy steps (README `## Observability` says why). Two
+  values live in the deploy steps (`docs/project-deployment.md`, *Telemetry platform*, says why). Two
   things are not knobs of the server's telemetry and are deliberately outside
   this rule: `SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT`, product
   configuration the server hands the web UI (only ever its own public
@@ -175,7 +177,7 @@ how this repo applies it and where it does not yet.
   `sovereign_config.build.info`. From #422 on, a new metric ships with its
   dashboard panel in the same PR.
 - **The web UI's telemetry is `crates/sovereign-config-web/src/telemetry/`**
-  (README `### Client telemetry: the web UI`). Every `spawn_local` in the
+  (`docs/observability.md`, *Client telemetry: the web UI*). Every `spawn_local` in the
   crate is `telemetry::spawn_local`, which is what gives each user action its
   trace and root span — import that one, never
   `wasm_bindgen_futures::spawn_local`, and name a new action with a new

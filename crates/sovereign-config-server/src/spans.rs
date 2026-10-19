@@ -223,8 +223,8 @@ fn http_method(method: &Method) -> (&'static str, &'static str) {
 /// Stamps the authenticated caller on the request's span: `user.id` is the
 /// token's `sub`, `user.name` the identity provider's display name
 /// (`preferred_username`, else `username`). Span attributes only — never a
-/// metric label, never a log field (README `## Observability` says what
-/// holding them in Tempo obliges).
+/// metric label, never a log field (docs/observability.md says what
+/// holding them in the trace store obliges).
 pub(crate) fn stamp_user(span: &Span, principal: &AuthenticatedPrincipal) {
     span.record("user.id", principal.subject.as_str());
     if let Some(name) = &principal.name {

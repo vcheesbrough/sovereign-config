@@ -83,8 +83,8 @@ Secret names are path segments, so they map one-to-one:
 /woodpecker/repos/vcheesbrough/sovereign-config/zot_ci_password
 ```
 
-`_` in a path segment requires **release 2.15.0 or later** — see the `Upgrade`
-section of the repository README before storing one.
+`_` in a path segment requires **release 2.15.0 or later** — see the release notes in
+[Upgrading](../../docs/upgrading.md) before storing one.
 
 Values shared across every repository live directly under `/woodpecker/shared`
 — write them there and nowhere else:

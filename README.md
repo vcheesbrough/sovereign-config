@@ -1,219 +1,331 @@
+<div align="center">
+
 # Sovereign Config
 
-Sovereign Config is a self-hosted, gRPC-first configuration service. This repository is a Cargo-workspace monorepo: the server, protocol crates, shared Rust client libraries, CLI, MCP server, WASM UI, and Woodpecker CI secrets extension are released together from the same source tag.
+**Self-hosted configuration and secrets, on infrastructure you control.**
+
+[![Latest release](https://img.shields.io/github/v/tag/vcheesbrough/sovereign-config?sort=semver&label=release&color=2ea44f)](docs/upgrading.md)
+[![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue)](LICENSE)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust&logoColor=white)](docs/development.md)
+[![gRPC and gRPC-Web](https://img.shields.io/badge/API-gRPC%20%2B%20gRPC--Web-244c5a)](docs/protocol-versioning.md)
+[![OpenTelemetry](https://img.shields.io/badge/telemetry-OpenTelemetry-7b5ea7?logo=opentelemetry&logoColor=white)](docs/observability.md)
+
+[Features](#features) · [Deployment](#deployment) · [Using it](#using-sovereign-config) · [Configuration](#configuration-reference) · [Roadmap](#roadmap) · [Docs](#documentation)
+
+</div>
+
+---
+
+Sovereign Config keeps a tree of configuration values, both plain values and encrypted secrets, at absolute paths such as `/apps/api/database_url`. It authenticates every request through your own OIDC identity provider, and it records who read or changed what. People work with it through a **web UI**, a **CLI** and an **MCP server**. Applications and pipelines read it through narrowly scoped, revocable **access URLs**.
+
+It is built for operators who want their configuration and secrets on infrastructure they control, with **no cloud dependency**, **no telemetry they did not configure**, and **no outbound connection they did not ask for**.
+
+## Features
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+🌳 **One tree of configuration**<br>
+Values live at case-insensitive, case-preserving absolute paths. A value can be exposed at several paths (aliases), and a whole subtree can be read or replaced atomically as JSON.
+
+</td>
+<td width="50%" valign="top">
+
+🔐 **Secrets encrypted at rest**<br>
+Secret values are sealed with XChaCha20-Poly1305 under a key you hold. They are masked everywhere and returned in plaintext only by an explicit, authorized and audited reveal.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+🛂 **Path-scoped access control**<br>
+Grants of `read`, `write` and `manage` on a path prefix come from your identity provider and are checked on every request.
+
+</td>
+<td valign="top">
+
+🔗 **Access URLs for machines**<br>
+A single self-contained URL whose credential is confined to one subtree with exactly the permissions you choose. It can be rotated or revoked at any time.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+📜 **Audit trail**<br>
+Every change, every secret reveal, every read and every access-URL lifecycle event is recorded with the identity behind it, kept for a year by default, and searchable from the web UI.
+
+</td>
+<td valign="top">
+
+🚀 **Deploy-time rendering**<br>
+`sovereign-config render` turns configuration into a command's environment without a shell, and fails closed.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+🤝 **Mixed-version operation**<br>
+Clients and server negotiate a protocol version on connect, so upgrading the server does not force every client to upgrade with it.
+
+</td>
+<td valign="top">
+
+📡 **OpenTelemetry**<br>
+Spans, logs and metrics are exported over OTLP when you configure them, and nothing is exported when you don't.
+
+</td>
+</tr>
+</table>
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    subgraph people["People"]
+        UI["Web UI"]
+        CLI["CLI"]
+        MCP["MCP server"]
+    end
+    subgraph machines["Applications and pipelines"]
+        APP["Rust provider"]
+        RENDER["render in a deploy step"]
+        WP["Woodpecker broker"]
+    end
+    SRV["Sovereign Config server"]
+    PG[("PostgreSQL<br/>secrets sealed")]
+    IDP["Authentik<br/>OIDC provider"]
+    OTEL["OTLP collector<br/>(optional)"]
+
+    UI -- "gRPC-Web + user token" --> SRV
+    CLI -- "gRPC + user token" --> SRV
+    MCP -- "gRPC + user token" --> SRV
+    APP -- "access URL" --> SRV
+    RENDER -- "access URL" --> SRV
+    WP -- "access URL" --> SRV
+    SRV --> PG
+    SRV -- "signing keys, access-URL accounts" --> IDP
+    SRV -. "spans, logs, metrics" .-> OTEL
+```
+
+## Components
+
+| Component | What it is | How it is distributed |
+| --- | --- | --- |
+| **Server** | The gRPC and gRPC-Web service, with the web UI embedded. | Container image `sovereign-config` |
+| **[CLI](docs/cli.md)** | `sovereign-config`: profiles, login, reads and writes, `render`. | Installer served by every server under `/downloads`; `cargo install` from a release tag |
+| **[MCP server](#mcp-server)** | `sovereign-config-mcp`: the administration surface as Model Context Protocol tools for a local MCP host. | Installer served by every server; `cargo install` from a release tag |
+| **[Application provider](crates/sovereign-config-provider/README.md)** | `sovereign-config-provider`: a Rust library that loads one subtree into a `serde` type. | Tagged workspace source |
+| **[Woodpecker secrets extension](crates/sovereign-config-woodpecker-broker/README.md)** | `sovereign-config-woodpecker-broker`: serves Woodpecker CI secrets from the tree. | Container image `sovereign-config-woodpecker-broker` |
+| **CLI image** | `docker:27-cli` with the CLI added, for CI deploy steps. | Container image `sovereign-config-cli` |
+
+Every component is released together from one source tag under one version.
+
+## Requirements
+
+| | Requirement | Notes |
+| :---: | --- | --- |
+| 🐳 | **Docker with Compose**, linux/amd64 | The reference stack is [`compose.yaml`](compose.yaml). |
+| 🐘 | **PostgreSQL** | The reference stack runs its own, pinned by digest. A deployment needs `CREATE` on its database, which the bundled role has. |
+| 🪪 | **Authentik 2026.5.2 or newer** | The repository ships Authentik blueprints that create everything the service needs (see [Authentication](docs/authentication.md)). Authentik is the only supported identity provider today; support for other OIDC providers is planned (see [Roadmap](#roadmap)). |
+| 🔀 | **A TLS-terminating reverse proxy** | It must forward HTTP/2 cleartext (h2c) to the service. The reference stack is currently labelled for the author's own Traefik setup (see [step 4](#4-configure-and-start)). |
+| 💾 | **Encrypted storage** | For the database volume and for every backup. |
+
+## Concepts
+
+| Concept | Meaning |
+| --- | --- |
+| **Path** | Every value lives at an absolute path: `/` followed by segments of letters, digits, `-` and `_`. Paths are ASCII case-insensitive but case-*retentive*. `/x/FOO` and `/x/foo` are the same value, which keeps the case it was first written with. |
+| **Value** | A value is classified `plain` or `secret`. A secret is masked as `********` unless explicitly revealed. |
+| **Grant** | A permission on a path prefix: `read` (read values and reveal secrets), `write` (put and delete values) or `manage` (administer access URLs). Replacing a subtree needs both `write` and `manage`. |
+| **Profile** | A named connection the CLI and MCP server keep locally: the server's endpoint, a configuration root, and how to authenticate. |
+| **Access URL** | A managed connection for a machine. It is a version-1 connection URL carrying its own credential, confined to one root with exactly the grants it was created with. |
 
 ## Deployment
 
-The production Compose stack contains PostgreSQL and Sovereign Config, plus the web UI's telemetry ingest in the `client-telemetry` profile, which a plain `docker compose up` leaves out (see [Client telemetry](#client-telemetry-the-web-ui)). It publishes no application, PostgreSQL, metrics, logging, or tracing ports. Traefik must provide the external `proxy-backend` network and is the only supported ingress. The operator must pre-create the external volume named by `POSTGRES_DATA_VOLUME` that holds the PostgreSQL data directory on encrypted storage; Compose deliberately refuses to create a default volume. All backup and staging storage must be encrypted too.
+### 1. Set up the identity provider
 
-Sovereign Config applies application-level encryption to secret-classified configuration values, and to nothing else. Those values are sealed with XChaCha20-Poly1305 under the key supplied through `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY`, each bound to the row that stores it, so a dump, a backup, a replication stream, or direct SQL access yields no readable secret. **Everything else in the database is stored verbatim** — every `plain` value, the complete tree of configuration paths, and managed-connection metadata such as display names and credential identifiers. Volume and backup encryption therefore remain a requirement, not a redundancy: they are still the only thing protecting that material. What changed is that secrets no longer depend on it alone.
+Apply the matching Authentik blueprint (`authentik/blueprint.yaml` for production, `authentik/blueprint-dev.yaml` for development) to your Authentik instance, substituting its `${VARIABLE}` placeholders first. It creates the OIDC provider, the grant scope mapping, the contributor group, and the restricted connection-manager service account and its API token. [Authentication](docs/authentication.md) lists every object it creates and the variables it needs.
 
-Create the secret files in an operator-controlled directory. The PostgreSQL password file is read by the PostgreSQL entrypoint and should be owned by `root:root` with mode `0400`. The database URL, connection-manager API token, and value encryption key files are read by Sovereign Config's fixed UID `10001` and must be owned by `10001:10001` with mode `0400`. Compose preserves host ownership for these file-backed secrets.
+> [!TIP]
+> Note the blueprint's **issuer URL**, its **client id** (the audience) and the **connection-manager API token**. The server needs all three.
 
-`POSTGRES_PASSWORD_SECRET_FILE` points to the file containing only the PostgreSQL password. `DATABASE_URL_FILE` points to the file containing the complete private-network URL, for example `postgresql://sovereign_config:<password>@postgres:5432/sovereign_config`. `MANAGER_API_TOKEN_FILE` points to the file containing only the dedicated Authentik connection-manager API token used to provision managed application connections. `VALUE_ENCRYPTION_KEY_FILE` points to the file containing only the value encryption key: 32 random bytes in standard base64, generated with `openssl rand -base64 32`. Never commit these files.
+### 2. Prepare storage
 
-Each of these secrets may instead be supplied directly through its environment variable — `SOVEREIGN_CONFIG_DATABASE_URL`, `SOVEREIGN_CONFIG_MANAGER_API_TOKEN`, and `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY` — which takes precedence over the matching `_FILE` variable. This suits an external secret manager that injects values into the environment. Startup fails with a redacted error when a required secret is absent through both routes.
+The operator must pre-create the external volume named by `POSTGRES_DATA_VOLUME` that holds the PostgreSQL data directory on encrypted storage; Compose deliberately refuses to create a default volume. All backup and staging storage must be encrypted too.
 
-**Back up the value encryption key, and keep that backup somewhere you would still have after losing the deployment.** It is the only thing that can decrypt the stored secrets; without it they are unrecoverable, no matter how good the database backups are. On first start with this key, the server seals any secrets still stored in plaintext from an earlier release. That step is one-way as far as older images are concerned: a version predating value encryption will return ciphertext instead of secrets, so rolling back past it means restoring a pre-upgrade dump. The server refuses to start if it finds a stored secret it cannot decrypt, rather than serving errors or sealing a second layer over intact data.
+The stack publishes no application, PostgreSQL, metrics, logging or tracing port. PostgreSQL sits on an internal network, and the service is reachable only through the reverse proxy on an external network. The reference stack names that network `proxy-backend`, after the author's own Traefik network.
 
-Set the required deployment inputs and start the stack:
+### 3. Create the secrets
+
+Create the secret files in an operator-controlled directory, and never commit them:
+
+| Host variable | File contents | Owner and mode |
+| --- | --- | --- |
+| `POSTGRES_PASSWORD_SECRET_FILE` | Only the PostgreSQL password. | `root:root`, `0400` (read by the PostgreSQL entrypoint) |
+| `DATABASE_URL_FILE` | The complete private-network URL, for example `postgresql://sovereign_config:<password>@postgres:5432/sovereign_config`. | `10001:10001`, `0400` |
+| `MANAGER_API_TOKEN_FILE` | Only the Authentik connection-manager API token from the blueprint. | `10001:10001`, `0400` |
+| `VALUE_ENCRYPTION_KEY_FILE` | Only the value encryption key: 32 random bytes in standard base64, from `openssl rand -base64 32`. | `10001:10001`, `0400` |
+
+The server runs as the fixed UID `10001`, and Compose preserves host ownership for these file-backed secrets. Each server secret may instead be supplied directly through its environment variable: `SOVEREIGN_CONFIG_DATABASE_URL`, `SOVEREIGN_CONFIG_MANAGER_API_TOKEN` or `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY`. The variable takes precedence over the matching `_FILE`, which suits a secret manager that injects values into the environment. Startup fails with a redacted error when a required secret is absent through both routes.
+
+> [!WARNING]
+> **Back up the value encryption key, and keep that backup somewhere you would still have after losing the deployment.** It is the only thing that can decrypt the stored secrets; without it they are unrecoverable, no matter how good the database backups are. The server refuses to start if it finds a stored secret it cannot decrypt, rather than serving errors or sealing a second layer over intact data.
+
+### 4. Configure and start
 
 ```sh
-export SOVEREIGN_CONFIG_IMAGE_TAG='1.5.0'
+export SOVEREIGN_CONFIG_IMAGE_TAG='<version>'
 export SOVEREIGN_CONFIG_ENV='prod'
-export SOVEREIGN_CONFIG_HOST='config.example.internal'
+export SOVEREIGN_CONFIG_HOST='config.example.com'
 export SOVEREIGN_CONFIG_CONTAINER_NAME='sovereign-config-production'
 export POSTGRES_DATA_VOLUME='sovereign-config-production-db'
 export POSTGRES_PASSWORD_SECRET_FILE="$HOME/.config/sovereign-config/postgres-password"
 export DATABASE_URL_FILE="$HOME/.config/sovereign-config/database-url"
 export MANAGER_API_TOKEN_FILE="$HOME/.config/sovereign-config/manager-api-token"
 export VALUE_ENCRYPTION_KEY_FILE="$HOME/.config/sovereign-config/value-encryption-key"
-export SOVEREIGN_CONFIG_OIDC_ISSUER='https://<authentik-host>/application/o/sovereign-config/'
+export SOVEREIGN_CONFIG_OIDC_ISSUER='https://auth.example.com/application/o/sovereign-config/'
 export SOVEREIGN_CONFIG_OIDC_AUDIENCE='sovereign-config'
-export SOVEREIGN_CONFIG_PUBLIC_ORIGIN='https://config.example.internal'
+export SOVEREIGN_CONFIG_PUBLIC_ORIGIN='https://config.example.com'
 export SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE='sovereign_config_prod_grants'
 export SOVEREIGN_CONFIG_MANAGER_GROUP='sovereign-config-connections'
-docker compose up -d
+docker compose up -d --wait
 ```
 
-`SOVEREIGN_CONFIG_PUBLIC_ORIGIN` is the exact canonical HTTPS origin embedded in generated connection URLs. It must carry no userinfo, no path other than `/`, no query, and no fragment; numeric-loopback HTTP is accepted only in tests. `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE` names the environment-specific Authentik user attribute that carries managed grants, matching the scope mapping in that environment's blueprint. `SOVEREIGN_CONFIG_MANAGER_GROUP` names the Authentik group each managed connection's service account is added to purely so an operator can browse them together; it grants no permissions and must match a plain group entry in that environment's blueprint. Both names are enumerated per environment under [Authentik objects by environment](#authentik-objects-by-environment). The Authentik administration origin is derived from `SOVEREIGN_CONFIG_OIDC_ISSUER`, so the API and issuer origins can never diverge. `SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT` is optional: set to exactly `SOVEREIGN_CONFIG_PUBLIC_ORIGIN` it tells the web UI to send its spans and logs to the ingest routed on that origin, and unset it tells the web UI there is none; any other value fails startup (see [Client telemetry](#client-telemetry-the-web-ui)).
+The service starts only after PostgreSQL reports healthy. It applies its forward-only database migrations before accepting requests.
 
-`SOVEREIGN_CONFIG_IMAGE_TAG` selects the published Zot image; it defaults to `local` for local builds. `SOVEREIGN_CONFIG_ENV` sets the Docker discovery labels on stdout logs and defaults to `dev`; everything exported over OTLP — spans, log records and metrics — carries its environment in `OTEL_RESOURCE_ATTRIBUTES` instead (see [Observability](#observability)). PostgreSQL is pinned by digest. The service starts only after PostgreSQL reports healthy.
+> [!IMPORTANT]
+> **`compose.yaml` currently depends on the author's own infrastructure.** It was written for the project's own deployment, and the image registry and reverse-proxy names below belong to that environment, not to Sovereign Config. The author intends to remove these dependencies, so that the stack runs as shipped with configuration alone (see [Roadmap](#roadmap)). Until then, adapt them to your environment.
 
-Cargo supplies the `major.minor` release line and **the Woodpecker pipeline number is the patch** (`scripts/ci-release-tag.sh`): pipeline 362 on a `2.41.x` workspace releases `2.41.362`. Pipeline numbers are unique and increasing, so there is nothing to allocate and no two pipelines can claim one version. Every push (or manual run) of the pipeline builds the three images and pushes each as soon as it is built — as a **candidate**, to its `-ci` repository (`registry.desync.link/sovereign-config-ci:<version>`, and likewise `-woodpecker-broker-ci`, `-cli-ci`). Once every check has passed, the `publish` workflow **releases** them (`compute-version` → `promote-images` → `tag-release`): it copies each candidate to its release name inside the registry, by digest, refusing to overwrite an existing release, and then tags the commit. A release name therefore only ever holds a checked build, and a git tag always has its images. Candidates of failed pipelines stay in the `-ci` repositories, which hold nothing else; `zot_ci_user` pushes to them as it does to the release repositories. Nothing prunes them yet (bored #468). A re-run is a new pipeline and tags the same commit again under its own number; a deployment takes the commit's highest tag. Patch numbers are therefore sparse — they jump by however many pipelines ran in between, deployments included. The deployed `System.GetVersion` response reports that computed release version; local builds report the Cargo version.
+- **The image.** It pulls `registry.desync.link/sovereign-config:<tag>` from the author's own registry. To run an image you built yourself ([Development](docs/development.md#building-and-testing)), tag it to match or change the `image:` line.
+- **The reverse proxy.** The Traefik labels name parts of the author's own Traefik setup: an external network named `proxy-backend`, a `websecure` entrypoint, a certificate resolver named `myresolver`, and the middlewares `lan-vpn-only`, `rate-limit`, `crowdsec` and `security-headers`. None of these exists in a fresh Traefik. Rename them to match your Traefik, or replace the labels for another proxy. Whatever proxy you use, it must forward h2c to port `50051`.
+- **Client telemetry.** The optional `otlp-ingest` service runs only in the `client-telemetry` profile (see [Observability](docs/observability.md#client-telemetry-the-web-ui)). A plain `docker compose up` leaves it out.
 
-**A push never deploys.** Development is deployed with Woodpecker's **Deploy feature — a `deployment` event targeting the `dev` environment, from any branch** — so pushes from several branches never queue behind each other's deploys or fight over the one dev environment. It promotes exactly as production does (below): it resolves the commit's existing tag, verifies the three published images, applies the development Authentik blueprint (`authentik/blueprint-dev.yaml`), validates the development connection manager against live Authentik, and deploys onto the development stack (`sovereign-config-dev.desync.link`, compose project `sovereign-config-dev`). Dev runs whichever branch was deployed last; a migration deployed from a branch stays applied to the dev database. The development deployment is verified by calling `System.GetVersion` through the public gRPC endpoint after Woodpecker completes. gRPC health and `System.GetVersion` are the only RPCs that do not require authentication.
+### 5. Verify
 
-Production is deployed with Woodpecker's **Deploy feature — a `deployment` event targeting the `prod` environment, from `main`**. All build, tag, publish, and version-allocation steps run only on a `push` or a manual run of the pipeline, never on a `deployment`, so a promotion never rebuilds, republishes, or mints a new version, and never redeploys development. Instead it **resolves the semver the push pipeline already tagged onto the commit** (`resolve-release-tag`; it never allocates — allocating on a deployment would mint an unbuilt tag), **verifies that exact image is present in the registry** (`verify-image`, no rebuild), applies the production Authentik blueprint (`authentik/blueprint.yaml`), validates the production connection manager against live Authentik, and deploys that image onto the production stack (`sovereign-config.desync.link`, container `sovereign-config-production`, compose project `sovereign-config-prod`). A commit can therefore only be deployed — to either environment — after its push pipeline has finished (checks + build + publish → git tag); a commit with no release tag fails closed. The pipeline does not require a dev deployment before a promotion, but **deploy the main commit to dev before promoting it to prod**. That is an operator rule, not a gate. A release tag means the checks passed: CI's migration checks run against a fresh PostgreSQL, and `deploy-prod` runs its own live connection-manager check. Only a dev deployment proves the release against a long-lived database and against live Authentik with the development blueprint, and before #466 every release had that proof. Skipping it is an accepted risk, not an oversight.
+- [ ] `https://<host>/` serves the web UI. Sign in with an Authentik user in the environment's contributor group.
+- [ ] `https://<host>/downloads` offers the CLI and MCP installers matched to this server.
+- [ ] `/readyz` on the internal listener (port `9090` inside the container) reports readiness, including the database.
 
-Before the first promotion the operator provides the production Woodpecker secrets `sovereign_config_prod_postgres_password`, `sovereign_config_prod_manager_api_token`, and `sovereign_config_prod_value_encryption_key` (the server refuses to start without it), the pre-created encrypted `sovereign-config-production-db` volume, and DNS/Traefik for the production host. The shared secrets the deployment path reuses — `github_token` (tag resolution), `zot_ci_user` and `zot_ci_password` (registry pull), and `authentik_api_token` (blueprint) — must permit the `deployment` event in their Woodpecker event allowlists.
+The gRPC health service, the protocol handshake and `System.GetVersion` are the only unauthenticated RPCs. The container's own health check uses the gRPC health service.
 
-Build release images only for linux/amd64. Each image has its own Dockerfile under `docker/`, which builds only what that image ships: `docker build --platform linux/amd64 -f docker/server.Dockerfile --tag sovereign-config:local .` for the server, `docker build --platform linux/amd64 -f docker/broker.Dockerfile --tag sovereign-config-woodpecker-broker:local .` for the Woodpecker secrets broker, and `docker build --platform linux/amd64 -f docker/cli.Dockerfile --tag sovereign-config-cli:local .` for the [CLI image](#the-cli-image-for-woodpecker-pipelines). `docker/web.Dockerfile` exports the release web bundle on its own (`--output type=local,dest=<dir>`) for the browser tests. The files duplicate their builder stages rather than share them; keep their pinned base-image digests in step, which a test enforces.
-Woodpecker keeps two separate Cargo caches, and neither reuses the other. The `unit-test` step builds debug and test artifacts into the `sovereign-config-contract-target` volume. The image builds compile release artifacts into the `sovereign-config-cargo-target` BuildKit cache mount. Each cache is bounded at 20 GiB by its own prune script, `scripts/ci-prune-cargo-target.sh` and `scripts/ci-prune-buildkit-cache.sh`.
+## Configuration reference
 
-The server embeds the fingerprinted Rust WASM administration application and serves it with gRPC-Web on the native gRPC listener. Browser assets, runtime OIDC configuration, and gRPC-Web use the service origin; the server sends no cross-origin API permission. Browser access tokens remain only in WASM memory, while rotating refresh tokens remain in tab-scoped session storage. Access expiry refreshes transparently and reload restores the tab's session; logout, absolute refresh expiry, or definitive refresh rejection require a new PKCE authorization.
+The server is configured entirely through environment variables. `compose.yaml` sets the listener addresses itself. An optional setting that is set but unusable fails startup rather than falling back to its default.
 
-## CLI
+<details open>
+<summary><b>Server variables</b></summary>
 
-Each running server publishes a prebuilt CLI installer matched to its own release. The installer is a static x86_64 Linux binary (no toolchain, no libc dependency) wrapped in a self-extracting shell script. Browse `https://<server>/downloads` for the download links and the exact command, or install directly — this downloads to a temporary directory that is removed afterwards:
+| Variable | Required | Purpose |
+| --- | :---: | --- |
+| `SOVEREIGN_CONFIG_DATABASE_URL` / `_FILE` | ✅ | The PostgreSQL connection URL. |
+| `SOVEREIGN_CONFIG_OIDC_ISSUER` | ✅ | The Authentik provider's issuer URL. The Authentik administration origin is derived from it, so the API and issuer origins can never diverge. |
+| `SOVEREIGN_CONFIG_OIDC_AUDIENCE` | ✅ | The provider's client id. Tokens for any other audience are refused. |
+| `SOVEREIGN_CONFIG_PUBLIC_ORIGIN` | ✅ | The exact canonical HTTPS origin embedded in generated access URLs. No userinfo, no path other than `/`, no query and no fragment. |
+| `SOVEREIGN_CONFIG_MANAGER_API_TOKEN` / `_FILE` | ✅ | The Authentik connection-manager API token. |
+| `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE` | ✅ | The Authentik user and group attribute that carries this environment's grants, matching the blueprint's scope mapping (`sovereign_config_prod_grants` or `sovereign_config_dev_grants`). |
+| `SOVEREIGN_CONFIG_MANAGER_GROUP` | ✅ | The Authentik group each access URL's service account is added to so an operator can browse them. It grants no permissions and must match the blueprint (`sovereign-config-connections` or `sovereign-config-dev-connections`). |
+| `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY` / `_FILE` | ✅ | The base64 32-byte key that seals secret values. |
+| `SOVEREIGN_CONFIG_GRPC_ADDR` | ✅ | The public listener, `0.0.0.0:50051` in `compose.yaml`. |
+| `SOVEREIGN_CONFIG_METRICS_ADDR` | ✅ | The internal listener that serves `/readyz`, `0.0.0.0:9090` in `compose.yaml`. The name predates metrics moving to OTLP. |
+| `SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT` | — | When set, it must equal `SOVEREIGN_CONFIG_PUBLIC_ORIGIN`, and it tells the web UI to send its spans and logs to the ingest on that origin. Unset means the web UI sends none. Any other value fails startup. |
+| `SOVEREIGN_CONFIG_AUDIT_RETENTION_DAYS` | — | How long an audit event is kept after it was last seen. Default `365`, maximum `3650`. |
+| `SOVEREIGN_CONFIG_AUDIT_COALESCE_WINDOW_HOURS` | — | The window in which repeated reads collapse into one audit event. Default `24`, maximum `168`. |
+| `SOVEREIGN_CONFIG_AUDIT_PAGE_SIZE` | — | The default and maximum number of events one audit query returns. Default `100`, maximum `1000`. |
+| `OTEL_*` | — | Telemetry export. See [Observability](docs/observability.md). |
+| `RUST_LOG` | — | Filters log output. |
+
+</details>
+
+<details>
+<summary><b>Compose stack variables</b></summary>
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SOVEREIGN_CONFIG_IMAGE_TAG` | `local` | The image tag to run. |
+| `SOVEREIGN_CONFIG_ENV` | `dev` | The environment named on container labels. |
+| `SOVEREIGN_CONFIG_HOST` | — | The public hostname the proxy routes. |
+| `SOVEREIGN_CONFIG_CONTAINER_NAME` | — | The container name, also the server's stable hostname. |
+| `POSTGRES_DATA_VOLUME` | — | The pre-created external volume for the database. |
+
+</details>
+
+## How data is stored and protected
+
+Sovereign Config applies application-level encryption to secret-classified configuration values, and to nothing else. Those values are sealed with XChaCha20-Poly1305 under the key supplied through `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY`, each bound to the row that stores it, so a dump, a backup, a replication stream, or direct SQL access yields no readable secret. **Everything else in the database is stored verbatim** — every `plain` value, the complete tree of configuration paths, and managed-connection metadata such as display names and credential identifiers. Volume and backup encryption therefore remain a requirement, not a redundancy: they are still the only thing protecting that material.
+
+Configuration values are stored in PostgreSQL as content rows. Each holds a `plain` or `secret` classification and the value itself, sealed as an `enc:v1:` AEAD envelope when the classification is `secret` and verbatim when it is `plain`, along with service-generated UTC creation and update timestamps. Each content row has one or more path rows, each exposing it at a canonical absolute path. Writing through any path updates the shared content, so every path to that value sees the change. A value's classification cannot be changed while more than one path resolves to it. Deleting a path removes only that path, and the value is deleted for good, in the same transaction, once its last path is removed. Updates are last-write-wins and keep the original creation timestamp. Deletion is a hard delete with no tombstone or value history. What was done to a value is recorded separately in the [audit trail](docs/audit-trail.md), which holds a plain value's previous text but never a secret's.
+
+> [!CAUTION]
+> Exposing one value at several paths (aliasing) is a deliberate administrative act. It requires `write` on both paths and `read` on the existing one. It also widens who can reach that value: a secret aliased into a namespace where more principals hold `read` becomes revealable by them. Listings only ever return the paths a caller may read.
+
+The server never seeds users, groups or authorization state, and PostgreSQL holds no ACL, grant, token or session records. Access tokens are verified locally against the identity provider's published keys, and tokens, claims, grants and provider URLs are never logged.
+
+## Using Sovereign Config
+
+### Web UI
+
+The server embeds a WebAssembly administration UI and serves it from the same origin as its gRPC-Web API. Signing in uses OIDC authorization code with PKCE. Access tokens stay in WASM memory only, and the rotating refresh token stays in tab-scoped session storage, so a reload restores the session but closing the tab ends it.
+
+| View | What it does |
+| --- | --- |
+| **Configuration** | Browses the namespace tree and edits the values at a path. A secret is a padlocked field: blank until you open the padlock to reveal it, and writable without being revealed. A JSON mode edits a whole subtree at once while preserving masked secrets. |
+| **Access URLs** | Listed beneath a path's values, where they can be created, rotated and revoked. The Access URLs page is the estate-wide view. |
+| **Audit trail** | At `/audit/`, searches the events you may see. Each value row links to its own history. |
+| **Downloads** | Offers the CLI and MCP installers matched to this server. |
+
+[Web UI](docs/web-ui.md) describes each view in detail.
+
+### CLI
+
+Install the CLI from your server, which serves an installer built from its own release. The exact command for your server is at `https://<server>/downloads`.
 
 ```sh
 sh -c 'd=$(mktemp -d); trap "rm -rf \"$d\"" EXIT; curl -fsSL "https://<server>/dist/install-sovereign-config-cli-<version>-x86_64-linux.sh" -o "$d/installer.sh" && sh "$d/installer.sh"'
 ```
 
-The installer verifies its embedded checksum, installs `sovereign-config` into `~/.local/bin` (override with `SOVEREIGN_CONFIG_BIN`), and prints the installed version. Re-run it to upgrade. Because the binary is built from the server's own release tag, the installed CLI is protocol-matched to that server. The installer extracts itself from its own file, so download it and run it — it cannot be piped straight into a shell.
-
-Alternatively, build the CLI from the matching tagged source with a Rust toolchain:
+Add a profile by pasting a connection URL at the hidden prompt, then log in with device flow:
 
 ```sh
-cargo install --locked --git https://github.com/vcheesbrough/sovereign-config --tag <version> sovereign-config-cli
-```
-
-Add a named development profile by entering its self-contained connection URL at the hidden prompt. The first profile becomes the default:
-
-```sh
-sovereign-config profile add dev
-# New URL: https://sovereign-config-dev.desync.link/#v=1&issuer=https%3A%2F%2Fauth.desync.link%2Fapplication%2Fo%2Fsovereign-config-dev%2F&client_id=sovereign-config-dev
+sovereign-config profile add prod
 sovereign-config login
 sovereign-config status
-sovereign-config logout
 ```
 
-Use `sovereign-config profile update <name>` to replace a URL and `sovereign-config profile default <name>` to change the default. A URL can instead be supplied as exactly one line on standard input. Profile URLs are never accepted as process arguments. Operational commands accept a global override, for example `sovereign-config --profile prod status`. A host with no profile store at all — a CI container, a deploy step — can instead supply the URL through `--url-file` or `SOVEREIGN_CONFIG_URL`; see [Credential inputs](#credential-inputs).
-
-`sovereign-config profile list` shows the stored profiles by name, marking the default with `*` and naming the server each one points at — its endpoint, followed by the configuration root when the profile is confined to one:
-
-```
-  dev         https://sovereign-config-dev.desync.link
-* prod        https://sovereign-config.desync.link/team/service
-```
-
-`--format json` instead renders an array of `{ "name", "default", "endpoint", "root", "url" }`, where `url` is the whole connection URL with any managed credential replaced by `*`. **Nothing a listing prints is a secret** — but the file it reads is not safe to print, because a managed profile's stored URL embeds its credential. Use this command rather than reading `config.toml`. Listing succeeds with an empty result before the first profile is added.
-
-Every value command reads `sovereign-config <verb> <ABSOLUTE_PATH> [OPTIONS]` — the path comes immediately after the verb — and acts on **exactly one value**. Add `--tree` and the same command acts on the whole subtree at that path instead: that is the only way to select subtree scope. `--format` then means one thing only, how a read is rendered: `plain` (the default) or `json`.
-
-Every command path is absolute, begins with `/`, and is ASCII case-insensitive: `/x/FOO` and `/x/foo` are the same value, resolved and authorized without regard to case. This is case-**retentive**, not case-sensitive — the service is a case-preserving store like APFS or NTFS. The first write of a path stores the exact case it was given; later writes through a differently-cased spelling of that same path update the value but leave its case exactly as first established. Reads, listings, and subtree keys return whatever case is currently established, which may not match the case just typed. Changing an established path's case requires deleting it and writing it again under the new spelling — there is no rename. Segments contain only letters, digits, `-`, and `_` — the full grammar is `/` or `^/[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$`. A profile with a configured root accepts only absolute paths within that subtree. Written content is read from standard input so it never appears in process arguments. Interactive deletion requires typing `delete`; automation must pass `--yes` explicitly.
+Read and write values:
 
 ```sh
 sovereign-config get /apps/api/settings
-sovereign-config get /apps/api/database-password --reveal
-sovereign-config get /apps/api --tree
-sovereign-config get /apps/api --tree --reveal --format json
+sovereign-config get /apps/api --tree --format json
 printf '%s' 'enabled=true' | sovereign-config set /apps/api/settings
-printf '%s' 'database-password' | sovereign-config set /apps/api/database-password --secret
-printf '%s' '{"enabled":"true","workers":"4"}' | sovereign-config set /apps/api --tree
+printf '%s' 's3cr3t' | sovereign-config set /apps/api/database_password --secret
 sovereign-config list /apps/api
-sovereign-config list /apps/api/settings --aliases
-sovereign-config alias /apps/api/settings /apps/api-v2/settings
 sovereign-config delete /apps/api/settings --yes
-sovereign-config delete /apps/api --tree --yes
 ```
 
-`get <PATH>` prints the one value stored at exactly that path, byte-exact and with no trailing newline, or `********` when it is a secret; descendants below it are ignored, and a path holding no value of its own fails with `configuration value not found`. `get <PATH> --tree` prints every value at or below the path. Add `--reveal` to return secret plaintext instead of the mask — for the one value, or for every secret leaf in a subtree. Revealing requires a `read` grant and never changes the stored data.
+> [!NOTE]
+> Written content is always read from standard input, and connection URLs are never accepted as process arguments, so neither appears in shell history or process listings.
 
-`set <PATH>` stores a plain value, `set <PATH> --secret` stores a secret, and `set <PATH> --tree` atomically replaces the subtree from a JSON document. All three read their content from standard input only. Writing a plain value requires `write`; subtree replacement requires both independent `write` and `manage` grants covering the selected root. `set` and `delete` print only fixed success summaries and never echo values.
-
-`list <PATH>` prints the paths directly below a namespace: each child value as written, and each child namespace with a trailing `/`. `list <PATH> --aliases` instead prints every path that resolves to the one value at that path, including the path itself. `alias <SOURCE_PATH> <NEW_PATH>` exposes an existing value at a second path; both are then the same value, and deleting one leaves the other intact.
-
-Plain output from `--tree` and `list` is one absolute path per line. A `--tree` line is `ABSOLUTE_PATH=VALUE`: a path segment can never contain `=`, so the **first** `=` always separates the two. So that one value is always one line, the value escapes `\` as `\\`, a line feed as `\n`, and a carriage return as `\r`; nothing else is escaped. **Plain output is therefore not byte-exact — use `--format json` when the exact bytes matter.** Values are ordered the same way the JSON renderer orders its keys, so the two formats always agree on order. They do not always agree on what is representable: a value that also has descendants — `/a` holding a value while `/a/b` exists — is two ordinary lines in plain, but cannot be a JSON node that is both a string and an object, so `--format json` fails on it. Plain is the more permissive of the two.
-
-JSON output is deterministic and pretty printed; each stored plain-text value is represented as a JSON string and every secret is represented by the exact preservation marker `"********"`. `list` in JSON is an array of the same strings its plain form prints. Subtree JSON is relative to the selected path, so selecting `/foo/foo2/foo3` containing `/foo/foo2/foo3/deepvalue` returns `{"deepvalue":"deepvalue"}` without a `foo3` wrapper. An exact selected value is a root JSON string, and `/` is the root object. `set --tree` atomically replaces the selected subtree using the same relative shape. Omitted plain values are deleted, but existing secrets are never deleted or overwritten by a subtree replacement whether omitted or represented by their mask marker; a plain value may not collide structurally with an existing secret. Use an exact `set`, a secret rotation, or an explicit delete for those transitions.
-
-### Rendering configuration into a command (`render`)
-
-`sovereign-config render [<ABSOLUTE_PATH>...] [OPTIONS] -- <cmd> [args...]` reads one or more configuration subtrees, overlays them onto the inherited environment as environment variables, and then **replaces itself** with `<cmd>`. This is the deploy-time consumption path: a Compose stack or a CI deploy step keeps one narrow, read-only, centrally revocable connection rooted at its own subtree, instead of carrying every value inline.
+To start a process with configuration in its environment, use `render`:
 
 ```sh
-sovereign-config render -- docker compose up -d --wait            # the connection root
-sovereign-config render /apps/api -- ./deploy.sh                  # one layer
-sovereign-config render /apps/api /apps/api/prod -- ./deploy.sh   # ordered, later wins
+sovereign-config render /apps/api /apps/api/prod -- ./deploy.sh
 ```
 
-Paths are **layers**, read in the order given, with a later layer overriding an earlier one on a name collision. With no path at all, the layer is the connection's own root — the prefix the credential already encodes. Only the **direct children** of a layer become variables; a deeper descendant has no flat name and is ignored.
+`render` reads each subtree in order, with later layers winning, and exports each direct child as a variable named exactly as stored. It then replaces itself with the command, with no shell in between. Every read happens before the command starts, so a failure means the command never runs. The [CLI reference](docs/cli.md) covers profiles, output formats, `render` and credential inputs for CI.
 
-**The variable name is the leaf, exactly as stored.** `/foo/AbC` holding `bAr` reaches the command as `AbC=bAr`, precisely as `export AbC=bAr` would. Nothing is uppercased, lowercased or otherwise transformed: paths are case-retentive (see [2.18.0 retains path letter case](#2180-retains-path-letter-case)), so the spelling a value was created under is the spelling the command sees, and it is the only one a deploy can predict. Uppercasing would leave `AbC` unreachable, because no path would produce it.
+### MCP server
 
-So the case has to be right where the value is created. `/apps/api/database_url` yields `database_url`, not `DATABASE_URL`; store leaves under the exact variable names the command expects.
-
-It follows that a collision is byte-exact on the name: two layers spelling a leaf differently produce **two** variables rather than overriding, because `AbC` and `abc` are two variables to the command as well. Only an exact match overrides.
-
-Because path segments admit `-` and a leading digit but environment variable names do not, a leaf that cannot be a variable name — `db-password`, `2fa_key` — is **refused**, naming the offending path, rather than exported under a name no shell and no Compose file can reference. `-` is not folded to `_`: that mapping is many-to-one, and `db-password` and `db_password` are different values. Name leaves using letters, digits and `_` only.
-
-The inherited environment is kept, not cleared: `PATH`, `HOME` and anything the caller set on the command line survive, because a deploy step routinely supplies one variable inline alongside everything it reads from configuration. Rendered values win a collision, being the more specific statement of intent — again matched byte-exactly, so an inherited `abc` and a rendered `AbC` are two variables.
-
-```sh
-SOVEREIGN_CONFIG_IMAGE_TAG=$(cat .release-tag) \
-  sovereign-config render -- docker compose -p sovereign-config-dev up -d --wait
-```
-
-Three properties make this safe to point at a production deploy:
-
-- **No shell is involved.** Values are placed in the child's environment through `execve`, so a value containing `$(...)`, a backtick, a quote or an embedded newline arrives byte-exact and is data. There is no stage at which it could be re-parsed as syntax.
-- **The process is replaced, not wrapped.** The command's exit status and signal disposition are `render`'s own, with no supervisor in between.
-- **It fails closed.** Every read happens before the exec, so a credential, read, reveal, confinement or naming failure means the command **never runs at all**, rather than running against a half-populated environment. A layer that contributes no variables is itself a failure: the service answers an absent subtree with an empty list, so a mistyped path is indistinguishable from a real but empty one, and neither is worth launching a deploy over.
-
-  That cuts both ways, deliberately. An override layer you have not populated yet must be left off the command line until it holds something, and `render` against a connection root with no values at all will not start a command — there is no layer to drop in that case, so give the root a value first. Both are the same refusal: a layer named on the command line was named because it was meant to contribute.
-
-`render` is a read; nothing is written to disk and no output mode other than the exec form exists yet.
-
-#### Credential inputs
-
-The hosts `render` exists for — a CI container, a Compose deploy step — have no profile store and no terminal to create one at, so two further credential inputs sit alongside `--profile`. All three are global and work on every operational command. Resolution order is fixed:
-
-1. `--profile <name>` — an explicit choice always wins.
-2. `--url-file <path>` — a file holding the connection URL as one line, such as a mounted CI secret. A single trailing newline is tolerated; an embedded one is refused rather than guessed at.
-3. `SOVEREIGN_CONFIG_URL` — the variable a CI step injects.
-4. Otherwise the default profile, which is where every interactive invocation lands.
-
-**A connection URL is never a process argument**, here as everywhere else: it carries the credential, and process arguments are world-readable on a typical host. `--url-file` names a file and `SOVEREIGN_CONFIG_URL` names a variable; neither is the URL itself.
-
-`render` removes `SOVEREIGN_CONFIG_URL` from the environment it hands the command, whether or not this invocation used it — the credential that read the configuration stops at `render`. It is removed before rendered values are applied, so configuration that legitimately holds a connection URL for the executed application's own use still reaches it; only the *inherited* credential is stripped.
-
-#### The CLI image for Woodpecker pipelines
-
-Each release also publishes `registry.desync.link/sovereign-config-cli:<version>`: the digest-pinned `docker:27-cli` image this repository's own deploy steps run, with the same static `sovereign-config` binary the installer carries at `/usr/local/bin/sovereign-config`. A Woodpecker step that already runs `docker` can swap its image for this one and gain the CLI with no install step and no download at run time. The image keeps the base image's root user and entrypoint, so the step's `commands:` drive the mounted Docker socket exactly as before. It is published under the server's semver, so pin the tag of the server you talk to; the image build fails unless the binary reports exactly that release.
-
-```yaml
-deploy:
-  image: registry.desync.link/sovereign-config-cli:<version>
-  volumes:
-    - /var/run/docker.sock:/var/run/docker.sock
-  environment:
-    SOVEREIGN_CONFIG_URL:
-      from_secret: sovereign_config_url
-  commands:
-    - sovereign-config render /apps/api /apps/api/prod -- docker compose up -d --wait
-```
-
-The connection URL arrives through `SOVEREIGN_CONFIG_URL` from a Woodpecker secret — never inline in the pipeline file — and `render` strips it before the command runs (see [Credential inputs](#credential-inputs)). Use a read-only managed connection rooted at the step's own subtree. The image pulls anonymously from `registry.desync.link`, so the step needs no registry credentials; if the registry is ever made to require authentication for pulls, the consuming repository needs a Woodpecker registry entry for `registry.desync.link`.
-
-#### Self-hosting exception
-
-Sovereign Config's own deploy steps deliberately do **not** consume their configuration through `render`, and keep their Woodpecker secrets. Reading `/sovereign-config/prod/...` in order to deploy Sovereign Config would create a circular availability dependency: a broken production deployment could not be redeployed through a path that requires production to be readable. Other repositories and the homelab stacks are the intended consumers.
-
-The native and gRPC-Web APIs serve two protobuf packages, `sovereign.config.v4` and `sovereign.config.v3`; `v4` is `v3` plus a read-only audit trail query. A client is not required to match the server's release: each connection negotiates a protocol version from the set the server advertises, so a client that speaks an older version than the server's newest keeps working and mixed-version operation is supported. Upgrading the server alone is therefore safe. See [Protocol versioning](#protocol-versioning) for how a version is introduced and retired, and note that protocol compatibility is a separate question from the client-visible behaviour changes described under [Upgrade](#upgrade) — 2.15.0 and 2.18.0 each broke older clients without any protocol version change.
-
-The version-1 URL origin is the native gRPC endpoint, its path is the canonical configuration root, and its fragment contains the OIDC issuer and client ID. Without `client_secret`, login uses device flow. With `client_secret`, the value is unpadded Base64URL-encoded `service-account-username:app-password`; the CLI obtains a fresh client-credentials access token for each operation and does not support login or logout for that profile. The entire managed URL is a secret even though its credential is encoded.
-
-Profiles are stored in `$XDG_CONFIG_HOME/sovereign-config/config.toml`, defaulting to `~/.config/sovereign-config/config.toml`. The directory is mode `0700` and the file is mode `0600`; because managed profiles contain credentials, protect the entire file. Human refresh credentials are stored in environment-bound mode-`0600` files under `$XDG_STATE_HOME/sovereign-config/credentials/`, defaulting to `~/.local/state/sovereign-config/credentials/`. Keep these paths in the WSL Linux filesystem rather than `/mnt/c` so Unix ownership and modes are enforced.
-
-The CLI prints only the device verification URI and user code during login. Access tokens remain in process memory; refresh credentials and managed credentials never appear in arguments or command output. Each status operation acquires a fresh access token and performs fresh RPCs without response caching or automatic retry. A definitive refresh rejection deletes the unusable human credential; a temporary Authentik outage retains it for a later attempt.
-
-## MCP server
-
-Each running server also publishes a prebuilt local **Model Context Protocol** server, `sovereign-config-mcp`, matched to its own release. It exposes the full implemented administration surface as MCP tools to any local stdio MCP host (for example Codex), using the authenticated user's permissions. It is local software — not a container or a remote HTTP service — and it talks to Sovereign Config only through the same public Rust client library the CLI uses; it never shells out to the CLI and never bypasses server authorization. Browse `https://<server>/downloads` for the link and command, or install directly into a self-cleaning temporary directory:
+`sovereign-config-mcp` is a local stdio [Model Context Protocol](https://modelcontextprotocol.io/) server that exposes the administration surface as tools to an MCP host, acting with the signed-in user's permissions. It uses the same client library as the CLI, so it never shells out and never bypasses server authorization. Install it from your server the same way as the CLI:
 
 ```sh
 sh -c 'd=$(mktemp -d); trap "rm -rf \"$d\"" EXIT; curl -fsSL "https://<server>/dist/install-sovereign-config-mcp-<version>-x86_64-linux.sh" -o "$d/installer.sh" && sh "$d/installer.sh"'
 ```
 
-The installer verifies its embedded checksum, installs `sovereign-config-mcp` into `~/.local/bin` (override with `SOVEREIGN_CONFIG_BIN`), and prints the installed version. Re-run it to upgrade. Because the binary is built from the server's own release tag, the installed MCP server is protocol-matched to that server by construction. Like the CLI installer, it extracts itself from its own file, so download it and run it — it cannot be piped straight into a shell. A Rust-toolchain source fallback is also available:
-
-```sh
-cargo install --locked --git https://github.com/vcheesbrough/sovereign-config --tag <version> --bin sovereign-config-mcp
-```
-
-Configure the MCP host to launch the installed binary directly as a local stdio process — no container, no wrapper. It reuses the CLI's profiles and stored credentials, selecting a profile with `--profile <name>` or the `SOVEREIGN_CONFIG_PROFILE` environment variable (the default profile otherwise). A minimal host entry:
+The binary can also be built from source with `cargo install --locked --git https://github.com/vcheesbrough/sovereign-config --tag <version> --bin sovereign-config-mcp`. Configure the MCP host to launch it directly:
 
 ```toml
 [mcp_servers.sovereign-config]
@@ -221,606 +333,110 @@ command = "sovereign-config-mcp"
 # args = ["--profile", "prod"]   # optional; omit to use the default profile
 ```
 
-After installing or upgrading the binary, or changing its configuration, restart or reload the MCP host once so it relaunches the stdio process — that is the single reload boundary. Credentials stay in the established credential store; profiles are managed with the CLI (`sovereign-config profile …`).
+It reuses the CLI's profiles and stored credentials. Select a profile with `--profile <name>` or `SOVEREIGN_CONFIG_PROFILE`, and manage profiles with the CLI. Restart or reload the MCP host after installing, upgrading or reconfiguring it. [MCP server](docs/mcp.md) has the details.
 
-The server exposes tools for authentication status and explicit device-flow `login`/`logout`; exact and subtree reads (`get`, `list`); plain and secret writes (`put_value`, `put_secret`); JSON-merge subtree replacement (`replace_subtree`); exact/recursive deletion (`delete`); explicit secret reveal (`reveal_secret`); multi-path value aliasing (`alias_add`, `alias_list`); and managed application connection lifecycle with their permission grants (`list_connections`, `create_connection`, `rotate_connection`, `revoke_connection`). The `login` tool surfaces the device verification URL and user code as a log notification, then polls the provider to completion. Secrets and authentication material never appear in tool arguments, diagnostics, or logs; plaintext is returned only by an explicit authorized reveal, and a managed connection's one-time URL only as the result of creating or rotating it. Every request is authorized by the server: a caller cannot reveal an unreadable secret, expand a delegated prefix, grant an unheld permission, or otherwise widen a request through the adapter.
+<details>
+<summary><b>Tools it exposes</b></summary>
 
-## Authentik
+| Area | Tools |
+| --- | --- |
+| Session | authentication status, `login`, `logout` |
+| Reading | `get`, `list`, `reveal_secret`, `alias_list` |
+| Writing | `put_value`, `put_secret`, `replace_subtree`, `delete`, `alias_add` |
+| Access URLs | `list_connections`, `create_connection`, `rotate_connection`, `revoke_connection` |
 
-The repository owns two isolated Authentik blueprints:
+</details>
 
-| Environment | Blueprint | Application and issuer provider | Audience |
-| --- | --- | --- | --- |
-| Production | `authentik/blueprint.yaml` | `sovereign-config` | `sovereign-config` |
-| Development | `authentik/blueprint-dev.yaml` | `sovereign-config-dev` | `sovereign-config-dev` |
+Secrets and authentication material never appear in tool arguments, diagnostics or logs. Plaintext is returned only by an explicit authorized reveal, and an access URL only by the call that creates or rotates it.
 
-Each environment has one public issuing provider shared by the browser, human CLI, and future managed application connections. It permits authorization-code, device-code, refresh-token, and client-credentials grants, uses an exact same-origin browser callback through `SOVEREIGN_CONFIG_BROWSER_REDIRECT_URI` or `SOVEREIGN_CONFIG_DEV_BROWSER_REDIRECT_URI`. Tokens must never cross environments: each server accepts only its own environment's issuer and audience. Each blueprint also deletes the confidential `sovereign-config-introspection[-dev]` provider earlier releases introspected tokens through; nothing uses it since access tokens are verified locally (see [Request authentication](#request-authentication)). Wildcard and first-use registration are not allowed.
+### Applications
 
-Both blueprints own the authenticated `sovereign-config-device-code` Stage Configuration flow and assign it to the exact brand selected by `AUTHENTIK_BRAND_DOMAIN` or `AUTHENTIK_DEV_BRAND_DOMAIN`. Supply the domain of the brand active for the Authentik public hostname; do not point this at a different tenant or create a second active brand accidentally. Woodpecker applies the development blueprint before automatic development deployment. Production deployment must apply only the production blueprint before starting the production stack.
+Rust applications can read their configuration with [`sovereign-config-provider`](crates/sovereign-config-provider/README.md). It takes an access URL, obtains a client-credentials token, reads the URL's subtree, reveals secret leaves and deserializes the result into a `serde` type. It negotiates a protocol version on connect, so a server upgrade does not require rebuilding its consumers. It deliberately caches nothing, so revealed secrets never outlive a load in memory. Rust is the only provider language today; providers for other languages, such as .NET, are planned (see [Roadmap](#roadmap)).
 
-Authentik 2026.5.2 or newer is required. That version includes configurable grant allowlists along with the device-authorization scope clipping fix needed by this design. Woodpecker checks the development deployment's authenticated version endpoint and schema before applying its blueprint; verify production the same way before applying its blueprint.
+Other deploy tooling can use `sovereign-config render` with an access URL in `SOVEREIGN_CONFIG_URL`, or the `sovereign-config-cli` image in a CI step (see [CLI](docs/cli.md#the-cli-image-for-woodpecker-pipelines)).
 
-The issuing providers use the selected Authentik signing certificate, five-minute access tokens, and rotating refresh tokens bounded to eight hours. Browser and human CLI clients request `openid sovereign-config offline_access`. Browser access tokens remain only in WASM memory; the rotating refresh credential is held in tab-scoped session storage so a reload can obtain a fresh access token without persisting a long-lived login across browser sessions. Logout, refresh expiry, or refresh rejection clears the browser session. Use authorization code with PKCE or device flow and keep all tokens out of shell history and logs.
+### Woodpecker CI
 
-### Authentik objects by environment
+[`sovereign-config-woodpecker-broker`](crates/sovereign-config-woodpecker-broker/README.md) is a Woodpecker CI external secrets extension. It verifies Woodpecker's signed request, reads an ordered list of configuration layers derived from the repository through a read-only access URL, and returns the merged secrets. Pipeline YAML is unchanged: secret names are stored as path segments, and `from_secret:` names resolve case-insensitively.
 
-Every Authentik object this application relies on is created by that environment's blueprint, and **the two environments share nothing that carries authorization**. Each name below exists in exactly one environment; a principal added to a production object has no development access and vice versa. The only objects both blueprints own are the `sovereign-config-device-code` flow and the brand assignment that references it, which are identical in each and carry no permissions.
+## Access control
 
-Nothing here is created by Sovereign Config itself except the per-connection service accounts noted at the end of each table — the server never seeds users, groups, roles, or authorization state.
-
-#### Production — `authentik/blueprint.yaml`
-
-| Object | Authentik kind | Purpose | Confers permission? |
-| --- | --- | --- | --- |
-| `sovereign-config-production-config-contributor` | Group | The contributor group. Carries the attribute `sovereign_config_prod_grants` set to `[{prefix: "/", permissions: [read, write, manage]}]`, so its members hold every permission on the whole production tree. **Add human operators here.** | Yes — through its grant attribute, not through the group name |
-| `sovereign-config-connections` | Group | Organizational only. Every managed access-URL service account Sovereign Config provisions is added here so an operator can browse them together in Authentik. Carries no roles and no attributes. Named by `SOVEREIGN_CONFIG_MANAGER_GROUP`; membership failure is best-effort and never blocks a connection. | No — deliberately none |
-| `sovereign-config-connection-manager` | Group | Binds the RBAC role of the same name to the connection-manager service account, which is its only member. Not for human membership. | Yes — Authentik RBAC, via its role |
-| `sovereign-config-connection-manager` | RBAC role | Global `authentik_core.add_user`, `add_token`, `view_token`, and `view_group` — metadata only. `view_token_key` is deliberately never granted, so no token key is ever readable, and the role is not a superuser and has no Admin UI access. | Yes — global, narrow |
-| `sovereign-config-connection-manager-objects` | Initial-permissions policy | Attaches object-level `view_user`, `change_user`, `delete_user`, `view_token`, and `set_token_key` to the role above **for the objects it creates only**, so it cannot read, change, or delete an unrelated user or token. | Yes — per object created |
-| `sovereign-config-connection-manager` | Service account (user) | The connection-manager identity, in `goauthentik.io/service-accounts`, a member of the manager group above. Isolated from the browser and from request authentication, which needs no credential. | Through its group |
-| `sovereign-config-connection-manager-api` | Token (`intent: api`, non-expiring) | The API token that identity authenticates with. Supplied to the server as `MANAGER_API_TOKEN_FILE` / `SOVEREIGN_CONFIG_MANAGER_API_TOKEN`. | Acts as the service account |
-| `sovereign_config_prod_grants` | User/group attribute | The direct grant attribute for this environment, named to the server by `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE`. Set it on a user, a service account, or any group for access narrower than the contributor group. | Yes — this is where production authorization actually lives |
-| `sovereign-config production grants` | OAuth2 scope mapping (scope `sovereign-config`) | Reads `sovereign_config_prod_grants` from the requesting user **and every group they belong to**, deduplicates, and emits the common `sovereign_config_grants` claim. | Emits the claim the server evaluates |
-| `sovereign-config production telemetry` | OAuth2 scope mapping (scope `telemetry:write`) | Adds no claim; being granted the scope is what the client-telemetry ingest requires. Only the web UI requests it. | Only to send web UI telemetry |
-| `<display-name-slug>-<connection-id>` | Service accounts (created at runtime) | One per managed access URL, created by the connection manager, granted exactly `{"prefix": "<root>", "permissions": [...]}` in `sovereign_config_prod_grants`, and added to `sovereign-config-connections`. | Yes — exactly the grant it was minted with |
-
-#### Development — `authentik/blueprint-dev.yaml`
-
-| Object | Authentik kind | Purpose | Confers permission? |
-| --- | --- | --- | --- |
-| `sovereign-config-development-config-contributor` | Group | The development contributor group. Carries `sovereign_config_dev_grants` set to `[{prefix: "/", permissions: [read, write, manage]}]`. | Yes — through its grant attribute |
-| `sovereign-config-dev-connections` | Group | Browsing group for development managed access-URL service accounts. No roles, no attributes. Named by `SOVEREIGN_CONFIG_MANAGER_GROUP` in the development deployment. | No — deliberately none |
-| `sovereign-config-dev-connection-manager` | Group | Binds the development RBAC role to the development connection-manager service account, its only member. | Yes — Authentik RBAC, via its role |
-| `sovereign-config-dev-connection-manager` | RBAC role | Same narrow global permissions as production: `add_user`, `add_token`, `view_token`, `view_group`. No `view_token_key`, not a superuser. | Yes — global, narrow |
-| `sovereign-config-dev-connection-manager-objects` | Initial-permissions policy | Same per-object `view`/`change`/`delete_user`, `view_token`, `set_token_key` attachment as production. | Yes — per object created |
-| `sovereign-config-dev-connection-manager` | Service account (user) | The development connection-manager identity. | Through its group |
-| `sovereign-config-dev-connection-manager-api` | Token (`intent: api`, non-expiring) | Its API token, supplied to the development deployment as `MANAGER_API_TOKEN_FILE` / `SOVEREIGN_CONFIG_MANAGER_API_TOKEN`. | Acts as the service account |
-| `sovereign_config_dev_grants` | User/group attribute | The development direct grant attribute, named by `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE`. | Yes — this is where development authorization lives |
-| `sovereign-config development grants` | OAuth2 scope mapping (scope `sovereign-config`) | Reads `sovereign_config_dev_grants` from the user and their groups and emits the same `sovereign_config_grants` claim. | Emits the claim the server evaluates |
-| `sovereign-config development telemetry` | OAuth2 scope mapping (scope `telemetry:write`) | As in production, for the development ingest. | Only to send web UI telemetry |
-| `<display-name-slug>-<connection-id>` | Service accounts (created at runtime) | One per development managed access URL, granted in `sovereign_config_dev_grants` and added to `sovereign-config-dev-connections`. | Yes — exactly the grant it was minted with |
-
-The environment-specific names the server must be told about are exactly two, and both must match the blueprint that was applied to the same Authentik instance:
-
-| Deployment variable | Production | Development |
-| --- | --- | --- |
-| `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE` | `sovereign_config_prod_grants` | `sovereign_config_dev_grants` |
-| `SOVEREIGN_CONFIG_MANAGER_GROUP` | `sovereign-config-connections` | `sovereign-config-dev-connections` |
-
-Note that the production connection-manager objects carry **no** environment word in their names (`sovereign-config-connection-manager`, `sovereign-config-connections`) while their development counterparts are infixed with `-dev-`, whereas the contributor groups spell both environments out in full (`-production-` / `-development-`). Read the name, not the pattern.
-
-### Configuration grants
-
-Each blueprint creates an environment-specific contributor group that bundles global `read`, `write`, and `manage` grants — `sovereign-config-production-config-contributor` against `sovereign_config_prod_grants`, and `sovereign-config-development-config-contributor` against `sovereign_config_dev_grants`.
-
-Add a user or service account only to the contributor groups required for that environment. Group membership is an Authentik administration convenience, not a Sovereign Config role: the environment's scope mapping emits the existing granular `sovereign_config_grants` claim, and the server independently evaluates `read`, `write`, or `manage` for every operation. No contributor role name is sent to or expanded by the server.
-
-For narrower access, place grants in the environment-specific direct grant attribute on a user, service account, or another group. For example, this development-only attribute permits reading one subtree without write or manage:
+Authorization lives in the identity provider. Each environment's blueprint creates a contributor group holding `read`, `write` and `manage` on `/`, and adding a person to it gives them the whole tree. For narrower access, set the environment's grant attribute on a user, a service account or a group:
 
 ```yaml
-sovereign_config_dev_grants:
+sovereign_config_prod_grants:
   - prefix: /apps/example
     permissions:
       - read
 ```
 
-Use `sovereign_config_prod_grants` for the equivalent production assignment. The `/` prefix is the global root. Every direct grant prefix must be absolute, for example `/apps/example`; after changing grants, obtain a new access token — a change reaches a principal with its next token, within five minutes (see [Request authentication](#request-authentication)). Each environment's `sovereign-config` scope mapping combines and deduplicates only its own direct and group grants before emitting the common granular claim, so the same principal can have different development and production permissions. Sovereign Config rejects malformed, non-canonical, or unknown grants. It never seeds users or authorization state and PostgreSQL contains no ACL, grant, token, or session records. The one thing it does record is the [audit trail](#audit-trail), which holds no authorization state: it says what each identity did, never what it may do.
+The identity provider signs the combined grants into every access token, and the server checks the relevant permission for every operation. A grant change reaches a principal with their next token, within five minutes.
 
-When upgrading from the shared `sovereign-config grants` scope mapping, apply both environment blueprints before deleting that legacy mapping manually. Neither blueprint deletes it because development and production can be migrated at different times.
-
-### Request authentication
-
-Every non-operational RPC requires exactly one Bearer token, a JWT access token issued by this environment's provider. Sovereign Config verifies it itself, without calling Authentik: it requires an `RS256` JOSE header naming a `kid`, checks the signature against that key in the issuer's JWKS, and requires `exp` (and `nbf`/`iat` when present) to hold within a fixed 30-second allowance for clock skew. It then accepts only the configured environment issuer and audience, the exact `sovereign-config` scope, a non-empty subject, and valid `sovereign_config_grants` — the same claims introspection used to return, since Authentik signs them into the access token. The `scope` requirement is also what refuses an ID token: Authentik signs ID tokens with the same key, issuer, audience and grants, but adds `scope` only to access tokens.
-
-Keys come only from `<SOVEREIGN_CONFIG_OIDC_ISSUER>jwks/`, the `jwks_uri` Authentik's discovery document names for a per-provider issuer — never from a token's `jku`, `x5u` or embedded `jwk` header, and never through a redirect. They are loaded at startup and re-read every ten minutes; a token naming a key not in the cache prompts one re-read, at most once every ten seconds per issuer, with concurrent misses sharing it. A re-read replaces the cached set, so a key Authentik stops publishing stops being trusted within ten minutes; a failed re-read keeps the last good set. The JWKS response is bounded to 64 KiB, and one fetch has three seconds. Tokens, claims, subjects, grants and provider URLs are not logged.
-
-A token that is malformed, signed by no published key, outside its validity window, or carrying the wrong claims returns gRPC `UNAUTHENTICATED`. `UNAVAILABLE` means only that a token names a key this server has not cached and cannot fetch: an unreachable Authentik does not affect tokens whose key is already cached. The server starts and serves while Authentik is unreachable, retrying the keys every fifteen seconds; until they load, authenticated calls return `UNAVAILABLE`.
-
-**Revocation takes effect when the token expires, not on the next request.** This was decided in #450, in exchange for no longer waiting on an Authentik round-trip for every call (about 38 ms, nearly all of an authenticated RPC's median). Access tokens live five minutes, so that is the longest any of these takes to reach a token already issued: rotating or revoking an access URL, changing a user's or group's grants or group membership, and disabling a user or ending their session in Authentik. Each takes effect at once for the *next* token — the old URL or password can mint none, and a new token carries the new grants. It is not a protocol change: requests, responses and status codes are unchanged, and a client refreshes its token exactly as before.
-
-### Credential rotation
-
-Request authentication holds no credential: the JWKS is public, so there is nothing to rotate on that path, and no maintenance window. Rotating the provider's signing key in Authentik is picked up on its own — the first token signed by the new key prompts a JWKS re-read — but tokens signed by the old key stop verifying at the next re-read after Authentik stops publishing it. One narrow window remains: if another token naming an unknown key prompted a re-read in the ten seconds before the swap, a genuine token signed by the new key is refused `UNAUTHENTICATED` until those ten seconds pass. The scheduled re-read never opens that window. Swap the signing key when a five-minute burst of re-authentication is acceptable.
-
-Rotating the connection-manager API token: update the environment's blueprint secret and the `MANAGER_API_TOKEN_FILE` contents together, apply the blueprint, then redeploy. Only managed-connection operations are affected while the two disagree; configuration reads and writes do not use it. Verify by listing managed connections after redeployment.
-
-### Managed application connections (Access URLs)
-
-A caller holding `manage` on a configuration root can provision a named machine connection — an **access URL**, as the administration UI calls it — and chooses which of `read`, `write`, and `manage` it grants on that root. At least one permission is required, and a caller can grant only permissions it itself holds on the root, so a manage-only operator cannot mint a write-capable URL. Sovereign Config creates a dedicated Authentik service account whose only grant is `{"prefix": "<root>", "permissions": [<selected>]}` — for example `["read"]` or `["read","write"]` — discovers its single non-expiring app password, and returns one canonical version-1 connection URL. The unchanged CLI accepts that URL on stdin through `profile add`/`profile update` and uses client credentials to operate within the encoded root, and each RPC is authorized against the URL's exact grant: a `read`-only URL can only read; a `write`-capable URL can additionally put and delete values within its root; a `manage`-capable URL can administer access URLs under its root. Value mutation therefore needs `write` (a `manage`-only URL cannot put or delete values), and JSON subtree replacement needs both `write` and `manage`.
-
-The complete URL is a secret and is returned exactly once, by creation and by successful rotation. Sovereign Config stores only non-secret lifecycle metadata — the opaque connection ID, display name, canonical root, selected permission set, opaque Authentik identifiers, and bounded state — and can never re-reveal a URL. A lost URL must be replaced by rotation, which preserves the connection's permissions and invalidates the previous URL immediately: it can obtain no new token. An access token already obtained with it stays valid until it expires, at most five minutes later (see [Request authentication](#request-authentication)); revocation is bounded the same way.
-
-An interrupted rotation is reported as ambiguous: no URL is returned, the connection is marked `rotation_unknown`, and the previous URL is never claimed to be still valid. A further rotation is refused while the earlier attempt could still be in flight, then permitted once that lease expires so the credential can be overwritten with a known fresh value. Revocation deletes the Authentik service account and removes the metadata row only after deletion is confirmed by the app password's absence, since Authentik denies at the permission layer before object lookup once the manager holds no remaining visible account, so "gone" and "not permitted" cannot be told apart on the user object itself; a partial failure stays visible as recoverable state rather than silently orphaning a usable credential.
-
-Each service account's Authentik username embeds a slug of its display name so an operator can recognize it directly in Authentik, with the opaque connection ID appended to guarantee uniqueness even when two connections share a display name. It is also added to the configured `SOVEREIGN_CONFIG_MANAGER_GROUP` group purely for browsing; group membership carries no permissions, and its failure is best-effort and never blocks or rolls back a connection.
-
-The connection-manager identity is isolated from the browser and from request authentication. It holds global `add_user`, `add_token`, `view_token`, and `view_group` — no key or user content is exposed by any of these, only metadata needed to discover and label an account it created — plus object-level `view`/`change`/`delete` on the users and `set_key` on the tokens it creates. It is not a superuser, cannot view any token key, and cannot touch unrelated Authentik objects. Browser code reaches only same-origin gRPC-Web; the Authentik administration endpoint and token are absent from every browser response and built asset.
-
-## Application provider
-
-`sovereign-config-provider` is an ergonomic Rust facade for consuming a managed connection from application code: it parses the version-1 connection URL, obtains a fresh client-credentials token, reads only the encoded subtree over native gRPC, transparently reveals secret leaves, and deserializes the result into a `serde` type. It is a thin layer over the shared core/client/native crates and adds no new URL format, authentication, or transport. It is distributed as tagged workspace source only — there is no provider container or prebuilt library artifact. It does not have to be built from the server's tag: it negotiates a protocol version on connect (see [Protocol versioning](#protocol-versioning)), so a server upgrade does not require redeploying its consumers. See `crates/sovereign-config-provider/README.md` for the API, error surface, and the no-cache/no-retry contract.
-
-## Woodpecker CI secrets extension
-
-`sovereign-config-woodpecker-broker` is a Woodpecker CI external secrets extension backed by Sovereign Config, published as its own image (`registry.desync.link/sovereign-config-woodpecker-broker`) under the same semver as the server. Woodpecker POSTs signed repository and pipeline metadata to a single configured endpoint; the broker verifies the RFC 9421 Ed25519 signature — including recomputing the body digest — renders an ordered list of configuration layers from the repository in the request, reads them through a read-only managed connection, and returns the merged secrets in Woodpecker's format. Later layers override earlier ones, so a per-repository path can override a shared default, and the repository identity always comes from the signed request rather than from configuration. Woodpecker supports exactly one secret-extension endpoint, so adopting it is a replacement rather than an addition. Pipeline YAML is unchanged: secret names are stored verbatim as path segments, which is why the canonical path grammar permits `_`. Woodpecker matches `from_secret:` names by exact lowercase string, so the broker always resolves a layer's direct children by their fold key regardless of the case a value was written with — a value stored as `serverIP` is still found under `from_secret: serverip`. See `crates/sovereign-config-woodpecker-broker/README.md` for the environment surface, the layer syntax, the security notes, and the cutover runbook.
-
-## Workspace layout
-
-Each crate has one consumer, target, or artifact. Dependencies only point down this list.
-
-| Crate | Role | Depends on |
-| --- | --- | --- |
-| `sovereign-config-proto` | Generated gRPC types: one module per protocol version (`v3`, `v4`) plus the unversioned handshake. | — |
-| `sovereign-config-core` | The shared contract: paths, value and secret newtypes, listing shapes, the JSON subtree codec, connection URLs, and `ClientError`. No I/O and no async. | — |
-| `sovereign-config-telemetry` | The server's telemetry module: `OTEL_*` validation, resource identity, OTLP export and flushing shutdown. The only crate that may name an OpenTelemetry SDK or exporter type; its `tests/allowlist.rs` fails if any other does. | — |
-| `sovereign-config-server` | The service binary: gRPC, gRPC-Web, PostgreSQL, Authentik. | proto, core, telemetry |
-| `sovereign-config-client` | The transport-agnostic client: the `Handshake` trait and the `negotiate` function that settles a session's protocol version, the `Transport`, `ValueTransport`, `ManagedConnectionTransport` and `AuditTransport` traits a transport bound to that version implements, `SessionTransport` for one version's whole surface, `AccessTokenProvider`, and the `Client` facade. | core |
-| `sovereign-config-native` | The native tonic transport, split into a `TonicChannel` that can only negotiate and the `TonicTransport` its `speaking` returns, with one dialer module per protocol version; plus OIDC device and refresh flows and the profile store. | proto, core, client |
-| `sovereign-config-web` | The browser UI, compiled to WebAssembly, with its own gRPC-Web transport and dialer module per protocol version. | proto, core, client |
-| `sovereign-config-layers` | Ordered configuration-layer reading and merging: per-layer `GetSubTree`, per-secret `RevealSecret`, direct-children-only naming, later-wins merge, and a caching client-credentials token provider. | core, client, native |
-| `sovereign-config-mcp`, `sovereign-config-provider` | The MCP server and the application provider facade. | core, client, native |
-| `sovereign-config-cli` | The CLI, whose `render` reads layers. | core, client, native, layers |
-| `sovereign-config-woodpecker-broker` | The Woodpecker CI secrets extension image. | core, client, native, layers |
-
-`core`, `client` and `native` stay three crates. Folding `client` into `core` would put `async-trait` and the transport abstraction into the server, which needs only the data contract. Folding `native` into `client` would pull tokio, reqwest and rustix into the WebAssembly build, which implements the same traits over gRPC-Web instead.
-
-`sovereign-config-layers` sits above `native`, not inside it. The reader needs the native transport and a cached client-credentials token provider, and only the broker and the CLI need layer merging — the provider and the MCP server do not, and `client` must stay free of tokio for the WebAssembly UI. What stays with each consumer is everything around the read: how the layer list is arrived at (Woodpecker templates against a signed request in `woodpecker-broker/src/layers.rs`; positional paths in the CLI), how a connection is opened, and what is done with the merged map.
-
-The two consumers differ on two policies, which is why each is a parameter rather than a default:
-
-- **An unreadable layer.** The broker **skips** it, because failing a request would strip every concurrent pipeline of every secret; `render` **fails** on it, because a deploy that silently receives less configuration than it asked for is the failure it exists to remove.
-- **Letter case.** The broker **folds** the leaf name and merges on the fold, because Woodpecker matches a `from_secret:` reference by exact lowercase string; `render` reports it **exactly as stored** and merges on that, because an environment variable name is case sensitive. One leaf `/apps/api/AbC` is therefore `abc` to the broker and `AbC` to `render`, and both are right.
-
-### Where code goes
-
-A module holds one concern. When a file starts mixing concerns, add a sibling module rather than growing it. `clippy.toml` holds functions to clippy's default of 100 lines, and `crates/sovereign-config-server/tests/lint_ratchet.rs` fails if product code silences that lint.
-
-- **Server services** (`values/`, `managed/`, `audit/`): each is split at the protocol seam. `service.rs` is the **shared implementation** — authorization, validation, the control flow and every `Status` — written in no protocol version's terms: it takes a `CallContext` and unvalidated inputs, returns `sovereign-config-core` types, and holds no SQL. `shim.rs` is the **one adapter** every version's shim instantiates — a macro, because each version's generated types are distinct types — plus the validation policies a version chooses between. `vN.rs` is **`vN`'s shim**: one invocation of that adapter naming `vN`'s generated package, plus anything only `vN` has. Nothing but a `vN.rs` shim may import the proto crate, and `tests/lint_ratchet.rs` fails if anything else does. `store.rs` holds every row type and query. Authorization, pure validation such as `values/subtree.rs`, secret masking (`content.rs`) and version-free connection metadata (`wire.rs`) each get their own module. Authentik orchestration lives in `managed/provisioning.rs`. `rpc.rs` holds what every service shares, including the `CallContext`.
-- **Server root**: `main.rs` is the startup sequence, one named step per concern. Authentication, Authentik, configuration, encryption, metrics and static assets each keep their own module.
-- **Core**: one module per concept (`path`, `value`, `listing`, `json`, `status`, `error`, `connection`, `managed`). Every public item is re-exported from the crate root, and dependants import it from there.
-- **Web**: one module per view (`configuration`, `value_rows`, `path_selector`, `tree`, `connections`, `downloads`) plus shared plumbing (`transport`, `session`, `route`, `shell`, `dom`, `browser`, `icons`). A thread-local static lives beside the code that owns it. Event handlers are registered through `dom::on_element_id` or `dom::listen`.
-- **Tests**: unit tests sit in a sibling `tests.rs` declared with `#[cfg(test)] mod tests;`, and Postgres-backed ones are `#[ignore]` and run in CI with `--ignored`. Browser tests use one `browser-tests/tests/<area>.spec.js` per view, with shared mocks in `helpers.js`.
-
-## Upgrade
-
-1. Stop Sovereign Config traffic through Traefik, stop the old Sovereign Config container while leaving PostgreSQL running, and verify no v2 server process remains before migration or v3 writes.
-2. Verify a recoverable PostgreSQL backup from encrypted backup/staging storage.
-3. Set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new published tag and run `docker compose up -d`.
-4. The service applies its forward-only migrations before accepting requests.
-5. Validate native gRPC health/version and `/readyz` through the trusted internal network before restoring traffic.
-
-Downgrades after a migration are unsupported. Restore the verified PostgreSQL backup into a replacement deployment instead. The rooted-path migration deletes every existing configuration value because prior releases stored unrooted paths; recreate required values at their absolute paths after deployment. The multi-path migration separates stored content from its access paths and drops the previous single-table layout, so a release earlier than 2.13 cannot run against a migrated database at all; verify the backup in step 2 before applying it, and promote to production only after the development deployment has exercised the new schema.
-
-### 2.15.0 widens the canonical path grammar
-
-Release 2.15.0 adds `_` to the path segment character set, so the canonical grammar becomes `/` or `^/[a-z0-9_-]+(/[a-z0-9_-]+)*$`. This is a widening of the `v3` protocol's behaviour rather than a signature change: every previously valid path stays valid, no stored data is rewritten, and no request or response type changes.
-
-It is **not** backward compatible for clients. A CLI, MCP server, or `sovereign-config-provider` build older than 2.15.0 rejects a path containing `_` as non-canonical and surfaces it as an opaque internal error. Because list, subtree, and path-query responses are validated as a whole, a single underscored path makes an older client fail every read of the namespace containing it — not just that one value.
-
-Sequence the rollout accordingly:
-
-1. Deploy the 2.15.0 server. Existing clients keep working, because no underscored path exists yet.
-2. Reinstall every CLI and MCP client from the upgraded server's `/dist` installer, and rebuild every `sovereign-config-provider` consumer against tag 2.15.0 or later.
-3. Only then create the first path containing `_`.
-
-A database that has applied migration `0008` cannot be served by a release earlier than 2.15.0 once an underscored path exists, because that server would reject its own stored data.
-
-### 2.18.0 retains path letter case
-
-Release 2.18.0 stops discarding the letter case a path was written with. The canonical grammar and resolution behaviour are unchanged: paths are still ASCII case-insensitive, `/x/FOO` and `/x/foo` are still the same value, and the service still folds ASCII letters to one lowercase key for uniqueness, lookup, and authorization. What changes is that a path-carrying response field — `ListedValue.path`, `ListedValue.alias_paths`, `ListValuesResponse.paths`, `SubTreeValue.path`, `ListValuePathsResponse` — may now return the mixed case a path was actually stored with, instead of always being lowercase. This is an additive `v3` change: message signatures and datatypes are unchanged, and every path stored before 2.18.0 is already all-lowercase and behaves identically.
-
-It is **not** backward compatible for clients that assumed every response path was already lowercase and therefore compared or stripped it byte-exactly. A CLI, MCP server, `sovereign-config-provider` consumer, or Woodpecker broker build older than 2.18.0 rejects a response containing a mixed-case path as invalid and fails the whole request it arrived in — the same failure shape as the 2.15.0 underscore widening, for the same reason: these clients parse every response path with the strict, already-canonical parser.
-
-Sequence the rollout accordingly:
-
-1. Deploy the 2.18.0 server. Existing clients keep working, because no path has ever been written with mixed case.
-2. Reinstall every CLI and MCP client from the upgraded server's `/dist` installer, and rebuild every `sovereign-config-provider` and Woodpecker broker consumer against tag 2.18.0 or later.
-3. Only then write a path with a letter in anything other than lowercase.
-
-Downgrading either the **server** or a **client** below 2.18.0 is not safe once a path exists with any letter case other than lowercase. Migration `0009` repurposes `configuration_paths.path` from the fold key it held before into the exact case a value was written with, and adds a generated `lowercase_path` column as the fold key in its place. A pre-2.18.0 server binds every lookup, collision check, and write against `path` on the assumption that it is already the fold key — once a row's `path` carries real mixed case, those byte-exact comparisons miss it (`NotFound` on a read) or collide with it (a unique-constraint failure on `lowercase_path` on a write), for the same reason a pre-2.18.0 client fails the whole response it parses.
-
-### 2.25.0 widens `GetVersion`
-
-Release 2.25.0 changes what `System.GetVersion` does, inside the already-released `sovereign.config.v3` package and with no protocol version bump. Before 2.25.0 it returned `FAILED_PRECONDITION` for any requested version other than the server's own. From 2.25.0 it **never rejects**: it answers `grpc-status: 0` with `supported_protocol_versions` listing what the server serves, and echoes the requested version only when that version is served — otherwise the server's newest. It also adds the additive `supported_protocol_versions` field. See [Protocol versioning](#protocol-versioning) for the mechanism this enables.
-
-This is a deliberate exception to the rule, stated in that section, that changing what an existing RPC does requires a new package. It was made in place because a client has no other way to learn which versions a server serves: a rejection tells it only that *its* version is unwelcome, which is what forced servers and clients to be upgraded in lockstep. Shipping it as `v4` would have required every existing client to reach `v4` before benefiting, reproducing the flag-day problem it exists to remove. It was approved explicitly before implementation, as `AGENTS.md` §3 requires of any protocol change, and is recorded here because a rule with an unrecorded exception reads as a rule that is negotiable.
-
-It is backward compatible for every client built from this repository, because none of them treats `grpc-status: 0` as acceptance, so all still fail closed. A build older than 2.25.0 compares the **echoed** `protocol_version` against the single version it speaks: asking for `v2` it receives `v3` back, sees a mismatch, and reports an incompatible protocol exactly as before. A 2.25.0 or later build selects from `supported_protocol_versions` and reports an incompatible protocol when that set shares nothing with its own.
-
-It is **not** backward compatible for a third-party client that treats a successful `GetVersion` as acceptance and never reads the echo. Such a client used to be stopped at the handshake by `FAILED_PRECONDITION`; it now receives `grpc-status: 0`, concludes its version was accepted, and proceeds to issue RPCs on a protocol the server does not serve, failing later and less clearly with `UNIMPLEMENTED`. The echoed `protocol_version` has always been the documented answer to "which version is this session speaking", so the fix on the client side is to read it. No such client is known, and no rollout sequencing is required.
-
-### 2.26.0 changes the client crates' API
-
-Release 2.26.0 makes every client dial the version it negotiates. **No wire contract changes** — no `.proto` edit, no change to what any RPC does, and a 2.26.0 client and an older one negotiate against a server identically. Deploying the server needs no client change, as always.
-
-It is, however, **source-breaking for code that builds against these crates**, which is the class [Protocol versioning](#protocol-versioning) warns about: a change can break clients without being a protocol change. Nothing breaks until a consumer rebuilds against tag 2.26.0 or later, and the migration is mechanical:
-
-- `TonicTransport::connect(endpoint)` → `TonicChannel::connect(endpoint)`, then `channel.speaking(negotiate(&channel).await?.protocol_version)` for a transport that can carry configuration traffic. A channel can only negotiate; naming the negotiated version is what produces a usable transport, which is what keeps a reported version and a dialled route the same thing.
-- `Client::service_status()` → the free function `sovereign_config_client::negotiate(&channel)`.
-- `Transport::get_version` moves to the new `Handshake` trait and now takes a `ProtocolVersion` rather than a `&str`, because `GetVersion` is itself routed by version. Only code implementing `Transport` by hand is affected; `sovereign-config-provider` consumers are not.
-
-`sovereign-config-provider`'s own API is unchanged, and it gains `Provider::protocol_version()` — worth logging at startup, since it is the version the service's per-version counters attribute the application to.
-
-### 2.28.0 adopts the unversioned handshake
-
-Release 2.28.0 moves negotiation onto a **new unversioned service**, `sovereign.config.Handshake`, and gives a request for a version the server does not serve a **distinct error** instead of tonic's generic `UNIMPLEMENTED`. Both are protocol changes, approved before implementation as `AGENTS.md` §3 requires. Neither touches `proto/sovereign/config/v3/`: no `v3` signature, and no `v3` behaviour, changed.
-
-**For deployed clients, nothing changes at connect.** A 2.25–2.27 client negotiates by calling `GetVersion` on `v3`'s own route, which is still served, still unauthenticated, and still echoes the version it was asked for. Upgrading the server alone remains safe, as always.
-
-**The catch-all is the 2.15.0 / 2.18.0 class of change**, and is called out for it: it alters what an already-deployed client receives on a route it may one day hit, and negotiation cannot protect a client that is already in the field. The blast radius is nil in practice, because every client from 2.25 on maps `FAILED_PRECONDITION` and `UNIMPLEMENTED` to the same incompatible-protocol error, so one of them meets the new answer exactly as it meets a deleted route today. That is asserted, not assumed, by `a_client_that_predates_the_catch_all_still_reports_incompatible_protocol`.
-
-It is **source-breaking for code that builds against the client crates**, the same class as 2.26.0. Nothing breaks until a consumer rebuilds against tag 2.28.0 or later:
-
-- `Handshake` is now two methods: `served_versions(&[ProtocolVersion])`, which calls the unversioned handshake, and `legacy_version()`, which calls `GetVersion` on `ProtocolVersion::LEGACY`'s route for a server that has no handshake. `Handshake::get_version(version)` is gone.
-- `negotiate` returns a `ServiceStatus` carrying `protocol_version` and an optional `deprecation_date`. It no longer carries `application_version`: the handshake carries versions and nothing else, so the service's release version is read from `System.GetVersion` on the negotiated route — `TonicTransport::dialer_version()` natively, `SessionTransport::get_version()` through a dialer.
-- `ProtocolVersion` is declared **most preferred first** and no longer derives `Ord`. Nothing compares versions: selection follows the server's order.
-- `ClientError::message()` returns `&str` rather than `&'static str`, because the incompatible-version error now names the version lists both ends offered, which cannot be known at compile time. It is bounded and stripped before it is built.
-- `ErrorKind` gains `VersionNotServed`, distinct from `IncompatibleProtocol`. Exhaustive matches on `ErrorKind` must handle it.
-- `sovereign-config-mcp`'s `Backend::service_status` returns a `ServiceReport` rather than a `ServiceStatus`, and `ToolFailure::message` is a `String`.
-
-`sovereign-config-provider`'s own API is unchanged. Its documented **fail-fast-on-retirement contract is reversed**, however: a provider whose negotiated version is retired under it now re-handshakes once and retries the load, rather than failing. The retry is safe because the rejected call never executed, and the retirement stays observable through the logged version change and the per-version counters. See [How negotiation works](#how-negotiation-works).
-
-Configuration values are stored in PostgreSQL as content rows holding a `plain` or `secret` classification, the value itself — sealed as an `enc:v1:` AEAD envelope when the classification is `secret`, verbatim when it is `plain` — and service-generated UTC creation/update timestamps, plus one or more path rows that each expose that content at a canonical absolute path beginning with `/`. Existing values migrate to exactly one path each. Each path row stores the exact case it was written with in `path`, and Postgres computes and stores its lowercase fold key in the generated `lowercase_path` column, which carries the primary key; `lowercase_path` can never drift from `path` because it cannot be written to directly. The fold key is what every comparison, lookup, and collision check uses — a path's stored case is a display concern only, never resolved or rewritten a segment at a time, so two path rows sharing a fold-equal ancestor may each keep their own case for it (see 2.18.0 above). Writing through any path updates the shared content, so every path to that value observes the change; classification cannot be changed while more than one path resolves to the value. Deleting a path removes only that path, and the value is deleted permanently once its last path is removed, in the same transaction and with no background reconciliation. There is no history or duplicate secret copy of the value itself; what was done to it is recorded separately in the [audit trail](#audit-trail), which holds a plain value's previous text but never a secret's. Updates are last-write-wins and preserve the original creation timestamp. Deletion is a hard delete with no tombstone, rollback record, or retained value history. Application-level encryption covers secret-classified values only, so PostgreSQL volume and backup encryption remain operator responsibilities for everything else the database holds.
-
-Exposing one value at several paths is a deliberate administrative act that requires `write` on both the existing and the new path and `read` on the existing one. It widens who can reach that value: a secret aliased into a namespace where more principals hold `read` becomes revealable by them. Listings and path queries only ever return the paths a caller may read, so a value may have paths that a given principal can neither see nor operate on.
-
-The browser opens on configuration values; `/` resolves there, and the Access URLs, [audit trail](#in-the-browser) and Downloads views are reached from a menu on the brand mark. The header carries the signed-in operator's name, taken from the OIDC ID token and used for that label alone, alongside the application version the service reports; an unreachable service is called out there rather than on a page of its own. The session's protocol version is deliberately not shown there — it is a client-compatibility concern, not an operator's — so the CLI and the MCP `status` tool are where it is read. Configuration URLs use `/configuration/<path>` and are always lowercase, but the path field, grid rows, and JSON editor all display each value under the exact case it was stored with; the final segment of each stored path is the value name. A drag-resizable sidebar carries the whole readable namespace tree, drawn with box-drawing characters and labeling each namespace with whichever case one of its own values established first — when two values under one namespace disagree on its case, the tie is broken deterministically, not by displaying two rows. Selecting a node opens that path directly, a node holding values of its own is shown in bold, and a node that is the root of an access URL carries a key. The tree is built from one whole-estate read, so a principal scoped to a prefix — which cannot read the root subtree — still gets the tree, without the bold markers. Below the sidebar breakpoint the tree is not shown and the path selector is the way to move between paths. The path selector offers namespaces containing readable values and also accepts a valid namespace that does not exist yet, which is how a value is first created under a namespace the tree cannot yet show. Leaving a path that holds an unsaved value edit — including through the browser's Back button — raises a confirmation before the edit is discarded. Each path's own access URLs are listed and can be created, rotated, and revoked beneath its values, with the selected node as the root; the Access URLs page remains the estate-wide view. Listing filters every returned value through server-side `read` permission, while row saves and deletes both require `write` permission. A secret is one padlocked field: blank behind a masked placeholder, never pre-filled with stored content, and the same box a replacement is typed into — so writing a new secret never requires the permission to read the current one. Opening the padlock is the explicit action that reveals the stored plaintext and leaves it editable in place. Revealed values are cleared when the padlock is shut, reloaded, navigated away from, logged out, or when any request fails. Per-row and per-entry actions are icon buttons whose tooltip and accessible name both name the value they act on; one of them opens that value's [audit history](#in-the-browser). The JSON switch is off by default; when enabled it loads the entire selected subtree with all-or-nothing `read` authorization and replaces the grid with a pretty JSON editor. Saving preserves masked secrets, atomically replaces plain values, and leaves per-value deletion unavailable in JSON mode.
-
-### 2.29.0 makes `RevealSecret` fail closed on an audit fault
-
-Release 2.29.0 adds the [audit trail](#audit-trail), and with it the second recorded exception to the rule that changing what an existing RPC does requires a new package. `v3`'s `RevealSecret` now writes an audit record before it returns a secret, and **fails the reveal if that record cannot be written**. It used to perform no writes at all.
-
-What a client sees is unchanged: the failure is `UNAVAILABLE` with the message `configuration storage is unavailable`, exactly the status the RPC already returned when its own read failed, and the success path is byte-identical. What changes is **which faults produce it**. A database that still serves reads but refuses writes — disk full, a failover that leaves it read-only, a fault on the `audit_events` table — used to leave reveals working and now fails them. That is new behaviour on a released package, so it is recorded here rather than argued away.
-
-It was made in place rather than as `v4` because it cannot be confined to a version. Recording that only happened on some protocol version would make every other version a way around the trail, which would defeat it. The alternative that avoids the exception — recording reveals best effort, as plain reads are — was considered and rejected: an unrecorded secret access is the one thing the trail exists to prevent, and a fault that silently stops recording secret access is exactly when it matters most. It was approved explicitly, during review of the change and before it merged; unlike 2.25.0 it was not approved before implementation, which is recorded because that is what happened.
-
-**Who it can affect:** any client that reveals secrets, which includes every application embedding the provider. During a write-refusing fault, a provider load that needs a secret fails where it previously succeeded, and so does starting any such application, since the provider holds no last-known-good configuration. The provider already treats `UNAVAILABLE` as a failed load, so nothing misbehaves; it fails, visibly and for the reason stated. `sovereign_config_audit_events_total{kind="secret.revealed",outcome="failed"}` counts each one, and is the series to alert on. No rollout sequencing is required.
-
-Changes (`PutValue`, `ReplaceSubTree`, `DeleteValues`, `AddValuePath`) also record inside their transactions and fail closed, but they are not part of this exception: they already wrote, and already failed when the database refused a write. `GetSubTree` and `ListValues` record best effort, and gain no failure mode at all.
-
-### 2.42.0 repairs past managed actor names
-
-Release 2.42.0 names a managed connection's account after the connection, and its tokens carry that name (see [Audit trail](#audit-trail)). Going forward this is no protocol change: `v4`'s `AuditEvent.actor_name` is still what the identity provider said at the time. The same is true of a person using the CLI or MCP server: the identity provider now signs their username even though those clients never request `profile`, so their new events are named. Their past events are not repaired. The **one-time repair of past events** is the third recorded exception to the rule that changing what an existing field reports requires a new package. For events recorded before the fix by a connection that still exists, `actor_name` now holds `<display name> (access URL)`, a name the identity provider never sent at the time. Before, it held nothing (the subject was shown) or the account's generated username. The narrative's leading actor changes with it, so a narrative search over those events matches the new name and no longer the old one.
-
-It was made in place because a new version cannot confine it. The rows are shared, so every version that reads them would see the same repaired values, and the only way to keep `v4`'s literal contract is to leave the bug in the trail for good. The owner chose to repair it so the trail reads as if the bug never existed. Nothing is lost: each repaired row keeps what it recorded in `recorded_actor_name` and `recorded_narrative`, which are never served, and the server logs per connection how many events it renamed.
-
-**Who it can affect:** a `v4` reader of past audit events by access URLs. It now sees the connection's name where it saw an opaque subject or a generated username. A reader that matched on the old value, such as a saved narrative search for a subject, finds those events under the new name instead. No status, field or RPC changes. The repair runs once per environment and only touches events of connections that still exist.
-
-### 2.31.0 introduces protocol `v4`
-
-Release 2.31.0 serves `sovereign.config.v4` beside `v3`, the first time two protocol versions have been served at once. It was approved explicitly before implementation, as `AGENTS.md` §3 requires. `v3` is untouched: no `v3` signature and no `v3` behaviour changed, and a `v3` client negotiates, dials and fails exactly as before. `v4` is described under [Served versions](#served-versions).
-
-**Deploying the server needs no client change.** Clients built from 2.31.0 negotiate `v4` automatically; everything older continues on `v3`. The browser UI is served by the same release, so it moves to `v4` with the server.
-
-Migration `0011` creates the `pg_trgm` extension for the audit query's filter indexes. It is a trusted extension, so it needs `CREATE` on the database rather than superuser, and the deployed role — the image's bootstrap role — owns the database in every environment. A deployment that connects as a role without `CREATE` must have an administrator run `CREATE EXTENSION pg_trgm` first, or the server stops at startup.
-
-It is **source-breaking for code that builds against the client crates**, the same class as 2.26.0 and 2.28.0. Nothing breaks until a consumer rebuilds against tag 2.31.0 or later:
-
-- `ProtocolVersion` gains `V4`, declared first, and `ProtocolVersion::PREFERRED` is now `V4`. An exhaustive `match` on `ProtocolVersion` must handle it.
-- `SessionTransport` now also requires `AuditTransport`. Only code implementing a dialer by hand is affected; the dialers in this workspace implement it, and a `v3` one answers an audit query with a bounded incompatible-protocol error without dialling.
-
-`sovereign-config-provider`'s own API is unchanged.
-
-## Protocol versioning
-
-Applications embedding `sovereign-config-provider` are deployed independently of the server and are expected to lag it. A server upgrade must therefore never break them. This section is the whole procedure for introducing and retiring a protocol version; it is self-contained and needs no reading of source.
-
-### How negotiation works
-
-1. The client calls the **handshake** — `/sovereign.config.Handshake/Negotiate` — sending every protocol version it speaks. The handshake is the one operation that is **not versioned and not routed by version**, and the only one a client may call before a version is agreed.
-2. The client's list exists for the server's **usage records only**. The server never filters or reorders its answer by it, never rejects on it, and treats it as untrusted input: it is counted under compiled-in labels, bounded in how much is examined, and can never mint a metric label of its own.
-3. The server answers with **every version it serves, most preferred first**, whatever the client asked for, and **never rejects**. Each version may carry a `deprecation_date` — an RFC 3339 UTC timestamp before which the server does not expect to retire it. That is a statement of intent, not a guarantee: a version may be served well past it, and a security flaw may retire one before it.
-4. The client selects the first version in the **server's** order that it also speaks, passing over a version carrying a deprecation date while one without is still to come. A selected deprecation date **warns and never fails** — the CLI to stderr, the MCP `status` tool in its output, the provider and broker through `tracing`, the browser in the header slot it already uses to report trouble with the service. With no version in common the client aborts with a bounded incompatible-protocol error that **names both lists**, so an operator can tell which end has to move.
-5. **Every RPC that follows travels on the negotiated version's routes.** A client is opened as a connection that can do nothing but negotiate; naming the negotiated version is the only way to obtain one that can carry configuration traffic. What an operator is shown is read back off that transport, so a reported version and a dialled route cannot disagree.
-6. If a later call fails with the **version-not-served** error, the client repeats the handshake **once**, selects again, obtains a *new* transport, and retries that call. The rejected call never executed, so the retry is safe. It logs the change of version. If nothing is in common, or the retry fails the same way, it aborts.
-
-**The handshake's shape is fixed, forever.** It can never be versioned, because it is the operation that tells a client which versions exist. It never gains, loses, retypes or repurposes a member. Anything a client needs beyond the list of served versions belongs in a versioned operation — which is why the service's release version is read from `System.GetVersion` on the negotiated route rather than from the handshake.
-
-The handshake is **unauthenticated**, and this is the recorded reason: a client has no token before it has negotiated, `System.GetVersion` already publishes the same list to anyone, and leaving the handshake outside authentication keeps each protocol version free to change its own authentication scheme. The cost is that the served list and the client lists sent to it are public, which is what the untrusted-input handling in step 2 exists for.
-
-#### Reaching a server that has no handshake
-
-Every server up to 2.27 authenticates **before** it routes, and exempts only the health probes and `<served>.System/GetVersion`. A handshake call carries no token, so such a server refuses it `UNAUTHENTICATED` — the request never reaches the router that would have said `UNIMPLEMENTED`. **Detecting a pre-handshake server is therefore not "`UNIMPLEMENTED`"**, and the obvious test fixture lies about this: a bare router with no authentication in front of it answers `UNIMPLEMENTED`, while a real deployed server answers `UNAUTHENTICATED`.
-
-On either answer the client falls back to `GetVersion` on `ProtocolVersion::LEGACY`'s own route, which those servers do exempt. If it answers, the server serves exactly that version. A handshake failure of any other kind — `UNAVAILABLE`, say — is reported as itself, and a fallback that also fails reports the fallback's failure. A server that *has* the handshake never answers it `UNAUTHENTICATED`, so the fallback cannot mask a genuine authentication problem.
-
-### The rule that makes this work
-
-**Adding a protocol version must never change what an existing version's clients see.**
-
-`GetVersionResponse.protocol_version` is why. Clients compiled before `supported_protocol_versions` existed ignore that field entirely and compare the echoed `protocol_version` against the single version they were built with. If the server ever echoed *its own preferred* version instead of the requested one, every one of those clients would fail on the day a newer version shipped — and they are already deployed, so they cannot be fixed retroactively. That is the fleet-wide outage this mechanism exists to prevent. **Never change the echo semantics.**
-
-The echo falls back to the server's preferred version only when the requested version is not served at all. A client asking for a version it speaks can never observe that fallback.
-
-`v3` also advertises its `supported_protocol_versions` **oldest first**, while the handshake reports **most preferred first**. The two orders are opposite on purpose: `v3` has advertised oldest-first since the field was added and a `v3` client is entitled to that order, so changing it would be a `v3` behaviour change and therefore a new version. `v4`, a new contract, reports most preferred first, as the handshake does. Both keep the echo.
-
-The regression tests that protect this are `a_server_newer_than_this_build_still_connects`, `a_client_compiled_without_the_supported_set_still_decodes_and_negotiates`, and the echo tests in `system.rs`. Do not weaken them.
-
-### The version-not-served error
-
-A request on a **version-shaped route naming a version this server does not serve** — retired, or never existed — is answered by a catch-all with `FAILED_PRECONDITION` plus two fixed metadata keys: one naming the kind (`version-not-served`), one echoing the version asked for. A client identifies it by the **marker, never by the status code**, which is shared with failures that are not about versions.
-
-A mistyped service or method on a *served* version stays `UNIMPLEMENTED`. Keeping those two apart is the point: a retired version is something a session can recover from by re-handshaking, and a typo is not.
-
-Two placement decisions are load-bearing, and `auth::grpc_service_layer` is what pins them:
-
-- the catch-all sits **inside** the gRPC-Web layer, so a browser receives an answer it can decode. Outside it, a retirement would reach the browser as an undecodable transport failure with no version in it;
-- it sits **outside** authentication, because an unserved version has no authentication scheme left to apply, and a client whose credentials also expired while it was away should still be told what actually broke.
-
-Both are asserted in `crates/sovereign-config-server/src/protocol/serving_tests.rs`.
-
-### What forces a new version, and what does not
-
-A new version **is** required for:
-
-- renaming, renumbering, retyping, removing or repurposing an existing field;
-- changing what an existing RPC does — the behaviour of a call is part of the contract, not just its signature;
-- **adding any field or RPC, even an optional one**;
-- **changing the set of values an existing field may carry** — a wider or narrower grammar, letter case, range, or a new enumeration member.
-
-The last two were relaxed until 2.28.0, which is what releases 2.15.0 (path grammar) and 2.18.0 (path letter case) are this repository's own evidence against: both were additive to the `v3` contract, both shipped without a version bump, and both broke older clients, because a client validates what it was built to expect and one unexpected value fails the whole response carrying it.
-
-A new version is **not** required for bug fixes or performance improvements that change no API shape and no substantive behaviour.
-
-**Exceptions are approved before implementation and recorded**, with the reason and who they can affect — a rule with an unrecorded exception reads as a rule that is negotiable. There have been three:
-
-- release 2.25.0 widened `GetVersion` itself in place, because the negotiation mechanism could not otherwise be introduced without the flag day it exists to remove. It is recorded under [2.25.0 widens `GetVersion`](#2250-widens-getversion). Treat it as the bootstrap of this mechanism, not as precedent.
-- release 2.29.0 made `RevealSecret` fail closed when its audit record cannot be written, because recording confined to one version would make every other version a way around the audit trail. It is recorded under [2.29.0 makes `RevealSecret` fail closed on an audit fault](#2290-makes-revealsecret-fail-closed-on-an-audit-fault). It is not precedent for other behaviour changes either: its justification is specific to a record that must not be bypassable.
-- release 2.42.0 repaired, once, the `actor_name` and narrative of past audit events by access URLs, which until then had recorded no name, because the rows are shared by every version and the alternative was keeping the bug in the trail for good. Its approval came during review rather than before implementation, which this section's rule asks for, and the record says so. It is recorded under [2.42.0 repairs past managed actor names](#2420-repairs-past-managed-actor-names). It is not precedent for rewriting history: the originals are kept beside every repaired row.
-
-Note the converse: a change can break clients *without* being a protocol change. 2.26.0 and 2.28.0 both changed the client crates' API without touching any wire contract. Version negotiation does not protect against that class; see [Upgrade](#upgrade) for how those were sequenced.
-
-### Served versions
-
-| Version | Preference | What it is |
-| --- | --- | --- |
-| `v4` | first | `v3`'s whole surface plus the `Audit` service. Validates a request's shape before authorizing it. |
-| `v3` | second | The original surface. No announced retirement. |
-
-`v4` differs from `v3` in exactly three ways, each recorded in `proto/sovereign/config/v4/service.proto`:
-
-- **`Audit.QueryAuditTrail`** reads the [audit trail](#audit-trail) back. `v3` has no such service.
-- **A malformed request is refused before it is authorized.** A `PutValue` with no content or with a NUL in it, a `ReplaceSubTree` entry with no content, and a managed connection with an empty, unknown or unspecified permission are `INVALID_ARGUMENT` on `v4` whoever sends them. `v3` authorizes first and reports the caller's missing grant instead — `v3`'s order, which cannot change. The wording of each refusal is the same on both.
-- **`GetVersion` lists the served versions most preferred first**, where `v3` lists them oldest first.
-
-### Introducing a new version
-
-Each version is its own protobuf package, because the gRPC route path embeds the package name — `/sovereign.config.v3.System/GetVersion`. Distinct packages mean distinct routes, so two versions serve concurrently on one router with no dispatch ambiguity. This is proven end to end by `test-consumers/sovereign-config-proto-testversion`, a dev-only package registered alongside `v3` in the server's own tests; read those tests if you want to see the mechanism working before you rely on it.
-
-The handshake is **not** part of this. It lives outside every version in `proto/sovereign/config/handshake.proto` and `crates/sovereign-config-server/src/handshake.rs`, has no shim, and is never copied or edited when a version is added.
-
-To add `vN`:
-
-1. Add `proto/sovereign/config/vN/service.proto` with `package sovereign.config.vN`, starting from the previous version's file. Make the breaking change there, and only there.
-2. Compile it in `crates/sovereign-config-proto/build.rs` and expose it as a `vN` module in that crate's `lib.rs`, alongside `v3`.
-3. Write the `vN` ↔ core mapping shims beside `crates/sovereign-config-server/src/values/v3.rs` and `managed/v3.rs`, point each at the `vN` generated types, and add its `mod` line and re-export in `values.rs` / `managed.rs`. **This layer must be only the proto↔core translation, plus that version's own basic validation.** Domain types in `sovereign-config-core` stay version-free, so a second version is a translation shim over one implementation rather than a forked server. If you find yourself duplicating logic rather than mapping types, the change belongs in the shared implementation (`service.rs`) or in core, not in the shim.
-
-   **Share adapter code, do not copy it and never chain it.** Because every added field or RPC is now a new version, most of a new version is unchanged from the one before — so an operation whose wire shape is identical in both has one adapter referenced by both shims. Generated types differ per package, so the adapter is a macro in each module's `shim.rs`: a version's `vN.rs` imports its generated package as `proto` and invokes it, and adds only what that version alone has, as `audit/v4.rs` does. An operation whose shape *does* change gets its own adapter for that operation rather than a branch in the shared one. A shim must never call another version's shim, or retiring a version would mean untangling the ones built on it.
-
-   **Each version chooses its own basic validation**, as a policy passed to that macro. `v3` passes `Deferred`: input it cannot translate, such as an unset oneof, goes down as `None` for the shared implementation to reject after it authorizes, which is the order `v3` has always failed in and so the order it keeps. From `v4` on the policy is `Upfront`: the shim refuses a malformed request before the shared implementation is called, with the shared implementation's own wording. A managed-connection refusal is counted through the shared implementation, so the operation metric sees it like any other.
-
-   And the shared implementation **never branches on the version**: the `CallContext` it receives may record which version a call arrived on, but an implementation that behaves differently per version is a forked server with extra steps. `System` stays per-version (`system.rs`), because `GetVersion`'s echo is version-specific by nature.
-4. Register the `vN` services on the router in `crates/sovereign-config-server/src/main.rs`, **leaving every existing `add_service` line in place.** Construct each `vN` shim over the same `Arc` of the shared implementation the `v3` line uses — one implementation, however many versions.
-5. Teach the **clients** to dial `vN`:
-   - Add `VN` to `ProtocolVersion` in `crates/sovereign-config-core/src/status.rs`, declared **before** the existing variants — the list is preference order, most preferred first. This says only that clients in this workspace can *speak* `vN`; it advertises nothing.
-   - **The workspace now fails to compile**, in `crates/sovereign-config-native/src/transport/mod.rs` and `crates/sovereign-config-web/src/transport/mod.rs`. Each selects its routes with an exhaustive `match` on `ProtocolVersion`, so a version with no dialer is a non-exhaustive-patterns error naming the transport that cannot speak it.
-   - Fix it by writing the dialers: add `transport/vN.rs` in each crate invoking that crate's `transport/adapter.rs` macro over the `vN` stubs (native) or messages and route label (browser), and add the `ProtocolVersion::VN` arm. **These modules must be only the proto↔core translation**, and share adapter code for the same reason step 3 gives on the server side. A version without an operation another has still implements its client trait, answering with a bounded error and dialling nothing, as `v3`'s `AuditTransport` does.
-
-   The order is deliberate: declaring the version first is what produces the compile error, and the compile error is what stops the version being declared without dispatch. Do not work around it by returning an older version's dialer — a version negotiated and reported while its traffic travels on an older version's routes makes `sovereign_config_protocol_requests_total` read backwards, showing the version actually carrying the traffic as idle and the unused one as busy. Since that counter is the retirement gate below, the result is a gate that says it is safe to delete the version everything is using.
-
-   `crates/sovereign-config-native/tests/protocol_dispatch.rs` then checks, for every version in `ProtocolVersion::ALL`, that each RPC reaches a route naming that version — asserted on what the server received. It covers `vN` the moment `vN` is declared; there is no list in it to extend. The browser's equivalent is `every_route_the_browser_dials_names_the_version_it_speaks`.
-6. Add `vN` to `SERVED_PROTOCOL_VERSIONS` and `SERVED_PROTOCOL_LABELS` in `crates/sovereign-config-server/src/system.rs`, `vN` **first** — that list is the server's preference order, and the handshake reports it verbatim. Do this **last**: it advertises the version to clients, so the services implementing it must already be registered.
-
-Two things you do *not* have to edit, because they derive from `SERVED_PROTOCOL_VERSIONS` and would be easy to miss:
-
-- **The unauthenticated-RPC allowlist.** `GetVersion` is called before any token exists by every client that predates the handshake, so it must stay unauthenticated on every served version. `is_operational_rpc` in `crates/sovereign-config-server/src/auth.rs` matches `/sovereign.config.<served>.System/GetVersion` against the served set rather than listing paths, so step 6 exempts `vN` automatically. The handshake route is exempt by name, and is not version-derived because it names no version.
-- **The per-version metric label**, which comes from `SERVED_PROTOCOL_LABELS` in the same step.
-
-Deploy the server before any client change. Clients now negotiate `vN` automatically; clients that have not been rebuilt continue on the version they were built for.
-
-### Retiring a version
-
-**Announce it first.** Set a `deprecation_date` on the version in `SERVED_PROTOCOL_VERSIONS` and ship that, so clients selecting it warn their operators and clients that can move to a non-deprecated version do so on their own. The date is a statement of intent, not a commitment: it binds nothing, and a security flaw may retire a version before it.
-
-**Then confirm no real consumer still speaks the version.** The gate is the **authenticated** series:
-
-```
-sovereign_config_protocol_requests_total{version="v3",outcome="authenticated"}
-```
-
-A version may be retired only once that series has been flat at zero across an observation window long enough to cover the slowest-moving consumer — at minimum a full deployment cycle of every application that embeds the provider. `sovereign_config_protocol_client_versions_total` is the companion view: it counts the versions clients *say* they speak in their handshake lists, so it shows a fleet becoming ready for a retirement before the request series goes quiet.
-
-**Check how much metric history you actually have before reading the gate.** "Flat at zero across a full deployment cycle" is a claim about a window, and it can only be made over samples that still exist. Prometheus retention is set outside this repository (the homelab `monitoring-stack` keeps one day), and a consumer that loads configuration at startup and restarts weekly is invisible six days in seven — so a one-day window says almost nothing about a monthly deployment cycle. Either raise retention to cover the observation window, or alert on any authenticated traffic for the version after cutover, since an alert's firing history does not depend on how long samples are kept.
-
-**Use the [audit trail](#audit-trail) to explain the metric, not to replace it.** The trail records the identity *and* the protocol version on every hooked call and keeps them for a year, so it is what names the consumer to chase when the gate will not go quiet; every application that embeds the provider begins a load with a plain read, so none of them can stay on an old version without appearing there. The metric stays the gate all the same: it is counted in the authentication layer for every authenticated RPC by construction, including calls nobody thought to audit, while the trail covers the calls that were hooked and records reads on a best-effort basis. In practice the two agree. If they do not, that is a finding to understand before retiring anything.
-
-Gate on `authenticated`, **not** on `attempted`. The gRPC endpoint is public, so `outcome="attempted"` counts everything whose route names the version before authentication runs — including an internet scanner, or a decommissioned application whose credentials were revoked months ago but whose process still retries. None of those breaks when the version is retired, yet any of them can hold `attempted` above zero indefinitely; gating on it would mean never retiring anything, or learning to ignore the counter. Nothing unauthenticated can move `authenticated`. A non-zero `attempted` with `authenticated` at zero is worth a look in the logs, but it is not a reason to keep the version.
-
-This is a precondition, not a courtesy. The provider does not cache: it holds no last-known-good configuration, by deliberate design, because retaining one would keep revealed secrets in process memory for the application's lifetime. An application still speaking a version you delete therefore fails on its next configuration load — it re-handshakes once, and if nothing is left in common, that is the end of it.
-
-Once the authenticated series reads zero:
-
-1. Delete `proto/sovereign/config/v3/` and its entry in `crates/sovereign-config-proto/build.rs` and `lib.rs`.
-2. Delete the `v3` mapping shims — `crates/sovereign-config-server/src/values/v3.rs` and `crates/sovereign-config-server/src/managed/v3.rs` — with their `mod` lines and re-exports, and `SystemService` in `system.rs`. The shared implementations and adapters beside them (`service.rs`, `shim.rs`) are untouched: they never knew `v3` existed. Once no version uses the `Deferred` validation policy, delete it too.
-3. Delete the `v3` client dialers — `crates/sovereign-config-native/src/transport/v3.rs` and `crates/sovereign-config-web/src/transport/v3.rs` — with their `mod` lines and their arm of each `dialer` and `routes` match.
-4. Delete the `v3` `add_service` lines in `crates/sovereign-config-server/src/main.rs`. **Its routes now fall to the catch-all**, which answers them version-not-served; there is nothing else to remove for dispatch.
-5. Remove `V3` from `ProtocolVersion`, `SERVED_PROTOCOL_VERSIONS` and `SERVED_PROTOCOL_LABELS`, and repoint `ProtocolVersion::LEGACY` if it named `V3`.
-6. Update `SYSTEM_SERVICE_NAME` in `main.rs`, which the container health probe asks for by name, and drop `v3`'s `System` from `serving_health_service`.
-
-With `v4` served, `v3` is the first version that *can* be retired: every client built from 2.31.0 on already speaks `v4`, so its authenticated series falls as consumers are rebuilt. It has no announced date.
-
-Steps 3 and 5 hold each other honest: removing the variant while a dialer still names it is a compile error in that dialer, and removing the dialer while the variant remains is a non-exhaustive `match`. `LEGACY` is checked the same way. A retired version leaves no orphan in either direction.
-
-Announce the retirement to every consuming repository before it ships. A client outside the supported range fails with a bounded incompatible-protocol error naming both lists at connect, which is a clear error but not a recoverable one.
+A caller holding `manage` on a path can create **access URLs** rooted there, granting any of the permissions it holds itself. Each access URL is backed by a dedicated Authentik service account whose only grant is that root. The URL is shown exactly once, on creation or rotation, and the service stores no copy. Rotation invalidates the previous URL immediately, and revocation deletes the service account. A token already issued remains valid until it expires, at most five minutes later. See [Authentication](docs/authentication.md) for the full model.
 
 ## Audit trail
 
-Every change to a configuration value, every reveal of a secret, every read of configuration, and every managed-connection create, rotate and revoke is recorded in the `audit_events` table, attributed to the identity that caused it and the protocol version its call arrived on. It is read back through `v4`'s `Audit.QueryAuditTrail`; `v3` has no way to read it.
-
-**An actor is named by the identity provider.** Every event stores the token's subject and, beside it, the name the token carried — `preferred_username`, else `username` — which is what the trail shows. Every client requests the `sovereign-config` scope, but not every client requests `profile`: the CLI and MCP server do not, and neither does a managed connection's service account. So each environment's `sovereign-config` scope mapping signs `preferred_username` itself. A person goes by their Authentik username, the same name `profile` gives them, whichever client they used. A managed connection's account is named after the connection's display name by the connection manager, and signed as `<display name> (access URL)` when it carries the `sovereign_config_managed` marker. Before 2.42.0 a CLI or MCP session recorded only its subject. Those past events are not repaired: the repair below covers access URLs alone. An access URL's activity therefore reads under the name the Access URLs view shows, and the marker is why it cannot read as a person's: whoever creates a connection chooses its name, and a connection named after a colleague must not put its writes and reveals in that colleague's name. The subject stored beside every name stays the identity.
-
-**Accounts and events from before 2.42.0 are repaired at startup.** Until then an account went by its generated username (`sc-managed-<slug>-<id>`) and its tokens carried no name, so its events showed its opaque subject. Once, in the background after a start, the server names each live connection's account after the connection, then — six minutes later, once every token minted under the old name has expired (tokens last five; a test holds the delay to the blueprints) — gives those accounts their current name in every past event recorded by subject alone or under the generated username, in `actor_name` and at the head of the narrative. The subject is never changed and an event under any other name is left alone. When both steps have fully succeeded the server records it in `managed_name_repair` (migration `0013`) and never runs the repair again, so an event recorded nameless after that stays as recorded. A start that is interrupted, or where any rename or the trail update failed, records nothing, and the next start runs it again; each step is idempotent. An account Authentik no longer has counts as done, since there is nothing left to name. One it refuses to rename (`outcome="rejected"`) keeps the repair open until it is resolved: fix the connection manager's permission on that user, or revoke the connection. Neither step can fail startup: a failure is logged at `warn` (a rename is also counted as `sovereign_config_managed_dependency_total{call="rename_account"}`). **This is the one rewrite of recorded history the trail allows,** a recorded protocol exception ([2.42.0 repairs past managed actor names](#2420-repairs-past-managed-actor-names)), and it is confined to supplying a name the identity provider should have signed from the start. It stays auditable and reversible: each repaired row keeps what it recorded in `recorded_actor_name` and `recorded_narrative` (migration `0013`; never served, so the trail reads as if the names had always been right), and the server logs, per connection, how many of its events were renamed. It cannot reach an event by a connection revoked before it ran: revocation deletes the only record linking that account's subject to a connection, so those events keep their subject.
-
-**No secret value is ever recorded.** A value reaches the trail only as plain content: `old_value` and `new_value` are populated for a plain value changing and are `NULL` for everything else, and a narrative naming a secret names its path, actor and action and nothing more. A read records the path it was asked for and how many values came back, never the values themselves — a subtree can hold secrets, masked or not, and the trail has no business copying content it was only asked to witness. The rule is enforced three times over: values reach an event only through a constructor that discards anything not classified plain, a table constraint confines them to the three single-value change kinds, and tests assert directly that no secret text reaches any column.
-
-Recording lives in the version-free service implementations, never in a protocol shim, so **every served protocol version is audited identically** and speaking an older one is not a way around the trail. Each record carries the served-version label of the route actually dialled, taken from the request rather than from a per-version constant, so a version added by copying an existing shim cannot misattribute its own traffic.
-
-**A repeated access collapses into one row.** Secret reveals, subtree reads and listings are keyed by identity, protocol version, path and time window: a repeat inside the window bumps `event_count` and moves `occurred_at` to the latest occurrence rather than inserting a row. This is what keeps a year of retention viable, because the provider does not cache and reveals every secret on every load. Changes never coalesce. The count and the period are rendered from `event_count`, `first_occurred_at` and `occurred_at` when a row is read, and are deliberately not stored in the narrative, so bumping a window stays a single statement. **The protocol version is part of the key on purpose**: during a rolling deploy one identity is seen on two versions inside one window, and they must stay two rows or the trail would misreport the very thing the column exists to show.
-
-**Failure policy differs by what is at stake.** A change records inside the mutation's own transaction and fails closed, so a change that could not be recorded did not happen. A secret reveal fails closed too, before the secret is returned. Both report the storage fault the RPC already returns when its own query fails, so no deployed client meets a status it does not already handle. A plain read is best effort: `GetSubTree` and `ListValues` perform no other write, and making every configuration read depend on the database accepting writes would give them a failure mode they do not have today — so a failed record is counted and logged and the read is served. Managed-connection flows call Authentik between their database steps, so their record is atomic with the state change that completes the operation; a failure leaves the row in the intermediate state that flow already recovers from.
-
-`sovereign_config_audit_events_total{kind="…",outcome="…"}` counts every write by event kind. **`outcome="failed"` is the series to alert on:** a failed write either failed the operation it belonged to or, for a plain read, was dropped while the read was served — either way the trail and reality have parted, and this counter is the only place that shows. `sovereign_config_audit_retention_swept_total` and `sovereign_config_audit_retention_sweep_failures_total` cover the retention sweep, which runs hourly in the background, deletes events last seen before the retention cutoff, and never takes the server down on failure.
-
-### Reading the trail
-
-`QueryAuditTrail` returns one page of events, newest first by first occurrence, and a cursor for the next. **An event is returned only where the caller holds `read` on its path** — the same grant check every listing applies. An alias event (`value.path_added`) names the alias's other path in its narrative, so it also needs `read` on that path: `ListValuePaths` hides an alias the caller cannot read, and the trail must not name it instead. A managed-connection event needs `manage` on the connection's root rather than `read`, the grant that lists the connection at all. Every condition is part of the query rather than applied to its result, so a page is never short because someone else's events were filtered out of it. A query is not itself recorded.
-
-Every filter is optional and every one that is set must match: a fragment of the path, matched case-insensitively anywhere in it; a fragment of the narrative; a time range, which matches an event whose period overlaps it; the protocol version it arrived on; and a set of event kinds. An **element query** names one value's path exactly and returns its own events plus subtree reads of any of its ancestors and listings of its parent — the only ways a plain value is ever read, since nothing reads one plain value alone. Fragments are matched as text, never as patterns: `_` is a path character and matches only itself.
-
-Paging is keyset, never offset, on each event's first occurrence and its id — both fixed for the event's life, and the order events are returned in, so a coalesced event keeps the place of its first occurrence however recently it was bumped. A new event lands above the cursor and a coalesced window bumped mid-scroll keeps its place, so a scroll returns each event exactly once. Paging on the most recent occurrence would not: a bump moves it, and a row that moves past the cursor is skipped. A coalesced event is served with its count and period rendered onto its narrative.
-
-The path and narrative filters are served by trigram indexes (`pg_trgm`, migration `0011`), and the paging order by its own index. Migration `0012` gives each alias event a column naming its other path, backfilled from the narrative for events recorded before it.
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `SOVEREIGN_CONFIG_AUDIT_RETENTION_DAYS` | `365` | How long an event is kept after it was last seen. Maximum `3650`. |
-| `SOVEREIGN_CONFIG_AUDIT_COALESCE_WINDOW_HOURS` | `24` | The window inside which repeated accesses collapse into one event. Maximum `168`. |
-| `SOVEREIGN_CONFIG_AUDIT_PAGE_SIZE` | `100` | How many events one audit query returns: what a query that names no page size gets, and the most any query gets. Maximum `1000`. |
-
-Each is optional, because the defaults are the intended configuration. One that is set but unusable fails startup rather than falling back, so a mistyped retention cannot silently become a year.
-
-### In the browser
-
-The **Audit trail** view, on the brand menu at `/audit/`, lists the events the signed-in operator may see, newest first, each with its time of first occurrence, the actor, the narrative and the protocol version it arrived on; a coalesced row's narrative carries its count and period. It filters on every field the query offers: a path fragment, a description fragment, a time range picked in the browser's own time zone, a protocol version, and kinds of event grouped as changes, secret reveals, access-URL changes and reads. **It opens without reads.** Every provider load is a read, so they outnumber everything else and would bury the changes someone came to look for; they are one checkbox away. A filter the service would refuse is reported on its field and never sent.
-
-The list has no page control. The next page loads in the background as the end of the list nears the viewport, following the service's cursor: one page is in flight at a time, nothing is asked for once the service says there is no more, and a page that arrives after the filters have changed is discarded rather than appended. A failed page is reported under the rows already loaded, which stay, and loads again only when **Retry** is pressed, so a failing service is not asked again on every scroll.
-
-Each value row in the Configuration grid has a history button that opens `/audit/<path>`: an element query for that value, which includes subtree reads of its ancestors and listings of its parent namespace and shows every kind of event, reads included. The path filter does not apply there, since the service does not combine the two. Leaving an unsaved edit through that button asks first, like any other navigation.
-
-**Used with the retirement gate, not instead of it.** Because every consumer begins a configuration load with a plain read, the trail sees every application that embeds the provider, and — unlike Prometheus, which keeps one day — it remembers for a year, so it can name the consumer still on an old protocol version. The `authenticated` metric series remains the formal gate under [Retiring a version](#retiring-a-version): it is counted in the authentication layer for every authenticated RPC by construction, while the trail covers the calls that were hooked and records reads best effort. If the two disagree, that is a finding, not a tie to break in favour of the more convenient one.
+Every configuration change, every secret reveal, every read and every access-URL create, rotate and revoke is recorded. Each record names the identity behind it and the protocol version the call arrived on. **No secret value is ever recorded.** Changes and reveals fail closed: one that cannot be recorded does not happen. Repeated reads by the same identity collapse into a single event per window, which keeps a year of retention practical. The trail is searchable in the web UI and through the `v4` API, and each caller sees only events on paths they may read. See [Audit trail](docs/audit-trail.md).
 
 ## Observability
 
-The server's telemetry is owned by one crate, `sovereign-config-telemetry`, and configured by the standard `OTEL_*` environment variables and nothing else — there is no telemetry section in the server's own configuration.
+With no `OTEL_*` variable set, the server logs JSON to stdout and exports nothing. Set the standard OpenTelemetry variables to export spans, structured logs and metrics over OTLP (`http/protobuf`) to a collector of your choice:
 
-**What leaves, over what.** Spans, structured log records and metrics leave the process over **OTLP (`http/protobuf`)** to one collector endpoint, the estate's shared collector (`http://monitor-alloy:4318` on the `proxy-backend` network). The server knows nothing behind that endpoint; which store keeps them is the platform's business. Everything exported carries the same resource identity: `service.name`, `service.version` (the release the binary was built as — never overridable by the environment), `deployment.environment.name`, `service.instance.id` (a version 5 UUID of the container hostname, which `compose.yaml` pins to the container name so it survives a redeploy) and `telemetry_source=otlp`. Log records are also written as JSON to stdout, so `docker logs` keeps working; stdout lines carry no span fields. Authentication events contain only the RPC path and bounded outcome/reason values. **Metrics are pushed, not scraped:** there is no `/metrics` endpoint, and nothing asks the platform to scrape the server (see [Metrics](#metrics)).
+```sh
+export OTEL_SERVICE_NAME=sovereign-config
+export OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=prod,telemetry_source=otlp
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_LOGS_EXPORTER=otlp
+export OTEL_METRICS_EXPORTER=otlp
+export OTEL_TRACES_EXPORTER=otlp
+```
 
-**Spans.** Every request on the public port, every call that leaves the process and every piece of scheduled work is a span; a log record written inside one carries its `trace_id` and `span_id`, so a trace in Tempo leads to its log lines in Loki (`{service_name="sovereign-config", deployment_environment="dev", log_source="otlp"} | trace_id="…"`) and back. Traces select in Tempo as `{resource.service.name="sovereign-config" && resource.deployment.environment="dev"}`.
+> [!WARNING]
+> With `OTEL_RESOURCE_ATTRIBUTES` set, start the stack with the Compose plugin binary (for example `/usr/local/libexec/docker/cli-plugins/docker-compose up -d --wait`) rather than `docker compose`. The Docker 27 CLI overwrites that variable when it runs the plugin, and the server then fails startup because `deployment.environment.name` is missing.
 
-| Span | Kind | Name | Attributes |
-| --- | --- | --- | --- |
-| A gRPC or gRPC-Web call | server | its route, `sovereign.config.v4.ManagedConnections/CreateManagedConnection` | `rpc.system.name=grpc`, `rpc.method` (the same route), `rpc.response.status_code` (`OK`, `UNAVAILABLE`, …), `sovereign_config.protocol.version` (`v3`, `v4`; absent for the handshake), and after authentication `user.id` and `user.name` |
-| A `POST` to a route this build does not serve | server | `_OTHER` | `rpc.system.name`, `rpc.method=_OTHER`, `rpc.method_original` (the route as requested, first 256 characters), `rpc.response.status_code` — the route is an attribute, never the name, so a request cannot mint a span name |
-| A web UI asset | server | the method, `GET` | `http.request.method`, `url.path` (first 256 characters), `http.response.status_code` |
-| Fetching an issuer's signing keys (JWKS) | client — a child of the request whose token named an uncached key, or a root span for the periodic re-read | `GET` | `http.request.method`, `server.address` (host only), `http.response.status_code` |
-| An Authentik admin call | client | method and route template, `PATCH /api/v3/core/users/{id}/` | `http.request.method`, `server.address`, `url.template`, `http.response.status_code` |
-| A Postgres call | client | store function and table, `insert_provisioning managed_connections` | `db.system.name=postgresql`, `db.operation.name` (the store function), `db.collection.name` |
-| Startup migrations | client, root | `migrate` | `db.system.name`, `db.operation.name=migrate` |
-| Startup secret encryption | internal, root | `sovereign_config.startup.encrypt_stored_secrets` | its Postgres calls as children |
-| An audit retention sweep | internal, root | `sovereign_config.audit.sweep` | `sovereign_config.audit.swept`, and its Postgres call as a child |
-| Startup name repair: naming managed accounts (#440) | internal, root | `sovereign_config.managed.rename_accounts` | `sovereign_config.managed.renamed`, and its Postgres and Authentik calls as children |
-| Startup name repair: renaming them in past events, a token lifetime later | internal, root | `sovereign_config.audit.rename_actors` | `sovereign_config.audit.renamed`, and its Postgres calls as children |
+Metrics are pushed rather than scraped, and there is no `/metrics` endpoint. A collector that is down never fails a request, a start or a health check. The web UI can also send its own traces through an authenticated, same-origin ingest. [Observability](docs/observability.md) documents every span, metric and log field, and the validation rules for the variables.
 
-A failed span carries `error.type`, a bounded classification (`ambiguous`, `unavailable`, `UNAVAILABLE`, …), and an error status. **Never on a span:** SQL text or bound values (a store span is named by its function), a token, a request or response body, Authentik response text, a URL actually called (identifiers stay template placeholders), or a connection URL. The span layer is fixed at span metadata from this product's own crates: `RUST_LOG` filters log output only and cannot drop a span, dependencies' internal spans (`h2`, `hyper`, `tonic`) are not exported, and a `tracing` event is a log record, never also a span event.
+## Upgrading
 
-An inbound W3C `traceparent` is adopted as the request span's parent, and the current context is injected into every Authentik call — **whether or not anything exports**: with telemetry off the span layer still runs over a no-op tracer, so a trace passing through a silent server is not broken. The inbound header's **sampled flag is not obeyed**: it arrives from the public internet before authentication, and a parent-based sampler would drop every span under a "not sampled" parent — letting any caller keep its requests, and the `user.*` they carry, out of Tempo with one header. The trace id and parent are kept, so a caller's trace still joins, and the `traceparent` forwarded to Authentik carries the sampled flag this server decided — also with telemetry off. The cost: a request that carries a `traceparent` is always recorded, whatever ratio `OTEL_TRACES_SAMPLER_ARG` sets for traces this server starts. A caller can still choose *which* trace id its request joins, including someone else's: a trace id is a correlation handle, not an authorisation boundary, and `user.id` on the server span says who actually made the call. `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` choose the sampler for traces this server starts (validated at startup); unset, the SDK default `parentbased_always_on` keeps everything, and sampling is the collector's decision.
+Stop traffic and the old server, back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new release, and run `docker compose up -d`. Migrations are forward-only, so a downgrade means restoring the backup.
 
-**Not spanned or timed, deliberately:** the internal listener (`/readyz`) and the gRPC health service on the public port (`grpc.health.v1.Health/*`, which the container health check calls every few seconds). Health checking is separate from telemetry, and a span or a data point per probe is noise.
+> [!IMPORTANT]
+> Some releases need clients upgraded in a particular order. Read [Upgrading](docs/upgrading.md) for the procedure and the notes for every release between yours and the target.
 
-**`user.*` on spans is personal data held in Tempo.** `user.id` is the token's subject and `user.name` the identity provider's `preferred_username` (else `username`) — span attributes only, never metric labels or log fields. Since 2.42.0 every authenticated request carries `user.name`, including those from the CLI and MCP server, which previously carried only `user.id`. For an access URL's requests, `user.name` is the connection's display name, marked `(access URL)` (see [Audit trail](#audit-trail)): an operator-chosen label rather than a person's name, though whoever chooses it may well write one in. It follows that **access to Tempo is access to who did what, when**: grant it as you would the audit trail, and treat **Tempo's retention as the control** on how long it is kept, since nothing in this product deletes a span. The web UI's log records (below) that join these traces carry the same two attributes from the same provider, stamped by its ingest rather than trusted from the client.
+## Compatibility
 
-**Configured how.** Three states, decided by the variables alone:
+The API is served as versioned protobuf packages, currently `sovereign.config.v4` (preferred) and `sovereign.config.v3`, over native gRPC and gRPC-Web on one port. A client sends the versions it speaks to an unversioned handshake, and the server answers with every version it serves. The client then uses the best one both sides support. A client older than the server therefore keeps working, and upgrading the server alone is safe. A version is retired only after it is announced with a deprecation date and its authenticated traffic has dropped to zero.
 
-| Variables | Behaviour |
-| --- | --- |
-| No `OTEL_*` variable set | Telemetry off: stdout only, no exporter, no background thread, one startup line saying so. This is `cargo run`, `cargo test` and CI — nothing needs setting. |
-| `OTEL_SDK_DISABLED=true` | The same, for a deployment that carries the variables and wants them silent. |
-| Anything else | The whole set is validated before the server does anything else, then logs, spans and metrics export. Each signal is silenced on its own by its `OTEL_*_EXPORTER=none`. |
+`v4` adds the audit-trail query to `v3`'s surface and validates a request's shape before authorizing it. Negotiation does not cover every change: some releases changed what older clients see without a protocol change, and [Upgrading](docs/upgrading.md) says how to sequence them. [Protocol versioning](docs/protocol-versioning.md) describes negotiation, the compatibility rules, and how versions are introduced and retired.
 
-Validation fails startup — naming the variable, never quoting its value — on: a signal exporting with no `OTEL_EXPORTER_OTLP_ENDPOINT` (the SDK's localhost default is never used); an endpoint that is not an absolute `http(s)` URL; a protocol other than `http/protobuf` (`grpc` is a valid value elsewhere but this server is not built with it); an exporter other than `otlp`/`none`; `OTEL_PROPAGATORS` other than `tracecontext`; a sampler other than `always_on`, `always_off` or a `parentbased_*` one (plain `traceidratio` is refused: it decides from the trace id, which a caller's `traceparent` chooses) or a sampler argument outside 0–1; a non-numeric batch or timeout setting; and a missing `service.name` or `deployment.environment.name`. `RUST_LOG` stays the one setting outside the family and filters the log output only.
+## Roadmap
 
-A deployment sets:
+The project intends to extend Sovereign Config in these directions. They are statements of intent, not commitments, and none has a release date.
 
-| Variable | Dev / prod value |
-| --- | --- |
-| `OTEL_SERVICE_NAME` | `sovereign-config` |
-| `OTEL_RESOURCE_ATTRIBUTES` | `deployment.environment.name=<dev\|prod>,telemetry_source=otlp` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://monitor-alloy:4318` |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` |
-| `OTEL_LOGS_EXPORTER`, `OTEL_METRICS_EXPORTER`, `OTEL_TRACES_EXPORTER` | `otlp` |
+| | Direction | Intent |
+| :---: | --- | --- |
+| 🧭 | **An infrastructure-neutral deployment** | `compose.yaml` still names the author's own image registry and Traefik setup (see [step 4](#4-configure-and-start)). The intent is to make the registry, proxy network, entrypoint, certificate resolver and middlewares configurable, or to ship them as an example rather than defaults, so the stack needs no editing. |
+| 🪪 | **More identity providers** | Authentication is built on standard OIDC access tokens, verified locally against the issuer's published keys, but the setup, grant mapping and managed connections currently depend on Authentik. The intent is to support other OIDC identity providers as well. |
+| 🧩 | **Providers for more languages** | Applications currently read configuration through the Rust `sovereign-config-provider` crate, or through `sovereign-config render` from any language. The intent is to offer native providers for other ecosystems, starting with .NET, with the same guarantees: a scoped access URL, protocol negotiation, and no caching of revealed secrets. |
 
-`compose.yaml` passes these **names** through and never holds a value. The values live in the deploy steps of `.woodpecker/deploy-dev.yml` and `deploy-prod.yml`, not in a Sovereign Config layer as other products on the estate keep them: this service is the store `render` reads, and rendering its own deploy from itself would make redeploying a broken store depend on the store. None of the values is secret; `OTEL_EXPORTER_OTLP_HEADERS` is passed through for a collector that needs a credential, and would then come from a pipeline secret. The deploy steps run Compose as its plugin binary rather than `docker compose`: the docker 27 CLI replaces `OTEL_RESOURCE_ATTRIBUTES` with its own attributes when it execs a plugin, which would strip `deployment.environment.name` and fail startup.
+## Documentation
 
-**Failure never reaches the service.** Nothing connects to the collector until the first batch; an unreachable collector costs dropped records and spans (metrics are cumulative, so the next export after an outage carries the totals again) and an `ERROR` line from the `opentelemetry_sdk` target on stdout per failed batch, never a failed request, a failed start or a failed health check. Shutdown flushes pending spans, records and a final metric collection at the same time, within one 5-second bound, so a hung collector cannot use up Docker's ten-second stop grace. The deploy gate (`docker compose up --wait` on the gRPC health check) has no telemetry dependency.
+| | Document | For |
+| :---: | --- | --- |
+| ⌨️ | [CLI](docs/cli.md) | Profiles, commands, output formats, `render`, CI use. |
+| 🖥️ | [Web UI](docs/web-ui.md) | Sessions and the behaviour of each view. |
+| 🤖 | [MCP server](docs/mcp.md) | Installing, configuring and the tool surface. |
+| 🪪 | [Authentication](docs/authentication.md) | Authentik blueprints, grants, token verification, credential rotation, access URLs. |
+| 📜 | [Audit trail](docs/audit-trail.md) | What is recorded, failure policy, querying, the browser view. |
+| 📡 | [Observability](docs/observability.md) | Spans, metrics, logs, configuration, web UI telemetry. |
+| ⬆️ | [Upgrading](docs/upgrading.md) | The upgrade procedure and per-release notes. |
+| 🤝 | [Protocol versioning](docs/protocol-versioning.md) | Version negotiation and the procedure for adding or retiring a version. |
+| 🛠️ | [Development](docs/development.md) | Workspace layout, building, testing and the release gate. |
+| 🏠 | [Project deployment](docs/project-deployment.md) | How the project's own instance is built and deployed. |
+| 🦀 | [Application provider](crates/sovereign-config-provider/README.md) | The Rust library API. |
+| 🪶 | [Woodpecker secrets extension](crates/sovereign-config-woodpecker-broker/README.md) | Broker configuration, layer syntax and cutover. |
 
-In Loki the server's records select as `{service_name="sovereign-config", deployment_environment="dev", log_source="otlp"}`: the platform's collector copies `telemetry_source` to its `log_source` label and `deployment.environment.name` to `deployment_environment` at ingest, and keeps `telemetry_source` as structured metadata. The same lines also arrive once more from the container's stdout under `log_source="docker"` while both paths run.
+## License
 
-`compose.yaml` labels **both** containers — the server and its database — with `observability.service.name` and `observability.deployment.environment`, so each is one service in two environments rather than two services named after their containers. Those labels now serve the stdout log path only; neither container carries a scrape label. The client-telemetry ingest carries the same two labels, and is the one container with scrape labels (for its own `:8888`; see [Client telemetry](#client-telemetry-the-web-ui)). The labels state identity only: **build identity is never a discovery label**, because a label carrying the release starts a fresh set of series on every deploy.
-
-### Metrics
-
-Metrics are **pushed over OTLP** with the same resource identity as spans and logs, collected and exported every 60 seconds (`OTEL_METRIC_EXPORT_INTERVAL`), cumulative. The platform's collector stores them in Prometheus, translating each instrument's name — dots to underscores, a unit word for a unit (`s` → `_seconds`), `_total` for a counter — and promoting only `service.name` (as `job` and `service_name`), `service.instance.id` (as `instance`) and `deployment.environment.name` (as `deployment_environment`) to series labels; every other resource attribute, `service.version` included, reaches Prometheus only on `target_info`. A series therefore selects as `{job="sovereign-config", deployment_environment="dev"}`. Every name and label below is the stored one; the table in `crates/sovereign-config-server/src/metrics/tests.rs` is the source of truth, and a rename that would move one fails there.
-
-| Stored as | Kind | Labels | Measures |
-| --- | --- | --- | --- |
-| `rpc_server_call_duration_seconds` | histogram | `rpc_system_name`, `rpc_method` (a served route, else `_OTHER`), `rpc_response_status_code` (`OK`, `UNAVAILABLE`, …), `error_type` on a server-error code | **RED** for every gRPC and gRPC-Web call: rate is `_count`, errors are the non-`OK` (or `error_type`) share, latency the buckets |
-| `http_server_request_duration_seconds` | histogram | `http_request_method`, `http_response_status_code`, `error_type` on a 5xx | RED for the web UI's asset requests — never the path |
-| `sovereign_config_audit_sweep_duration_seconds` | histogram | `error_type` on a failed sweep | RED for the hourly retention sweep |
-| `db_client_connection_count` | gauge | `db_client_connection_pool_name="postgres"`, `db_client_connection_state` (`idle`, `used`) | **Saturation** of the Postgres pool |
-| `db_client_connection_max` | gauge | `db_client_connection_pool_name` | The pool's ceiling; `used` over it is how close a request is to waiting for a connection |
-| `sovereign_config_build_info` | gauge, always 1 | `version`, `revision`, `protocol` | Build identity (below) |
-| `sovereign_config_protocol_requests_total` | counter | `version`, `outcome` | Requests by protocol version (below); the retirement gate |
-| `sovereign_config_protocol_client_versions_total` | counter | `version` | Versions named in handshake client lists |
-| `sovereign_config_authentication_total` | counter | `outcome`, `reason` | Authentication results, bounded reasons only: `accepted`, `missing_bearer`, `malformed_bearer`, `wrong_algorithm`, `bad_signature` (no published key verifies it, including an unknown `kid`), `inactive` (expired or not yet valid), `invalid_claims`, `dependency_unavailable` (an uncached key that could not be fetched) |
-| `sovereign_config_managed_connection_operations_total` | counter | `operation`, `result` | Managed-connection operations |
-| `sovereign_config_managed_dependency_total` | counter | `call`, `outcome` | Authentik calls made for managed connections |
-| `sovereign_config_audit_events_total` | counter | `kind`, `outcome` | Audit writes; `outcome="failed"` is the alert series ([Audit trail](#audit-trail)) |
-| `sovereign_config_audit_retention_swept_total`, `…_sweep_failures_total` | counter | — | The retention sweep |
-
-Durations are seconds, on explicit boundaries (5 ms to 10 s, the semantic conventions' recommendation), and a histogram's labels are its span's attribute keys and values, so a metric and a trace agree. Every counter series exists from startup at zero, whether or not anything has happened: an unused protocol version reads `0`, not absent. **No label is ever request-derived** — every value comes from a compiled-in enumeration — and no series carries an identifier, a path or build identity; a test over everything the exporter receives fails on any of the forbidden keys, whatever the metric. Health probes are not recorded.
-
-`sovereign_config_up` is gone with the scrape: under push, a server that stops reporting simply goes quiet, and the absence of `sovereign_config_build_info` (#422) is what says so. Readiness — including the database probe `up` used to carry — is `/readyz` on the internal listener, which is not telemetry.
-
-Build identity is `sovereign_config_build_info{version="…",revision="…",protocol="…"} 1` — a gauge pinned at 1, joined onto other series with `… * on(job, instance) group_left(version, revision, protocol)`, where `instance` is the server's `service.instance.id` and so survives a redeploy. For example, the call rate by release: `sum by (job, instance) (rate(rpc_server_call_duration_seconds_count[5m])) * on(job, instance) group_left(version, revision) sovereign_config_build_info`. `version` is the release the binary was stamped with, `revision` the commit (`unknown` for an unstamped local build), and `protocol` **the whole served set, most preferred first** — `v4,v3`. It is one series and stays one series: a series per version would match an instance twice and break that join, and a single preferred version would claim the server had dropped the older versions it still serves. Per-version traffic, and the retirement gate, are `sovereign_config_protocol_requests_total` below.
-
-`sovereign_config_protocol_requests_total{version="…",outcome="…"}` counts gRPC requests by the protocol version their route names, in two series:
-
-| `outcome` | Counts | Answers |
-| --- | --- | --- |
-| `attempted` | Every `POST` to a well-formed route of that version, **before** authentication. gRPC and gRPC-Web are `POST`-only, so a crawler's `GET` against a versioned path counts nowhere. | Is anything still *trying* to speak this version? Includes scanners and clients with revoked credentials. |
-| `authenticated` | The subset of those that passed authentication. | Is any **real consumer** still speaking this version? |
-
-**The `authenticated` series is the input to the retirement decision** described under [Protocol versioning](#protocol-versioning): a protocol version may not be removed until it has been flat at zero across a full deployment cycle of every consuming application, because clients have no fallback. It is a separate series precisely so the gate is reachable — the endpoint is public, and traffic that would not break on retirement can hold `attempted` above zero forever. `attempted ≥ authenticated` always holds, and the difference is refused traffic.
-
-Both answer a question `GetVersion` alone cannot — negotiation happens once at connect, so a long-lived provider registers a single connect and then goes quiet while its traffic continues. The `GetVersion` handshake is itself unauthenticated, so it appears under `attempted` only. The `version` label is drawn from a compiled-in list and never from the request. Traffic on a `/sovereign.config.` route this build does not serve — an unknown version, or a path not shaped like `<version>.<Service>/<Method>` — is counted under `version="unrecognised",outcome="attempted"` rather than creating a label of its own or being credited to a real version.
-
-### Client telemetry: the web UI
-
-The web UI sends **spans and structured log records** over OTLP/JSON (hand-built: `wasm32` has no OpenTelemetry SDK) to an **authenticated ingest that is same-origin with the app, one per environment**. The CLI, MCP server, provider and broker send nothing: they are operator tools, not user devices.
-
-**The ingest** is the `otlp-ingest` service in `compose.yaml`: the published `ghcr.io/vcheesbrough/otlp-collector-oidc` image, pinned by digest and unmodified. It validates the bearer access token against this environment's provider — signature, issuer and **audience** (`SOVEREIGN_CONFIG_OIDC_ISSUER` / `SOVEREIGN_CONFIG_OIDC_AUDIENCE`, the server's own values, so a token minted for any other client is refused), expiry and the `telemetry:write` scope — and refuses a token without `sub` or `preferred_username`. It then **stamps over whatever the page sent**: `user.id` (`sub`), `user.name` (`preferred_username`), `user.email` and `user.full_name` when the token has them, `deployment.environment.name` and `telemetry_source=client` (`CLIENT_RESOURCE_ATTRIBUTES`); it bounds `service.name` to `sovereign-config-web`, caps the decompressed body at 1 MiB, clamps timestamps, refuses client metrics, and forwards to `monitor-alloy` with the same `OTEL_EXPORTER_OTLP_*` values the server uses. Every refusal of a token is `401`, the failed rule named in the body, and counted in the ingest's own metrics (`otelcol_oidcclientauth_rejections{reason}`, scraped from its `:8888` through its Docker labels — the one container here that is still scraped, because the published image serves Prometheus). Its outbound connections are the provider's discovery and JWKS (`auth.desync.link`) and the collector; nothing else.
-
-**Routing.** Traefik routes `Host(<SOVEREIGN_CONFIG_HOST>) && PathPrefix(/v1/)` — OTLP's own paths, unrewritten — to the ingest over TLS to its embedded certificate, with the app's `lan-vpn-only`, `rate-limit` and `crowdsec` middlewares and a 1 MiB body cap. `/v1/` is free on the app's host: gRPC-Web is under `/sovereign.config.*` and `/grpc.health.v1.*`, and the page's own routes are `/configuration/`, `/connections/`, `/audit/` and `/downloads`. The ingest publishes no port, sits on `proxy-backend` only, and runs as its image's user `10001`, read-only, with every capability dropped and 128 MiB of memory.
-
-**Never in a gate.** The ingest is in its own Compose profile, so the deploy's health-gated `up --wait` does not include it; the deploy starts it afterwards with `--profile client-telemetry up -d --no-deps otlp-ingest`, and a failure there is a warning, not a failed deploy. Nothing lists it in `depends_on`. **Stopping the container is the emergency stop** — every page in that environment drops its spans and records and carries on; there is no kill switch to build. Server telemetry never passes through it.
-
-**How the page learns of it.** The server's `/app-config.js`, which already carried the issuer and client id, gains a `telemetry` member — `{endpoint, serviceVersion}` — only when `SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT` is set, and that value must be the public origin (startup fails otherwise, because the page sends the operator's token there). **Absent means off:** the page initialises nothing, sends nothing, and says so once on the console. There is no compiled-in endpoint. `serviceVersion` is the server's release, which is the build of the bundle it embeds. This is a static asset, not a protocol change: no `sovereign.config` message or RPC is involved. It is product configuration handed to the page, not a knob of the server's own telemetry, which stays the `OTEL_*` family.
-
-**What the page does.**
-
-- **Credential:** the operator's access token, read per request and never refreshed by telemetry — the page's own OIDC stack refreshes, and a second refresher would race it for the one refresh token. The page asks for `telemetry:write` only when an ingest is configured.
-- **Failure is normal:** a `401` marks the token stale so the page's next call refreshes it, and a second `401` stops export for the rest of the page's life; `429`, `502`, `503`, `504` and no answer at all are retried within the session with exponential backoff and jitter (honouring `Retry-After`), at most three times; every other status drops the batch; three batches given up in a row stop export for the page. Spans and records share that one policy — one refresh, one stop — and one flush, logs first; each signal waits in its own buffer bounded at 500 items and 256 KiB, oldest dropped first, and leaves once the page has been quiet for a second (at most five seconds after the first), so an action is one request per signal however long its calls take. On page hide best-effort `keepalive` requests send what is waiting, within one 48 KiB budget. Failures are console **warnings on transitions only** — starting to fail, recovering, giving up — never a line per batch and never anything the operator is shown. Records made before a login are not sent, nor is an action that ends without a session; a warning among the records goes to the console. Logging out discards everything waiting, so nothing leaves under the next operator's token.
-- **What a record says:** one per gRPC-Web call — `rpc.system=grpc`, `rpc.service`, `rpc.method`, `sovereign_config.client.duration_ms`, and on failure `error.type` (a bounded error kind) at `WARN`. Bodies and attribute values are compiled-in text or numbers by type, so a token, a value, a secret the page shows, or a configuration path cannot reach a record. The page sets no `user.*`. The records keep the key names they shipped with in 2.38 (`rpc.system`, `rpc.service`, and `rpc.method` as the bare method) so Loki queries written against them still hold; the spans use the server's current names.
-- **Spans — a trace starts in the browser:** each user action — a click, a submit, a keystroke, a history pop, the page load — is one trace, carried by the action's own future so interleaved actions never share one, and ending when the last future the action spawned does. Its **root** is an `internal` span named for the action from a compiled-in set (`navigate`, `page_load`, `save_value`, `reveal_secret`, …; never a path or a value), carrying `sovereign_config.client.rpc_count` and failed when any of its calls failed. Under it, **one `client` span per gRPC-Web call**, named `<service>/<method>` like the server's own span, with the server's keys: `rpc.system.name=grpc`, `rpc.method`, `rpc.response.status_code` when an answer carried a status, `sovereign_config.protocol.version`, and on any non-`OK` outcome `error.type` (the status name, or a bounded error kind when no status came back) with an error status — the client side counts every non-`OK` code as failed, where the server marks only its own faults. Each call's sampled `traceparent` names **that call's span** as the parent, so the server's request span (adopted, above) hangs under it, and Traefik's under that. The call's log record carries the same `trace_id` and `span_id`. An action that made no call (a copy to the clipboard) exports nothing; one that makes more than 64 exports the first 64 call spans and counts them all, and its later calls name the root as their `traceparent`'s parent, so their server spans hang under it rather than under a span never sent. Actions leave on `POST /v1/traces` when they end, with the same bearer and failure rules as the records.
-
-**When the ingest is not running**, the edge falls back to the app's own router for `/v1/`. The server refuses anything under `/v1/` with a `404` before authentication — no token verified per batch — so the page sees "no ingest here", drops its batches, and after three stops for the session with one console warning.
-
-**Finding it.** In Tempo: `{resource.service.name="sovereign-config-web" && resource.deployment.environment="dev"}` finds the page's traces, each rooted in the browser (`resource.log_source="client"` marks what came through the ingest); `{resource.service.name="sovereign-config-web" && name="navigate"}` one kind of action. In Loki: `{service_name="sovereign-config-web", log_source="client", deployment_environment="dev"}` — the platform copies `telemetry_source` to `log_source` and `deployment.environment.name` to `deployment_environment`, as for the server, and keeps `telemetry_source="client"` and `user_name` as structured metadata. A record's `trace_id` finds its trace in Tempo, and its `span_id` the call's span. The ingest's own logs are `{service_name="sovereign-config-otlp-ingest"}`.
-
-**`telemetry:write` is per client, not per user.** Authentik grants a provider's scopes to every user who signs in to it, so the scope cannot be withdrawn from one operator. What it does buy: the CLI and MCP server share the web UI's client id and never request it, so their tokens are refused by the ingest. Withdrawing client telemetry from everyone in an environment is stopping its ingest, or unsetting `SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT`.
-
-**What follows from stamping identity.** Loki now holds `user.*` on the web UI's records, as Tempo does on the server's spans: **access to Loki is access to who did what, when**, so Grafana permissions over it are a personal-data control and are granted as the audit trail is. **The platform's retention (7 days) is the stated mitigation**, and it is how a deletion request is answered: nothing in this product deletes a record, and none outlives that window. These values never become metric labels.
-
-## Release Gate
-
-Release a version — push its git tag — only after `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `shellcheck` and unit tests of the repository's shell scripts, native and WASM checks, unit and integration checks, PostgreSQL migration checks, gRPC/gRPC-Web checks, and Chromium/Firefox UI checks pass. Candidate images reach the `-ci` repositories as soon as they are built, before those checks finish; only a release copies them to the names deployments and other pipelines pin. Each release publishes **three** images from the same source tag and the same semver — `sovereign-config`, `sovereign-config-woodpecker-broker` and `sovereign-config-cli` — so they are protocol-matched by construction; a deployment fails closed if any is missing from the registry. Each image builds from its own `docker/<image>.Dockerfile` (`server` / `broker` / `cli`). The release image bundles static musl CLI and MCP-server installers built from the same tag and served unauthenticated under `/dist`; the image build gates on each installer extracting to a binary whose reported version equals the release tag. The tagged source also supplies the protocol-matched CLI and MCP server through `cargo install --locked`. SBOM generation is out of scope for the MVP.
+Sovereign Config is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).

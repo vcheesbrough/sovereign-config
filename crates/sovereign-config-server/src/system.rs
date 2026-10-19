@@ -13,7 +13,7 @@
 //!
 //! The served list itself lives here because this is where it has always lived,
 //! and both readers — this RPC and the handshake — take it from one place.
-//! See `## Protocol versioning` in `README.md`.
+//! See `docs/protocol-versioning.md`.
 
 use sovereign_config_core::ProtocolVersion;
 use sovereign_config_proto::sovereign::config::{
@@ -70,7 +70,7 @@ pub(crate) struct ServedProtocol {
 /// `add_service` call for it must already be on the router. Removing one is the
 /// last step of retiring it, gated on the `outcome="authenticated"` series of
 /// `sovereign_config_protocol_requests_total` reading zero for that version —
-/// see the README.
+/// see `docs/protocol-versioning.md`.
 pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ServedProtocol] = &[
     ServedProtocol {
         version: ProtocolVersion::V4,

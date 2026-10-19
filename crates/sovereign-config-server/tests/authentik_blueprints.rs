@@ -43,7 +43,7 @@ fn blueprints_emit_isolated_granular_grants() {
 /// The web UI's provider grants `telemetry:write`, which the client-telemetry
 /// ingest requires, and `profile`, which puts the `preferred_username` it
 /// also requires on the access token. Losing either stops client telemetry
-/// in silence (README "Observability").
+/// in silence (docs/observability.md).
 #[test]
 fn the_web_ui_provider_carries_the_telemetry_scope() {
     for (blueprint, provider, telemetry_mapping) in [

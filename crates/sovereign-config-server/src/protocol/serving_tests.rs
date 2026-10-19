@@ -324,7 +324,7 @@ async fn a_client_compiled_without_the_supported_set_still_decodes_and_negotiate
 ///
 /// The failure mode is silent and expensive: an under-counting metric reads
 /// zero for a version that is still in use, which is exactly the signal the
-/// README makes the precondition for deleting that version's package. The
+/// protocol-versioning doc makes the precondition for deleting that version's package. The
 /// resulting outage would have no failing test behind it.
 #[tokio::test]
 async fn a_request_refused_beneath_the_layer_is_still_counted() {
