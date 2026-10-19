@@ -517,16 +517,16 @@ impl ManagedConnectionsService {
             // makes authoritative, tells "still current" from "gone"; when
             // it cannot answer either, the outcome is as unknown as an
             // ambiguous one, and settles the same way.
-            ProviderError::Rejected => match self.credential_gone(username).await {
-                Some(gone) => gone,
-                None => {
+            ProviderError::Rejected => {
+                let Some(gone) = self.credential_gone(username).await else {
                     warn!(
                         connection_id = connection_id.as_str(),
                         "rotation was refused and whether the credential still exists could not be confirmed; the connection stays rotation_unknown until its lease expires and a retry settles it"
                     );
                     return;
-                }
-            },
+                };
+                gone
+            }
             ProviderError::NotFound => true,
             // Ambiguous: the provider may have applied the new key.
             ProviderError::Ambiguous | ProviderError::Invalid => {
