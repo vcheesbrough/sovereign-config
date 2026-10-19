@@ -265,22 +265,33 @@ fn validated_client_telemetry_endpoint(
 
 /// The OAuth client every access URL names, which managed accounts
 /// authenticate through: `SOVEREIGN_CONFIG_MANAGER_CLIENT_ID` when set, else
-/// the token audience — the same value with Authentik, where the audience is
-/// the application's client id. It must be a client id a connection URL can
-/// carry; the audience otherwise need not be, so the error says which
-/// variable to change.
+/// the token audience. With Authentik the two must be equal — a token minted
+/// through any other client carries that client's id as its `aud` and would
+/// be refused — and the audience is then also what a connection URL must be
+/// able to carry. Every refusal names the variable to change, never a value.
+/// The Authentik crate checks the same rule again; this is the check that can
+/// name the variables.
 fn manager_client_id(explicit: Option<&str>, audience: &str) -> Result<String> {
-    match explicit.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(client_id) if ClientCredential::admits_client_id(client_id) => {
-            Ok(client_id.to_owned())
+    if let Some(client_id) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        if !ClientCredential::admits_client_id(client_id) {
+            bail!("{MANAGER_CLIENT_ID} is not a client id a connection URL can carry");
         }
-        Some(_) => bail!("{MANAGER_CLIENT_ID} is not a client id a connection URL can carry"),
-        None if ClientCredential::admits_client_id(audience) => Ok(audience.to_owned()),
-        None => bail!(
-            "SOVEREIGN_CONFIG_OIDC_AUDIENCE is not a client id a connection URL can carry; \
-             set {MANAGER_CLIENT_ID} to the client access URLs should name"
-        ),
+        if client_id != audience {
+            bail!(
+                "{MANAGER_CLIENT_ID} must equal SOVEREIGN_CONFIG_OIDC_AUDIENCE with Authentik, \
+                 whose tokens carry the client id they were minted through as their audience; \
+                 leave it unset"
+            );
+        }
     }
+    if !ClientCredential::admits_client_id(audience) {
+        bail!(
+            "SOVEREIGN_CONFIG_OIDC_AUDIENCE is not a client id a connection URL can carry; \
+             with Authentik it is also the client id access URLs name, so it must be the \
+             application's client id"
+        );
+    }
+    Ok(audience.to_owned())
 }
 
 /// An optional whole-number setting: `default` when unset or blank, otherwise
@@ -517,34 +528,51 @@ mod tests {
         }
     }
 
-    /// Decoupled from the audience: an audience a URL can't carry is fine
-    /// once the client id is set, and each refusal names the variable to
-    /// change without quoting either value.
+    /// With Authentik the client id is the audience: setting it to anything
+    /// else, or to a value of the wrong form, is refused, as is an audience a
+    /// URL can't carry. Each refusal names the variable to change and quotes
+    /// no value.
     #[test]
     fn the_access_url_client_id_is_checked_and_names_its_variable() {
-        let urn_audience = "urn:sentinel:audience";
         assert_eq!(
-            manager_client_id(Some("sovereign-config"), urn_audience).unwrap(),
+            manager_client_id(Some("sovereign-config"), "sovereign-config").unwrap(),
             "sovereign-config"
         );
 
-        let unset = format!("{:#}", manager_client_id(None, urn_audience).unwrap_err());
-        assert!(unset.contains("SOVEREIGN_CONFIG_OIDC_AUDIENCE"), "{unset}");
+        let mismatch = format!(
+            "{:#}",
+            manager_client_id(Some("other-sentinel"), "audience-sentinel").unwrap_err()
+        );
         assert!(
-            unset.contains("SOVEREIGN_CONFIG_MANAGER_CLIENT_ID"),
-            "{unset}"
+            mismatch.starts_with(
+                "SOVEREIGN_CONFIG_MANAGER_CLIENT_ID must equal SOVEREIGN_CONFIG_OIDC_AUDIENCE"
+            ),
+            "{mismatch}"
         );
 
-        let set = format!(
+        let malformed = format!(
             "{:#}",
             manager_client_id(Some("bad sentinel/id"), "sovereign-config").unwrap_err()
         );
         assert!(
-            set.starts_with("SOVEREIGN_CONFIG_MANAGER_CLIENT_ID"),
-            "{set}"
+            malformed.starts_with("SOVEREIGN_CONFIG_MANAGER_CLIENT_ID is not"),
+            "{malformed}"
         );
 
-        for message in [unset, set] {
+        let audience = format!(
+            "{:#}",
+            manager_client_id(None, "urn:sentinel:audience").unwrap_err()
+        );
+        assert!(
+            audience.starts_with("SOVEREIGN_CONFIG_OIDC_AUDIENCE is not"),
+            "{audience}"
+        );
+        assert!(
+            !audience.contains("set SOVEREIGN_CONFIG_MANAGER_CLIENT_ID"),
+            "{audience}"
+        );
+
+        for message in [mismatch, malformed, audience] {
             assert!(!message.contains("sentinel"), "{message}");
         }
     }

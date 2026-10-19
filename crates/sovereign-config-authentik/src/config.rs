@@ -66,8 +66,6 @@ impl AuthentikConfig {
     }
 }
 
-/// Validates the client id a connection URL carries, by the grammar the URL
-/// itself admits.
 /// The client id, provided it is the audience (see [`AuthentikConfig::new`]).
 fn client_id_for(client_id: &str, audience: &str) -> Result<String> {
     let client_id = validated_client_id(client_id)?;
@@ -80,6 +78,8 @@ fn client_id_for(client_id: &str, audience: &str) -> Result<String> {
     Ok(client_id)
 }
 
+/// Validates the client id a connection URL carries, by the grammar the URL
+/// itself admits.
 fn validated_client_id(value: &str) -> Result<String> {
     if !ClientCredential::admits_client_id(value) {
         bail!("the managed accounts' OAuth client id is not one a connection URL admits");
