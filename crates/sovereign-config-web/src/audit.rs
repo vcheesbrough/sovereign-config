@@ -8,7 +8,8 @@
 
 use crate::telemetry::{ActionKind, spawn_local};
 use sovereign_config_core::{
-    AuditEntry, AuditEventKind, AuditQuery, ClientError, ConfigPath, ProtocolVersion, Timestamp,
+    AuditCounts, AuditEntry, AuditEventKind, AuditQuery, ClientError, ConfigPath, ProtocolVersion,
+    Timestamp,
 };
 use std::cell::RefCell;
 use wasm_bindgen::JsCast;
@@ -108,6 +109,7 @@ impl KindGroup {
 pub(crate) struct FilterInput {
     pub(crate) path: String,
     pub(crate) text: String,
+    pub(crate) actor: String,
     pub(crate) from: Option<Timestamp>,
     pub(crate) until: Option<Timestamp>,
     pub(crate) protocol_version: String,
@@ -148,6 +150,13 @@ pub(crate) fn build_query(
     if text.chars().count() > MAX_TEXT_FILTER_CHARACTERS || text.contains('\0') {
         errors.push(FilterError {
             field: "audit-text-filter",
+            message: "enter at most 256 characters",
+        });
+    }
+    let actor = input.actor.trim();
+    if actor.chars().count() > MAX_TEXT_FILTER_CHARACTERS || actor.contains('\0') {
+        errors.push(FilterError {
+            field: "audit-actor-filter",
             message: "enter at most 256 characters",
         });
     }
@@ -203,6 +212,7 @@ pub(crate) fn build_query(
         kinds,
         page_size: 0,
         cursor: None,
+        actor_filter: (!actor.is_empty()).then(|| actor.to_owned()),
     })
 }
 
@@ -261,7 +271,12 @@ impl PageRequest {
 }
 
 pub(crate) enum PageOutcome {
-    Loaded { next_cursor: Option<String> },
+    Loaded {
+        next_cursor: Option<String>,
+        /// The query's counts, when this was its first page and the service's
+        /// version reports them.
+        counts: Option<AuditCounts>,
+    },
     Failed,
 }
 
@@ -280,6 +295,7 @@ pub(crate) struct AuditFeed {
     query: AuditQuery,
     next_cursor: Option<String>,
     state: FeedState,
+    counts: Option<AuditCounts>,
 }
 
 impl AuditFeed {
@@ -291,6 +307,7 @@ impl AuditFeed {
         self.query = query;
         self.next_cursor = None;
         self.state = FeedState::Loading;
+        self.counts = None;
         self.request()
     }
 
@@ -319,13 +336,20 @@ impl AuditFeed {
             return false;
         }
         match outcome {
-            PageOutcome::Loaded { next_cursor } => {
+            PageOutcome::Loaded {
+                next_cursor,
+                counts,
+            } => {
                 self.state = if next_cursor.is_some() {
                     FeedState::Idle
                 } else {
                     FeedState::Ended
                 };
                 self.next_cursor = next_cursor;
+                // Only a first page carries counts; later pages keep them.
+                if counts.is_some() {
+                    self.counts = counts;
+                }
             }
             PageOutcome::Failed => self.state = FeedState::Failed,
         }
@@ -344,6 +368,7 @@ impl AuditFeed {
         self.active = false;
         self.next_cursor = None;
         self.state = FeedState::Idle;
+        self.counts = None;
     }
 
     /// Whether the list already shows `query`, loaded or loading, so asking
@@ -356,6 +381,10 @@ impl AuditFeed {
         self.state
     }
 
+    pub(crate) const fn counts(&self) -> Option<AuditCounts> {
+        self.counts
+    }
+
     fn request(&self) -> PageRequest {
         PageRequest {
             generation: self.generation,
@@ -364,6 +393,23 @@ impl AuditFeed {
                 ..self.query.clone()
             },
         }
+    }
+}
+
+/// The line above the list once a page has loaded: the trail's size and how
+/// much of it matches, when the service reports them; otherwise how many rows
+/// are on show, and whether more may follow.
+pub(crate) fn status_text(loaded: u32, counts: Option<AuditCounts>, ended: bool) -> String {
+    let noun = |count: u64| if count == 1 { "event" } else { "events" };
+    match counts {
+        Some(AuditCounts { total, matching }) if matching == total => {
+            format!("{total} {}", noun(total))
+        }
+        Some(AuditCounts { total, matching }) => {
+            format!("{matching} of {total} {} match", noun(total))
+        }
+        None if ended => format!("{loaded} {}", noun(loaded.into())),
+        None => format!("{loaded} {} so far", noun(loaded.into())),
     }
 }
 
@@ -488,6 +534,7 @@ fn reset_filters(value_history: bool) {
     for id in [
         "audit-path-filter",
         "audit-text-filter",
+        "audit-actor-filter",
         "audit-from",
         "audit-until",
         "audit-protocol",
@@ -581,6 +628,7 @@ fn clear_filter_errors() {
     for field in [
         "audit-path-filter",
         "audit-text-filter",
+        "audit-actor-filter",
         "audit-protocol",
         "audit-until",
         "audit-kinds",
@@ -606,6 +654,7 @@ fn read_form() -> FilterInput {
     FilterInput {
         path: text("audit-path-filter"),
         text: text("audit-text-filter"),
+        actor: text("audit-actor-filter"),
         from: instant("audit-from"),
         until: instant("audit-until").map(end_of_minute),
         protocol_version: text("audit-protocol"),
@@ -642,10 +691,12 @@ async fn fetch_page(request: PageRequest) {
     if !FEED.with_borrow(|feed| feed.is_current(request.generation)) {
         return;
     }
-    let result = result.and_then(|page| append_events(&page.events).map(|()| page.next_cursor));
+    let result = result
+        .and_then(|page| append_events(&page.events).map(|()| (page.next_cursor, page.counts)));
     let outcome = match &result {
-        Ok(next_cursor) => PageOutcome::Loaded {
+        Ok((next_cursor, counts)) => PageOutcome::Loaded {
             next_cursor: next_cursor.clone(),
+            counts: *counts,
         },
         Err(_) => PageOutcome::Failed,
     };
@@ -654,16 +705,9 @@ async fn fetch_page(request: PageRequest) {
         Ok(_) => {
             let count = audit_row_count();
             set_hidden("empty-audit", count != 0);
-            let ended = FEED.with_borrow(AuditFeed::state) == FeedState::Ended;
-            let noun = if count == 1 { "event" } else { "events" };
-            set_text(
-                "audit-state",
-                &if ended {
-                    format!("{count} {noun}")
-                } else {
-                    format!("{count} {noun} so far")
-                },
-            );
+            let (ended, counts) =
+                FEED.with_borrow(|feed| (feed.state() == FeedState::Ended, feed.counts()));
+            set_text("audit-state", &status_text(count, counts, ended));
             if ended {
                 disarm_observer();
             } else {
@@ -764,11 +808,11 @@ fn render_event(document: &Document, event: &AuditEntry) -> Result<Element, Clie
 
 #[cfg(test)]
 mod tests {
-    use sovereign_config_core::{AuditEventKind, AuditQuery, ConfigPath, Timestamp};
+    use sovereign_config_core::{AuditCounts, AuditEventKind, AuditQuery, ConfigPath, Timestamp};
 
     use super::{
         AuditFeed, FeedState, FilterInput, KindGroup, PageOutcome, build_query, end_of_minute,
-        timestamp_from_millis,
+        status_text, timestamp_from_millis,
     };
 
     fn query(text: &str) -> AuditQuery {
@@ -781,7 +825,12 @@ mod tests {
     fn loaded(cursor: Option<&str>) -> PageOutcome {
         PageOutcome::Loaded {
             next_cursor: cursor.map(str::to_owned),
+            counts: None,
         }
+    }
+
+    const fn counts(total: u64, matching: u64) -> AuditCounts {
+        AuditCounts { total, matching }
     }
 
     fn defaults(element: bool) -> FilterInput {
@@ -919,6 +968,66 @@ mod tests {
     }
 
     #[test]
+    fn the_first_pages_counts_are_kept_while_scrolling_and_dropped_on_restart() {
+        let mut feed = AuditFeed::default();
+        let first = feed.restart(query("x"));
+        assert!(feed.settle(
+            first.generation,
+            PageOutcome::Loaded {
+                next_cursor: Some("page-2".into()),
+                counts: Some(counts(120, 7)),
+            }
+        ));
+        assert_eq!(feed.counts(), Some(counts(120, 7)));
+        let second = feed.advance().unwrap();
+        assert!(feed.settle(second.generation, loaded(None)));
+        assert_eq!(
+            feed.counts(),
+            Some(counts(120, 7)),
+            "a later page carries none and must not clear them"
+        );
+
+        feed.restart(query("y"));
+        assert_eq!(feed.counts(), None, "a new query has not been counted yet");
+        feed.invalidate();
+        assert_eq!(feed.counts(), None);
+    }
+
+    #[test]
+    fn the_status_line_shows_the_total_and_the_matches() {
+        assert_eq!(
+            status_text(100, Some(counts(2345, 2345)), false),
+            "2345 events"
+        );
+        assert_eq!(status_text(1, Some(counts(1, 1)), true), "1 event");
+        assert_eq!(
+            status_text(7, Some(counts(2345, 7)), true),
+            "7 of 2345 events match"
+        );
+        assert_eq!(
+            status_text(0, Some(counts(1, 0)), true),
+            "0 of 1 event match"
+        );
+        assert_eq!(status_text(0, Some(counts(0, 0)), true), "0 events");
+        // A service that reports no counts (`v4`) gets what was on show.
+        assert_eq!(status_text(100, None, false), "100 events so far");
+        assert_eq!(status_text(1, None, true), "1 event");
+    }
+
+    #[test]
+    fn an_empty_actor_filter_is_no_filter() {
+        let query = build_query(
+            &FilterInput {
+                actor: "   ".into(),
+                ..defaults(false)
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(query.actor_filter, None);
+    }
+
+    #[test]
     fn every_kind_belongs_to_exactly_one_group() {
         for kind in AuditEventKind::ALL {
             let groups = KindGroup::ALL
@@ -964,6 +1073,7 @@ mod tests {
         let input = FilterInput {
             path: " apps/api ".into(),
             text: " revealed ".into(),
+            actor: " Ops Bot ".into(),
             from: Some(Timestamp {
                 seconds: 10,
                 nanos: 0,
@@ -978,6 +1088,7 @@ mod tests {
         let query = build_query(&input, None).unwrap();
         assert_eq!(query.path_filter.as_deref(), Some("apps/api"));
         assert_eq!(query.text_filter.as_deref(), Some("revealed"));
+        assert_eq!(query.actor_filter.as_deref(), Some("Ops Bot"));
         assert_eq!(query.from.map(|at| at.seconds), Some(10));
         assert_eq!(query.until.map(|at| at.seconds), Some(20));
         assert_eq!(query.protocol_version.as_deref(), Some("v3"));
@@ -990,6 +1101,7 @@ mod tests {
         let input = FilterInput {
             path: "apps.api".into(),
             text: "x".repeat(257),
+            actor: "a\0b".into(),
             from: Some(Timestamp {
                 seconds: 20,
                 nanos: 0,
@@ -1011,6 +1123,7 @@ mod tests {
             [
                 "audit-path-filter",
                 "audit-text-filter",
+                "audit-actor-filter",
                 "audit-protocol",
                 "audit-until",
                 "audit-kinds"

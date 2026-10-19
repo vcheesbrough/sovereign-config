@@ -71,14 +71,22 @@ Note the converse: a change can break clients *without* being a protocol change.
 
 | Version | Preference | What it is |
 | --- | --- | --- |
-| `v4` | first | `v3`'s whole surface plus the `Audit` service. Validates a request's shape before authorizing it. |
-| `v3` | second | The original surface. No announced retirement. |
+| `v5` | first | `v4`'s whole surface, with an actor filter on the audit query and the query's counts on its first page. |
+| `v4` | second | `v3`'s whole surface plus the `Audit` service. Validates a request's shape before authorizing it. No announced retirement. |
+| `v3` | third | The original surface. No announced retirement. |
 
 `v4` differs from `v3` in exactly three ways, each recorded in `proto/sovereign/config/v4/service.proto`:
 
 - **`Audit.QueryAuditTrail`** reads the [audit trail](audit-trail.md) back. `v3` has no such service.
 - **A malformed request is refused before it is authorized.** A `PutValue` with no content or with a NUL in it, a `ReplaceSubTree` entry with no content, and a managed connection with an empty, unknown or unspecified permission are `INVALID_ARGUMENT` on `v4` whoever sends them. `v3` authorizes first and reports the caller's missing grant instead — `v3`'s order, which cannot change. The wording of each refusal is the same on both.
 - **`GetVersion` lists the served versions most preferred first**, where `v3` lists them oldest first.
+
+`v5` differs from `v4` only in `Audit.QueryAuditTrail`, as recorded in `proto/sovereign/config/v5/service.proto`:
+
+- **`actor_filter`** on the request: a fragment matched case-insensitively anywhere in the actor's subject or recorded name. A client on `v4` has no way to send it, and the clients in this workspace refuse a `v4` query that carries one rather than drop it, which would show every actor's events as matches.
+- **`total_count` and `match_count`** on the response, set on a query's first page only: how many events the caller may see in the query's scope, and how many of them match every filter.
+
+Every other service is unchanged, and so is the rest of `v4`'s behaviour.
 
 ## Introducing a new version
 

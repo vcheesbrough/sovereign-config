@@ -18,7 +18,9 @@
 //! content, and recording it would make every scroll of the trail a new entry
 //! in it.
 
-use sovereign_config_core::{AuditEntry, AuditEventKind, AuditPage, ConfigPath, Timestamp};
+use sovereign_config_core::{
+    AuditCounts, AuditEntry, AuditEventKind, AuditPage, ConfigPath, Timestamp,
+};
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use tonic::Status;
@@ -31,7 +33,7 @@ use crate::rpc::{CallContext, storage_unavailable, to_timestamp};
 /// The longest path fragment a query may carry: comfortably past any real
 /// path, short enough that a request cannot make the trigram match costly.
 const MAX_PATH_FILTER_CHARACTERS: usize = 512;
-/// The longest narrative fragment a query may carry.
+/// The longest narrative or actor fragment a query may carry.
 const MAX_TEXT_FILTER_CHARACTERS: usize = 256;
 /// The longest protocol version label the trail stores; see the table's own
 /// `protocol_version` constraint.
@@ -56,6 +58,10 @@ pub(super) struct TrailQuery<'a> {
     pub(super) kinds: Option<Vec<AuditEventKind>>,
     pub(super) page_size: u32,
     pub(super) cursor: &'a str,
+    pub(super) actor_filter: &'a str,
+    /// Whether the caller's version reports the query's counts. They are
+    /// counted on the first page only.
+    pub(super) counts: bool,
 }
 
 /// A query whose every filter has been validated and folded.
@@ -63,6 +69,7 @@ struct ValidQuery<'a> {
     path_fragment: Option<String>,
     element: Option<ElementScope>,
     text_fragment: Option<&'a str>,
+    actor_fragment: Option<&'a str>,
     from: Option<OffsetDateTime>,
     until: Option<OffsetDateTime>,
     protocol_version: Option<&'a str>,
@@ -88,33 +95,45 @@ impl AuditTrailService {
         let readable_prefixes = granted_prefixes(principal, Permission::Read);
         let manageable_prefixes = granted_prefixes(principal, Permission::Manage);
         if readable_prefixes.is_empty() && manageable_prefixes.is_empty() {
-            return Ok(AuditPage::default());
+            return Ok(AuditPage {
+                counts: (query.counts && valid.after.is_none()).then(AuditCounts::default),
+                ..AuditPage::default()
+            });
         }
         let page_size = match query.page_size {
             0 => self.page_size,
             requested => requested.min(self.page_size),
         };
-        let rows = store::query_events(
-            &self.database,
-            &EventFilter {
-                readable_prefixes: &readable_prefixes,
-                manageable_prefixes: &manageable_prefixes,
-                path_fragment: valid.path_fragment.as_deref(),
-                element: valid.element.as_ref(),
-                text_fragment: valid.text_fragment,
-                from: valid.from,
-                until: valid.until,
-                protocol_version: valid.protocol_version,
-                kinds: &valid.kinds,
-                after: valid.after,
-                // One row past the page says whether there is another page,
-                // without a cursor that leads to an empty one.
-                limit: i64::from(page_size) + 1,
-            },
-        )
-        .await
-        .map_err(|_| storage_unavailable())?;
-        page(rows, page_size)
+        let filter = EventFilter {
+            readable_prefixes: &readable_prefixes,
+            manageable_prefixes: &manageable_prefixes,
+            path_fragment: valid.path_fragment.as_deref(),
+            element: valid.element.as_ref(),
+            text_fragment: valid.text_fragment,
+            actor_fragment: valid.actor_fragment,
+            from: valid.from,
+            until: valid.until,
+            protocol_version: valid.protocol_version,
+            kinds: &valid.kinds,
+            after: valid.after,
+            // One row past the page says whether there is another page,
+            // without a cursor that leads to an empty one.
+            limit: i64::from(page_size) + 1,
+        };
+        let rows = store::query_events(&self.database, &filter)
+            .await
+            .map_err(|_| storage_unavailable())?;
+        let mut page = page(rows, page_size)?;
+        if query.counts && valid.after.is_none() {
+            let counts = store::count_events(&self.database, &filter)
+                .await
+                .map_err(|_| storage_unavailable())?;
+            page.counts = Some(AuditCounts {
+                total: u64::try_from(counts.total).map_err(|_| storage_unavailable())?,
+                matching: u64::try_from(counts.matching).map_err(|_| storage_unavailable())?,
+            });
+        }
+        Ok(page)
     }
 }
 
@@ -159,11 +178,10 @@ fn validate<'a>(query: &'a TrailQuery<'a>) -> Result<ValidQuery<'a>, Status> {
         return Err(invalid_query());
     }
     let text_fragment = non_empty(query.text_filter)
-        .map(|fragment| {
-            (fragment.chars().count() <= MAX_TEXT_FILTER_CHARACTERS && !fragment.contains('\0'))
-                .then_some(fragment)
-                .ok_or_else(invalid_query)
-        })
+        .map(free_text_fragment)
+        .transpose()?;
+    let actor_fragment = non_empty(query.actor_filter)
+        .map(free_text_fragment)
         .transpose()?;
     let protocol_version = non_empty(query.protocol_version)
         .map(|version| {
@@ -192,12 +210,25 @@ fn validate<'a>(query: &'a TrailQuery<'a>) -> Result<ValidQuery<'a>, Status> {
         path_fragment,
         element,
         text_fragment,
+        actor_fragment,
         from,
         until,
         protocol_version,
         kinds,
         after,
     })
+}
+
+/// A fragment of free text — a narrative or an actor — as a query may carry
+/// it: bounded, and with no NUL, which `PostgreSQL` text cannot hold.
+#[expect(
+    clippy::result_large_err,
+    reason = "tonic::Status is the crate's RPC error type and is returned by value"
+)]
+fn free_text_fragment(fragment: &str) -> Result<&str, Status> {
+    (fragment.chars().count() <= MAX_TEXT_FILTER_CHARACTERS && !fragment.contains('\0'))
+        .then_some(fragment)
+        .ok_or_else(invalid_query)
 }
 
 fn non_empty(text: &str) -> Option<&str> {
@@ -278,6 +309,7 @@ fn page(mut rows: Vec<StoredEvent>, page_size: u32) -> Result<AuditPage, Status>
     Ok(AuditPage {
         events,
         next_cursor,
+        counts: None,
     })
 }
 
@@ -328,6 +360,8 @@ mod tests {
             kinds: Some(Vec::new()),
             page_size: 0,
             cursor: "",
+            actor_filter: "",
+            counts: false,
         }
     }
 
@@ -432,6 +466,30 @@ mod tests {
         let valid = validate(&kinds).unwrap();
         assert_eq!(valid.kinds, ["secret.revealed"]);
         assert_eq!(valid.protocol_version, Some("v4"));
+    }
+
+    #[test]
+    fn the_actor_filter_is_bounded_free_text() {
+        let actor = TrailQuery {
+            actor_filter: "Ops Bot",
+            ..query()
+        };
+        assert_eq!(validate(&actor).unwrap().actor_fragment, Some("Ops Bot"));
+        assert_eq!(validate(&query()).unwrap().actor_fragment, None);
+        let long = "ü".repeat(257);
+        for invalid in ["a\0b", long.as_str()] {
+            let query = TrailQuery {
+                actor_filter: invalid,
+                ..query()
+            };
+            assert!(validate(&query).is_err(), "{invalid:?}");
+        }
+        let longest = "ü".repeat(256);
+        let query = TrailQuery {
+            actor_filter: &longest,
+            ..query()
+        };
+        assert!(validate(&query).is_ok(), "the limit counts characters");
     }
 
     #[test]

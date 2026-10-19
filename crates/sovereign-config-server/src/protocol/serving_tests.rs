@@ -243,7 +243,7 @@ async fn both_protocol_packages_answer_on_their_own_routes() {
     assert_eq!(v3.protocol_version, "v3");
     // `v3` advertises the served set oldest first, whatever the preference
     // order of `SERVED_PROTOCOL_LABELS`.
-    assert_eq!(v3.supported_protocol_versions, ["v3", "v4"]);
+    assert_eq!(v3.supported_protocol_versions, ["v3", "v4", "v5"]);
     assert_eq!(test.application_version, "testversion-service");
     assert_eq!(test.protocol_version, TEST_VERSION);
     assert_ne!(v3.application_version, test.application_version);
@@ -773,13 +773,13 @@ async fn the_handshake_answers_without_a_version_and_is_counted_under_none() {
     );
 }
 
-/// `v4` served beside `v3` the way `main.rs` registers them, behind the
-/// shipped labels: each version's `GetVersion` keeps its own contract, each is
-/// counted under its own label, and `v4`'s `Audit` route is registered — it
-/// answers for itself rather than falling through as `UNIMPLEMENTED`.
+/// `v4` and `v5` served beside `v3` the way `main.rs` registers them, behind
+/// the shipped labels: each version's `GetVersion` keeps its own contract,
+/// each is counted under its own label, and each `Audit` route is registered —
+/// it answers for itself rather than falling through as `UNIMPLEMENTED`.
 #[tokio::test]
-async fn v4_serves_beside_v3_with_each_contract_and_label_its_own() {
-    use sovereign_config_proto::sovereign::config::v4;
+async fn every_version_serves_beside_v3_with_each_contract_and_label_its_own() {
+    use sovereign_config_proto::sovereign::config::{v4, v5};
 
     let metrics = Arc::new(ProtocolMetrics::new(SERVED_PROTOCOL_LABELS));
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -789,6 +789,7 @@ async fn v4_serves_beside_v3_with_each_contract_and_label_its_own() {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgresql://unused@127.0.0.1:1/unused")
         .expect("a lazy pool must build without connecting");
+    let audit_trail = Arc::new(crate::audit::AuditTrailService::new(pool, 10));
     let router = Server::builder()
         .layer(ProtocolVersionLayer::new(
             Arc::clone(&metrics),
@@ -799,9 +800,13 @@ async fn v4_serves_beside_v3_with_each_contract_and_label_its_own() {
             crate::system::V4System,
         ))
         .add_service(v4::audit_server::AuditServer::new(
-            crate::audit::v4::V4Audit::new(Arc::new(crate::audit::AuditTrailService::new(
-                pool, 10,
-            ))),
+            crate::audit::v4::V4Audit::new(Arc::clone(&audit_trail)),
+        ))
+        .add_service(v5::system_server::SystemServer::new(
+            crate::system::V5System,
+        ))
+        .add_service(v5::audit_server::AuditServer::new(
+            crate::audit::v5::V5Audit::new(audit_trail),
         ));
     let server = tokio::spawn(
         router.serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
@@ -826,23 +831,41 @@ async fn v4_serves_beside_v3_with_each_contract_and_label_its_own() {
         .await
         .expect("the v4 route must answer")
         .into_inner();
+    let on_v5 = v5::system_client::SystemClient::new(channel.clone())
+        .get_version(v5::GetVersionRequest {
+            protocol_version: "v5".to_owned(),
+        })
+        .await
+        .expect("the v5 route must answer")
+        .into_inner();
     assert_eq!(on_v3.protocol_version, "v3");
-    assert_eq!(on_v3.supported_protocol_versions, ["v3", "v4"]);
+    assert_eq!(on_v3.supported_protocol_versions, ["v3", "v4", "v5"]);
     assert_eq!(on_v4.protocol_version, "v4");
-    assert_eq!(on_v4.supported_protocol_versions, ["v4", "v3"]);
+    assert_eq!(on_v4.supported_protocol_versions, ["v5", "v4", "v3"]);
+    assert_eq!(on_v5.protocol_version, "v5");
+    assert_eq!(on_v5.supported_protocol_versions, ["v5", "v4", "v3"]);
 
-    let audit = v4::audit_client::AuditClient::new(channel)
+    let audit = v4::audit_client::AuditClient::new(channel.clone())
         .query_audit_trail(v4::QueryAuditTrailRequest::default())
         .await
         .expect_err("no principal is attached");
     assert_eq!(
         audit.code(),
         tonic::Code::Unauthenticated,
-        "the audit route must reach its own service"
+        "the v4 audit route must reach its own service"
+    );
+    let audit = v5::audit_client::AuditClient::new(channel)
+        .query_audit_trail(v5::QueryAuditTrailRequest::default())
+        .await
+        .expect_err("no principal is attached");
+    assert_eq!(
+        audit.code(),
+        tonic::Code::Unauthenticated,
+        "the v5 audit route must reach its own service"
     );
 
     let rendered = metrics.series();
-    for (version, count) in [("v3", 1), ("v4", 2)] {
+    for (version, count) in [("v3", 1), ("v4", 2), ("v5", 2)] {
         let series = format!(
             "sovereign_config_protocol_requests_total{{version=\"{version}\",outcome=\"attempted\"}} {count}"
         );

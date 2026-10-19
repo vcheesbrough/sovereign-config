@@ -1,5 +1,6 @@
 //! The `System` service: protocol negotiation and authenticated identity, once
-//! per protocol version — [`SystemService`] for `v3` and [`V4System`] for `v4`.
+//! per protocol version — [`SystemService`] for `v3`, [`V4System`] for `v4` and
+//! [`V5System`] for `v5`.
 //! It stays per-version, unlike every other service, because `GetVersion` is
 //! version-specific by nature: each version answers on its own route, in its
 //! own message, with its own promised ordering.
@@ -21,7 +22,7 @@ use sovereign_config_proto::sovereign::config::{
         GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
         system_server::System,
     },
-    v4,
+    v4, v5,
 };
 use tonic::{Extensions, Request, Response, Status};
 
@@ -73,6 +74,11 @@ pub(crate) struct ServedProtocol {
 /// see `docs/protocol-versioning.md`.
 pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ServedProtocol] = &[
     ServedProtocol {
+        version: ProtocolVersion::V5,
+        age: 5,
+        deprecation_date: None,
+    },
+    ServedProtocol {
         version: ProtocolVersion::V4,
         age: 4,
         deprecation_date: None,
@@ -90,8 +96,11 @@ pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ServedProtocol] = &[
 /// Spelled out rather than derived, because a `const` cannot map a slice; the
 /// test below is what keeps the two in step. Compiled-in labels are what keep
 /// `sovereign_config_protocol_requests_total` bounded.
-pub(crate) const SERVED_PROTOCOL_LABELS: &[&str] =
-    &[ProtocolVersion::V4.as_str(), ProtocolVersion::V3.as_str()];
+pub(crate) const SERVED_PROTOCOL_LABELS: &[&str] = &[
+    ProtocolVersion::V5.as_str(),
+    ProtocolVersion::V4.as_str(),
+    ProtocolVersion::V3.as_str(),
+];
 
 /// The version a request that names no version this server serves is told about:
 /// the most preferred served version.
@@ -143,10 +152,10 @@ fn v3_supported_protocol_versions() -> Vec<String> {
     advertised_to_v3(SERVED_PROTOCOL_VERSIONS)
 }
 
-/// The served set as **`v4`** reports it: most preferred first, the order the
-/// handshake reports. `v4` is free to choose, because it is a new contract;
-/// `v3` is not, and keeps its own order.
-fn v4_supported_protocol_versions() -> Vec<String> {
+/// The served set as **`v4`** and **`v5`** report it: most preferred first,
+/// the order the handshake reports. `v4` was free to choose, because it was a
+/// new contract; `v3` is not, and keeps its own order.
+fn preferred_first_supported_protocol_versions() -> Vec<String> {
     SERVED_PROTOCOL_VERSIONS
         .iter()
         .map(|entry| entry.version.as_str().to_owned())
@@ -225,7 +234,7 @@ impl v4::system_server::System for V4System {
         Ok(Response::new(v4::GetVersionResponse {
             application_version: APPLICATION_VERSION.to_owned(),
             protocol_version: echoed(request.into_inner().protocol_version),
-            supported_protocol_versions: v4_supported_protocol_versions(),
+            supported_protocol_versions: preferred_first_supported_protocol_versions(),
         }))
     }
 
@@ -240,15 +249,43 @@ impl v4::system_server::System for V4System {
     }
 }
 
+/// `v5`'s `System`: unchanged from `v4`'s.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct V5System;
+
+#[tonic::async_trait]
+impl v5::system_server::System for V5System {
+    async fn get_version(
+        &self,
+        request: Request<v5::GetVersionRequest>,
+    ) -> Result<Response<v5::GetVersionResponse>, Status> {
+        Ok(Response::new(v5::GetVersionResponse {
+            application_version: APPLICATION_VERSION.to_owned(),
+            protocol_version: echoed(request.into_inner().protocol_version),
+            supported_protocol_versions: preferred_first_supported_protocol_versions(),
+        }))
+    }
+
+    async fn get_identity(
+        &self,
+        request: Request<v5::GetIdentityRequest>,
+    ) -> Result<Response<v5::GetIdentityResponse>, Status> {
+        require_principal(request.extensions())?;
+        Ok(Response::new(v5::GetIdentityResponse {
+            authenticated: true,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         SERVED_PROTOCOL_LABELS, SERVED_PROTOCOL_VERSIONS, ServedProtocol, System, SystemService,
-        V4System, advertised_to_v3, oldest_first, v3_supported_protocol_versions,
+        V4System, V5System, advertised_to_v3, oldest_first, v3_supported_protocol_versions,
     };
     use crate::APPLICATION_VERSION;
     use sovereign_config_core::ProtocolVersion;
-    use sovereign_config_proto::sovereign::config::{v3::GetVersionRequest, v4};
+    use sovereign_config_proto::sovereign::config::{v3::GetVersionRequest, v4, v5};
     use tonic::Request;
 
     async fn get_version(
@@ -269,7 +306,7 @@ mod tests {
 
         assert_eq!(response.protocol_version, ProtocolVersion::V3.as_str());
         assert_eq!(response.application_version, APPLICATION_VERSION);
-        assert_eq!(response.supported_protocol_versions, ["v3", "v4"]);
+        assert_eq!(response.supported_protocol_versions, ["v3", "v4", "v5"]);
     }
 
     #[tokio::test]
@@ -399,7 +436,7 @@ mod tests {
                 ProtocolVersion::PREFERRED.as_str(),
                 "an unserved request falls back to the preferred served version"
             );
-            assert_eq!(response.supported_protocol_versions, ["v3", "v4"]);
+            assert_eq!(response.supported_protocol_versions, ["v3", "v4", "v5"]);
         }
     }
 
@@ -425,10 +462,40 @@ mod tests {
 
             assert_eq!(response.protocol_version, requested);
             assert_eq!(response.application_version, APPLICATION_VERSION);
-            assert_eq!(response.supported_protocol_versions, ["v4", "v3"]);
+            assert_eq!(response.supported_protocol_versions, ["v5", "v4", "v3"]);
         }
         let unserved = get_version_on_v4("v1").await;
-        assert_eq!(unserved.protocol_version, ProtocolVersion::V4.as_str());
+        assert_eq!(
+            unserved.protocol_version,
+            ProtocolVersion::PREFERRED.as_str()
+        );
+    }
+
+    /// `v5` keeps the same echo and the same order as `v4`.
+    #[tokio::test]
+    async fn v5_echoes_the_requested_version_and_advertises_preference_order() {
+        for requested in ["v5", "v4", "v3"] {
+            let response = v5::system_server::System::get_version(
+                &V5System,
+                Request::new(v5::GetVersionRequest {
+                    protocol_version: requested.to_owned(),
+                }),
+            )
+            .await
+            .expect("GetVersion never rejects a requested version")
+            .into_inner();
+
+            assert_eq!(response.protocol_version, requested);
+            assert_eq!(response.application_version, APPLICATION_VERSION);
+            assert_eq!(response.supported_protocol_versions, ["v5", "v4", "v3"]);
+        }
+        let refused = v5::system_server::System::get_identity(
+            &V5System,
+            Request::new(v5::GetIdentityRequest {}),
+        )
+        .await
+        .expect_err("no principal is attached");
+        assert_eq!(refused.code(), tonic::Code::Unauthenticated);
     }
 
     #[tokio::test]

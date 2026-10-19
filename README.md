@@ -377,7 +377,7 @@ A caller holding `manage` on a path can create **access URLs** rooted there, gra
 
 ## Audit trail
 
-Every configuration change, every secret reveal, every read and every access-URL create, rotate and revoke is recorded. Each record names the identity behind it and the protocol version the call arrived on. **No secret value is ever recorded.** Changes and reveals fail closed: one that cannot be recorded does not happen. Repeated reads by the same identity collapse into a single event per window, which keeps a year of retention practical. The trail is searchable in the web UI and through the `v4` API, and each caller sees only events on paths they may read. See [Audit trail](docs/audit-trail.md).
+Every configuration change, every secret reveal, every read and every access-URL create, rotate and revoke is recorded. Each record names the identity behind it and the protocol version the call arrived on. **No secret value is ever recorded.** Changes and reveals fail closed: one that cannot be recorded does not happen. Repeated reads by the same identity collapse into a single event per window, which keeps a year of retention practical. The trail is searchable in the web UI and through the API from `v4` (by actor, and with counts, from `v5`), and each caller sees only events on paths they may read. See [Audit trail](docs/audit-trail.md).
 
 ## Observability
 
@@ -407,9 +407,9 @@ Stop traffic and the old server, back up the database, set `SOVEREIGN_CONFIG_IMA
 
 ## Compatibility
 
-The API is served as versioned protobuf packages, currently `sovereign.config.v4` (preferred) and `sovereign.config.v3`, over native gRPC and gRPC-Web on one port. A client sends the versions it speaks to an unversioned handshake, and the server answers with every version it serves. The client then uses the best one both sides support. A client older than the server therefore keeps working, and upgrading the server alone is safe. A version is retired only after it is announced with a deprecation date and its authenticated traffic has dropped to zero.
+The API is served as versioned protobuf packages, currently `sovereign.config.v5` (preferred), `sovereign.config.v4` and `sovereign.config.v3`, over native gRPC and gRPC-Web on one port. A client sends the versions it speaks to an unversioned handshake, and the server answers with every version it serves. The client then uses the best one both sides support. A client older than the server therefore keeps working, and upgrading the server alone is safe. A version is retired only after it is announced with a deprecation date and its authenticated traffic has dropped to zero.
 
-`v4` adds the audit-trail query to `v3`'s surface and validates a request's shape before authorizing it. Negotiation does not cover every change: some releases changed what older clients see without a protocol change, and [Upgrading](docs/upgrading.md) says how to sequence them. [Protocol versioning](docs/protocol-versioning.md) describes negotiation, the compatibility rules, and how versions are introduced and retired.
+`v4` adds the audit-trail query to `v3`'s surface and validates a request's shape before authorizing it; `v5` adds an actor filter and counts to that query. Negotiation does not cover every change: some releases changed what older clients see without a protocol change, and [Upgrading](docs/upgrading.md) says how to sequence them. [Protocol versioning](docs/protocol-versioning.md) describes negotiation, the compatibility rules, and how versions are introduced and retired.
 
 ## Roadmap
 

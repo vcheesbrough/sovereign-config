@@ -240,6 +240,8 @@ pub(super) struct EventFilter<'a> {
     pub(super) path_fragment: Option<&'a str>,
     pub(super) element: Option<&'a ElementScope>,
     pub(super) text_fragment: Option<&'a str>,
+    /// Matched against the actor's subject and the name it was recorded with.
+    pub(super) actor_fragment: Option<&'a str>,
     pub(super) from: Option<OffsetDateTime>,
     pub(super) until: Option<OffsetDateTime>,
     pub(super) protocol_version: Option<&'a str>,
@@ -296,6 +298,76 @@ fn push_covered<'a>(
         ));
 }
 
+/// The query's scope: every event the caller may see, narrowed to one value's
+/// history for an element query. What a total counts.
+fn push_scope<'a>(query: &mut QueryBuilder<'a, Postgres>, filter: &EventFilter<'a>) {
+    query.push("((kind NOT IN (");
+    push_connection_kinds(query);
+    query.push(") AND ");
+    push_covered(query, "path_fold", filter.readable_prefixes);
+    query.push(") OR (kind IN (");
+    push_connection_kinds(query);
+    query.push(") AND ");
+    push_covered(query, "path_fold", filter.manageable_prefixes);
+    // An alias event names its other path, so it needs `read` there too. One
+    // with no counterpart recorded is hidden rather than shown: failing closed
+    // costs a row, failing open discloses a path.
+    query.push(")) AND (kind <> 'value.path_added' OR ");
+    push_covered(query, "counterpart_fold", filter.readable_prefixes);
+    query.push(")");
+    if let Some(element) = filter.element {
+        query
+            .push(" AND (path_fold = ")
+            .push_bind(&element.path)
+            .push(" OR (kind = 'subtree.read' AND path_fold = ANY(")
+            .push_bind(&element.ancestors)
+            .push(")) OR (kind = 'values.listed' AND path_fold = ")
+            .push_bind(&element.parent)
+            .push("))");
+    }
+}
+
+/// Every filter that narrows the scope, each as an ` AND …` clause, so an
+/// unset one adds nothing.
+fn push_filters<'a>(query: &mut QueryBuilder<'a, Postgres>, filter: &EventFilter<'a>) {
+    if let Some(fragment) = filter.path_fragment {
+        query
+            .push(" AND path_fold LIKE ")
+            .push_bind(contains_pattern(fragment))
+            .push(" ESCAPE '\\'");
+    }
+    if let Some(fragment) = filter.text_fragment {
+        query
+            .push(" AND narrative ILIKE ")
+            .push_bind(contains_pattern(fragment))
+            .push(" ESCAPE '\\'");
+    }
+    if let Some(fragment) = filter.actor_fragment {
+        let pattern = contains_pattern(fragment);
+        query
+            .push(" AND (actor_subject ILIKE ")
+            .push_bind(pattern.clone())
+            .push(" ESCAPE '\\' OR actor_name ILIKE ")
+            .push_bind(pattern)
+            .push(" ESCAPE '\\')");
+    }
+    if let Some(from) = filter.from {
+        query.push(" AND occurred_at >= ").push_bind(from);
+    }
+    if let Some(until) = filter.until {
+        query.push(" AND first_occurred_at <= ").push_bind(until);
+    }
+    if let Some(version) = filter.protocol_version {
+        query.push(" AND protocol_version = ").push_bind(version);
+    }
+    if !filter.kinds.is_empty() {
+        query
+            .push(" AND kind = ANY(")
+            .push_bind(filter.kinds)
+            .push(")");
+    }
+}
+
 /// One page of events matching `filter`, newest first.
 ///
 /// Built clause by clause so each filter that is unset costs nothing and each
@@ -313,58 +385,10 @@ pub(super) async fn query_events(
     let mut query = QueryBuilder::<Postgres>::new(
         "SELECT id, kind, display_path, occurred_at, first_occurred_at, event_count, \
          actor_subject, actor_name, protocol_version, old_value, new_value, narrative \
-         FROM audit_events WHERE ((kind NOT IN (",
+         FROM audit_events WHERE ",
     );
-    push_connection_kinds(&mut query);
-    query.push(") AND ");
-    push_covered(&mut query, "path_fold", filter.readable_prefixes);
-    query.push(") OR (kind IN (");
-    push_connection_kinds(&mut query);
-    query.push(") AND ");
-    push_covered(&mut query, "path_fold", filter.manageable_prefixes);
-    // An alias event names its other path, so it needs `read` there too. One
-    // with no counterpart recorded is hidden rather than shown: failing closed
-    // costs a row, failing open discloses a path.
-    query.push(")) AND (kind <> 'value.path_added' OR ");
-    push_covered(&mut query, "counterpart_fold", filter.readable_prefixes);
-    query.push(")");
-    if let Some(fragment) = filter.path_fragment {
-        query
-            .push(" AND path_fold LIKE ")
-            .push_bind(contains_pattern(fragment))
-            .push(" ESCAPE '\\'");
-    }
-    if let Some(element) = filter.element {
-        query
-            .push(" AND (path_fold = ")
-            .push_bind(&element.path)
-            .push(" OR (kind = 'subtree.read' AND path_fold = ANY(")
-            .push_bind(&element.ancestors)
-            .push(")) OR (kind = 'values.listed' AND path_fold = ")
-            .push_bind(&element.parent)
-            .push("))");
-    }
-    if let Some(fragment) = filter.text_fragment {
-        query
-            .push(" AND narrative ILIKE ")
-            .push_bind(contains_pattern(fragment))
-            .push(" ESCAPE '\\'");
-    }
-    if let Some(from) = filter.from {
-        query.push(" AND occurred_at >= ").push_bind(from);
-    }
-    if let Some(until) = filter.until {
-        query.push(" AND first_occurred_at <= ").push_bind(until);
-    }
-    if let Some(version) = filter.protocol_version {
-        query.push(" AND protocol_version = ").push_bind(version);
-    }
-    if !filter.kinds.is_empty() {
-        query
-            .push(" AND kind = ANY(")
-            .push_bind(filter.kinds)
-            .push(")");
-    }
+    push_scope(&mut query, filter);
+    push_filters(&mut query, filter);
     if let Some((first_occurred_at, id)) = filter.after {
         query
             .push(" AND (first_occurred_at, id) < (")
@@ -379,6 +403,37 @@ pub(super) async fn query_events(
     query
         .build_query_as()
         .fetch_all(database)
+        .await
+        .inspect_err(crate::spans::record_storage_error)
+}
+
+/// A query's counts: its scope, and what in it matches every filter.
+#[derive(Debug, FromRow)]
+pub(super) struct EventCounts {
+    pub(super) total: i64,
+    pub(super) matching: i64,
+}
+
+/// How many events `filter`'s scope holds, and how many of them match its
+/// filters, in one pass. The cursor and limit are ignored: these are the
+/// query's counts, not a page's.
+#[instrument(
+    name = "count_events audit_events",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "count_events", db.collection.name = "audit_events")
+)]
+pub(super) async fn count_events(
+    database: &PgPool,
+    filter: &EventFilter<'_>,
+) -> Result<EventCounts, sqlx::Error> {
+    let mut query =
+        QueryBuilder::<Postgres>::new("SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE TRUE");
+    push_filters(&mut query, filter);
+    query.push(") AS matching FROM audit_events WHERE ");
+    push_scope(&mut query, filter);
+    query
+        .build_query_as()
+        .fetch_one(database)
         .await
         .inspect_err(crate::spans::record_storage_error)
 }

@@ -92,10 +92,11 @@ function scalarField(number, value) {
   return Buffer.concat([varint(number << 3), varint(value)]);
 }
 
-// `v4` is `v3` plus the Audit service, with every shared message identical on
-// the wire, so the shared mocks answer on both and a test picks the version its
-// session negotiates (see `negotiate`).
-const SHARED_VERSIONS = '{v3,v4}';
+// `v4` is `v3` plus the Audit service, and `v5` is `v4` with an actor filter
+// and counts on the audit query, with every shared message identical on the
+// wire, so the shared mocks answer on all three and a test picks the version
+// its session negotiates (see `negotiate`).
+const SHARED_VERSIONS = '{v3,v4,v5}';
 
 function storedValue(value) {
   return typeof value === 'string' ? { value, secret: false } : value;
@@ -463,7 +464,8 @@ async function mockApplication(page) {
   });
   await page.route(`**/sovereign.config.${SHARED_VERSIONS}.System/GetVersion`, route => {
     const application = Buffer.from('1.5.0');
-    const protocol = Buffer.from(route.request().url().includes('.v4.') ? 'v4' : 'v3');
+    const url = route.request().url();
+    const protocol = Buffer.from(url.includes('.v5.') ? 'v5' : url.includes('.v4.') ? 'v4' : 'v3');
     const message = Buffer.concat([
       Buffer.from([0x0a, application.length]), application,
       Buffer.from([0x12, protocol.length]), protocol
@@ -608,7 +610,7 @@ async function negotiate(page, version) {
   });
 }
 
-// `v4.AuditEventKind` numbers, by the trail's labels.
+// `v4.AuditEventKind` and `v5.AuditEventKind` numbers, by the trail's labels.
 const AUDIT_KINDS = {
   'value.created': 1,
   'value.updated': 2,
@@ -658,14 +660,14 @@ function auditRequest(body) {
     protocolVersion: text(6),
     kinds: kindNumbers.map(number => labels[number]),
     pageSize: (fields.get(8) || [0])[0],
-    cursor: text(9)
+    cursor: text(9),
+    actorFilter: text(10)
   };
 }
 
-// The service's filters, as docs/audit-trail.md "Reading the trail" states them.
-function auditMatches(event, query) {
-  const firstAt = event.firstAt ?? event.at;
-  if (query.pathFilter && !event.path.toLowerCase().includes(query.pathFilter.toLowerCase())) return false;
+// The query's scope: the whole trail, or one value's history. What a total
+// counts.
+function auditInScope(event, query) {
   if (query.elementPath) {
     const element = query.elementPath.toLowerCase();
     const eventPath = event.path.toLowerCase();
@@ -675,6 +677,21 @@ function auditMatches(event, query) {
     const parentListing = event.kind === 'values.listed' && eventPath === parentPath(element).toLowerCase();
     if (!own && !ancestorRead && !parentListing) return false;
   }
+  return true;
+}
+
+function includesFolded(text, fragment) {
+  return (text || '').toLowerCase().includes(fragment.toLowerCase());
+}
+
+// The service's filters, as docs/audit-trail.md "Reading the trail" states them.
+function auditMatches(event, query) {
+  const firstAt = event.firstAt ?? event.at;
+  if (!auditInScope(event, query)) return false;
+  if (query.pathFilter && !event.path.toLowerCase().includes(query.pathFilter.toLowerCase())) return false;
+  if (query.actorFilter
+    && !includesFolded(event.subject ?? 'operator-subject', query.actorFilter)
+    && !includesFolded(event.name, query.actorFilter)) return false;
   if (query.textFilter && !event.narrative.toLowerCase().includes(query.textFilter.toLowerCase())) return false;
   if (query.protocolVersion && (event.protocol || 'v4') !== query.protocolVersion) return false;
   if (query.kinds.length && !query.kinds.includes(event.kind)) return false;
@@ -684,14 +701,16 @@ function auditMatches(event, query) {
 }
 
 /**
- * Mocks `v4.Audit/QueryAuditTrail` over `events`, which are given newest
- * first. Pages hold `pageSize` events and the cursor is the offset of the next
- * one — opaque to the client, which is all the contract promises.
+ * Mocks `v4.Audit/QueryAuditTrail` and `v5.Audit/QueryAuditTrail` over
+ * `events`, which are given newest first. Pages hold `pageSize` events and the
+ * cursor is the offset of the next one — opaque to the client, which is all the
+ * contract promises. `v5`'s first page also carries the query's counts.
  */
 async function mockAudit(page, { events = [], pageSize = 3 } = {}) {
   const state = { requests: [], failures: 0 };
   let delayed;
-  await page.route('**/sovereign.config.v4.Audit/QueryAuditTrail', async route => {
+  await page.route('**/sovereign.config.{v4,v5}.Audit/QueryAuditTrail', async route => {
+    const v5 = route.request().url().includes('.v5.');
     const query = auditRequest(route.request().postDataBuffer());
     state.requests.push(query);
     const reply = (body, status = 0) => route.fulfill({
@@ -715,9 +734,16 @@ async function mockAudit(page, { events = [], pageSize = 3 } = {}) {
     const start = query.cursor ? Number(query.cursor) : 0;
     const slice = matching.slice(start, start + pageSize);
     const next = start + pageSize < matching.length ? String(start + pageSize) : '';
+    const counted = v5 && !query.cursor;
     return reply(Buffer.concat([
       ...slice.map(event => field(1, auditEvent(event))),
-      ...(next ? [field(2, Buffer.from(next))] : [])
+      ...(next ? [field(2, Buffer.from(next))] : []),
+      ...(counted
+        ? [
+          scalarField(3, events.filter(event => auditInScope(event, query)).length),
+          scalarField(4, matching.length)
+        ]
+        : [])
     ]));
   });
   state.failNext = (count = 1) => { state.failures = count; };

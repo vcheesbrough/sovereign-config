@@ -10,7 +10,7 @@ Each crate has one consumer, target, or artifact. Dependencies only point down t
 
 | Crate | Role | Depends on |
 | --- | --- | --- |
-| `sovereign-config-proto` | Generated gRPC types: one module per protocol version (`v3`, `v4`) plus the unversioned handshake. | — |
+| `sovereign-config-proto` | Generated gRPC types: one module per protocol version (`v3`, `v4`, `v5`) plus the unversioned handshake. | — |
 | `sovereign-config-core` | The shared contract: paths, value and secret newtypes, listing shapes, the JSON subtree codec, connection URLs, and `ClientError`. No I/O and no async. | — |
 | `sovereign-config-identity` | The identity-provider contract managed connections are provisioned through: the `ManagedIdentityProvider` trait, its bounded `ProviderError` and opaque identifiers, and (feature `conformance`) the conformance suite every implementation runs plus the in-memory fake that passes it. No transport. | core |
 | `sovereign-config-telemetry` | The server's telemetry module: `OTEL_*` validation, resource identity, OTLP export and flushing shutdown, and the client span every outbound HTTP call opens (`client`). The only crate that may name an OpenTelemetry SDK or exporter type; its `tests/allowlist.rs` fails if any other does. | — |

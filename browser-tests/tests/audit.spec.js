@@ -47,9 +47,10 @@ function narratives(page) {
   return page.locator('#audit-body .audit-narrative');
 }
 
-// A v4 session: the audit trail is not served on v3.
-async function signIn(page, events, options = {}) {
-  await negotiate(page, 'v4');
+// A v5 session unless a test asks for another: the audit trail is not served
+// on v3, and `v4` has neither the actor filter nor the counts.
+async function signIn(page, events, { version = 'v5', ...options } = {}) {
+  await negotiate(page, version);
   const audit = await mockAudit(page, { events, ...options });
   await openCallback(page);
   await expect(signedIn(page)).toBeVisible();
@@ -81,7 +82,8 @@ test.describe('audit trail', () => {
     expect(audit.requests[0].kinds).not.toContain('subtree.read');
     expect(audit.requests[0].kinds).not.toContain('values.listed');
     expect(audit.requests[0].kinds).toContain('secret.revealed');
-    await expect(page.locator('#audit-state')).toHaveText('4 events');
+    // Reads are hidden on opening, so not everything matches.
+    await expect(page.locator('#audit-state')).toHaveText('4 of 7 events match');
 
     // Timestamp, actor, narrative and protocol version, in that order. The
     // coalesced row is dated by its first occurrence and its narrative
@@ -102,6 +104,7 @@ test.describe('audit trail', () => {
     await page.getByLabel('Reads').check();
     await expect(rows(page)).toHaveCount(7);
     expect(audit.requests.at(-1).kinds).toEqual([]);
+    await expect(page.locator('#audit-state')).toHaveText('7 events');
 
     const accessibility = await new AxeBuilder({ page }).analyze();
     expect(accessibility.violations).toEqual([]);
@@ -114,6 +117,42 @@ test.describe('audit trail', () => {
     await expect(page.getByRole('link', { name: 'Audit trail', exact: true, includeHidden: true }))
       .toHaveAttribute('aria-current', 'page');
     await expect(narratives(page).first()).toHaveText('A Vincent changed /apps/api/token');
+  });
+
+  test('filters by actor name or subject, and says how many events match', async ({ page }) => {
+    const audit = await signIn(page, EVENTS, { pageSize: 25 });
+    await page.goto('/audit/');
+    await expect(rows(page)).toHaveCount(4);
+
+    await page.getByLabel('Actor contains').fill('PROVIDER');
+    await page.getByRole('button', { name: 'Filter' }).click();
+    await expect(narratives(page)).toHaveText([/revealed \/apps\/api\/password/]);
+    expect(audit.requests.at(-1)).toMatchObject({ actorFilter: 'PROVIDER', cursor: '' });
+    await expect(page.locator('#audit-state')).toHaveText('1 of 7 events match');
+
+    await page.getByLabel('Actor contains').fill('vincent');
+    await page.getByRole('button', { name: 'Filter' }).click();
+    await expect(rows(page)).toHaveCount(3);
+    await expect(page.locator('#audit-state')).toHaveText('3 of 7 events match');
+
+    await page.getByLabel('Actor contains').fill('nobody');
+    await page.getByRole('button', { name: 'Filter' }).click();
+    await expect(page.locator('#empty-audit')).toBeVisible();
+    await expect(page.locator('#audit-state')).toHaveText('0 of 7 events match');
+  });
+
+  test('a v4 service shows what has loaded and cannot filter by actor', async ({ page }) => {
+    const audit = await signIn(page, MANY, { pageSize: 25, version: 'v4' });
+    await page.goto('/audit/');
+    await expect(rows(page)).toHaveCount(25);
+    await expect(page.locator('#audit-state')).toHaveText('25 events so far');
+    const asked = audit.requests.length;
+
+    await page.getByLabel('Actor contains').fill('vincent');
+    await page.getByRole('button', { name: 'Filter' }).click();
+    await expect(page.locator('#audit-page-error'))
+      .toHaveText('filtering the audit trail by actor is not available on protocol v4');
+    expect(audit.requests).toHaveLength(asked);
   });
 
   test('filters by path, description, time range, protocol version and event kind', async ({ page }) => {
@@ -216,7 +255,8 @@ test.describe('audit trail', () => {
     const audit = await signIn(page, MANY, { pageSize: 25 });
     await page.goto('/audit/');
     await expect(rows(page)).toHaveCount(25);
-    await expect(page.locator('#audit-state')).toHaveText('25 events so far');
+    // The whole trail's size from the first page, not what has loaded.
+    await expect(page.locator('#audit-state')).toHaveText('60 events');
     expect(audit.requests.map(request => request.cursor)).toEqual(['']);
 
     await scrollToEnd(page);
@@ -285,7 +325,7 @@ test.describe('audit trail', () => {
     releaseFirst();
     await page.waitForTimeout(300);
     await expect(narratives(page)).toHaveText(['A Vincent created /apps/worker/concurrency']);
-    await expect(page.locator('#audit-state')).toHaveText('1 event');
+    await expect(page.locator('#audit-state')).toHaveText('1 of 7 events match');
   });
 
   test('each value opens its own history, including the reads that reached it', async ({ page }) => {

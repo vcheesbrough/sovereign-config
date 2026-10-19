@@ -6,8 +6,9 @@
 //!   served. Pure.
 //! - `store` — every `PostgreSQL` statement behind the trail.
 //! - `service` — reading the trail back, in no protocol version's terms.
-//! - `v4` — the `v4` tonic impl of the `Audit` service: a translation shim
-//!   over `service`. `v3` has no `Audit` service.
+//! - `shim` — the kind and event mapping every version's shim shares.
+//! - `v4`, `v5` — each version's tonic impl of the `Audit` service: a
+//!   translation shim over `service`. `v3` has no `Audit` service.
 //!
 //! **No secret value is ever recorded.** A value reaches an event only as a
 //! [`Recorded`], whose constructor discards anything not classified plain, so
@@ -20,8 +21,10 @@
 
 mod narrative;
 mod service;
+mod shim;
 mod store;
 pub(crate) mod v4;
+pub(crate) mod v5;
 
 use std::{sync::Arc, time::Duration};
 

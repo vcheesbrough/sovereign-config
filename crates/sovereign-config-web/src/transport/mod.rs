@@ -12,8 +12,10 @@
 //! a version the browser cannot dial does not compile.
 
 mod adapter;
+mod audit_wire;
 mod v3;
 mod v4;
+mod v5;
 
 use std::{future::Future, rc::Rc};
 
@@ -51,6 +53,7 @@ use crate::telemetry;
 /// until that version has a dialer.
 fn dialer(version: ProtocolVersion) -> Box<dyn SessionTransport> {
     match version {
+        ProtocolVersion::V5 => Box::new(v5::Dialer),
         ProtocolVersion::V4 => Box::new(v4::Dialer),
         ProtocolVersion::V3 => Box::new(v3::Dialer),
     }
@@ -60,6 +63,7 @@ fn dialer(version: ProtocolVersion) -> Box<dyn SessionTransport> {
 #[cfg(test)]
 fn routes(version: ProtocolVersion) -> &'static [&'static str] {
     match version {
+        ProtocolVersion::V5 => v5::ROUTES,
         ProtocolVersion::V4 => v4::ROUTES,
         ProtocolVersion::V3 => v3::ROUTES,
     }
@@ -583,7 +587,7 @@ mod tests {
 
     use sovereign_config_core::{ClientError, ErrorKind, ProtocolVersion};
 
-    use super::{BrowserTransport, routes, v4};
+    use super::{BrowserTransport, routes, v4, v5};
 
     /// The RPCs a version's routes have to cover: `System` (2),
     /// `Configuration` (8) and `ManagedConnections` (4). Written as the sum so
@@ -645,6 +649,40 @@ mod tests {
         assert_eq!(
             v4::AUDIT_ROUTES,
             ["/sovereign.config.v4.Audit/QueryAuditTrail"]
+        );
+    }
+
+    #[test]
+    fn v5_audit_routes_name_v5() {
+        assert_eq!(
+            v5::AUDIT_ROUTES,
+            ["/sovereign.config.v5.Audit/QueryAuditTrail"]
+        );
+    }
+
+    /// `v4` cannot filter by actor. Sending the query without the filter would
+    /// show every actor's events as matches, so the dialer refuses it without
+    /// posting.
+    #[tokio::test]
+    async fn a_v4_dialer_refuses_an_actor_filter_without_posting() {
+        use sovereign_config_client::AuditTransport as _;
+        use sovereign_config_core::{AuditQuery, Secret};
+
+        let error = super::v4::Dialer
+            .query_audit_trail(
+                &AuditQuery {
+                    actor_filter: Some("ops".into()),
+                    ..AuditQuery::default()
+                },
+                &Secret::new("audit-token"),
+            )
+            .await
+            .expect_err("v4 cannot filter by actor");
+
+        assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
+        assert_eq!(
+            error.message(),
+            "filtering the audit trail by actor is not available on protocol v4"
         );
     }
 
