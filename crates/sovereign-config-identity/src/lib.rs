@@ -151,6 +151,32 @@ opaque_identifier!(
     CredentialId
 );
 
+/// What a client presents at the provider's token endpoint to act as an
+/// account: the `client_credentials` grant's `client_id`, and the secret the
+/// connection URL carries for it.
+///
+/// The client id is the provider's to choose. One that authenticates app
+/// passwords through a shared client (Authentik) returns that client's id for
+/// every account; one that makes each account its own OAuth client
+/// (Keycloak) returns that client's id. The server puts it in the connection
+/// URL as given, so deployed clients need no change either way.
+pub struct ClientCredential {
+    /// Non-empty, and only ASCII letters, digits, `-`, `.`, `_` and `~`: what
+    /// a connection URL admits.
+    pub client_id: String,
+    pub secret: Secret,
+}
+
+/// Redacts the secret by construction; the client id is not sensitive.
+impl fmt::Debug for ClientCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientCredential")
+            .field("client_id", &self.client_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The service account [`ManagedIdentityProvider::create_account`] created.
 pub struct ProvisionedAccount {
     pub account: AccountId,
@@ -158,7 +184,7 @@ pub struct ProvisionedAccount {
     /// trail records its access under. Bounded like an identifier.
     pub subject: String,
     /// The account's one credential, returned only here and only once.
-    pub secret: Secret,
+    pub credential: ClientCredential,
 }
 
 /// Redacts every identifier and the credential by construction, so a failed
@@ -255,8 +281,14 @@ pub trait ManagedIdentityProvider: Send + Sync {
     async fn find_credentials(&self, username: &str) -> Result<Vec<CredentialId>, ProviderError>;
 
     /// Replaces the credential's value with a fresh one the implementation
-    /// generates, and returns it. The previous value stops working.
-    async fn replace_credential(&self, credential: &CredentialId) -> Result<Secret, ProviderError>;
+    /// generates, and returns it with the client id it authenticates as —
+    /// the same one [`Self::create_account`] returned. The previous value
+    /// stops working: a provider that keeps a rotated secret valid for a
+    /// grace period must not.
+    async fn replace_credential(
+        &self,
+        credential: &CredentialId,
+    ) -> Result<ClientCredential, ProviderError>;
 
     /// Deletes the account, and with it every credential it holds.
     /// [`ProviderError::NotFound`] when it no longer exists.
@@ -299,7 +331,10 @@ mod tests {
         let provisioned = ProvisionedAccount {
             account: account.clone(),
             subject: "subject-sentinel".to_owned(),
-            secret: Secret::new("secret-sentinel"),
+            credential: ClientCredential {
+                client_id: "sovereign-config".to_owned(),
+                secret: Secret::new("secret-sentinel"),
+            },
         };
         let printed = format!("{account:?} {credential:?} {provisioned:?}");
         assert!(!printed.contains("sentinel"), "{printed}");

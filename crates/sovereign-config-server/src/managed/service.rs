@@ -36,11 +36,11 @@ use crate::metrics::{
 };
 use crate::rpc::{CallContext, STORAGE_UNAVAILABLE_MESSAGE};
 
-/// Non-secret settings used to build canonical connection URLs.
+/// Non-secret settings used to build canonical connection URLs. The client id
+/// a URL carries is the identity provider's, returned with each credential.
 pub(crate) struct ManagedSettings {
     pub(crate) public_origin: String,
     pub(crate) issuer: String,
-    pub(crate) client_id: String,
     /// How long a rotation marked `rotation_unknown` is assumed to still be in
     /// flight. Must exceed the identity provider's call timeout so an expired
     /// lease proves the previous attempt has ended.
@@ -320,9 +320,9 @@ impl ManagedConnectionsService {
             &self.settings.public_origin,
             &root,
             &self.settings.issuer,
-            &self.settings.client_id,
+            &replacement.client_id,
             &username,
-            &replacement,
+            &replacement.secret,
         )
         .map_err(|_| internal_error())?;
         // If a concurrent revoke already claimed the row (it is no longer

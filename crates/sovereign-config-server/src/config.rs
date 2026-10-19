@@ -60,7 +60,6 @@ fn audit_page_size(value: Option<&str>) -> Result<u32> {
 pub(crate) struct ManagedConnectionConfig {
     pub(crate) public_origin: String,
     pub(crate) issuer: String,
-    pub(crate) client_id: String,
     /// The identity provider managed connections are provisioned in.
     pub(crate) provider: AuthentikConfig,
 }
@@ -127,6 +126,7 @@ impl Config {
         let provider = AuthentikConfig::new(
             &issuer_url,
             Secret::new(required_secret("SOVEREIGN_CONFIG_MANAGER_API_TOKEN")?),
+            &audience,
             &required_env("SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE")?,
             &required_env("SOVEREIGN_CONFIG_MANAGER_GROUP")?,
             MANAGER_TIMEOUT,
@@ -170,7 +170,6 @@ impl Config {
             managed: ManagedConnectionConfig {
                 public_origin,
                 issuer,
-                client_id: audience,
                 provider,
             },
             audit,

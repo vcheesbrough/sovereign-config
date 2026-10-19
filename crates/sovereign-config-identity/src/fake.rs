@@ -13,8 +13,8 @@ use async_trait::async_trait;
 
 use crate::conformance::{ConformanceTarget, Operation};
 use crate::{
-    AccountGrant, AccountId, CredentialId, ManagedIdentityProvider, ProviderError,
-    ProvisionedAccount, Secret,
+    AccountGrant, AccountId, ClientCredential, CredentialId, ManagedIdentityProvider,
+    ProviderError, ProvisionedAccount, Secret,
 };
 
 /// One account as the fake holds it, for a test to assert on.
@@ -24,12 +24,25 @@ pub struct FakeAccount {
     pub username: String,
     pub subject: String,
     pub credential: CredentialId,
+    /// The account's own OAuth client, as a provider that makes every account
+    /// a client (Keycloak) issues one, so a caller that ignores it and uses a
+    /// configured client id fails its tests.
+    pub client_id: String,
     pub secret: String,
     pub name: Option<String>,
     pub connection_id: Option<String>,
     pub root: Option<String>,
     pub permissions: Vec<String>,
     pub in_browse_group: bool,
+}
+
+impl FakeAccount {
+    fn client_credential(&self) -> ClientCredential {
+        ClientCredential {
+            client_id: self.client_id.clone(),
+            secret: Secret::new(self.secret.clone()),
+        }
+    }
 }
 
 struct Scripted {
@@ -184,6 +197,7 @@ impl ManagedIdentityProvider for FakeIdentityProvider {
                 username: username.to_owned(),
                 subject: format!("fake-subject-{id}"),
                 credential: identifier(CredentialId::parse, format!("fake-credential-{id}")),
+                client_id: format!("fake-client-{id}"),
                 secret: format!("fake-secret-{id}-0"),
                 name: None,
                 connection_id: None,
@@ -194,7 +208,7 @@ impl ManagedIdentityProvider for FakeIdentityProvider {
             let provisioned = ProvisionedAccount {
                 account,
                 subject: created.subject.clone(),
-                secret: Secret::new(created.secret.clone()),
+                credential: created.client_credential(),
             };
             state.accounts.insert(id.to_string(), created);
             Ok(provisioned)
@@ -258,7 +272,10 @@ impl ManagedIdentityProvider for FakeIdentityProvider {
         })
     }
 
-    async fn replace_credential(&self, credential: &CredentialId) -> Result<Secret, ProviderError> {
+    async fn replace_credential(
+        &self,
+        credential: &CredentialId,
+    ) -> Result<ClientCredential, ProviderError> {
         self.run(Operation::ReplaceCredential, |state| {
             state.next_id += 1;
             let generation = state.next_id;
@@ -268,7 +285,7 @@ impl ManagedIdentityProvider for FakeIdentityProvider {
                 .find(|account| &account.credential == credential)
                 .ok_or(ProviderError::NotFound)?;
             account.secret = format!("fake-secret-{}-{generation}", account.account.as_str());
-            Ok(Secret::new(account.secret.clone()))
+            Ok(account.client_credential())
         })
     }
 

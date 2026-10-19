@@ -11,6 +11,9 @@ use sovereign_config_core::Secret;
 pub struct AuthentikConfig {
     pub(crate) api_origin: Url,
     pub(crate) api_token: Secret,
+    /// The OAuth client every managed account authenticates through: Authentik
+    /// accepts an app password as `client_secret` for the server's own client.
+    pub(crate) client_id: String,
     pub(crate) grants_attribute: String,
     pub(crate) managed_group: String,
     pub(crate) timeout: Duration,
@@ -18,15 +21,18 @@ pub struct AuthentikConfig {
 
 impl AuthentikConfig {
     /// `issuer` is the OIDC issuer the server already validated; the
-    /// administration API is served from its exact origin.
+    /// administration API is served from its exact origin. `client_id` is the
+    /// server's own OAuth client, which managed accounts authenticate through.
     ///
     /// # Errors
     ///
-    /// The grants attribute or group name is not permitted, or the issuer has
-    /// no usable origin. The message names the setting, never its value.
+    /// The client id, grants attribute or group name is not permitted, or the
+    /// issuer has no usable origin. The message names the setting, never its
+    /// value.
     pub fn new(
         issuer: &Url,
         api_token: Secret,
+        client_id: &str,
         grants_attribute: &str,
         managed_group: &str,
         timeout: Duration,
@@ -34,6 +40,7 @@ impl AuthentikConfig {
         Ok(Self {
             api_origin: issuer_api_origin(issuer)?,
             api_token,
+            client_id: validated_client_id(client_id)?,
             grants_attribute: validated_grants_attribute(grants_attribute)?,
             managed_group: validated_group_name(managed_group)?,
             timeout,
@@ -45,6 +52,19 @@ impl AuthentikConfig {
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
+}
+
+/// Validates the client id a connection URL carries, by the grammar the URL
+/// itself admits.
+fn validated_client_id(value: &str) -> Result<String> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+    {
+        bail!("SOVEREIGN_CONFIG_OIDC_AUDIENCE is not a permitted client id");
+    }
+    Ok(value.to_owned())
 }
 
 /// Validates the environment-specific user attribute holding managed grants.
@@ -95,6 +115,7 @@ mod tests {
         AuthentikConfig::new(
             &ISSUER.parse().unwrap(),
             Secret::new(TOKEN_SENTINEL),
+            "sovereign-config",
             grants_attribute,
             group,
             Duration::from_secs(5),
@@ -125,6 +146,17 @@ mod tests {
         );
         for invalid in ["", " padded", "padded ", &"x".repeat(101), "line\nbreak"] {
             assert!(validated_group_name(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn client_id_is_what_a_connection_url_admits() {
+        assert_eq!(
+            validated_client_id("sovereign-config_2.x~").unwrap(),
+            "sovereign-config_2.x~"
+        );
+        for invalid in ["", "with space", "slash/ed", "q?uery"] {
+            assert!(validated_client_id(invalid).is_err(), "{invalid:?}");
         }
     }
 

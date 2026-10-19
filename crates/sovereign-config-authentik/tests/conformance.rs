@@ -280,6 +280,7 @@ async fn target() -> Target {
     let config = AuthentikConfig::new(
         &issuer,
         Secret::new("conformance-api-token"),
+        "sovereign-config",
         "sovereign_config_conformance_grants",
         GROUP_NAME,
         Duration::from_secs(2),

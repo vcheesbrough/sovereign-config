@@ -35,7 +35,6 @@ async fn service_over(fake: &Arc<FakeIdentityProvider>) -> Option<V3ManagedConne
             ManagedSettings {
                 public_origin: PUBLIC_ORIGIN.to_owned(),
                 issuer: ISSUER.to_owned(),
-                client_id: "sovereign-config".to_owned(),
                 rotation_lease: ROTATION_LEASE,
             },
             Arc::new(ManagedConnectionMetrics::default()),
@@ -60,7 +59,7 @@ fn expected_url(root: &str, account: &FakeAccount) -> String {
         PUBLIC_ORIGIN,
         &ConfigPath::parse(root).unwrap(),
         ISSUER,
-        "sovereign-config",
+        &account.client_id,
         &account.username,
         &Secret::new(account.secret.clone()),
     )

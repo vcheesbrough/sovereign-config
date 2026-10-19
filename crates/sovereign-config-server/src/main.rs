@@ -240,7 +240,6 @@ fn managed_dependencies(
     let settings = ManagedSettings {
         public_origin: managed.public_origin,
         issuer: managed.issuer,
-        client_id: managed.client_id,
         rotation_lease,
     };
     Ok((provider, settings))

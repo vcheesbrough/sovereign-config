@@ -632,6 +632,7 @@ mod provider_account_round_trip {
             AuthentikConfig::new(
                 &issuer,
                 Secret::new("migration-test-token"),
+                "sovereign-config",
                 "sovereign_config_grants",
                 "Connections",
                 Duration::from_secs(2),

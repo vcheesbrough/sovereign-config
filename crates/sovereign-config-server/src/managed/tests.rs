@@ -504,6 +504,7 @@ async fn service_with_metrics(
         AuthentikConfig::new(
             &issuer,
             Secret::new("manager-api-token-sentinel"),
+            "sovereign-config",
             GRANTS_ATTRIBUTE,
             MANAGED_GROUP,
             Duration::from_millis(400),
@@ -518,7 +519,6 @@ async fn service_with_metrics(
             ManagedSettings {
                 public_origin: PUBLIC_ORIGIN.to_owned(),
                 issuer: ISSUER.to_owned(),
-                client_id: "sovereign-config".to_owned(),
                 rotation_lease: ROTATION_LEASE,
             },
             metrics,
@@ -676,6 +676,9 @@ async fn create_provisions_exactly_one_read_only_grant_and_returns_one_url() {
     let connection = ConnectionUrl::parse(&url).expect("returned URL must be canonical");
     assert_eq!(connection.root().as_str(), "/apps/api");
     assert_eq!(connection.issuer(), ISSUER);
+    // Authentik's credential authenticates through the server's own client,
+    // the id deployed clients have always been handed (#381).
+    assert_eq!(connection.client_id(), "sovereign-config");
     assert!(connection.client_authentication().is_some());
     assert!(url.starts_with(PUBLIC_ORIGIN));
 

@@ -28,7 +28,6 @@ fn shims(metrics: Arc<ManagedConnectionMetrics>) -> (V3ManagedConnections, V4Man
         ManagedSettings {
             public_origin: "https://config.example.test".to_owned(),
             issuer: "https://auth.example.test/application/o/sovereign-config/".to_owned(),
-            client_id: "sovereign-config".to_owned(),
             rotation_lease: Duration::from_secs(60),
         },
         metrics,

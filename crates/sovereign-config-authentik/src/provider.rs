@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 use sovereign_config_core::Secret;
 use sovereign_config_identity::{
-    AccountGrant, AccountId, CredentialId, ManagedIdentityProvider, ProviderError,
-    ProvisionedAccount,
+    AccountGrant, AccountId, ClientCredential, CredentialId, ManagedIdentityProvider,
+    ProviderError, ProvisionedAccount,
 };
 
 use crate::client::AuthentikAdminClient;
@@ -18,6 +18,7 @@ use crate::password::generate_app_password;
 
 pub struct AuthentikProvider {
     client: AuthentikAdminClient,
+    client_id: String,
     grants_attribute: String,
     managed_group: String,
 }
@@ -30,9 +31,21 @@ impl AuthentikProvider {
     pub fn new(config: AuthentikConfig) -> anyhow::Result<Self> {
         Ok(Self {
             client: AuthentikAdminClient::new(config.api_origin, config.api_token, config.timeout)?,
+            client_id: config.client_id,
             grants_attribute: config.grants_attribute,
             managed_group: config.managed_group,
         })
+    }
+}
+
+impl AuthentikProvider {
+    /// An app password, presented through the server's own client: every
+    /// account shares its client id.
+    fn credential(&self, app_password: Secret) -> ClientCredential {
+        ClientCredential {
+            client_id: self.client_id.clone(),
+            secret: app_password,
+        }
     }
 }
 
@@ -58,7 +71,7 @@ impl ManagedIdentityProvider for AuthentikProvider {
         Ok(ProvisionedAccount {
             account: account_id(created.user_id)?,
             subject: created.user_uid,
-            secret: created.app_password,
+            credential: self.credential(created.app_password),
         })
     }
 
@@ -116,14 +129,17 @@ impl ManagedIdentityProvider for AuthentikProvider {
             .collect()
     }
 
-    async fn replace_credential(&self, credential: &CredentialId) -> Result<Secret, ProviderError> {
+    async fn replace_credential(
+        &self,
+        credential: &CredentialId,
+    ) -> Result<ClientCredential, ProviderError> {
         // Nothing has been sent when generation fails, so it is definitively
         // not applied.
         let replacement = generate_app_password().map_err(|_| ProviderError::Unavailable)?;
         self.client
             .set_credential_secret(credential.as_str(), &replacement)
             .await?;
-        Ok(replacement)
+        Ok(self.credential(replacement))
     }
 
     async fn delete_account(&self, account: &AccountId) -> Result<(), ProviderError> {
