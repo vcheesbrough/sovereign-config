@@ -19,9 +19,9 @@ use core::fmt;
 use async_trait::async_trait;
 pub use sovereign_config_core::Secret;
 
-#[cfg(feature = "conformance")]
+#[cfg(any(test, feature = "conformance"))]
 pub mod conformance;
-#[cfg(feature = "conformance")]
+#[cfg(any(test, feature = "conformance"))]
 pub mod fake;
 
 /// The longest identifier a provider may hand back, in bytes: what the server
