@@ -376,6 +376,13 @@ impl ManagedConnectionsService {
     /// proof that no usable credential survives. Anything other than a
     /// definite empty result is treated as unknown.
     pub(super) async fn credential_is_gone(&self, username: &str) -> bool {
+        self.credential_gone(username).await == Some(true)
+    }
+
+    /// [`Self::credential_is_gone`], keeping a failed lookup apart: `None`
+    /// when the provider could not say, which proves neither absence nor
+    /// presence.
+    pub(super) async fn credential_gone(&self, username: &str) -> Option<bool> {
         match self.provider.find_credentials(username).await {
             Ok(identifiers) => {
                 self.metrics.record_dependency(
@@ -386,14 +393,14 @@ impl ManagedConnectionsService {
                         ManagedDependencyOutcome::Ok
                     },
                 );
-                identifiers.is_empty()
+                Some(identifiers.is_empty())
             }
             Err(error) => {
                 self.metrics.record_dependency(
                     ManagedDependencyCall::FindCredentials,
                     dependency_outcome(error),
                 );
-                false
+                None
             }
         }
     }

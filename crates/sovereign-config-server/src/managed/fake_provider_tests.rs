@@ -304,6 +304,31 @@ async fn a_rejected_rotation_of_a_vanished_credential_requires_cleanup() {
     );
 }
 
+/// When the confirming lookup itself fails, nothing is known: the connection
+/// stays `rotation_unknown`, as after an ambiguous failure, rather than being
+/// declared `active` on no evidence.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn a_rejected_rotation_that_cannot_be_confirmed_stays_unknown() {
+    let fake = Arc::new(FakeIdentityProvider::new());
+    let service = service_over_or_skip!(&fake);
+
+    let (connection_id, _) = create(&service, "Unconfirmed", "/", &operator("/"))
+        .await
+        .expect("create must succeed");
+    fake.fail_next(Operation::ReplaceCredential, ProviderError::Rejected);
+    fake.fail_next(Operation::FindCredentials, ProviderError::Unavailable);
+
+    let status = rotate(&service, &connection_id)
+        .await
+        .expect_err("a rejected replacement fails the rotation");
+    assert_bounded(&status);
+    assert_eq!(
+        row(&service, &connection_id).await.map(|row| row.state),
+        Some("rotation_unknown".to_owned())
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
 async fn revoke_deletes_the_account_and_confirms_absence_by_its_credential() {
