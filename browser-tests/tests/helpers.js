@@ -2,9 +2,13 @@ const { expect } = require('@playwright/test');
 const path = require('node:path');
 
 const configScript = 'globalThis.SOVEREIGN_CONFIG={issuer:"https://auth.example.test/application/o/sovereign-config/",clientId:"sovereign-config"};';
-const staticDir = process.env.PLAYWRIGHT_STATIC_DIR
-  ? path.resolve(process.env.PLAYWRIGHT_STATIC_DIR)
-  : path.resolve(__dirname, '../../web-dist');
+// The bundle the web server is serving, whose index.html the mocked
+// navigations below return: the static directory when PLAYWRIGHT_STATIC is
+// set (as in playwright.config.js), else where `trunk serve` writes
+// (crates/sovereign-config-web/Trunk.toml), never the embedded web-dist/.
+const staticDir = process.env.PLAYWRIGHT_STATIC
+  ? path.resolve(__dirname, '..', process.env.PLAYWRIGHT_STATIC_DIR || '../web-dist')
+  : path.resolve(__dirname, '../../target/trunk-dist');
 const tokenEndpoint = 'https://auth.example.test/application/o/token/';
 
 // The header no longer narrates the session in words: the button on offer is

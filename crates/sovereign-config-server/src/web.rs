@@ -240,7 +240,11 @@ where
             } else {
                 path
             };
-            match Assets::get(requested) {
+            // A hidden file in the bundle is build bookkeeping, never part of
+            // the UI: the `.trunk-profile` marker the build guard reads (#278)
+            // must not be served.
+            let hidden = requested.split('/').any(|segment| segment.starts_with('.'));
+            match Assets::get(requested).filter(|_| !hidden) {
                 Some(asset) => asset_response(
                     asset.data.as_ref(),
                     mime_guess::from_path(requested)
@@ -661,6 +665,26 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_slice(&body_bytes(response).await).unwrap();
         assert_eq!(manifest["installers"].as_array().unwrap().len(), 0);
+    }
+
+    /// The bundle's `.trunk-profile` marker (and any other hidden file) is
+    /// build bookkeeping, not part of the UI, so it is never served.
+    #[tokio::test]
+    async fn hidden_bundle_files_are_not_served() {
+        assert!(
+            super::Assets::get(".trunk-profile").is_some(),
+            "the marker is embedded, so this test proves the filter, not its absence"
+        );
+        let (_dir, layer) = dist_layer();
+        for path in ["/.trunk-profile", "/nested/.hidden.txt"] {
+            let response = layer
+                .clone()
+                .layer(passthrough!())
+                .oneshot(Request::get(path).body(()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), http::StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     #[tokio::test]

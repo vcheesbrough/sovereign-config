@@ -1,5 +1,6 @@
 .git
 target
-.browser-dist
 .env
 *.md
+# Built in the image from source; a local bundle is never part of the context.
+web-dist

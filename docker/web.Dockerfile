@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-# The release WebAssembly bundle on its own, for the Playwright suite in
-# checks.yml: `docker build -f docker/web.Dockerfile --output type=local,dest=.browser-dist .`
+# The release WebAssembly bundle on its own, for the checks workflow's
+# web-bundle step, which unit-test and the Playwright suite both use:
+# `docker build -f docker/web.Dockerfile --output type=local,dest=web-dist .`
+# web-dist/ is not in the checkout (card #278); this is how CI gets one.
 # The server image builds the same bundle in docker/server.Dockerfile, which
 # duplicates these stages; keep the two in step.
 
@@ -15,13 +17,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY test-consumers ./test-consumers
 COPY proto ./proto
-COPY web-dist ./web-dist
 RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=sovereign-config-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=sovereign-config-cargo-target,target=/src/target \
     rustup target add wasm32-unknown-unknown \
     && cd crates/sovereign-config-web \
-    && NO_COLOR=false trunk build --release
+    && NO_COLOR=false trunk build --release --dist ../../web-dist
 
 FROM scratch AS web-dist-artifact
 COPY --from=web-builder /src/web-dist /

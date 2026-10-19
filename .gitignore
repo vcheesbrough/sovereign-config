@@ -1,8 +1,10 @@
 /target/
 /.idea/
-/.browser-dist/
 /browser-tests/node_modules/
 /browser-tests/test-results/
 .env
 .env.*
 !.env.example
+# The release web bundle the server embeds: a build output, never tracked, so
+# a debug bundle from the development loop cannot reach a commit (card #278).
+/web-dist/

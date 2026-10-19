@@ -493,6 +493,66 @@ fn broker_and_cli_builds_compile_only_what_they_ship() {
     );
 }
 
+/// `web-dist/` is not in the checkout (card #278), so the checks build the
+/// release bundle into it from `docker/web.Dockerfile` — the stages the server
+/// image builds it with — before anything that embeds or serves it runs; and no
+/// image build copies a `web-dist` from the build context, where a stale or
+/// debug bundle could stand in for the one the build makes.
+#[test]
+fn the_checks_build_the_web_bundle_the_server_embeds() {
+    let pipeline = pipeline();
+    assert_eq!(pipeline.workflows_of("web-bundle"), ["checks"]);
+    let bundle = commands_text(step(&pipeline, "web-bundle"));
+    assert!(
+        bundle.contains("docker build -f docker/web.Dockerfile")
+            && bundle.contains("--output type=local,dest=web-dist "),
+        "web-bundle must export docker/web.Dockerfile's bundle into web-dist: {bundle}"
+    );
+    for name in ["unit-test", "client-playwright"] {
+        let dependencies: Vec<&str> = step(&pipeline, name)
+            .get("depends_on")
+            .and_then(Value::as_sequence)
+            .unwrap_or_else(|| panic!("{name} should list its dependencies"))
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            dependencies.contains(&"web-bundle"),
+            "{name} must wait for web-bundle"
+        );
+    }
+    let playwright = commands_text(step(&pipeline, "client-playwright"));
+    assert!(
+        !playwright.contains("docker build"),
+        "client-playwright must test the bundle web-bundle built, not build its own"
+    );
+    assert!(
+        playwright.contains("docker cp web-dist/."),
+        "client-playwright must serve the bundle web-bundle built"
+    );
+
+    for (name, text) in all_dockerfiles() {
+        assert!(
+            !text.lines().any(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                words.first() == Some(&"COPY")
+                    && !words.iter().any(|word| word.starts_with("--from="))
+                    && words
+                        .iter()
+                        .any(|word| word.trim_start_matches("./").starts_with("web-dist"))
+            }),
+            "{name} must build the web bundle, never COPY web-dist from the build context"
+        );
+    }
+    for image in ["server", "web"] {
+        assert!(
+            stage(&dockerfile(image), "web-builder")
+                .contains("trunk build --release --dist ../../web-dist"),
+            "docker/{image}.Dockerfile must build the release bundle into web-dist explicitly"
+        );
+    }
+}
+
 /// The CLI image is the exact docker CLI image the pipeline's own docker steps
 /// run, plus the static CLI binary on `PATH` — so another repository's step can
 /// swap its image for it and gain `sovereign-config` without losing `docker`.
@@ -803,7 +863,12 @@ fn every_step_sits_in_its_workflow() {
     let expected: [(&str, &[&str]); 5] = [
         (
             "checks",
-            &["script-validation", "unit-test", "client-playwright"],
+            &[
+                "script-validation",
+                "web-bundle",
+                "unit-test",
+                "client-playwright",
+            ],
         ),
         (
             "build",
