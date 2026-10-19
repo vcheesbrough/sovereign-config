@@ -171,7 +171,7 @@ steps:
       # Cargo never reaps artifacts from commits it no longer builds; this
       # enforces the 20 GiB ceiling on the shared volume (bored card #326).
       - scripts/ci-prune-cargo-target.sh
-      - cargo test --package sovereign-config-server live_ -- --ignored --test-threads=1
+      - cargo test --package sovereign-config-authentik live_ -- --ignored --test-threads=1
 
   deploy-dev:
     depends_on:

@@ -1,5 +1,5 @@
-//! Authentik orchestration for a managed connection: provisioning the
-//! service account, and the compensation and reconciliation that keep a
+//! Identity-provider orchestration for a managed connection: provisioning
+//! the service account, and the compensation and reconciliation that keep a
 //! failed or ambiguous external call from orphaning a live credential.
 
 use std::time::Duration;
@@ -7,6 +7,7 @@ use std::time::Duration;
 use sovereign_config_core::{
     ConfigPath, ConnectionId, ConnectionUrl, ManagedConnectionState, ManagedPermissions,
 };
+use sovereign_config_identity::{AccountGrant, AccountId, ProviderError, ProvisionedAccount};
 use tokio::time::sleep;
 use tonic::Status;
 use tracing::{info, warn};
@@ -15,7 +16,6 @@ use super::ManagedConnectionsService;
 use super::store::ConnectionRow;
 use super::wire::{ProvisionedConnection, dependency_error, internal_error, metadata};
 use crate::audit::{Actor, AuditEvent};
-use crate::authentik::{AdminError, CreatedServiceAccount};
 use crate::metrics::{ManagedDependencyCall, ManagedDependencyOutcome};
 
 /// How many times to re-probe for a possibly-delayed create before giving up
@@ -50,11 +50,7 @@ impl ManagedConnectionsService {
         permissions: &ManagedPermissions,
         created: (&Actor<'_>, AuditEvent<'_>),
     ) -> Result<ProvisionedConnection, Status> {
-        let account = match self
-            .admin
-            .create_service_account(account_name.username)
-            .await
-        {
+        let account = match self.provider.create_account(account_name.username).await {
             Ok(account) => {
                 self.metrics.record_dependency(
                     ManagedDependencyCall::CreateAccount,
@@ -87,7 +83,7 @@ impl ManagedConnectionsService {
             Ok(completed) => completed,
             Err(status) => {
                 return Err(self
-                    .compensate_created_account(connection_id, account.user_id, status)
+                    .compensate_created_account(connection_id, &account.account, status)
                     .await);
             }
         };
@@ -106,21 +102,27 @@ impl ManagedConnectionsService {
         account_name: AccountName<'_>,
         root: &ConfigPath,
         permissions: &ManagedPermissions,
-        account: &CreatedServiceAccount,
+        account: &ProvisionedAccount,
         (actor, event): (&Actor<'_>, AuditEvent<'_>),
     ) -> Result<(ConnectionRow, ConnectionUrl), Status> {
         // Record the external identity immediately so a crash from here on
         // leaves a row that revocation can reconcile and clean up.
         self.record_provider_user(connection_id, account).await?;
-        self.configure_account(connection_id, account_name, root, permissions, account)
-            .await?;
+        self.configure_account(
+            connection_id,
+            account_name,
+            root,
+            permissions,
+            &account.account,
+        )
+        .await?;
         let connection_url = ConnectionUrl::managed(
             &self.settings.public_origin,
             root,
             &self.settings.issuer,
-            &self.settings.client_id,
+            account.credential.client_id(),
             account_name.username,
-            &account.app_password,
+            account.credential.secret(),
         )
         .map_err(|_| internal_error())?;
         // The creation is recorded with the transition that completes it. If
@@ -149,13 +151,9 @@ impl ManagedConnectionsService {
         account_name: AccountName<'_>,
         root: &ConfigPath,
         permissions: &ManagedPermissions,
-        account: &CreatedServiceAccount,
+        account: &AccountId,
     ) -> Result<(), Status> {
-        let identifiers = match self
-            .admin
-            .find_app_password_identifiers(account_name.username)
-            .await
-        {
+        let identifiers = match self.provider.find_credentials(account_name.username).await {
             Ok(identifiers) => identifiers,
             Err(error) => {
                 self.metrics.record_dependency(
@@ -183,18 +181,13 @@ impl ManagedConnectionsService {
         self.record_credential_identifier(connection_id, credential_identifier)
             .await?;
 
-        match self
-            .admin
-            .set_managed_attributes(
-                account.user_id,
-                connection_id.as_str(),
-                account_name.display_name,
-                &self.settings.grants_attribute,
-                root.as_str(),
-                &permissions.grant_tokens(),
-            )
-            .await
-        {
+        let grant = AccountGrant {
+            connection_id: connection_id.as_str(),
+            display_name: account_name.display_name,
+            root: root.as_str(),
+            permissions: &permissions.grant_tokens(),
+        };
+        match self.provider.grant(account, &grant).await {
             Ok(()) => {
                 self.metrics.record_dependency(
                     ManagedDependencyCall::SetAttributes,
@@ -211,24 +204,19 @@ impl ManagedConnectionsService {
         }
 
         // Group membership is an operator convenience for browsing accounts in
-        // Authentik; it grants nothing and its failure must never fail or roll
-        // back a connection that is otherwise fully functional.
-        self.assign_managed_group(connection_id, account.user_id)
-            .await;
+        // the identity provider; it grants nothing and its failure must never
+        // fail or roll back a connection that is otherwise fully functional.
+        self.assign_managed_group(connection_id, account).await;
         Ok(())
     }
 
-    pub(super) async fn assign_managed_group(&self, connection_id: &ConnectionId, user_id: i64) {
-        let outcome = match self
-            .admin
-            .find_group_by_name(&self.settings.managed_group)
-            .await
-        {
-            Ok(Some(group_id)) => match self.admin.add_user_to_group(user_id, &group_id).await {
-                Ok(()) => ManagedDependencyOutcome::Ok,
-                Err(error) => dependency_outcome(error),
-            },
-            Ok(None) => ManagedDependencyOutcome::NotFound,
+    pub(super) async fn assign_managed_group(
+        &self,
+        connection_id: &ConnectionId,
+        account: &AccountId,
+    ) {
+        let outcome = match self.provider.assign_browse_group(account).await {
+            Ok(()) => ManagedDependencyOutcome::Ok,
             Err(error) => dependency_outcome(error),
         };
         if !matches!(outcome, ManagedDependencyOutcome::Ok) {
@@ -247,12 +235,15 @@ impl ManagedConnectionsService {
     pub(super) async fn compensate_created_account(
         &self,
         connection_id: &ConnectionId,
-        user_id: i64,
+        account: &AccountId,
         failure: Status,
     ) -> Status {
-        let deletion = self.admin.delete_user(user_id).await;
+        let deletion = self.provider.delete_account(account).await;
+        // The account was created moments ago in this flow, so `NotFound` is
+        // trusted as proof it is gone: the exception `delete_account`'s
+        // contract allows, unlike revocation's confirmed delete.
         match deletion {
-            Ok(()) | Err(AdminError::NotFound) => {
+            Ok(()) | Err(ProviderError::NotFound) => {
                 self.metrics.record_dependency(
                     ManagedDependencyCall::DeleteUser,
                     deletion.map_or(ManagedDependencyOutcome::NotFound, |()| {
@@ -298,15 +289,14 @@ impl ManagedConnectionsService {
         &self,
         connection_id: &ConnectionId,
         username: &str,
-        error: AdminError,
+        error: ProviderError,
     ) -> Status {
-        // `Invalid` covers two cases the adapter cannot tell apart: a garbled
-        // 2xx that Authentik never really committed, and a 2xx that Authentik
-        // did commit but whose fields failed this server's own strict
-        // validation. Since the second case is a real, live account, `Invalid`
-        // must be reconciled the same way as `Ambiguous` rather than assumed
-        // definitively absent.
-        if !matches!(error, AdminError::Ambiguous | AdminError::Invalid) {
+        // `Invalid` covers two cases the provider cannot tell apart: a garbled
+        // response to a create it never really committed, and one it did
+        // commit but whose fields failed strict validation. Since the second
+        // case is a real, live account, `Invalid` must be reconciled the same
+        // way as `Ambiguous` rather than assumed definitively absent.
+        if !matches!(error, ProviderError::Ambiguous | ProviderError::Invalid) {
             // Only a transport-level rejection or unavailability is
             // definitive: the request could not have been applied.
             let _ = self.delete_row(connection_id).await;
@@ -320,7 +310,7 @@ impl ManagedConnectionsService {
             connection_id = connection_id.as_str(),
             "service account creation outcome is unknown; reconciling by the generated username"
         );
-        // Authentik may have committed the account; probe only the exact
+        // The provider may have committed the account; probe only the exact
         // generated username and remove only the matching managed account. A
         // single immediate probe cannot distinguish "never created" from "the
         // original request is still processing", so retry with a bounded
@@ -332,8 +322,8 @@ impl ManagedConnectionsService {
             if attempt > 0 {
                 sleep(CREATE_RECONCILIATION_DELAY).await;
             }
-            match self.admin.find_user_by_username(username).await {
-                Ok(Some(user)) => {
+            match self.provider.find_account(username).await {
+                Ok(Some(account)) => {
                     self.metrics.record_dependency(
                         ManagedDependencyCall::FindUser,
                         ManagedDependencyOutcome::Ok,
@@ -344,7 +334,7 @@ impl ManagedConnectionsService {
                         "reconciliation found the account the ambiguous create made; removing it"
                     );
                     return self
-                        .compensate_created_account(connection_id, user.user_id, dependency_error())
+                        .compensate_created_account(connection_id, &account, dependency_error())
                         .await;
                 }
                 Ok(None) => {
@@ -377,16 +367,23 @@ impl ManagedConnectionsService {
         .await
     }
 
-    /// Confirms that no app password remains for the exact managed username.
+    /// Confirms that no credential remains for the exact managed username.
     ///
-    /// This is the authoritative absence check. Deleting or reading the user
-    /// depends on object permissions that vanish along with the account, so
-    /// Authentik answers those with a refusal rather than "not found". The
-    /// token view is global, and Authentik removes a service account's tokens
-    /// with it, so an empty result proves no usable credential survives.
-    /// Anything other than a definite empty result is treated as unknown.
+    /// This is the authoritative absence check. Deleting or reading the
+    /// account can depend on object permissions that vanish along with it, so
+    /// a provider may answer those with a refusal rather than "not found"; an
+    /// empty credential list is the one answer the provider contract makes
+    /// proof that no usable credential survives. Anything other than a
+    /// definite empty result is treated as unknown.
     pub(super) async fn credential_is_gone(&self, username: &str) -> bool {
-        match self.admin.find_app_password_identifiers(username).await {
+        self.credential_gone(username).await == Some(true)
+    }
+
+    /// [`Self::credential_is_gone`], keeping a failed lookup apart: `None`
+    /// when the provider could not say, which proves neither absence nor
+    /// presence.
+    pub(super) async fn credential_gone(&self, username: &str) -> Option<bool> {
+        match self.provider.find_credentials(username).await {
             Ok(identifiers) => {
                 self.metrics.record_dependency(
                     ManagedDependencyCall::FindCredentials,
@@ -396,14 +393,14 @@ impl ManagedConnectionsService {
                         ManagedDependencyOutcome::Ok
                     },
                 );
-                identifiers.is_empty()
+                Some(identifiers.is_empty())
             }
             Err(error) => {
                 self.metrics.record_dependency(
                     ManagedDependencyCall::FindCredentials,
                     dependency_outcome(error),
                 );
-                false
+                None
             }
         }
     }
@@ -431,12 +428,12 @@ pub(super) async fn cleanup_required(
     Status::unavailable(CLEANUP_MESSAGE)
 }
 
-pub(super) const fn dependency_outcome(error: AdminError) -> ManagedDependencyOutcome {
+pub(super) const fn dependency_outcome(error: ProviderError) -> ManagedDependencyOutcome {
     match error {
-        AdminError::NotFound => ManagedDependencyOutcome::NotFound,
-        AdminError::Rejected => ManagedDependencyOutcome::Rejected,
-        AdminError::Unavailable => ManagedDependencyOutcome::Unavailable,
-        AdminError::Ambiguous => ManagedDependencyOutcome::Ambiguous,
-        AdminError::Invalid => ManagedDependencyOutcome::Invalid,
+        ProviderError::NotFound => ManagedDependencyOutcome::NotFound,
+        ProviderError::Rejected => ManagedDependencyOutcome::Rejected,
+        ProviderError::Unavailable => ManagedDependencyOutcome::Unavailable,
+        ProviderError::Ambiguous => ManagedDependencyOutcome::Ambiguous,
+        ProviderError::Invalid => ManagedDependencyOutcome::Invalid,
     }
 }

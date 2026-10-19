@@ -3,7 +3,7 @@ use std::{env, time::Duration};
 use reqwest::Url;
 use sovereign_config_core::Secret;
 
-use super::{AdminError, AuthentikAdminClient, CreatedServiceAccount};
+use super::{AuthentikAdminClient, CreatedServiceAccount, ProviderError};
 
 const LIVE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default browsing group when the environment does not name one — the
@@ -224,7 +224,10 @@ async fn live_manager_cannot_touch_unrelated_objects() {
 
     let checks = async {
         let denied = client.delete_user(canary.user_id).await;
-        if !matches!(denied, Err(AdminError::NotFound | AdminError::Rejected)) {
+        if !matches!(
+            denied,
+            Err(ProviderError::NotFound | ProviderError::Rejected)
+        ) {
             return Err(format!(
                 "deleting an unrelated user must be denied, got {denied:?}"
             ));

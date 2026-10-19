@@ -198,3 +198,39 @@ fn unit_test_resolves_dependencies_with_the_lockfile() {
         );
     }
 }
+
+/// The live Authentik checks are selected by a crate and a name filter, so a
+/// move of either would leave both deploy steps green and testing nothing.
+/// They live in the Authentik implementation's crate (#381); the checks run
+/// compiles them there too, where they skip without credentials.
+#[test]
+fn the_live_steps_run_the_authentik_crates_live_tests() {
+    const LIVE_RUN: &str =
+        "cargo test --package sovereign-config-authentik live_ -- --ignored --test-threads=1";
+    let pipeline = pipeline();
+    for step in [
+        "validate-authentik-manager-live",
+        "validate-authentik-manager-live-prod",
+    ] {
+        assert!(
+            commands(pipeline.step(step)).contains(&LIVE_RUN),
+            "{step} must run the Authentik crate's live tests"
+        );
+    }
+    let live_tests = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../sovereign-config-authentik/src/client/live_tests.rs"),
+    )
+    .expect("the live tests live in the Authentik crate");
+    assert!(
+        live_tests.matches("async fn live_").count() >= 3,
+        "the `live_` filter must still select the live tests"
+    );
+    assert!(
+        commands(pipeline.step("unit-test")).iter().any(|command| {
+            command.contains("--ignored")
+                && command.contains("--package sovereign-config-authentik")
+        }),
+        "unit-test's ignored run must compile the Authentik crate's ignored tests"
+    );
+}

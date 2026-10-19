@@ -157,10 +157,12 @@ how this repo applies it and where it does not yet.
   `compose.yaml`.
 - **Spans are the transport's job, in `crates/sovereign-config-server/src/spans.rs`:**
   a hand-written `tower` layer opens each request's server span (no
-  `tower-http`, one pin fewer), and only that module adopts or injects trace
-  context. A new outbound HTTP call goes through `spans::client_span` and
-  `spans::send`; a new store function gets `#[instrument]` with the
-  `db.*` fields its neighbours carry; a new served RPC goes into
+  `tower-http`, one pin fewer), and only that module adopts trace context.
+  A new outbound HTTP call goes through `client_span` and `send` from
+  `sovereign_config_telemetry::client` (which `spans` re-exports, and the
+  only place context is injected), so the server and the Authentik crate
+  open the same client span; a new store function gets `#[instrument]` with
+  the `db.*` fields its neighbours carry; a new served RPC goes into
   `spans::RPC_ROUTES` (a test compares it with the served `.proto` files).
   Span attribute keys are semantic-convention names or `sovereign_config.`-
   prefixed; `sovereign_config_telemetry::testing::Capture::finish` fails any

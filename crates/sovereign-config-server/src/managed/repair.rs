@@ -18,6 +18,7 @@
 use std::time::Duration;
 
 use sovereign_config_core::{ConnectionId, ManagedConnectionState};
+use sovereign_config_identity::ProviderError;
 use tracing::{Instrument, field::Empty, info, warn};
 
 use super::ManagedConnectionsService;
@@ -25,7 +26,6 @@ use super::identity::managed_username;
 use super::provisioning::dependency_outcome;
 use super::store::AccountRow;
 use crate::audit::{self, ActorRename};
-use crate::authentik::AdminError;
 use crate::metrics::{ManagedDependencyCall, ManagedDependencyOutcome};
 use crate::spans;
 
@@ -108,10 +108,14 @@ impl ManagedConnectionsService {
         // span failed so Tempo does not show an incomplete repair as clean.
         let mut holding_open: Option<&'static str> = None;
         for account in accounts.iter().filter(|account| is_live(account)) {
-            let Some(user_id) = account.provider_user_id else {
+            let Some(account_id) = account.account() else {
                 continue;
             };
-            let outcome = match self.admin.rename_user(user_id, &account.display_name).await {
+            let outcome = match self
+                .provider
+                .rename_account(&account_id, &account.display_name)
+                .await
+            {
                 Ok(()) => {
                     renamed += 1;
                     ManagedDependencyOutcome::Ok
@@ -119,7 +123,7 @@ impl ManagedConnectionsService {
                 Err(error) => {
                     // A deleted account has nothing left to name; only a
                     // failure a later start could fix keeps the repair open.
-                    if !matches!(error, AdminError::NotFound) {
+                    if error != ProviderError::NotFound {
                         holding_open = Some(error.label());
                     }
                     warn!(

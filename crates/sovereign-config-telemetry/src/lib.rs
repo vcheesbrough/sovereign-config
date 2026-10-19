@@ -27,6 +27,7 @@
 //! instruments once, on the `opentelemetry` API's [`Meter`] that
 //! [`Telemetry::meter`] hands out, and never sees an SDK type.
 
+pub mod client;
 pub mod config;
 pub mod context;
 pub mod keys;

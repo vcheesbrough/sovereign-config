@@ -1,6 +1,5 @@
 mod audit;
 mod auth;
-mod authentik;
 mod config;
 mod encryption;
 mod handshake;
@@ -38,7 +37,6 @@ use tracing::{Instrument, error, info};
 
 use audit::{AuditRecorder, AuditTrailService, v4::V4Audit};
 use auth::{Authenticator, grpc_service_layer};
-use authentik::AuthentikAdminClient;
 use config::{Config, ManagedConnectionConfig, required_env};
 use handshake::HandshakeService;
 use managed::{
@@ -51,7 +49,8 @@ use metrics::{
 };
 use opentelemetry::metrics::Meter;
 use protocol::ProtocolVersionLayer;
-use sovereign_config_core::Secret;
+use sovereign_config_authentik::AuthentikProvider;
+use sovereign_config_identity::ManagedIdentityProvider;
 use sovereign_config_proto::sovereign::config::{
     handshake_server::HandshakeServer,
     v3::{
@@ -124,7 +123,7 @@ async fn serve(meter: &Meter) -> Result<()> {
     let protocol_metrics = Arc::new(ProtocolMetrics::new(SERVED_PROTOCOL_LABELS));
     let audit_metrics = Arc::new(AuditMetrics::default());
     let audit = AuditRecorder::new(Arc::clone(&audit_metrics), config.audit.coalesce_window);
-    let (managed_admin, managed_settings) = managed_dependencies(config.managed)?;
+    let (managed_provider, managed_settings) = managed_dependencies(config.managed)?;
     let database = connect_database(&config.database_url).await?;
     let value_cipher = Arc::new(config.value_cipher);
     encrypt_stored_secrets(&database, &value_cipher).await?;
@@ -156,12 +155,12 @@ async fn serve(meter: &Meter) -> Result<()> {
     ));
     let managed_connections = Arc::new(ManagedConnectionsService::new(
         database.clone(),
-        managed_admin,
+        managed_provider,
         managed_settings,
         managed_metrics,
         audit,
     ));
-    // In the background: it calls Authentik and then waits out a token
+    // In the background: it calls the identity provider and then waits out a token
     // lifetime, and must never delay or fail startup (#440).
     let repair = Arc::clone(&managed_connections);
     tokio::spawn(async move { repair.repair_actor_names(TRAIL_REPAIR_DELAY).await });
@@ -228,27 +227,22 @@ async fn serve(meter: &Meter) -> Result<()> {
         .context("gRPC server terminated")
 }
 
-/// The Authentik admin client and the non-secret settings the managed
-/// connection service builds URLs and grants from.
+/// The identity provider and the non-secret settings the managed connection
+/// service builds URLs from. The only place an implementation is chosen:
+/// everything past this sees the trait.
 fn managed_dependencies(
     managed: ManagedConnectionConfig,
-) -> Result<(AuthentikAdminClient, ManagedSettings)> {
-    let admin = AuthentikAdminClient::new(
-        managed.api_origin.clone(),
-        Secret::new(managed.api_token),
-        managed.timeout,
-    )?;
+) -> Result<(Arc<dyn ManagedIdentityProvider>, ManagedSettings)> {
+    // Comfortably longer than the bounded provider call, so an expired lease
+    // proves the previous rotation attempt has ended.
+    let rotation_lease = managed.provider.timeout() * 6;
+    let provider = Arc::new(AuthentikProvider::new(managed.provider)?);
     let settings = ManagedSettings {
         public_origin: managed.public_origin,
         issuer: managed.issuer,
-        client_id: managed.client_id,
-        grants_attribute: managed.grants_attribute,
-        managed_group: managed.managed_group,
-        // Comfortably longer than the bounded Authentik call, so an expired
-        // lease proves the previous rotation attempt has ended.
-        rotation_lease: managed.timeout * 6,
+        rotation_lease,
     };
-    Ok((admin, settings))
+    Ok((provider, settings))
 }
 
 /// Connects to the required `PostgreSQL` dependency and applies the

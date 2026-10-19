@@ -15,7 +15,7 @@ use serde_json::json;
 use sovereign_config_core::Secret;
 use tokio::{net::TcpListener, task::JoinHandle, time::sleep};
 
-use super::{AdminError, AuthentikAdminClient, MAX_ADMIN_RESPONSE_BYTES};
+use super::{AuthentikAdminClient, MAX_ADMIN_RESPONSE_BYTES, ProviderError};
 
 const TEST_API_TOKEN: &str = "authentik-admin-token-sentinel";
 const TEST_USERNAME: &str = "sc-managed-0123456789abcdefghijklmnopqrst";
@@ -178,17 +178,17 @@ async fn create_service_account_rejects_malformed_payloads() {
             .create_service_account(TEST_USERNAME)
             .await
             .unwrap_err();
-        assert_eq!(error, AdminError::Invalid, "body {preview:?}");
+        assert_eq!(error, ProviderError::Invalid, "body {preview:?}");
     }
 }
 
 #[tokio::test]
 async fn http_statuses_classify_to_bounded_errors() {
     for (status, expected) in [
-        (StatusCode::FORBIDDEN, AdminError::Rejected),
-        (StatusCode::NOT_FOUND, AdminError::NotFound),
-        (StatusCode::TOO_MANY_REQUESTS, AdminError::Rejected),
-        (StatusCode::INTERNAL_SERVER_ERROR, AdminError::Ambiguous),
+        (StatusCode::FORBIDDEN, ProviderError::Rejected),
+        (StatusCode::NOT_FOUND, ProviderError::NotFound),
+        (StatusCode::TOO_MANY_REQUESTS, ProviderError::Rejected),
+        (StatusCode::INTERNAL_SERVER_ERROR, ProviderError::Ambiguous),
     ] {
         let server = server(
             status,
@@ -213,7 +213,7 @@ async fn timeouts_classify_as_ambiguous() {
         .create_service_account(TEST_USERNAME)
         .await
         .unwrap_err();
-    assert_eq!(error, AdminError::Ambiguous);
+    assert_eq!(error, ProviderError::Ambiguous);
 }
 
 #[tokio::test]
@@ -226,7 +226,7 @@ async fn redirects_are_invalid_and_never_followed() {
     )
     .await;
     let error = client(&server).delete_user(7).await.unwrap_err();
-    assert_eq!(error, AdminError::Invalid);
+    assert_eq!(error, ProviderError::Invalid);
     let hits = server.hits.lock().unwrap();
     assert_eq!(hits.len(), 1);
     assert!(
@@ -292,7 +292,7 @@ async fn app_password_discovery_validates_identifiers() {
         .find_app_password_identifiers(TEST_USERNAME)
         .await
         .unwrap_err();
-    assert_eq!(error, AdminError::Invalid);
+    assert_eq!(error, ProviderError::Invalid);
 }
 
 #[tokio::test]
@@ -336,7 +336,7 @@ async fn group_lookup_finds_the_exact_name_and_rejects_ambiguity() {
         .find_group_by_name("sovereign-config-connections")
         .await
         .unwrap_err();
-    assert_eq!(error, AdminError::Invalid);
+    assert_eq!(error, ProviderError::Invalid);
 }
 
 #[tokio::test]
@@ -390,7 +390,7 @@ async fn managed_attributes_name_the_account_after_its_connection() {
 }
 
 /// A failed admin call is a failed client span, classified by the bounded
-/// `AdminError` label and never by anything Authentik said.
+/// `ProviderError` label and never by anything Authentik said.
 #[tokio::test]
 async fn a_failed_admin_call_marks_its_client_span_with_the_classification() {
     let server = server(
@@ -407,7 +407,7 @@ async fn a_failed_admin_call_marks_its_client_span_with_the_classification() {
             .delete_user(42)
             .await
             .expect_err("a refused delete fails");
-        assert_eq!(error, AdminError::Rejected);
+        assert_eq!(error, ProviderError::Rejected);
     }
     let exported = capture.finish();
 

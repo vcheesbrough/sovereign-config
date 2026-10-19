@@ -2,7 +2,8 @@
 //!
 //! Implements the `ManagedConnections` gRPC service: listing safe metadata,
 //! and creating, rotating, and revoking machine connections whose credentials
-//! live only in Authentik. Each connection carries an operator-selected
+//! live only in the identity provider (`ManagedIdentityProvider`, which
+//! `main.rs` alone builds — Authentik today). Each connection carries an operator-selected
 //! permission set (read/write/manage) on its root. Sovereign Config persists
 //! non-secret lifecycle metadata and returns each connection URL exactly once.
 //!
@@ -12,9 +13,10 @@
 //!   validation policies a version chooses between.
 //! - `v3`, `v4` — each version's tonic impl: `shim` pointed at that version's
 //!   generated types.
-//! - `provisioning` — Authentik orchestration, compensation, reconciliation.
+//! - `provisioning` — identity-provider orchestration, compensation,
+//!   reconciliation.
 //! - `store` — every `PostgreSQL` row type and query.
-//! - `identity` — generated connection ids, usernames, and app passwords.
+//! - `identity` — generated connection ids and usernames.
 //! - `wire` — version-free metadata and the bounded `Status` values.
 
 mod identity;

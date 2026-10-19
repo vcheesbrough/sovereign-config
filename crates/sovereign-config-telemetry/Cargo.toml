@@ -23,6 +23,8 @@ opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_ex
 opentelemetry-http.workspace = true
 tracing-opentelemetry.workspace = true
 http.workspace = true
+# The outbound HTTP client `client::send` injects context into.
+reqwest.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

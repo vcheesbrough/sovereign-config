@@ -2,12 +2,17 @@ use std::{env, fs, net::IpAddr, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
+use sovereign_config_authentik::AuthentikConfig;
+use sovereign_config_core::Secret;
+use sovereign_config_identity::ClientCredential;
 
 use crate::encryption::{ValueCipher, decode_key};
 
 /// For one fetch of an issuer's signing keys (docs/authentication.md, "Request authentication").
 const JWKS_TIMEOUT: Duration = Duration::from_secs(3);
 const MANAGER_TIMEOUT: Duration = Duration::from_secs(5);
+/// Optional: the OAuth client access URLs name, when it is not the audience.
+const MANAGER_CLIENT_ID: &str = "SOVEREIGN_CONFIG_MANAGER_CLIENT_ID";
 
 const SECONDS_PER_HOUR: u64 = 60 * 60;
 const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
@@ -58,12 +63,8 @@ fn audit_page_size(value: Option<&str>) -> Result<u32> {
 pub(crate) struct ManagedConnectionConfig {
     pub(crate) public_origin: String,
     pub(crate) issuer: String,
-    pub(crate) client_id: String,
-    pub(crate) grants_attribute: String,
-    pub(crate) managed_group: String,
-    pub(crate) api_origin: Url,
-    pub(crate) api_token: String,
-    pub(crate) timeout: Duration,
+    /// The identity provider managed connections are provisioned in.
+    pub(crate) provider: AuthentikConfig,
 }
 
 pub(crate) struct WebConfig {
@@ -125,12 +126,17 @@ impl Config {
             env::var(CLIENT_TELEMETRY_ENDPOINT).ok().as_deref(),
             &public_origin,
         )?;
-        let grants_attribute = validated_grants_attribute(&required_env(
-            "SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE",
-        )?)?;
-        let managed_group = validated_group_name(&required_env("SOVEREIGN_CONFIG_MANAGER_GROUP")?)?;
-        let api_origin = issuer_api_origin(&issuer_url)?;
-        let api_token = required_secret("SOVEREIGN_CONFIG_MANAGER_API_TOKEN")?;
+        let manager_client_id =
+            manager_client_id(env::var(MANAGER_CLIENT_ID).ok().as_deref(), &audience)?;
+        let provider = AuthentikConfig::new(
+            &issuer_url,
+            Secret::new(required_secret("SOVEREIGN_CONFIG_MANAGER_API_TOKEN")?),
+            &manager_client_id,
+            &audience,
+            &required_env("SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE")?,
+            &required_env("SOVEREIGN_CONFIG_MANAGER_GROUP")?,
+            MANAGER_TIMEOUT,
+        )?;
         let value_cipher = value_cipher_from_env()?;
         let audit = AuditConfig {
             retention: Duration::from_secs(
@@ -170,12 +176,7 @@ impl Config {
             managed: ManagedConnectionConfig {
                 public_origin,
                 issuer,
-                client_id: audience,
-                grants_attribute,
-                managed_group,
-                api_origin,
-                api_token,
-                timeout: MANAGER_TIMEOUT,
+                provider,
             },
             audit,
             value_cipher,
@@ -262,31 +263,35 @@ fn validated_client_telemetry_endpoint(
     Ok(Some(public_origin.to_owned()))
 }
 
-/// Validates the environment-specific user attribute holding managed grants.
-fn validated_grants_attribute(value: &str) -> Result<String> {
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        bail!("SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE is not a permitted attribute name");
+/// The OAuth client every access URL names, which managed accounts
+/// authenticate through: `SOVEREIGN_CONFIG_MANAGER_CLIENT_ID` when set, else
+/// the token audience. With Authentik the two must be equal — a token minted
+/// through any other client carries that client's id as its `aud` and would
+/// be refused — and the audience is then also what a connection URL must be
+/// able to carry. Every refusal names the variable to change, never a value.
+/// The Authentik crate checks the same rule again; this is the check that can
+/// name the variables.
+fn manager_client_id(explicit: Option<&str>, audience: &str) -> Result<String> {
+    if let Some(client_id) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        if !ClientCredential::admits_client_id(client_id) {
+            bail!("{MANAGER_CLIENT_ID} is not a client id a connection URL can carry");
+        }
+        if client_id != audience {
+            bail!(
+                "{MANAGER_CLIENT_ID} must equal SOVEREIGN_CONFIG_OIDC_AUDIENCE with Authentik, \
+                 whose tokens carry the client id they were minted through as their audience; \
+                 leave it unset"
+            );
+        }
     }
-    Ok(value.to_owned())
-}
-
-/// Validates the exact name of the Authentik group managed service accounts
-/// are added to for browsing. Not a security boundary, so only bounded and
-/// non-empty, matching the shape of a display name rather than an identifier.
-fn validated_group_name(value: &str) -> Result<String> {
-    if value.is_empty()
-        || value.trim() != value
-        || value.chars().count() > 100
-        || value.chars().any(char::is_control)
-    {
-        bail!("SOVEREIGN_CONFIG_MANAGER_GROUP is not a permitted group name");
+    if !ClientCredential::admits_client_id(audience) {
+        bail!(
+            "SOVEREIGN_CONFIG_OIDC_AUDIENCE is not a client id a connection URL can carry; \
+             with Authentik it is also the client id access URLs name, so it must be the \
+             application's client id"
+        );
     }
-    Ok(value.to_owned())
+    Ok(audience.to_owned())
 }
 
 /// An optional whole-number setting: `default` when unset or blank, otherwise
@@ -306,16 +311,6 @@ fn bounded_setting(name: &str, value: Option<&str>, default: u32, maximum: u32) 
         Ok(parsed) if (1..=maximum).contains(&parsed) => Ok(parsed),
         _ => bail!("{name} must be a whole number from 1 to {maximum}"),
     }
-}
-
-/// Derives the Authentik administration origin from the configured issuer so
-/// the API origin always matches the issuer origin exactly.
-fn issuer_api_origin(issuer: &Url) -> Result<Url> {
-    issuer
-        .origin()
-        .ascii_serialization()
-        .parse::<Url>()
-        .context("SOVEREIGN_CONFIG_OIDC_ISSUER origin is not a permitted API origin")
 }
 
 /// Rejects issuers that are valid URLs but not in the exact canonical form
@@ -374,8 +369,8 @@ pub(crate) fn required_secret(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        audit_page_size, bounded_setting, issuer_api_origin, required_env, validate_issuer_url,
-        validated_client_telemetry_endpoint, validated_group_name, validated_public_origin,
+        audit_page_size, bounded_setting, manager_client_id, required_env, validate_issuer_url,
+        validated_client_telemetry_endpoint, validated_public_origin,
     };
 
     /// Absent is off; present is the public origin and nothing else, because
@@ -452,17 +447,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn api_origin_is_derived_from_the_issuer_origin() {
-        let issuer = "https://auth.example.test/application/o/sovereign-config/"
-            .parse()
-            .unwrap();
-        assert_eq!(
-            issuer_api_origin(&issuer).unwrap().as_str(),
-            "https://auth.example.test/"
-        );
-    }
-
     const SETTING: &str = "SOVEREIGN_CONFIG_AUDIT_RETENTION_DAYS";
 
     #[test]
@@ -531,13 +515,65 @@ mod tests {
     }
 
     #[test]
-    fn group_name_is_bounded_and_trimmed() {
+    fn the_access_url_client_id_defaults_to_the_audience() {
         assert_eq!(
-            validated_group_name("Sovereign Config Connections").unwrap(),
-            "Sovereign Config Connections"
+            manager_client_id(None, "sovereign-config").unwrap(),
+            "sovereign-config"
         );
-        for invalid in ["", " padded", "padded ", &"x".repeat(101), "line\nbreak"] {
-            assert!(validated_group_name(invalid).is_err(), "{invalid:?}");
+        for blank in ["", "   "] {
+            assert_eq!(
+                manager_client_id(Some(blank), "sovereign-config").unwrap(),
+                "sovereign-config"
+            );
+        }
+    }
+
+    /// With Authentik the client id is the audience: setting it to anything
+    /// else, or to a value of the wrong form, is refused, as is an audience a
+    /// URL can't carry. Each refusal names the variable to change and quotes
+    /// no value.
+    #[test]
+    fn the_access_url_client_id_is_checked_and_names_its_variable() {
+        assert_eq!(
+            manager_client_id(Some("sovereign-config"), "sovereign-config").unwrap(),
+            "sovereign-config"
+        );
+
+        let mismatch = format!(
+            "{:#}",
+            manager_client_id(Some("other-sentinel"), "audience-sentinel").unwrap_err()
+        );
+        assert!(
+            mismatch.starts_with(
+                "SOVEREIGN_CONFIG_MANAGER_CLIENT_ID must equal SOVEREIGN_CONFIG_OIDC_AUDIENCE"
+            ),
+            "{mismatch}"
+        );
+
+        let malformed = format!(
+            "{:#}",
+            manager_client_id(Some("bad sentinel/id"), "sovereign-config").unwrap_err()
+        );
+        assert!(
+            malformed.starts_with("SOVEREIGN_CONFIG_MANAGER_CLIENT_ID is not"),
+            "{malformed}"
+        );
+
+        let audience = format!(
+            "{:#}",
+            manager_client_id(None, "urn:sentinel:audience").unwrap_err()
+        );
+        assert!(
+            audience.starts_with("SOVEREIGN_CONFIG_OIDC_AUDIENCE is not"),
+            "{audience}"
+        );
+        assert!(
+            !audience.contains("set SOVEREIGN_CONFIG_MANAGER_CLIENT_ID"),
+            "{audience}"
+        );
+
+        for message in [mismatch, malformed, audience] {
+            assert!(!message.contains("sentinel"), "{message}");
         }
     }
 

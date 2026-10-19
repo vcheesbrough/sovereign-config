@@ -29,7 +29,7 @@ The blueprints carry `${VARIABLE}` placeholders, which Authentik's own blueprint
 | `AUTHENTIK_BRAND_DOMAIN` | `AUTHENTIK_DEV_BRAND_DOMAIN` | The domain of the brand active for the Authentik public hostname. |
 | `AUTHENTIK_SOVEREIGN_CONFIG_MANAGER_API_TOKEN` | `AUTHENTIK_SOVEREIGN_CONFIG_DEV_MANAGER_API_TOKEN` | The connection-manager API token's key. The same value is given to the server as its manager API token (see [the README](../README.md#configuration-reference)). Generate it once, store it as a secret, and reuse it on every apply. |
 
-The issuer the server is configured with (`SOVEREIGN_CONFIG_OIDC_ISSUER`) is the provider's per-application issuer, `https://<authentik-host>/application/o/<application>/`, and the audience (`SOVEREIGN_CONFIG_OIDC_AUDIENCE`) is the provider's client id — `sovereign-config` or `sovereign-config-dev`.
+The issuer the server is configured with (`SOVEREIGN_CONFIG_OIDC_ISSUER`) is the provider's per-application issuer, `https://<authentik-host>/application/o/<application>/`, and the audience (`SOVEREIGN_CONFIG_OIDC_AUDIENCE`) is the provider's client id — `sovereign-config` or `sovereign-config-dev`. Access URLs name the same client, through which their service accounts authenticate. `SOVEREIGN_CONFIG_MANAGER_CLIENT_ID` names that client separately and defaults to the audience. With Authentik it must equal the audience, and the server refuses to start otherwise, because a token minted through another client would carry that client's id as its `aud`.
 
 ## Authentik objects by environment
 

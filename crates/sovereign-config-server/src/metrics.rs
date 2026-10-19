@@ -723,7 +723,8 @@ impl ManagedDependencyCall {
     }
 }
 
-/// Fixed dependency outcomes: `ok` plus the bounded [`crate::authentik::AdminError`] kinds.
+/// Fixed dependency outcomes: `ok` plus the bounded
+/// [`sovereign_config_identity::ProviderError`] kinds.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ManagedDependencyOutcome {
     Ok,

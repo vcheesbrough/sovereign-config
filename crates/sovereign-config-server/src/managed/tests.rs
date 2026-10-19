@@ -21,22 +21,26 @@ use sovereign_config_core::{ConnectionUrl, ManagedPermission};
 use sqlx::postgres::PgPoolOptions;
 use tokio::{net::TcpListener, task::JoinHandle, time::sleep};
 
+use sovereign_config_authentik::{AuthentikConfig, AuthentikProvider};
 use sovereign_config_core::Secret;
 use tonic::{Request, Status};
 use tracing::Instrument;
 
 use super::identity::{
-    USERNAME_PREFIX, USERNAME_SLUG_MAX_CHARS, generate_app_password, generate_connection_id,
-    managed_username, username_slug,
+    USERNAME_PREFIX, USERNAME_SLUG_MAX_CHARS, generate_connection_id, managed_username,
+    username_slug,
 };
 use super::store::ConnectionRow;
 use super::{ManagedConnectionsService, ManagedSettings, V3ManagedConnections};
+
+/// The same service driven through the in-memory identity provider (#381).
+#[path = "fake_provider_tests.rs"]
+mod fake_provider;
 use crate::audit::AuditRecorder;
 use crate::audit::test_support::{
     break_audit_writes, clear_trail, kinds, restore_audit_writes, trail,
 };
 use crate::auth::{AuthenticatedPrincipal, Grant, Permission};
-use crate::authentik::AuthentikAdminClient;
 use crate::metrics::ManagedConnectionMetrics;
 use sovereign_config_proto::sovereign::config::v3::{
     CreateManagedConnectionRequest, ListManagedConnectionsRequest, RevokeManagedConnectionRequest,
@@ -457,14 +461,9 @@ async fn test_pool() -> Option<sqlx::PgPool> {
         .ok()
 }
 
-async fn service(mock: &MockAuthentik) -> Option<V3ManagedConnections> {
-    service_with_metrics(mock, Arc::new(ManagedConnectionMetrics::default())).await
-}
-
-async fn service_with_metrics(
-    mock: &MockAuthentik,
-    metrics: Arc<ManagedConnectionMetrics>,
-) -> Option<V3ManagedConnections> {
+/// The test database, migrated and with no managed connections; `None` when
+/// none is configured, which skips the test.
+async fn fresh_database() -> Option<sqlx::PgPool> {
     let database_url = env::var("SOVEREIGN_CONFIG_TEST_DATABASE_URL").ok()?;
     let database = PgPoolOptions::new()
         .acquire_timeout(Duration::from_secs(5))
@@ -483,22 +482,44 @@ async fn service_with_metrics(
         .execute(&database)
         .await
         .expect("the name repair marker must be clearable");
-    let admin = AuthentikAdminClient::new(
-        mock.origin.clone(),
-        Secret::new("manager-api-token-sentinel"),
-        Duration::from_millis(400),
+    Some(database)
+}
+
+async fn service(mock: &MockAuthentik) -> Option<V3ManagedConnections> {
+    service_with_metrics(mock, Arc::new(ManagedConnectionMetrics::default())).await
+}
+
+async fn service_with_metrics(
+    mock: &MockAuthentik,
+    metrics: Arc<ManagedConnectionMetrics>,
+) -> Option<V3ManagedConnections> {
+    let database = fresh_database().await?;
+    // The real Authentik implementation, against the mock: these tests prove
+    // the service's behaviour through the identity-provider seam unchanged.
+    let issuer = mock
+        .origin
+        .join("application/o/sovereign-config/")
+        .expect("the mock issuer must parse");
+    let provider = AuthentikProvider::new(
+        AuthentikConfig::new(
+            &issuer,
+            Secret::new("manager-api-token-sentinel"),
+            "sovereign-config",
+            "sovereign-config",
+            GRANTS_ATTRIBUTE,
+            MANAGED_GROUP,
+            Duration::from_millis(400),
+        )
+        .expect("the mock Authentik configuration must validate"),
     )
     .expect("mock admin client must build");
     Some(V3ManagedConnections::new(Arc::new(
         ManagedConnectionsService::new(
             database,
-            admin,
+            Arc::new(provider),
             ManagedSettings {
                 public_origin: PUBLIC_ORIGIN.to_owned(),
                 issuer: ISSUER.to_owned(),
-                client_id: "sovereign-config".to_owned(),
-                grants_attribute: GRANTS_ATTRIBUTE.to_owned(),
-                managed_group: MANAGED_GROUP.to_owned(),
                 rotation_lease: ROTATION_LEASE,
             },
             metrics,
@@ -641,16 +662,6 @@ fn generated_identifiers_are_opaque_and_bounded() {
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
     );
-
-    let password = generate_app_password().unwrap();
-    assert_eq!(password.expose().len(), 48);
-    assert!(
-        password
-            .expose()
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric())
-    );
-    assert_ne!(password.expose(), generate_app_password().unwrap().expose());
 }
 
 #[tokio::test]
@@ -666,6 +677,9 @@ async fn create_provisions_exactly_one_read_only_grant_and_returns_one_url() {
     let connection = ConnectionUrl::parse(&url).expect("returned URL must be canonical");
     assert_eq!(connection.root().as_str(), "/apps/api");
     assert_eq!(connection.issuer(), ISSUER);
+    // Authentik's credential authenticates through the server's own client,
+    // the id deployed clients have always been handed (#381).
+    assert_eq!(connection.client_id(), "sovereign-config");
     assert!(connection.client_authentication().is_some());
     assert!(url.starts_with(PUBLIC_ORIGIN));
 

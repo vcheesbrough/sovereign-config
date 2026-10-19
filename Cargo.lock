@@ -2612,8 +2612,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovereign-config-authentik"
+version = "2.44.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.9",
+ "getrandom 0.3.4",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sovereign-config-core",
+ "sovereign-config-identity",
+ "sovereign-config-telemetry",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sovereign-config-cli"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2637,7 +2655,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-client"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "async-trait",
  "sovereign-config-core",
@@ -2647,7 +2665,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-core"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -2657,8 +2675,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovereign-config-identity"
+version = "2.44.0"
+dependencies = [
+ "async-trait",
+ "sovereign-config-core",
+ "tokio",
+]
+
+[[package]]
 name = "sovereign-config-layers"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "async-trait",
  "sovereign-config-client",
@@ -2670,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-mcp"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2685,7 +2712,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-native"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -2707,7 +2734,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-proto"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "prost 0.13.5",
  "prost-types",
@@ -2718,7 +2745,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-proto-testversion"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "prost 0.13.5",
  "protoc-bin-vendored",
@@ -2728,7 +2755,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-provider"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -2747,14 +2774,14 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-render-consumer"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "sovereign-config-rust-consumer"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "async-trait",
  "sovereign-config-client",
@@ -2764,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-rust-provider-consumer"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "serde",
  "sovereign-config-provider",
@@ -2773,7 +2800,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-server"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -2795,7 +2822,9 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "sovereign-config-authentik",
  "sovereign-config-core",
+ "sovereign-config-identity",
  "sovereign-config-proto",
  "sovereign-config-proto-testversion",
  "sovereign-config-telemetry",
@@ -2814,7 +2843,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-telemetry"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "http",
  "opentelemetry",
@@ -2823,6 +2852,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
+ "reqwest 0.12.28",
  "rustix",
  "serde_json",
  "thiserror",
@@ -2835,7 +2865,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-web"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2855,7 +2885,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-woodpecker-broker"
-version = "2.43.0"
+version = "2.44.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",

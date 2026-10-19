@@ -2,11 +2,12 @@
 //! implementation sees a request: `v3` nothing, `v4` its own basic validation.
 //!
 //! Both shims run over one shared implementation, as `main.rs` registers them.
-//! Nothing here reaches storage or Authentik, so it runs without either.
+//! Nothing here reaches storage or the identity provider, so it runs over a
+//! lazy pool and the in-memory provider.
 
 use std::{sync::Arc, time::Duration};
 
-use sovereign_config_core::Secret;
+use sovereign_config_identity::fake::FakeIdentityProvider;
 use sovereign_config_proto::sovereign::config::{v3, v4};
 use sqlx::postgres::PgPoolOptions;
 use tonic::{Code, Request};
@@ -15,30 +16,18 @@ use super::{
     ManagedConnectionsService, ManagedSettings, V3ManagedConnections, V4ManagedConnections,
 };
 use crate::audit::AuditRecorder;
-use crate::authentik::AuthentikAdminClient;
 use crate::metrics::ManagedConnectionMetrics;
 
 fn shims(metrics: Arc<ManagedConnectionMetrics>) -> (V3ManagedConnections, V4ManagedConnections) {
     let pool = PgPoolOptions::new()
         .connect_lazy("postgresql://unused@127.0.0.1:1/unused")
         .expect("a lazy pool must build without connecting");
-    let admin = AuthentikAdminClient::new(
-        "http://127.0.0.1:1/"
-            .parse()
-            .expect("a loopback origin parses"),
-        Secret::new("unused-api-token"),
-        Duration::from_millis(50),
-    )
-    .expect("a loopback admin client must build");
     let shared = Arc::new(ManagedConnectionsService::new(
         pool,
-        admin,
+        Arc::new(FakeIdentityProvider::new()),
         ManagedSettings {
             public_origin: "https://config.example.test".to_owned(),
             issuer: "https://auth.example.test/application/o/sovereign-config/".to_owned(),
-            client_id: "sovereign-config".to_owned(),
-            grants_attribute: "sovereign_config_grants".to_owned(),
-            managed_group: "sovereign-config-connections".to_owned(),
             rotation_lease: Duration::from_secs(60),
         },
         metrics,

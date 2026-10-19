@@ -1,0 +1,24 @@
+[package]
+name = "sovereign-config-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The identity-provider contract managed connections are provisioned through: the trait, its types and its conformance suite"
+publish = false
+
+[features]
+# The conformance suite and the in-memory fake that passes it; only ever
+# enabled from a `[dev-dependencies]` entry.
+conformance = []
+
+[dependencies]
+async-trait.workspace = true
+sovereign-config-core = { path = "../sovereign-config-core" }
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,4 +1,5 @@
-//! Server-only Authentik administration adapter for managed connections.
+//! The Authentik administration client: one method per REST call the
+//! provider makes, in Authentik's own terms.
 //!
 //! Every request uses the dedicated connection-manager API token over the
 //! exact configured origin with redirects disabled, a short total timeout,
@@ -15,40 +16,11 @@ use serde_json::{Value, json};
 use sovereign_config_core::Secret;
 use tracing::Instrument;
 
-use crate::spans;
+use sovereign_config_identity::ProviderError;
+use sovereign_config_telemetry::client::{client_span, record_error, send};
 
 const MAX_ADMIN_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_EXTERNAL_IDENTIFIER_CHARS: usize = 128;
-
-/// Bounded classification of an Authentik administration failure.
-///
-/// The classification deliberately discards all Authentik response content.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AdminError {
-    /// The exact target object does not exist.
-    NotFound,
-    /// Authentik definitively rejected the request without applying it.
-    Rejected,
-    /// The request could not be delivered, so it was definitively not applied.
-    Unavailable,
-    /// The outcome is unknown: Authentik may have applied the request.
-    Ambiguous,
-    /// The response violated the adapter's strict decoding or redirect policy.
-    Invalid,
-}
-
-impl AdminError {
-    /// The classification as a span's `error.type` and a log field.
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::NotFound => "not_found",
-            Self::Rejected => "rejected",
-            Self::Unavailable => "unavailable",
-            Self::Ambiguous => "ambiguous",
-            Self::Invalid => "invalid",
-        }
-    }
-}
 
 /// Route templates, as client spans name them: identifiers stay placeholders.
 const SERVICE_ACCOUNT_ROUTE: &str = "/api/v3/core/users/service_account/";
@@ -129,7 +101,7 @@ impl AuthentikAdminClient {
     pub(crate) async fn create_service_account(
         &self,
         username: &str,
-    ) -> Result<CreatedServiceAccount, AdminError> {
+    ) -> Result<CreatedServiceAccount, ProviderError> {
         #[derive(Deserialize)]
         struct ServiceAccountResponse {
             username: String,
@@ -151,7 +123,7 @@ impl AuthentikAdminClient {
             )
             .await?;
         let decoded: ServiceAccountResponse =
-            serde_json::from_slice(&body).map_err(|_| AdminError::Invalid)?;
+            serde_json::from_slice(&body).map_err(|_| ProviderError::Invalid)?;
         if decoded.username != username
             || decoded.token.is_empty()
             || decoded.token.bytes().any(|byte| byte.is_ascii_control())
@@ -159,7 +131,7 @@ impl AuthentikAdminClient {
             || decoded.user_uid.is_empty()
             || decoded.user_uid.len() > MAX_EXTERNAL_IDENTIFIER_CHARS
         {
-            return Err(AdminError::Invalid);
+            return Err(ProviderError::Invalid);
         }
         Ok(CreatedServiceAccount {
             user_id: decoded.user_pk,
@@ -181,7 +153,7 @@ impl AuthentikAdminClient {
         grants_attribute: &str,
         root: &str,
         permissions: &[&str],
-    ) -> Result<(), AdminError> {
+    ) -> Result<(), ProviderError> {
         let mut attributes = serde_json::Map::new();
         attributes.insert(
             "goauthentik.io/user/service-account".to_owned(),
@@ -209,7 +181,7 @@ impl AuthentikAdminClient {
     pub(crate) async fn find_group_by_name(
         &self,
         name: &str,
-    ) -> Result<Option<String>, AdminError> {
+    ) -> Result<Option<String>, ProviderError> {
         #[derive(Deserialize)]
         struct GroupRecord {
             pk: String,
@@ -224,7 +196,7 @@ impl AuthentikAdminClient {
         endpoint.query_pairs_mut().append_pair("name", name);
         let body = self.call(Method::GET, GROUPS_ROUTE, endpoint, None).await?;
         let decoded: GroupListResponse =
-            serde_json::from_slice(&body).map_err(|_| AdminError::Invalid)?;
+            serde_json::from_slice(&body).map_err(|_| ProviderError::Invalid)?;
         let mut matching = decoded.results.into_iter().filter(|record| {
             record.name == name
                 && !record.pk.is_empty()
@@ -232,7 +204,7 @@ impl AuthentikAdminClient {
         });
         let found = matching.next().map(|record| record.pk);
         if matching.next().is_some() {
-            return Err(AdminError::Invalid);
+            return Err(ProviderError::Invalid);
         }
         Ok(found)
     }
@@ -245,7 +217,7 @@ impl AuthentikAdminClient {
         &self,
         user_id: i64,
         group_id: &str,
-    ) -> Result<(), AdminError> {
+    ) -> Result<(), ProviderError> {
         self.call(
             Method::PATCH,
             USER_ROUTE,
@@ -259,7 +231,7 @@ impl AuthentikAdminClient {
     /// Names an existing managed service account after its connection, as
     /// [`Self::set_managed_attributes`] does for a new one. Only the name is
     /// patched, so the account's credential and grants are untouched.
-    pub(crate) async fn rename_user(&self, user_id: i64, name: &str) -> Result<(), AdminError> {
+    pub(crate) async fn rename_user(&self, user_id: i64, name: &str) -> Result<(), ProviderError> {
         self.call(
             Method::PATCH,
             USER_ROUTE,
@@ -278,7 +250,7 @@ impl AuthentikAdminClient {
     pub(crate) async fn find_user_by_username(
         &self,
         username: &str,
-    ) -> Result<Option<FoundUser>, AdminError> {
+    ) -> Result<Option<FoundUser>, ProviderError> {
         #[derive(Deserialize)]
         struct UserRecord {
             pk: i64,
@@ -293,7 +265,7 @@ impl AuthentikAdminClient {
         endpoint.query_pairs_mut().append_pair("username", username);
         let body = self.call(Method::GET, USERS_ROUTE, endpoint, None).await?;
         let decoded: UserListResponse =
-            serde_json::from_slice(&body).map_err(|_| AdminError::Invalid)?;
+            serde_json::from_slice(&body).map_err(|_| ProviderError::Invalid)?;
         let mut matching = decoded
             .results
             .into_iter()
@@ -302,7 +274,7 @@ impl AuthentikAdminClient {
             .next()
             .map(|record| FoundUser { user_id: record.pk });
         if matching.next().is_some() {
-            return Err(AdminError::Invalid);
+            return Err(ProviderError::Invalid);
         }
         Ok(found)
     }
@@ -312,7 +284,7 @@ impl AuthentikAdminClient {
     pub(crate) async fn find_app_password_identifiers(
         &self,
         username: &str,
-    ) -> Result<Vec<String>, AdminError> {
+    ) -> Result<Vec<String>, ProviderError> {
         #[derive(Deserialize)]
         struct TokenRecord {
             identifier: String,
@@ -329,7 +301,7 @@ impl AuthentikAdminClient {
             .append_pair("intent", "app_password");
         let body = self.call(Method::GET, TOKENS_ROUTE, endpoint, None).await?;
         let decoded: TokenListResponse =
-            serde_json::from_slice(&body).map_err(|_| AdminError::Invalid)?;
+            serde_json::from_slice(&body).map_err(|_| ProviderError::Invalid)?;
         let identifiers = decoded
             .results
             .into_iter()
@@ -342,7 +314,7 @@ impl AuthentikAdminClient {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         }) {
-            return Err(AdminError::Invalid);
+            return Err(ProviderError::Invalid);
         }
         Ok(identifiers)
     }
@@ -352,7 +324,7 @@ impl AuthentikAdminClient {
         &self,
         identifier: &str,
         replacement: &Secret,
-    ) -> Result<(), AdminError> {
+    ) -> Result<(), ProviderError> {
         self.call(
             Method::POST,
             SET_KEY_ROUTE,
@@ -364,7 +336,7 @@ impl AuthentikAdminClient {
     }
 
     /// Deletes the exact managed service account.
-    pub(crate) async fn delete_user(&self, user_id: i64) -> Result<(), AdminError> {
+    pub(crate) async fn delete_user(&self, user_id: i64) -> Result<(), ProviderError> {
         self.call(
             Method::DELETE,
             USER_ROUTE,
@@ -385,8 +357,8 @@ impl AuthentikAdminClient {
         route: &'static str,
         url: Url,
         body: Option<Value>,
-    ) -> Result<Vec<u8>, AdminError> {
-        let span = spans::client_span(&method, Some(route), &self.api_origin);
+    ) -> Result<Vec<u8>, ProviderError> {
+        let span = client_span(&method, Some(route), &self.api_origin);
         async {
             let mut request = self
                 .http
@@ -395,12 +367,12 @@ impl AuthentikAdminClient {
             if let Some(body) = body {
                 request = request.json(&body);
             }
-            let result = match spans::send(&self.http, request).await {
+            let result = match send(&self.http, request).await {
                 Ok(response) => expect_success(response).await,
                 Err(error) => Err(classify_transport(&error)),
             };
             if let Err(error) = &result {
-                spans::record_error(error.label());
+                record_error(error.label());
             }
             result
         }
@@ -408,37 +380,39 @@ impl AuthentikAdminClient {
         .await
     }
 
-    fn endpoint(&self, path: &str) -> Result<Url, AdminError> {
-        self.api_origin.join(path).map_err(|_| AdminError::Invalid)
+    fn endpoint(&self, path: &str) -> Result<Url, ProviderError> {
+        self.api_origin
+            .join(path)
+            .map_err(|_| ProviderError::Invalid)
     }
 }
 
-fn classify_transport(error: &reqwest::Error) -> AdminError {
+fn classify_transport(error: &reqwest::Error) -> ProviderError {
     if error.is_timeout() {
-        AdminError::Ambiguous
+        ProviderError::Ambiguous
     } else if error.is_connect() || error.is_builder() || error.is_request() {
-        AdminError::Unavailable
+        ProviderError::Unavailable
     } else if error.is_redirect() {
-        AdminError::Invalid
+        ProviderError::Invalid
     } else {
-        AdminError::Ambiguous
+        ProviderError::Ambiguous
     }
 }
 
-fn classify_status(status: StatusCode) -> AdminError {
+fn classify_status(status: StatusCode) -> ProviderError {
     if status == StatusCode::NOT_FOUND {
-        AdminError::NotFound
+        ProviderError::NotFound
     } else if status.is_client_error() {
-        AdminError::Rejected
+        ProviderError::Rejected
     } else if status.is_redirection() {
-        AdminError::Invalid
+        ProviderError::Invalid
     } else {
-        AdminError::Ambiguous
+        ProviderError::Ambiguous
     }
 }
 
 /// Reads a bounded successful response body, discarding any failure text.
-async fn expect_success(response: reqwest::Response) -> Result<Vec<u8>, AdminError> {
+async fn expect_success(response: reqwest::Response) -> Result<Vec<u8>, ProviderError> {
     let status = response.status();
     if !status.is_success() {
         return Err(classify_status(status));
@@ -447,19 +421,19 @@ async fn expect_success(response: reqwest::Response) -> Result<Vec<u8>, AdminErr
         .content_length()
         .is_some_and(|length| length > MAX_ADMIN_RESPONSE_BYTES as u64)
     {
-        return Err(AdminError::Invalid);
+        return Err(ProviderError::Invalid);
     }
     let mut body = Vec::new();
     let mut stream = response;
     while let Some(chunk) = stream.chunk().await.map_err(|error| {
         if error.is_timeout() {
-            AdminError::Ambiguous
+            ProviderError::Ambiguous
         } else {
-            AdminError::Invalid
+            ProviderError::Invalid
         }
     })? {
         if body.len() + chunk.len() > MAX_ADMIN_RESPONSE_BYTES {
-            return Err(AdminError::Invalid);
+            return Err(ProviderError::Invalid);
         }
         body.extend_from_slice(&chunk);
     }

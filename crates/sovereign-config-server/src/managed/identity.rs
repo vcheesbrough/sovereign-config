@@ -1,19 +1,18 @@
-//! Generated identifiers and credentials for a managed connection: the
-//! opaque connection id, the recognizable Authentik username, and the
-//! replacement app password.
+//! Generated identifiers for a managed connection: the opaque connection id
+//! and the recognizable username its service account is created under. The
+//! credentials are the identity provider's to generate.
 
-use sovereign_config_core::{ConnectionId, Secret};
+use sovereign_config_core::ConnectionId;
 use tonic::Status;
 
 use super::wire::internal_error;
 
 const CONNECTION_ID_CHARS: usize = 32;
-const APP_PASSWORD_CHARS: usize = 48;
 pub(super) const USERNAME_PREFIX: &str = "sc-managed-";
 pub(super) const USERNAME_SLUG_MAX_CHARS: usize = 32;
 
-/// Builds the Authentik username for a connection, embedding a slug of the
-/// display name so operators can recognize the account in Authentik, with the
+/// Builds the identity provider's username for a connection, embedding a slug
+/// of the display name so operators can recognize the account there, with the
 /// opaque connection ID guaranteeing uniqueness regardless of display-name
 /// collisions. The connection ID alone is used only when the display name
 /// contains no characters that survive slugging.
@@ -56,16 +55,6 @@ pub(super) fn generate_connection_id() -> Result<ConnectionId, Status> {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let value = random_string(ALPHABET, CONNECTION_ID_CHARS)?;
     ConnectionId::parse(value).map_err(|_| internal_error())
-}
-
-/// Generates a high-entropy replacement app password from the OS CSPRNG.
-#[expect(
-    clippy::result_large_err,
-    reason = "tonic::Status is the crate's RPC error type and is returned by value"
-)]
-pub(super) fn generate_app_password() -> Result<Secret, Status> {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    Ok(Secret::new(random_string(ALPHABET, APP_PASSWORD_CHARS)?))
 }
 
 /// Draws unbiased characters from the OS CSPRNG with rejection sampling.

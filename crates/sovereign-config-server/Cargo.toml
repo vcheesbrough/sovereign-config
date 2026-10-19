@@ -37,10 +37,16 @@ opentelemetry.workspace = true
 zeroize.workspace = true
 sovereign-config-proto = { path = "../sovereign-config-proto" }
 sovereign-config-core = { path = "../sovereign-config-core" }
+# The identity-provider contract managed connections depend on, and its one
+# implementation, which only `main.rs` names (`tests/lint_ratchet.rs`).
+sovereign-config-identity = { path = "../sovereign-config-identity" }
+sovereign-config-authentik = { path = "../sovereign-config-authentik" }
 sovereign-config-telemetry = { path = "../sovereign-config-telemetry" }
 
 [dev-dependencies]
 prost.workspace = true
+# The in-memory provider, for driving the managed service without HTTP.
+sovereign-config-identity = { path = "../sovereign-config-identity", features = ["conformance"] }
 # Exported spans and log records in plain types, for asserting on what left.
 sovereign-config-telemetry = { path = "../sovereign-config-telemetry", features = ["testing"] }
 # SIGTERM for the telemetry process tests, as `docker stop` sends it.

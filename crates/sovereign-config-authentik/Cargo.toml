@@ -1,0 +1,31 @@
+[package]
+name = "sovereign-config-authentik"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Authentik as the identity provider managed connections are provisioned in"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+getrandom.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+sovereign-config-core = { path = "../sovereign-config-core" }
+sovereign-config-identity = { path = "../sovereign-config-identity" }
+sovereign-config-telemetry = { path = "../sovereign-config-telemetry" }
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true
+sovereign-config-identity = { path = "../sovereign-config-identity", features = ["conformance"] }
+# Exported spans in plain types, for asserting what an Authentik call exports.
+sovereign-config-telemetry = { path = "../sovereign-config-telemetry", features = ["testing"] }
+
+[lints]
+workspace = true
