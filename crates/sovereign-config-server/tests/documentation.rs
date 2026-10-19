@@ -141,6 +141,16 @@ fn the_readme_leaves_the_projects_own_deployment_to_its_own_document() {
     assert!(readme.contains("docs/project-deployment.md"));
 }
 
+/// The docker 27 CLI overwrites `OTEL_RESOURCE_ATTRIBUTES` when it execs the
+/// compose plugin, which fails startup. The README turns telemetry on, so it
+/// has to carry the workaround where the reader does that.
+#[test]
+fn the_readme_warns_that_docker_compose_clobbers_the_resource_attributes() {
+    let readme = fs::read_to_string(workspace_root().join("README.md")).expect("read README");
+    assert!(readme.contains("OTEL_RESOURCE_ATTRIBUTES"));
+    assert!(readme.contains("cli-plugins/docker-compose"));
+}
+
 #[test]
 fn anchors_follow_githubs_rules() {
     let text = "# Title\n## 2.15.0 widens the `path` grammar\n### Production — `authentik/blueprint.yaml`\n## Title\n```sh\n# not a heading\n```\n";

@@ -48,7 +48,7 @@ Every component is released together from one source tag under one version.
 
 ### 1. Set up the identity provider
 
-Apply the matching Authentik blueprint (`authentik/blueprint.yaml` for production, `authentik/blueprint-dev.yaml` for development) to your Authentik instance. It creates the OIDC provider, the grant scope mapping, the contributor group, and the restricted connection-manager service account and its API token. [Authentication](docs/authentication.md) lists every object it creates and the variables it needs. Note the blueprint's issuer URL, its client id (the audience) and the connection-manager API token. The server needs all three.
+Apply the matching Authentik blueprint (`authentik/blueprint.yaml` for production, `authentik/blueprint-dev.yaml` for development) to your Authentik instance, substituting its `${VARIABLE}` placeholders first. It creates the OIDC provider, the grant scope mapping, the contributor group, and the restricted connection-manager service account and its API token. [Authentication](docs/authentication.md) lists every object it creates and the variables it needs. Note the blueprint's issuer URL, its client id (the audience) and the connection-manager API token. The server needs all three.
 
 ### 2. Prepare storage
 
@@ -250,11 +250,14 @@ export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export OTEL_LOGS_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_TRACES_EXPORTER=otlp
 ```
 
+With `OTEL_RESOURCE_ATTRIBUTES` set, start the stack with the Compose plugin binary (for example `/usr/local/libexec/docker/cli-plugins/docker-compose up -d --wait`) rather than `docker compose`. The Docker 27 CLI overwrites that variable when it runs the plugin, and the server then fails startup because `deployment.environment.name` is missing.
+
+
 Metrics are pushed rather than scraped, and there is no `/metrics` endpoint. A collector that is down never fails a request, a start or a health check. The web UI can also send its own traces through an authenticated, same-origin ingest. [Observability](docs/observability.md) documents every span, metric and log field, and the validation rules for the variables.
 
 ## Upgrading
 
-Back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new release, and run `docker compose up -d`. Migrations are forward-only, so a downgrade means restoring the backup. Some releases need clients upgraded in a particular order. Read [Upgrading](docs/upgrading.md) for the procedure and the notes for every release between yours and the target.
+Stop traffic and the old server, back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new release, and run `docker compose up -d`. Migrations are forward-only, so a downgrade means restoring the backup. Some releases need clients upgraded in a particular order. Read [Upgrading](docs/upgrading.md) for the procedure and the notes for every release between yours and the target.
 
 ## Compatibility
 

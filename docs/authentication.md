@@ -21,7 +21,7 @@ The issuing providers use the selected Authentik signing certificate, five-minut
 
 ## Applying a blueprint
 
-Apply a blueprint with Authentik's blueprint import, or any tool that drives it, supplying these context variables:
+The blueprints carry `${VARIABLE}` placeholders, which Authentik's own blueprint import does not expand. Substitute them before importing (for example with `envsubst`, or a tool that does it for you, as the project's own pipeline does with `woodpecker-plugin-authentik-blueprint`). An unsubstituted file imports the literal placeholder text as the browser redirect URI and as the manager token's key:
 
 | Production variable | Development variable | Value |
 | --- | --- | --- |
