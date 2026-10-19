@@ -69,6 +69,18 @@ docker build --platform linux/amd64 -f docker/cli.Dockerfile --tag sovereign-con
 
 `docker/web.Dockerfile` exports the release web bundle on its own (`--output type=local,dest=web-dist`); the checks pipeline builds `web-dist/` this way, since it is not in the checkout, before compiling the server that embeds it and running the browser tests against it. The server image builds the bundle itself and never copies `web-dist/` from the build context. The files duplicate their builder stages rather than share them; keep their pinned base-image digests in step, which a test enforces. Container images are always pinned by digest.
 
+### Web bundle
+
+`web-dist/` is the browser bundle the server embeds. It is a build output, not tracked in git, so build it before compiling the server:
+
+```sh
+(cd crates/sovereign-config-web && trunk build --release --dist ../../web-dist)
+# or, without a local trunk:
+docker build -f docker/web.Dockerfile --output type=local,dest=web-dist .
+```
+
+The server's `build.rs` refuses to compile unless `web-dist/` holds a release bundle, which it reads from the `.trunk-profile` marker a hook in `crates/sovereign-config-web/Trunk.toml` writes into every bundle. A missing bundle would embed nothing, and a debug one is several times the size of the release one. A plain `trunk serve` or `trunk build`, including the one the Playwright suite starts when `PLAYWRIGHT_STATIC` is unset, writes only to `target/trunk-dist/`, so it never replaces the embedded bundle.
+
 ## Versioning
 
 Cargo supplies the `major.minor` release line and the CI pipeline number is the patch (`scripts/ci-release-tag.sh`): pipeline 362 on a `2.41.x` workspace releases `2.41.362`. Pipeline numbers are unique and increasing, so there is nothing to allocate and no two pipelines can claim one version. A re-run is a new pipeline and tags the same commit again under its own number; a deployment takes the commit's highest tag. Patch numbers are therefore sparse. The deployed `System.GetVersion` response reports that computed release version; local builds report the Cargo version.

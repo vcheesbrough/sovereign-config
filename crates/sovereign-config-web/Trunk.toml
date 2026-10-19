@@ -1,4 +1,17 @@
+# `web-dist/` is the bundle the server embeds, and it must be a release build
+# (the server's build.rs refuses anything else). So a plain `trunk serve` or
+# `trunk build` - which the Playwright suite runs - writes to a scratch
+# directory under `target/`, and only an explicit
+# `trunk build --release --dist ../../web-dist` produces the embedded bundle.
 [build]
 target = "index.html"
-dist = "../../web-dist"
+dist = "../../target/trunk-dist"
 public_url = "/"
+
+# Records which profile built the bundle, as `.trunk-profile` containing
+# `release` or `debug`, so the server's build.rs can tell a release bundle from
+# a debug one. Trunk copies the staging directory to `dist` after this stage.
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = ["-c", "printf '%s' \"$TRUNK_PROFILE\" > \"$TRUNK_STAGING_DIR/.trunk-profile\""]

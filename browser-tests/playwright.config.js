@@ -1,5 +1,8 @@
 const { defineConfig, devices } = require('@playwright/test');
 
+// With PLAYWRIGHT_STATIC set, serve a prebuilt release bundle; otherwise
+// `trunk serve` builds into target/trunk-dist (Trunk.toml), never web-dist/.
+// tests/helpers.js reads index.html from the same place.
 const staticDir = process.env.PLAYWRIGHT_STATIC_DIR || '../web-dist';
 
 module.exports = defineConfig({
