@@ -33,7 +33,7 @@ Every component is released together from one source tag under one version.
 - **Docker with Compose** on linux/amd64. The reference stack is [`compose.yaml`](compose.yaml).
 - **PostgreSQL.** The reference stack runs its own, pinned by digest. A deployment needs `CREATE` on its database, which the bundled role has.
 - **Authentik 2026.5.2 or newer** as the identity provider. The repository ships Authentik blueprints that create everything the service needs (see [Authentication](docs/authentication.md)). Authentik is the only supported identity provider today; support for other OIDC providers is planned (see [Roadmap](#roadmap)).
-- **A TLS-terminating reverse proxy** that forwards HTTP/2 cleartext (h2c) to the service. The reference stack is labelled for Traefik, the supported and tested ingress.
+- **A TLS-terminating reverse proxy** that forwards HTTP/2 cleartext (h2c) to the service. The reference stack is currently labelled for the author's own Traefik setup (see [step 4](#4-configure-and-start)).
 - **Encrypted storage** for the database volume and for every backup.
 
 ## Concepts
@@ -54,7 +54,7 @@ Apply the matching Authentik blueprint (`authentik/blueprint.yaml` for productio
 
 The operator must pre-create the external volume named by `POSTGRES_DATA_VOLUME` that holds the PostgreSQL data directory on encrypted storage; Compose deliberately refuses to create a default volume. All backup and staging storage must be encrypted too.
 
-The stack publishes no application, PostgreSQL, metrics, logging or tracing port. PostgreSQL sits on an internal network, and the service is reachable only through the reverse proxy on the external `proxy-backend` network.
+The stack publishes no application, PostgreSQL, metrics, logging or tracing port. PostgreSQL sits on an internal network, and the service is reachable only through the reverse proxy on an external network. The reference stack names that network `proxy-backend`, after the author's own Traefik network.
 
 ### 3. Create the secrets
 
@@ -93,10 +93,10 @@ docker compose up -d --wait
 
 The service starts only after PostgreSQL reports healthy. It applies its forward-only database migrations before accepting requests.
 
-`compose.yaml` is the project's reference deployment, so adapt three things in it to your environment:
+> **`compose.yaml` currently depends on the author's own infrastructure.** It was written for the project's own deployment, and the image registry and reverse-proxy names below belong to that environment, not to Sovereign Config. The author intends to remove these dependencies, so that the stack runs as shipped with configuration alone (see [Roadmap](#roadmap)). Until then, adapt them to your environment.
 
-- **The image.** It pulls `registry.desync.link/sovereign-config:<tag>`, the project's own registry. To run an image you built yourself ([Development](docs/development.md#building-and-testing)), tag it to match or change the `image:` line.
-- **The reverse proxy.** The Traefik labels expect an external network named `proxy-backend`, a `websecure` entrypoint, a certificate resolver named `myresolver`, and the middlewares `lan-vpn-only`, `rate-limit`, `crowdsec` and `security-headers`. Rename them to match your Traefik, or replace the labels for another proxy. Whatever proxy you use, it must forward h2c to port `50051`.
+- **The image.** It pulls `registry.desync.link/sovereign-config:<tag>` from the author's own registry. To run an image you built yourself ([Development](docs/development.md#building-and-testing)), tag it to match or change the `image:` line.
+- **The reverse proxy.** The Traefik labels name parts of the author's own Traefik setup: an external network named `proxy-backend`, a `websecure` entrypoint, a certificate resolver named `myresolver`, and the middlewares `lan-vpn-only`, `rate-limit`, `crowdsec` and `security-headers`. None of these exists in a fresh Traefik. Rename them to match your Traefik, or replace the labels for another proxy. Whatever proxy you use, it must forward h2c to port `50051`.
 - **Client telemetry.** The optional `otlp-ingest` service runs only in the `client-telemetry` profile (see [Observability](docs/observability.md#client-telemetry-the-web-ui)). A plain `docker compose up` leaves it out.
 
 ### 5. Verify
@@ -271,6 +271,7 @@ The API is served as versioned protobuf packages, currently `sovereign.config.v4
 
 The project intends to extend Sovereign Config in these directions. They are statements of intent, not commitments, and none has a release date.
 
+- **An infrastructure-neutral deployment.** `compose.yaml` still names the author's own image registry and Traefik setup (see [step 4](#4-configure-and-start)). The intent is to make the registry, proxy network, entrypoint, certificate resolver and middlewares configurable, or to ship them as an example rather than defaults, so the stack needs no editing.
 - **More identity providers.** Authentication is built on standard OIDC access tokens, verified locally against the issuer's published keys, but the setup, grant mapping and managed connections currently depend on Authentik. The intent is to support other OIDC identity providers as well.
 - **Providers for more languages.** Applications currently read configuration through the Rust `sovereign-config-provider` crate, or through `sovereign-config render` from any language. The intent is to offer native providers for other ecosystems, starting with .NET, with the same guarantees: a scoped access URL, protocol negotiation, and no caching of revealed secrets.
 
