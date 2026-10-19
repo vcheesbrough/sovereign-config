@@ -658,7 +658,7 @@ function auditRequest(body) {
   };
 }
 
-// The service's filters, as README "Reading the trail" states them.
+// The service's filters, as docs/audit-trail.md "Reading the trail" states them.
 function auditMatches(event, query) {
   const firstAt = event.firstAt ?? event.at;
   if (query.pathFilter && !event.path.toLowerCase().includes(query.pathFilter.toLowerCase())) return false;

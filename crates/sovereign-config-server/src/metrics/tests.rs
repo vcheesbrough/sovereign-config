@@ -20,7 +20,7 @@ use super::{
 use crate::{Families, audit::EventKind, register_metrics, system::SERVED_PROTOCOL_LABELS};
 
 /// Every instrument this server exports, and the name the platform stores
-/// it under. **The source of truth** for the README's series names, the
+/// it under. **The source of truth** for the documented series names, the
 /// retirement gate (`sovereign_config_protocol_requests_total`) and the
 /// audit alert series (`sovereign_config_audit_events_total`): a rename that
 /// would move a stored name fails here, not in a query.

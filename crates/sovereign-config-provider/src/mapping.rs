@@ -89,7 +89,7 @@ fn leaf_text(
 /// are lowercase Rust identifiers, so the JSON tree this builds has to be
 /// keyed by fold regardless of the case a value was actually written with —
 /// unlike `sovereign_config_core::render_subtree_json`, which is deliberately
-/// display-cased for CLI/UI output. See card #294's README note on `render`.
+/// display-cased for CLI/UI output. See `render` in `docs/cli.md`.
 fn relative_segments(root: &ConfigPath, path: &ConfigPath) -> Result<Vec<String>, ProviderError> {
     if root.fold() == "/" {
         return Ok(path

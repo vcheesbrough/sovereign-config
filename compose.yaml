@@ -54,8 +54,8 @@ services:
       SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT: ${SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT:-}
       # Telemetry: names only, never a value. Each is passed through from the
       # deploy step's environment when set there and left unset otherwise, so
-      # a deployment without them runs with telemetry off (README
-      # "Observability"). The values live with the deploy step.
+      # a deployment without them runs with telemetry off
+      # (docs/observability.md). The values live with the deploy step.
       OTEL_SERVICE_NAME:
       OTEL_RESOURCE_ATTRIBUTES:
       OTEL_EXPORTER_OTLP_ENDPOINT:
@@ -94,7 +94,7 @@ services:
       - "observability.deployment.environment=${SOVEREIGN_CONFIG_ENV:-dev}"
     restart: unless-stopped
 
-  # The web UI's telemetry ingest (README "Observability", *Client
+  # The web UI's telemetry ingest (docs/observability.md, *Client
   # telemetry*): the published otlp-collector-oidc image, unmodified, one per
   # environment. It validates the operator's access token (issuer, audience =
   # this product's client id, expiry, `telemetry:write`), stamps `user.*`, the

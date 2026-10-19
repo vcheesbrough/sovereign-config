@@ -600,7 +600,7 @@ impl ExportedMetric {
 /// `_sum` and `_count` series.
 ///
 /// A mirror, for tests: a rename that would move a stored name fails the
-/// test comparing against it, rather than the README's queries.
+/// test comparing against it, rather than the documented queries.
 ///
 /// # Panics
 ///

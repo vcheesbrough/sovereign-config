@@ -4,7 +4,7 @@
 //! compiled into a released binary. It exists so the dual-registration
 //! mechanism — two `sovereign.config.vN` packages on one tonic router — is
 //! exercised before a real second version depends on it. See
-//! `## Protocol versioning` in the repository `README.md`.
+//! `docs/protocol-versioning.md` in the repository.
 
 pub mod sovereign {
     pub mod config {

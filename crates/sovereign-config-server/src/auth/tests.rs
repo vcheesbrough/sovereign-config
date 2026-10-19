@@ -897,8 +897,8 @@ async fn a_new_signing_key_is_picked_up_with_exactly_one_refresh() {
 /// With the real throttle in place: the periodic re-read does not start the
 /// refresh interval, so a key rotated in after it is picked up by the first
 /// token naming it. A token-driven fetch does start it, and a second new key
-/// inside the interval is refused without a fetch — the window the README
-/// documents.
+/// inside the interval is refused without a fetch — the window
+/// docs/authentication.md documents.
 #[tokio::test]
 async fn only_token_driven_fetches_start_the_refresh_interval() {
     let server = issuer().await;

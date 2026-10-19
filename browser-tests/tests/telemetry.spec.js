@@ -8,7 +8,7 @@ const {
 } = require('./helpers');
 
 // The page's own origin: the ingest is same-origin with the app, and the
-// server hands the page exactly that (README "Observability").
+// server hands the page exactly that (docs/observability.md).
 const endpoint = 'http://127.0.0.1:8088';
 const telemetryConfig = 'globalThis.SOVEREIGN_CONFIG={issuer:"https://auth.example.test/application/o/sovereign-config/",clientId:"sovereign-config",telemetry:{endpoint:"http://127.0.0.1:8088",serviceVersion:"2.38.0-test"}};';
 const VALUES = { '/apps/api/enabled': 'secret-looking-content' };

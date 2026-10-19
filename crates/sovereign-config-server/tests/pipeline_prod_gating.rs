@@ -730,7 +730,7 @@ fn production_deploy_targets_the_production_environment() {
 /// Nothing gates on the client-telemetry ingest. The health-gated `up
 /// --wait` leaves its profile out, and the separate start that follows is
 /// allowed to fail: an ingest that cannot start costs the web UI's telemetry
-/// and never a deploy (README "Observability").
+/// and never a deploy (docs/observability.md).
 #[test]
 fn no_deploy_gates_on_the_client_telemetry_ingest() {
     let pipeline = pipeline();

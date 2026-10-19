@@ -132,8 +132,8 @@ fn readme_documents_the_value_encryption_boundary() {
 }
 
 #[test]
-fn readme_lists_every_production_secret_the_deployment_consumes() {
-    let readme = include_str!("../../../README.md");
+fn deployment_doc_lists_every_production_secret_the_deployment_consumes() {
+    let doc = include_str!("../../../docs/project-deployment.md");
     let pipeline = include_str!("../../../.woodpecker/deploy-prod.yml");
 
     // A missing entry here is not cosmetic: the deploy step recreates the
@@ -146,14 +146,17 @@ fn readme_lists_every_production_secret_the_deployment_consumes() {
         "sovereign_config_prod_value_encryption_key",
     ] {
         assert!(pipeline.contains(secret), "{secret} missing from pipeline");
-        assert!(readme.contains(secret), "{secret} missing from README");
+        assert!(
+            doc.contains(secret),
+            "{secret} missing from docs/project-deployment.md"
+        );
     }
 }
 
 /// Access tokens are verified against the issuer's JWKS (#450), so nothing
 /// deploys an introspection endpoint, client or secret any more. A leftover
 /// would be a credential provisioned for nothing — or a sign that something
-/// started introspecting again without the README saying so.
+/// started introspecting again without `docs/authentication.md` saying so.
 #[test]
 fn nothing_deploys_introspection_configuration() {
     for (file, text) in [
@@ -219,7 +222,7 @@ fn environment(service: &serde_yaml::Mapping) -> serde_yaml::Mapping {
 }
 
 /// Telemetry is configured by the standard `OTEL_*` variables, whose values
-/// belong to the deploy step (README "Observability"). The compose file names
+/// belong to the deploy step (docs/project-deployment.md). The compose file names
 /// them so they reach the server, and holds no value: a value here would be a
 /// second place to retarget telemetry, and one that needs a commit to change.
 ///
@@ -272,7 +275,7 @@ fn compose_passes_the_otel_names_and_no_value() {
     );
 }
 
-/// The web UI's ingest (README "Observability", *Client telemetry*) faces the
+/// The web UI's ingest (docs/observability.md, *Client telemetry*) faces the
 /// public edge with an operator's token in every request, so it runs as the
 /// published image hardened, on the edge network only, and outside every
 /// health gate: in its own profile, so a plain `up --wait` never includes it,

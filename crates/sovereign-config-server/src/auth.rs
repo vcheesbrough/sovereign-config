@@ -49,7 +49,7 @@ const MAX_JWKS_RESPONSE_BYTES: usize = 64 * 1024;
 const CLOCK_LEEWAY: Duration = Duration::from_secs(30);
 /// The unversioned handshake.
 ///
-/// Unauthenticated by decision, recorded in `README.md`: a client has no token
+/// Unauthenticated by decision, recorded in `docs/protocol-versioning.md`: a client has no token
 /// before it has negotiated, `System.GetVersion` already publishes the same
 /// list, and keeping it outside authentication leaves each protocol version
 /// free to change its own scheme. The cost is that the served list and the
@@ -571,7 +571,7 @@ fn is_operational_rpc(path: &str) -> bool {
 }
 
 /// OTLP/HTTP's own paths, which the edge routes to the client-telemetry
-/// ingest on this same hostname (README "Observability").
+/// ingest on this same hostname (docs/observability.md).
 ///
 /// The server never serves them. It only sees one when the ingest is not
 /// running and the edge falls back to the app's router, and then it refuses

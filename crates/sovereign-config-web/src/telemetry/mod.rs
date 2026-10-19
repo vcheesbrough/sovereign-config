@@ -1,5 +1,5 @@
 //! Client telemetry: the page's spans and log records, over OTLP/JSON, to
-//! this environment's authenticated ingest (README "Observability", *Client
+//! this environment's authenticated ingest (docs/observability.md, *Client
 //! telemetry*; `client-export.md`).
 //!
 //! - **Off unless the product says otherwise.** The endpoint comes from

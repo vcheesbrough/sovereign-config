@@ -29,7 +29,7 @@ serde = { version = "1", features = ["derive"] }
   upgraded ahead of this build keeps working, so deploying a new server does not
   require redeploying the applications that consume it. A build stops working
   only once the server has *retired* every version it speaks — an announced,
-  observable event. See `## Protocol versioning` in the repository `README.md`.
+  observable event. See [Protocol versioning](../../docs/protocol-versioning.md).
 
 ## Usage
 

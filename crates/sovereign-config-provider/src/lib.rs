@@ -77,7 +77,7 @@
 //! and the error names both what this build speaks and what the server serves.
 //! The server announces a retirement ahead of time with a deprecation date,
 //! which the provider logs as a warning while continuing to work. See
-//! `## Protocol versioning` in the repository `README.md` for the deprecation
+//! `docs/protocol-versioning.md` in the repository for the deprecation
 //! procedure and the metric that gates it.
 //!
 //! Release 2.15.0 widened the canonical path grammar to permit `_` in segments.
