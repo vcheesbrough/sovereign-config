@@ -175,16 +175,24 @@ impl ClientCredential {
     /// empty or holds a control character.
     pub fn new(client_id: impl Into<String>, secret: Secret) -> Result<Self, InvalidIdentifier> {
         let client_id = client_id.into();
-        if client_id.is_empty()
-            || !client_id.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
-            })
+        if !Self::admits_client_id(&client_id)
             || secret.expose().is_empty()
             || secret.expose().chars().any(char::is_control)
         {
             return Err(InvalidIdentifier);
         }
         Ok(Self { client_id, secret })
+    }
+
+    /// Whether `client_id` is one a connection URL can carry: non-empty,
+    /// and only ASCII letters, digits, `-`, `.`, `_` and `~`. For checking a
+    /// configured client id at startup, before any credential exists.
+    #[must_use]
+    pub fn admits_client_id(client_id: &str) -> bool {
+        !client_id.is_empty()
+            && client_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+            })
     }
 
     #[must_use]

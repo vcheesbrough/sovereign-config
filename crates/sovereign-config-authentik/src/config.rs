@@ -1,18 +1,22 @@
 //! What the Authentik implementation needs, validated once at startup. The
-//! server parses the `SOVEREIGN_CONFIG_MANAGER_*` variables into it; error
-//! messages name those variables and never quote a value.
+//! server parses the `SOVEREIGN_CONFIG_MANAGER_*` variables into it; no error
+//! message quotes a value.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use sovereign_config_core::Secret;
+use sovereign_config_identity::ClientCredential;
 
 pub struct AuthentikConfig {
     pub(crate) api_origin: Url,
     pub(crate) api_token: Secret,
     /// The OAuth client every managed account authenticates through: Authentik
-    /// accepts an app password as `client_secret` for the server's own client.
+    /// accepts an app password as `client_secret` for an application's
+    /// client. Usually the server's own, whose id is also the token audience,
+    /// but the two are separate settings: the audience is what tokens must
+    /// carry, this is what a connection URL names.
     pub(crate) client_id: String,
     pub(crate) grants_attribute: String,
     pub(crate) managed_group: String,
@@ -22,13 +26,15 @@ pub struct AuthentikConfig {
 impl AuthentikConfig {
     /// `issuer` is the OIDC issuer the server already validated; the
     /// administration API is served from its exact origin. `client_id` is the
-    /// server's own OAuth client, which managed accounts authenticate through.
+    /// OAuth client managed accounts authenticate through, which every
+    /// connection URL names.
     ///
     /// # Errors
     ///
     /// The client id, grants attribute or group name is not permitted, or the
-    /// issuer has no usable origin. The message names the setting, never its
-    /// value.
+    /// issuer has no usable origin. No message quotes a value; the server,
+    /// which knows where the client id came from, checks it first and names
+    /// its variable.
     pub fn new(
         issuer: &Url,
         api_token: Secret,
@@ -57,11 +63,7 @@ impl AuthentikConfig {
 /// Validates the client id a connection URL carries, by the grammar the URL
 /// itself admits.
 fn validated_client_id(value: &str) -> Result<String> {
-    if value.is_empty()
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
-    {
+    if !ClientCredential::admits_client_id(value) {
         bail!("the managed accounts' OAuth client id is not one a connection URL admits");
     }
     Ok(value.to_owned())

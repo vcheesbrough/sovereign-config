@@ -4,12 +4,15 @@ use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use sovereign_config_authentik::AuthentikConfig;
 use sovereign_config_core::Secret;
+use sovereign_config_identity::ClientCredential;
 
 use crate::encryption::{ValueCipher, decode_key};
 
 /// For one fetch of an issuer's signing keys (docs/authentication.md, "Request authentication").
 const JWKS_TIMEOUT: Duration = Duration::from_secs(3);
 const MANAGER_TIMEOUT: Duration = Duration::from_secs(5);
+/// Optional: the OAuth client access URLs name, when it is not the audience.
+const MANAGER_CLIENT_ID: &str = "SOVEREIGN_CONFIG_MANAGER_CLIENT_ID";
 
 const SECONDS_PER_HOUR: u64 = 60 * 60;
 const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
@@ -123,10 +126,12 @@ impl Config {
             env::var(CLIENT_TELEMETRY_ENDPOINT).ok().as_deref(),
             &public_origin,
         )?;
+        let manager_client_id =
+            manager_client_id(env::var(MANAGER_CLIENT_ID).ok().as_deref(), &audience)?;
         let provider = AuthentikConfig::new(
             &issuer_url,
             Secret::new(required_secret("SOVEREIGN_CONFIG_MANAGER_API_TOKEN")?),
-            &audience,
+            &manager_client_id,
             &required_env("SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE")?,
             &required_env("SOVEREIGN_CONFIG_MANAGER_GROUP")?,
             MANAGER_TIMEOUT,
@@ -257,6 +262,26 @@ fn validated_client_telemetry_endpoint(
     Ok(Some(public_origin.to_owned()))
 }
 
+/// The OAuth client every access URL names, which managed accounts
+/// authenticate through: `SOVEREIGN_CONFIG_MANAGER_CLIENT_ID` when set, else
+/// the token audience — the same value with Authentik, where the audience is
+/// the application's client id. It must be a client id a connection URL can
+/// carry; the audience otherwise need not be, so the error says which
+/// variable to change.
+fn manager_client_id(explicit: Option<&str>, audience: &str) -> Result<String> {
+    match explicit.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(client_id) if ClientCredential::admits_client_id(client_id) => {
+            Ok(client_id.to_owned())
+        }
+        Some(_) => bail!("{MANAGER_CLIENT_ID} is not a client id a connection URL can carry"),
+        None if ClientCredential::admits_client_id(audience) => Ok(audience.to_owned()),
+        None => bail!(
+            "SOVEREIGN_CONFIG_OIDC_AUDIENCE is not a client id a connection URL can carry; \
+             set {MANAGER_CLIENT_ID} to the client access URLs should name"
+        ),
+    }
+}
+
 /// An optional whole-number setting: `default` when unset or blank, otherwise
 /// a value from `1` to `maximum`.
 fn optional_bounded(name: &str, default: u32, maximum: u32) -> Result<u32> {
@@ -332,7 +357,7 @@ pub(crate) fn required_secret(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        audit_page_size, bounded_setting, required_env, validate_issuer_url,
+        audit_page_size, bounded_setting, manager_client_id, required_env, validate_issuer_url,
         validated_client_telemetry_endpoint, validated_public_origin,
     };
 
@@ -474,6 +499,52 @@ mod tests {
                 error.contains("SOVEREIGN_CONFIG_AUDIT_PAGE_SIZE") && error.contains("1 to 1000"),
                 "{unusable:?}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn the_access_url_client_id_defaults_to_the_audience() {
+        assert_eq!(
+            manager_client_id(None, "sovereign-config").unwrap(),
+            "sovereign-config"
+        );
+        for blank in ["", "   "] {
+            assert_eq!(
+                manager_client_id(Some(blank), "sovereign-config").unwrap(),
+                "sovereign-config"
+            );
+        }
+    }
+
+    /// Decoupled from the audience: an audience a URL can't carry is fine
+    /// once the client id is set, and each refusal names the variable to
+    /// change without quoting either value.
+    #[test]
+    fn the_access_url_client_id_is_checked_and_names_its_variable() {
+        let urn_audience = "urn:sentinel:audience";
+        assert_eq!(
+            manager_client_id(Some("sovereign-config"), urn_audience).unwrap(),
+            "sovereign-config"
+        );
+
+        let unset = format!("{:#}", manager_client_id(None, urn_audience).unwrap_err());
+        assert!(unset.contains("SOVEREIGN_CONFIG_OIDC_AUDIENCE"), "{unset}");
+        assert!(
+            unset.contains("SOVEREIGN_CONFIG_MANAGER_CLIENT_ID"),
+            "{unset}"
+        );
+
+        let set = format!(
+            "{:#}",
+            manager_client_id(Some("bad sentinel/id"), "sovereign-config").unwrap_err()
+        );
+        assert!(
+            set.starts_with("SOVEREIGN_CONFIG_MANAGER_CLIENT_ID"),
+            "{set}"
+        );
+
+        for message in [unset, set] {
+            assert!(!message.contains("sentinel"), "{message}");
         }
     }
 

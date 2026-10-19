@@ -129,3 +129,11 @@ It was made in place because a new version cannot confine it. The rows are share
 
 **Who it can affect:** a `v4` reader of past audit events by access URLs. It now sees the connection's name where it saw an opaque subject or a generated username. A reader that matched on the old value, such as a saved narrative search for a subject, finds those events under the new name instead. No status, field or RPC changes. The repair runs once per environment and only touches events of connections that still exist.
 
+
+### 2.44.0 puts managed connections behind an identity-provider interface
+
+Release 2.44.0 moves the Authentik administration client behind a provider-neutral interface. Nothing changes on the wire, and access URLs are byte-identical. Two things affect an upgrade.
+
+**Migration 0014 is one-way.** It changes `managed_connections.provider_user_id` from an integer to text, keeping every existing value as its decimal digits. Once it has run, a 2.43 server can't start against that database. Back up PostgreSQL before upgrading, as the [procedure](#upgrade-procedure) says. Rolling back means restoring that backup, not running an older image.
+
+**The access URL's client id is checked at startup.** Access URLs name an OAuth client: `SOVEREIGN_CONFIG_MANAGER_CLIENT_ID`, new and optional, which defaults to `SOVEREIGN_CONFIG_OIDC_AUDIENCE`. That client id must contain only ASCII letters, digits, `-`, `.`, `_` and `~`, or the server refuses to start and names the variable to fix. Before, an audience outside that set started the server and broke only managed create and rotate. Deployments whose audience is an Authentik client id such as `sovereign-config` need no change. If the audience is something a URL can't carry, set `SOVEREIGN_CONFIG_MANAGER_CLIENT_ID` to the client access URLs should name.

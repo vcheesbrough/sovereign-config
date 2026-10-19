@@ -223,11 +223,12 @@ The server is configured entirely through environment variables. `compose.yaml` 
 | --- | :---: | --- |
 | `SOVEREIGN_CONFIG_DATABASE_URL` / `_FILE` | ✅ | The PostgreSQL connection URL. |
 | `SOVEREIGN_CONFIG_OIDC_ISSUER` | ✅ | The Authentik provider's issuer URL. The Authentik administration origin is derived from it, so the API and issuer origins can never diverge. |
-| `SOVEREIGN_CONFIG_OIDC_AUDIENCE` | ✅ | The provider's client id. Tokens for any other audience are refused. |
+| `SOVEREIGN_CONFIG_OIDC_AUDIENCE` | ✅ | The `aud` every access token must carry; tokens for any other audience are refused. With Authentik it is the application's client id. |
 | `SOVEREIGN_CONFIG_PUBLIC_ORIGIN` | ✅ | The exact canonical HTTPS origin embedded in generated access URLs. No userinfo, no path other than `/`, no query and no fragment. |
 | `SOVEREIGN_CONFIG_MANAGER_API_TOKEN` / `_FILE` | ✅ | The Authentik connection-manager API token. |
 | `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE` | ✅ | The Authentik user and group attribute that carries this environment's grants, matching the blueprint's scope mapping (`sovereign_config_prod_grants` or `sovereign_config_dev_grants`). |
 | `SOVEREIGN_CONFIG_MANAGER_GROUP` | ✅ | The Authentik group each access URL's service account is added to so an operator can browse them. It grants no permissions and must match the blueprint (`sovereign-config-connections` or `sovereign-config-dev-connections`). |
+| `SOVEREIGN_CONFIG_MANAGER_CLIENT_ID` | — | The OAuth client id every access URL names, which its service account authenticates through. Unset means `SOVEREIGN_CONFIG_OIDC_AUDIENCE`, which is right for Authentik. Only ASCII letters, digits, `-`, `.`, `_` and `~`. If unset, the audience must meet that rule. |
 | `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY` / `_FILE` | ✅ | The base64 32-byte key that seals secret values. |
 | `SOVEREIGN_CONFIG_GRPC_ADDR` | ✅ | The public listener, `0.0.0.0:50051` in `compose.yaml`. |
 | `SOVEREIGN_CONFIG_METRICS_ADDR` | ✅ | The internal listener that serves `/readyz`, `0.0.0.0:9090` in `compose.yaml`. The name predates metrics moving to OTLP. |
