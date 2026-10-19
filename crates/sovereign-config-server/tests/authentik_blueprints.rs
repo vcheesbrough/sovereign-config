@@ -96,12 +96,12 @@ fn assert_environment(environment: &Environment<'_>) {
     assert!(!expression.contains(environment.other_attribute));
     assert!(expression.contains("claims = {\"sovereign_config_grants\": grants}"));
     assert!(expression.contains("return claims"));
-    // A managed connection's account is named in its tokens, and only a
-    // managed one: a person's `preferred_username` comes from `profile`. The
-    // name is marked as an access URL's, so a connection named after a person
-    // never reads as that person in the audit trail (#440).
+    // Every token is named, whichever scopes its client asked for (#440): a
+    // managed connection's account by its connection's name, marked as an
+    // access URL's so it never reads as a person; anyone else by their
+    // username, as `profile` names them.
     assert!(expression.contains(
-        "if request.user.attributes.get(\"sovereign_config_managed\"):\n    claims[\"preferred_username\"] = f\"{request.user.name} (access URL)\""
+        "if request.user.attributes.get(\"sovereign_config_managed\"):\n    claims[\"preferred_username\"] = f\"{request.user.name} (access URL)\"\nelse:\n    claims[\"preferred_username\"] = request.user.username"
     ));
     assert!(!expression.contains("config-contributor"));
 

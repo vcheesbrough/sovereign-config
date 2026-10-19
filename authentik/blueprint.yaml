@@ -22,14 +22,19 @@ entries:
                 if grant not in grants:
                     grants.append(grant)
         claims = {"sovereign_config_grants": grants}
-        # A managed connection's service account requests only this scope, so
-        # it has no profile claims. The connection manager names the account
-        # after its connection; signing that name here is what lets the audit
-        # trail show it instead of the account's opaque subject. Whoever
-        # creates a connection chooses its name, so it is marked as an access
-        # URL's: a connection named after a person must not read as them.
+        # Every client requests this scope, but not every client requests
+        # `profile`: a managed connection's service account and the CLI and
+        # MCP server ask for this one alone. Signing the name here is what lets
+        # the audit trail show who acted instead of an opaque subject, whichever
+        # client they used. A person goes by their username, as `profile`
+        # names them. A managed account is named after its connection by the
+        # connection manager; whoever creates a connection chooses that name,
+        # so it is marked as an access URL's, and a connection named after a
+        # person never reads as them.
         if request.user.attributes.get("sovereign_config_managed"):
             claims["preferred_username"] = f"{request.user.name} (access URL)"
+        else:
+            claims["preferred_username"] = request.user.username
         return claims
 
   # The web UI's permission to send telemetry to this environment's ingest
@@ -90,8 +95,9 @@ entries:
         - !Find [authentik_providers_oauth2.scopemapping, [scope_name, openid]]
         # The browser UI names the signed-in operator in its header. `sub` is
         # issued hashed here (see sub_mode below), so `profile` (name,
-        # preferred_username) and `email` are the only sources of a claim a
-        # person recognises — `email` is a separate scope from `profile` in
+        # preferred_username) and `email` are where its claims come from (the
+        # grants mapping above also signs preferred_username, for clients that
+        # never request `profile`) — `email` is a separate scope from `profile` in
         # Authentik's default mappings, so both are attached. Neither labels
         # anything but the header: authorization runs on the grants mapping
         # alone.
