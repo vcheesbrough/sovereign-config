@@ -14,9 +14,9 @@ pub struct AuthentikConfig {
     pub(crate) api_token: Secret,
     /// The OAuth client every managed account authenticates through: Authentik
     /// accepts an app password as `client_secret` for an application's
-    /// client. Usually the server's own, whose id is also the token audience,
-    /// but the two are separate settings: the audience is what tokens must
-    /// carry, this is what a connection URL names.
+    /// client. The audience is what tokens must carry and this is what a
+    /// connection URL names; they are distinct concepts, but with Authentik
+    /// they must be the same value, which [`AuthentikConfig::new`] enforces.
     pub(crate) client_id: String,
     pub(crate) grants_attribute: String,
     pub(crate) managed_group: String,

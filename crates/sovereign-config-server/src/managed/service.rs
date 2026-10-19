@@ -297,6 +297,7 @@ impl ManagedConnectionsService {
         let actor = context.actor()?;
 
         let credential = row.credential().ok_or_else(internal_error)?;
+        let username = managed_username(&connection_id, &row.display_name);
         let replacement = match self.provider.replace_credential(&credential).await {
             Ok(replacement) => {
                 self.metrics.record_dependency(
@@ -310,12 +311,12 @@ impl ManagedConnectionsService {
                     ManagedDependencyCall::SetCredential,
                     dependency_outcome(error),
                 );
-                self.settle_failed_rotation(&connection_id, error).await;
+                self.settle_failed_rotation(&connection_id, &username, error)
+                    .await;
                 return Err(dependency_error());
             }
         };
 
-        let username = managed_username(&connection_id, &row.display_name);
         let connection_url = ConnectionUrl::managed(
             &self.settings.public_origin,
             &root,
@@ -500,42 +501,51 @@ impl ManagedConnectionsService {
 
     /// Settles a rotation whose credential write failed, according to whether
     /// the failure proves the previous credential is still current.
-    async fn settle_failed_rotation(&self, connection_id: &ConnectionId, error: ProviderError) {
-        match error {
-            // Definitive rejection before mutation: the previous
-            // credential is still current.
-            ProviderError::Rejected | ProviderError::Unavailable => {
-                warn!(
-                    connection_id = connection_id.as_str(),
-                    "rotation failed before the credential changed; the previous URL stays current"
-                );
-                let _ = self
-                    .transition_state(
-                        connection_id,
-                        ManagedConnectionState::RotationUnknown,
-                        ManagedConnectionState::Active,
-                    )
-                    .await;
-            }
-            // The token is gone; only revocation can clean this up.
-            ProviderError::NotFound => {
-                warn!(
-                    connection_id = connection_id.as_str(),
-                    "the credential to rotate no longer exists; the connection requires cleanup by revocation"
-                );
-                let _ = self
-                    .transition_state(
-                        connection_id,
-                        ManagedConnectionState::RotationUnknown,
-                        ManagedConnectionState::CleanupRequired,
-                    )
-                    .await;
-            }
+    async fn settle_failed_rotation(
+        &self,
+        connection_id: &ConnectionId,
+        username: &str,
+        error: ProviderError,
+    ) {
+        let credential_gone = match error {
+            // Undelivered: nothing changed, so the previous credential is
+            // still current.
+            ProviderError::Unavailable => false,
+            // Refused before mutation — but a provider may refuse, rather
+            // than report missing, a credential it no longer has or hides.
+            // Only the credential lookup, whose empty answer the contract
+            // makes authoritative, tells "still current" from "gone".
+            ProviderError::Rejected => self.credential_is_gone(username).await,
+            ProviderError::NotFound => true,
             // Ambiguous: the provider may have applied the new key.
-            ProviderError::Ambiguous | ProviderError::Invalid => warn!(
+            ProviderError::Ambiguous | ProviderError::Invalid => {
+                warn!(
+                    connection_id = connection_id.as_str(),
+                    "rotation outcome is unknown; the connection stays rotation_unknown until its lease expires and a retry settles it"
+                );
+                return;
+            }
+        };
+        let settled = if credential_gone {
+            // The credential is gone; only revocation can clean this up.
+            warn!(
                 connection_id = connection_id.as_str(),
-                "rotation outcome is unknown; the connection stays rotation_unknown until its lease expires and a retry settles it"
-            ),
-        }
+                "the credential to rotate no longer exists; the connection requires cleanup by revocation"
+            );
+            ManagedConnectionState::CleanupRequired
+        } else {
+            warn!(
+                connection_id = connection_id.as_str(),
+                "rotation failed before the credential changed; the previous URL stays current"
+            );
+            ManagedConnectionState::Active
+        };
+        let _ = self
+            .transition_state(
+                connection_id,
+                ManagedConnectionState::RotationUnknown,
+                settled,
+            )
+            .await;
     }
 }

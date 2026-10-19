@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use sovereign_config_core::{ConfigPath, ConnectionUrl, ManagedPermission, Secret};
 use sovereign_config_identity::{
-    ProviderError,
+    ManagedIdentityProvider as _, ProviderError,
     conformance::Operation,
     fake::{FakeAccount, FakeIdentityProvider},
 };
@@ -271,6 +271,37 @@ async fn rotate_replaces_the_secret_and_settles_every_failure() {
             "{error:?}"
         );
     }
+}
+
+/// A provider may refuse, rather than report missing, a credential that is
+/// gone. A rejected rotation is therefore only settled as "the previous URL
+/// stays current" once the credential is confirmed to exist; a vanished one
+/// leaves the connection for revocation, never `active` with a dead URL.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn a_rejected_rotation_of_a_vanished_credential_requires_cleanup() {
+    let fake = Arc::new(FakeIdentityProvider::new());
+    let service = service_over_or_skip!(&fake);
+
+    let (connection_id, _) = create(&service, "Vanishing", "/", &operator("/"))
+        .await
+        .expect("create must succeed");
+    let [account] = fake.accounts().try_into().expect("exactly one account");
+    // Gone behind the server's back, and refused rather than reported
+    // missing when the rotation reaches it.
+    fake.delete_account(&account.account)
+        .await
+        .expect("the account is deleted out of band");
+    fake.fail_next(Operation::ReplaceCredential, ProviderError::Rejected);
+
+    let status = rotate(&service, &connection_id)
+        .await
+        .expect_err("a rejected replacement fails the rotation");
+    assert_bounded(&status);
+    assert_eq!(
+        row(&service, &connection_id).await.map(|row| row.state),
+        Some("cleanup_required".to_owned())
+    );
 }
 
 #[tokio::test]
