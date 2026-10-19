@@ -220,10 +220,15 @@ impl FakeJwks {
 async fn jwks(
     State(state): State<FakeJwksState>,
 ) -> (StatusCode, [(&'static str, &'static str); 1], String) {
-    state.calls.fetch_add(1, Ordering::Relaxed);
-    sleep(state.delay).await;
+    // The answer is fixed when the request arrives, before it is counted: a
+    // test that switches the response once it sees an arrival must not change
+    // the answer that arrival gets. Read after the delay, a switch could reach
+    // the first request — the refresh test then saw a success where it staged
+    // a failure, and waited an hour for a retry that never came.
     let status = *state.status.lock().unwrap();
     let body = state.body.lock().unwrap().clone();
+    state.calls.fetch_add(1, Ordering::Relaxed);
+    sleep(state.delay).await;
     (status, [("content-type", "application/json")], body)
 }
 
