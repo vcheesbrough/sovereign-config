@@ -247,7 +247,9 @@ export OTEL_SERVICE_NAME=sovereign-config
 export OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=prod,telemetry_source=otlp
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-export OTEL_LOGS_EXPORTER=otlp OTEL_METRICS_EXPORTER=otlp OTEL_TRACES_EXPORTER=otlp
+export OTEL_LOGS_EXPORTER=otlp
+export OTEL_METRICS_EXPORTER=otlp
+export OTEL_TRACES_EXPORTER=otlp
 ```
 
 With `OTEL_RESOURCE_ATTRIBUTES` set, start the stack with the Compose plugin binary (for example `/usr/local/libexec/docker/cli-plugins/docker-compose up -d --wait`) rather than `docker compose`. The Docker 27 CLI overwrites that variable when it runs the plugin, and the server then fails startup because `deployment.environment.name` is missing.
