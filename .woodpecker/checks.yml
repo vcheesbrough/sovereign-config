@@ -1,5 +1,10 @@
-# Checks workflow: every gate that needs no deployment. No step depends on
-# another, so all of them start together.
+# Checks workflow: every gate that needs no deployment. web-dist/ is not in
+# the checkout (card #278), so web-bundle builds the release web bundle into
+# the workspace first: unit-test compiles the server, which embeds it, and
+# client-playwright tests it. Because Woodpecker runs dependencies as whole
+# stages (see below), script-validation and web-bundle form the first level
+# and unit-test and client-playwright the second; script-validation is quick,
+# so the bundle build is what the second level waits for.
 #
 # The pipeline is split into workflows, one file each, in the style of v-note:
 #
@@ -7,7 +12,7 @@
 #   deployment:  deploy-dev    (dev target, from any branch)
 #                deploy-prod   (prod target, from main only)
 #
-#   checks       script-validation, unit-test, client-playwright   (+ postgres-test)
+#   checks       script-validation ∥ web-bundle → unit-test ∥ client-playwright   (+ postgres-test)
 #   build        compute-version ∥ prune-build-cache
 #                → build-server ∥ build-broker ∥ build-cli   (each pushes a -ci candidate)
 #   publish      compute-version → promote-images → tag-release
@@ -52,8 +57,20 @@ steps:
       - sh scripts/ci-prune-buildkit-cache-test.sh
       - sh scripts/ci-release-tag-test.sh
 
-  unit-test:
+  # Builds the release WebAssembly bundle into web-dist/ in the shared workspace,
+  # with the same docker/web.Dockerfile stages the server image builds it with.
+  web-bundle:
     depends_on: []
+    when:
+      - event: [push, manual]
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - docker build -f docker/web.Dockerfile --output type=local,dest=web-dist .
+
+  unit-test:
+    depends_on: [web-bundle]
     when:
       - event: [push, manual]
     image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
@@ -84,11 +101,11 @@ steps:
       - rustup target add wasm32-unknown-unknown
       - cargo check --locked --target wasm32-unknown-unknown --package sovereign-config-core --package sovereign-config-client --package sovereign-config-web
 
-  # Builds the release WebAssembly bundle and runs the Playwright suite against it
-  # in Chromium and Firefox. The backend is mocked at the network layer
+  # Runs the Playwright suite in Chromium and Firefox against the release bundle
+  # web-bundle built. The backend is mocked at the network layer
   # (browser-tests/tests/helpers.js), so this is a client test, not end-to-end.
   client-playwright:
-    depends_on: []
+    depends_on: [web-bundle]
     when:
       - event: [push, manual]
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
@@ -96,17 +113,15 @@ steps:
       - /var/run/docker.sock:/var/run/docker.sock
     commands:
       - |
-        rm -rf .browser-dist
-        docker build -f docker/web.Dockerfile --output type=local,dest=.browser-dist .
         CONTAINER=$$(docker create --workdir /tests \
           --env PLAYWRIGHT_STATIC=1 \
           --env PLAYWRIGHT_STATIC_DIR=/web-dist \
           mcr.microsoft.com/playwright:v1.61.1-noble@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48 \
           sh -lc 'npm ci --ignore-scripts && npm test')
-        trap 'docker rm --force "$$CONTAINER" >/dev/null 2>&1 || true; rm -rf .browser-dist' EXIT
+        trap 'docker rm --force "$$CONTAINER" >/dev/null 2>&1 || true' EXIT
         docker cp browser-tests/. "$$CONTAINER:/tests"
         docker cp test-contracts/. "$$CONTAINER:/test-contracts"
-        docker cp .browser-dist/. "$$CONTAINER:/web-dist"
+        docker cp web-dist/. "$$CONTAINER:/web-dist"
         docker start --attach "$$CONTAINER"
 
 services:

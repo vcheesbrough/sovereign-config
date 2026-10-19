@@ -7,6 +7,9 @@
 # the pipeline_prod_gating tests keep their pinned base digests in step.
 
 # Duplicated in docker/web.Dockerfile; keep the two in step.
+# web-dist/ is not in the checkout (card #278): this stage builds the release
+# bundle into /src/web-dist itself. Trunk's default dist is a scratch dir, so
+# --dist is what makes this the bundle the server embeds.
 FROM docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2 AS web-builder
 WORKDIR /src
 RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/cargo/registry \
@@ -17,13 +20,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY test-consumers ./test-consumers
 COPY proto ./proto
-COPY web-dist ./web-dist
 RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=sovereign-config-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=sovereign-config-cargo-target,target=/src/target \
     rustup target add wasm32-unknown-unknown \
     && cd crates/sovereign-config-web \
-    && NO_COLOR=false trunk build --release
+    && NO_COLOR=false trunk build --release --dist ../../web-dist
 
 # The server embeds web-dist/ (rust-embed), so it builds on top of the bundle.
 FROM web-builder AS builder
