@@ -239,6 +239,9 @@ impl ManagedConnectionsService {
         failure: Status,
     ) -> Status {
         let deletion = self.provider.delete_account(account).await;
+        // The account was created moments ago in this flow, so `NotFound` is
+        // trusted as proof it is gone: the exception `delete_account`'s
+        // contract allows, unlike revocation's confirmed delete.
         match deletion {
             Ok(()) | Err(ProviderError::NotFound) => {
                 self.metrics.record_dependency(

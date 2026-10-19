@@ -264,8 +264,15 @@ pub trait ManagedIdentityProvider: Send + Sync {
     /// The one operation whose failure class does not settle the outcome: a
     /// provider that checks permission on the object it acts on can apply the
     /// delete and then refuse it, or answer "not found" for an account it
-    /// merely hides. After any failure a caller confirms absence through
-    /// [`Self::find_credentials`], never from the class.
+    /// merely hides. After a failure on an account that may have been out of
+    /// the caller's sight — one it recorded earlier, as revocation deletes —
+    /// a caller confirms absence through [`Self::find_credentials`], never
+    /// from the class.
+    ///
+    /// The exception is deleting an account the caller created moments ago in
+    /// the same flow, to undo a failed provisioning: nothing can have hidden
+    /// it in between, so [`ProviderError::NotFound`] is trusted there as
+    /// proof it is gone.
     async fn delete_account(&self, account: &AccountId) -> Result<(), ProviderError>;
 }
 

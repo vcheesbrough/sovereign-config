@@ -37,12 +37,14 @@ impl AuthentikProvider {
 }
 
 /// Authentik's primary key for an account this implementation issued. An
-/// identifier that is not one cannot name an Authentik user.
+/// identifier that is not one is refused before anything is sent: `Rejected`
+/// (definitely not applied), never `NotFound`, which would claim the account
+/// is absent without asking.
 fn user_id(account: &AccountId) -> Result<i64, ProviderError> {
     account
         .as_str()
         .parse()
-        .map_err(|_| ProviderError::NotFound)
+        .map_err(|_| ProviderError::Rejected)
 }
 
 fn account_id(user_id: i64) -> Result<AccountId, ProviderError> {
@@ -126,5 +128,17 @@ impl ManagedIdentityProvider for AuthentikProvider {
 
     async fn delete_account(&self, account: &AccountId) -> Result<(), ProviderError> {
         self.client.delete_user(user_id(account)?).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_identifier_this_implementation_never_issued_is_refused_not_absent() {
+        let foreign = AccountId::parse("not-an-authentik-key").unwrap();
+        assert_eq!(user_id(&foreign), Err(ProviderError::Rejected));
+        assert_eq!(user_id(&account_id(4242).unwrap()), Ok(4242));
     }
 }
