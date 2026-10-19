@@ -96,6 +96,7 @@ async fn live_manager_completes_the_managed_connection_lifecycle() {
             .set_managed_attributes(
                 account.user_id,
                 "livetestconnectionid0123456789ab",
+                "Live test connection",
                 "sovereign_config_live_test_grants",
                 "/apps/api",
                 &["read"],

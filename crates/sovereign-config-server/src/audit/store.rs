@@ -138,6 +138,68 @@ pub(super) async fn delete_before(
     Ok(swept.rows_affected())
 }
 
+/// Renames, in past events, each managed account in `names` (#440): an event
+/// recorded under its subject alone, or under a name it has since stopped
+/// carrying, takes its current name, in `actor_name` and at the head of its
+/// narrative, where every narrative names its actor. What it overwrites is
+/// kept in `recorded_actor_name` and `recorded_narrative`. The subject is
+/// never touched. An event under any other name, or whose narrative does not
+/// start with the name it was recorded under, is left as it is. Returns how
+/// many events changed, per subject.
+#[instrument(
+    name = "rename_actors audit_events",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "rename_actors", db.collection.name = "audit_events")
+)]
+pub(super) async fn rename_actors(
+    database: &PgPool,
+    names: &[super::ActorRename],
+) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    let subjects: Vec<&str> = names.iter().map(|rename| rename.subject.as_str()).collect();
+    let current: Vec<&str> = names.iter().map(|rename| rename.name.as_str()).collect();
+    let superseded: Vec<&str> = names
+        .iter()
+        .map(|rename| rename.superseded.as_str())
+        .collect();
+    let superseded_marked: Vec<&str> = names
+        .iter()
+        .map(|rename| rename.superseded_marked.as_str())
+        .collect();
+    sqlx::query_as::<_, (String, i64)>(
+        r"
+        WITH renamed AS (
+            UPDATE audit_events AS event
+            SET actor_name = rename.name,
+                narrative = rename.name
+                    || substr(event.narrative, char_length(COALESCE(event.actor_name, event.actor_subject)) + 1),
+                -- The first values recorded, should a row ever be renamed twice.
+                recorded_actor_name = CASE
+                    WHEN event.recorded_narrative IS NULL THEN event.actor_name
+                    ELSE event.recorded_actor_name
+                END,
+                recorded_narrative = COALESCE(event.recorded_narrative, event.narrative)
+            FROM unnest($1::text[], $2::text[], $3::text[], $4::text[])
+                AS rename(subject, name, superseded, superseded_marked)
+            WHERE event.actor_subject = rename.subject
+              AND (
+                  event.actor_name IS NULL
+                  OR event.actor_name IN (rename.superseded, rename.superseded_marked)
+              )
+              AND starts_with(event.narrative, COALESCE(event.actor_name, event.actor_subject) || ' ')
+            RETURNING event.actor_subject
+        )
+        SELECT actor_subject, count(*) FROM renamed GROUP BY actor_subject ORDER BY actor_subject
+        ",
+    )
+    .bind(subjects)
+    .bind(current)
+    .bind(superseded)
+    .bind(superseded_marked)
+    .fetch_all(database)
+    .await
+    .inspect_err(crate::spans::record_storage_error)
+}
+
 /// One stored event, as the audit query reads it back.
 #[derive(Debug, FromRow)]
 pub(super) struct StoredEvent {

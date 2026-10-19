@@ -688,10 +688,13 @@ pub(crate) enum ManagedDependencyCall {
     DeleteUser,
     /// Best-effort: never fails or rolls back connection creation.
     AssignGroup,
+    /// The startup repair naming an existing account after its connection
+    /// (#440). Best-effort: never fails startup.
+    RenameAccount,
 }
 
 impl ManagedDependencyCall {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::CreateAccount,
         Self::SetAttributes,
         Self::FindUser,
@@ -699,6 +702,7 @@ impl ManagedDependencyCall {
         Self::SetCredential,
         Self::DeleteUser,
         Self::AssignGroup,
+        Self::RenameAccount,
     ];
 
     const fn index(self) -> usize {
@@ -714,6 +718,7 @@ impl ManagedDependencyCall {
             Self::SetCredential => "set_credential",
             Self::DeleteUser => "delete_user",
             Self::AssignGroup => "assign_group",
+            Self::RenameAccount => "rename_account",
         }
     }
 }

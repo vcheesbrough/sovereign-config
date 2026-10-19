@@ -169,11 +169,15 @@ impl AuthentikAdminClient {
     }
 
     /// Replaces the managed service account's attributes with the exact
-    /// managed marker, grants, and preserved service-account markers.
+    /// managed marker, grants, and preserved service-account markers, and
+    /// names the account after its connection. The blueprint's grant scope
+    /// mapping signs that name into the account's tokens as
+    /// `preferred_username`, which is what the audit trail shows for it.
     pub(crate) async fn set_managed_attributes(
         &self,
         user_id: i64,
         connection_id: &str,
+        display_name: &str,
         grants_attribute: &str,
         root: &str,
         permissions: &[&str],
@@ -193,7 +197,7 @@ impl AuthentikAdminClient {
             Method::PATCH,
             USER_ROUTE,
             self.endpoint(&format!("/api/v3/core/users/{user_id}/"))?,
-            Some(json!({ "attributes": attributes })),
+            Some(json!({ "name": display_name, "attributes": attributes })),
         )
         .await
         .map(|_| ())
@@ -247,6 +251,20 @@ impl AuthentikAdminClient {
             USER_ROUTE,
             self.endpoint(&format!("/api/v3/core/users/{user_id}/"))?,
             Some(json!({ "groups": [group_id] })),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Names an existing managed service account after its connection, as
+    /// [`Self::set_managed_attributes`] does for a new one. Only the name is
+    /// patched, so the account's credential and grants are untouched.
+    pub(crate) async fn rename_user(&self, user_id: i64, name: &str) -> Result<(), AdminError> {
+        self.call(
+            Method::PATCH,
+            USER_ROUTE,
+            self.endpoint(&format!("/api/v3/core/users/{user_id}/"))?,
+            Some(json!({ "name": name })),
         )
         .await
         .map(|_| ())

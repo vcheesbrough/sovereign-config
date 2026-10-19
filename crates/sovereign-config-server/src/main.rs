@@ -42,7 +42,8 @@ use authentik::AuthentikAdminClient;
 use config::{Config, ManagedConnectionConfig, required_env};
 use handshake::HandshakeService;
 use managed::{
-    ManagedConnectionsService, ManagedSettings, V3ManagedConnections, V4ManagedConnections,
+    ManagedConnectionsService, ManagedSettings, TRAIL_REPAIR_DELAY, V3ManagedConnections,
+    V4ManagedConnections,
 };
 use metrics::{
     AuditMetrics, AuthenticationMetrics, JobMetrics, ManagedConnectionMetrics, ProtocolMetrics,
@@ -160,6 +161,10 @@ async fn serve(meter: &Meter) -> Result<()> {
         managed_metrics,
         audit,
     ));
+    // In the background: it calls Authentik and then waits out a token
+    // lifetime, and must never delay or fail startup (#440).
+    let repair = Arc::clone(&managed_connections);
+    tokio::spawn(async move { repair.repair_actor_names(TRAIL_REPAIR_DELAY).await });
     let audit_trail = Arc::new(AuditTrailService::new(database, config.audit.page_size));
 
     info!(

@@ -105,7 +105,7 @@ supported — a server upgrade alone must never break them.
   carry** — a wider or narrower grammar, letter case, range, or a new enum
   member. Anything else is a new package served alongside the old one, never an
   edit in place. Exceptions are approved before implementation and recorded in
-  the README with their reason; there are two (2.25.0 and 2.29.0).
+  the README with their reason; there are three (2.25.0, 2.29.0 and 2.42.0).
 - **The handshake's shape is fixed, forever**, because it can never itself be
   versioned. Do not add to it, and do not give it a version-shaped package name
   — `/sovereign.config.Handshake/…` has one dotted segment fewer than a

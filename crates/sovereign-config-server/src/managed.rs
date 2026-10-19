@@ -19,6 +19,7 @@
 
 mod identity;
 mod provisioning;
+mod repair;
 mod service;
 mod shim;
 mod store;
@@ -26,6 +27,7 @@ mod v3;
 mod v4;
 mod wire;
 
+pub(crate) use repair::TRAIL_REPAIR_DELAY;
 pub(crate) use service::{ManagedConnectionsService, ManagedSettings};
 pub(crate) use v3::V3ManagedConnections;
 pub(crate) use v4::V4ManagedConnections;
