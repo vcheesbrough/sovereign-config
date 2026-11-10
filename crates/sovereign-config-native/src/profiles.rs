@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, env, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use sovereign_config_core::{ClientError, ConnectionUrl, ErrorKind};
 
-use crate::storage::{read_private, write_private};
+use crate::storage::{read_private, remove_private, write_private};
 
 const CONFIG_FORMAT_VERSION: u8 = 1;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
@@ -100,6 +100,44 @@ impl ProfileStore {
             return Err(not_found());
         }
         name.clone_into(&mut config.default_profile);
+        self.store(&config)
+    }
+
+    /// Returns the connection of a profile that [`Self::delete`] would delete,
+    /// so a caller can confirm with the user, and release state tied to the
+    /// profile, before anything changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error [`Self::delete`] would, short of a storage failure
+    /// while writing.
+    pub fn deletable(&self, name: &str) -> Result<ConnectionUrl, ClientError> {
+        validate_name(name)?;
+        let config = self.required()?;
+        check_deletable(&config, name)?;
+        ConnectionUrl::parse(&config.profiles[name].url).map_err(|_| unavailable())
+    }
+
+    /// Deletes an existing profile.
+    ///
+    /// The default profile can be deleted only when it is the last one, and
+    /// deleting the last profile removes the configuration file: a store with
+    /// profiles but no default is not a state this file can hold, and picking
+    /// a new default on the caller's behalf would silently redirect every
+    /// command run without `--profile`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded error for invalid names, missing profiles, the default
+    /// profile while others remain, or unsafe storage.
+    pub fn delete(&self, name: &str) -> Result<(), ClientError> {
+        validate_name(name)?;
+        let mut config = self.required()?;
+        check_deletable(&config, name)?;
+        config.profiles.remove(name);
+        if config.profiles.is_empty() {
+            return remove_private(&self.path).map_err(|()| unavailable());
+        }
         self.store(&config)
     }
 
@@ -252,6 +290,19 @@ fn validate_name(name: &str) -> Result<(), ClientError> {
             "profile name is invalid",
         ))
     }
+}
+
+fn check_deletable(config: &StoredConfig, name: &str) -> Result<(), ClientError> {
+    if !config.profiles.contains_key(name) {
+        return Err(not_found());
+    }
+    if config.default_profile == name && config.profiles.len() > 1 {
+        return Err(ClientError::new(
+            ErrorKind::InvalidRequest,
+            "profile is the default; select another default first",
+        ));
+    }
+    Ok(())
 }
 
 fn not_found() -> ClientError {
@@ -451,6 +502,72 @@ mod tests {
 
         profiles.set_default("dev").unwrap();
         assert!(profiles.list().unwrap()[0].is_default);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_profiles_keeps_the_default_and_removes_the_file_with_the_last_one() {
+        let root = temporary_path().with_extension("delete");
+        let _ = fs::remove_dir_all(&root);
+        let path = root.join("config.toml");
+        let profiles = ProfileStore::new(path.clone());
+
+        // Nothing stored yet: there is nothing to delete.
+        assert_eq!(
+            profiles.delete("dev").unwrap_err().message(),
+            "profile was not found"
+        );
+
+        profiles
+            .add("dev", &connection("dev.example.test", None))
+            .unwrap();
+        profiles
+            .add("prod", &connection("prod.example.test", None))
+            .unwrap();
+        assert!(profiles.delete("Bad").is_err());
+        assert_eq!(
+            profiles.delete("missing").unwrap_err().message(),
+            "profile was not found"
+        );
+
+        // The default stays while another profile remains; nothing changes.
+        assert_eq!(
+            profiles.delete("dev").unwrap_err().message(),
+            "profile is the default; select another default first"
+        );
+        assert_eq!(
+            profiles.deletable("dev").unwrap_err().message(),
+            "profile is the default; select another default first"
+        );
+        assert_eq!(profiles.list().unwrap().len(), 2);
+
+        assert_eq!(
+            profiles.deletable("prod").unwrap().endpoint(),
+            "https://prod.example.test"
+        );
+        profiles.delete("prod").unwrap();
+        let listed = profiles.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "dev");
+        assert!(listed[0].is_default);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // The last profile may go even though it is the default, and takes
+        // the file with it, so the next profile added becomes the default.
+        assert!(profiles.deletable("dev").is_ok());
+        profiles.delete("dev").unwrap();
+        assert!(!path.exists());
+        assert_eq!(profiles.list().unwrap(), Vec::new());
+        profiles
+            .add("next", &connection("next.example.test", None))
+            .unwrap();
+        assert_eq!(
+            profiles.connection(None).unwrap().endpoint(),
+            "https://next.example.test"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

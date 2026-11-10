@@ -161,4 +161,11 @@ pub enum ProfileCommand {
     Update { name: String },
     /// Select the profile used when `--profile` is absent
     Default { name: String },
+    /// Delete a profile and the login it alone uses
+    Delete {
+        name: String,
+        /// Skip the interactive confirmation
+        #[arg(long)]
+        yes: bool,
+    },
 }
