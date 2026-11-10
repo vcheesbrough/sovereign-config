@@ -1550,17 +1550,30 @@ async fn profile_delete_confirms_keeps_the_default_and_releases_unshared_logins(
     let every_profile = ["alias", "dev", "pipeline", "prod"];
     assert_eq!(names().await, every_profile);
 
-    // Refusals change nothing: no profile and no login is lost.
-    let default = run_cli(home.path(), &["profile", "delete", "dev", "--yes"]).await;
-    assert!(!default.status.success());
-    assert!(
-        combined(&default).contains("profile is the default; select another default first"),
-        "{}",
-        combined(&default)
-    );
-    let missing = run_cli(home.path(), &["profile", "delete", "missing", "--yes"]).await;
-    assert!(!missing.status.success());
-    assert!(combined(&missing).contains("profile was not found"));
+    // Refusals change nothing: no profile and no login is lost. Each is
+    // checked without `--yes` too, where it must win over the confirmation's
+    // own "requires --yes" error: a profile that will be refused is refused
+    // before the user is asked to confirm anything.
+    for (name, refusal) in [
+        (
+            "dev",
+            "profile is the default; select another default first",
+        ),
+        ("missing", "profile was not found"),
+    ] {
+        for arguments in [
+            &["profile", "delete", name, "--yes"][..],
+            &["profile", "delete", name][..],
+        ] {
+            let refused = run_cli(home.path(), arguments).await;
+            assert!(!refused.status.success());
+            assert!(
+                combined(&refused).contains(refusal),
+                "{arguments:?}: {}",
+                combined(&refused)
+            );
+        }
+    }
     // Standard input is a pipe here, so typing the confirmation is not
     // enough: without a terminal the command insists on `--yes`.
     let unconfirmed = run_cli_with_input(
