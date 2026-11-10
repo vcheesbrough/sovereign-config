@@ -1518,6 +1518,105 @@ async fn human_credentials_are_isolated_by_endpoint_and_selected_profile() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn profile_delete_confirms_keeps_the_default_and_releases_unshared_logins() {
+    let development = start_services(DeviceResult::Success).await;
+    let production = start_services(DeviceResult::Success).await;
+    let home = TempDir::new().unwrap();
+    let config = home.path().join("sovereign-config/config.toml");
+    add_profile(home.path(), &development, "dev", false).await;
+    // `alias` shares `dev`'s login: same endpoint, issuer and client.
+    let alias_url = connection_url(&development, false, "apps/example");
+    assert_success(
+        &run_cli_with_input(
+            home.path(),
+            &["profile", "add", "alias"],
+            Some(&format!("{alias_url}\n")),
+        )
+        .await,
+    );
+    add_profile(home.path(), &production, "prod", false).await;
+    add_profile(home.path(), &development, "pipeline", true).await;
+    assert_success(&run_cli(home.path(), &["login"]).await);
+    assert_success(&run_cli(home.path(), &["--profile", "prod", "login"]).await);
+    assert_eq!(credential_files(home.path()).len(), 2);
+    let names = || async {
+        let listed = run_cli(home.path(), &["profile", "list"]).await;
+        assert_success(&listed);
+        String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .map(|line| line[2..].split_whitespace().next().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let every_profile = ["alias", "dev", "pipeline", "prod"];
+    assert_eq!(names().await, every_profile);
+
+    // Refusals change nothing: no profile and no login is lost.
+    let default = run_cli(home.path(), &["profile", "delete", "dev", "--yes"]).await;
+    assert!(!default.status.success());
+    assert!(
+        combined(&default).contains("profile is the default; select another default first"),
+        "{}",
+        combined(&default)
+    );
+    let missing = run_cli(home.path(), &["profile", "delete", "missing", "--yes"]).await;
+    assert!(!missing.status.success());
+    assert!(combined(&missing).contains("profile was not found"));
+    // Standard input is a pipe here, so typing the confirmation is not
+    // enough: without a terminal the command insists on `--yes`.
+    let unconfirmed = run_cli_with_input(
+        home.path(),
+        &["profile", "delete", "prod"],
+        Some("delete\n"),
+    )
+    .await;
+    assert!(!unconfirmed.status.success());
+    assert!(
+        combined(&unconfirmed)
+            .contains("profile deletion requires --yes when standard input is not a terminal")
+    );
+    let overridden = run_cli(
+        home.path(),
+        &["--profile", "dev", "profile", "delete", "prod", "--yes"],
+    )
+    .await;
+    assert!(!overridden.status.success());
+    assert!(combined(&overridden).contains("--profile applies only to operational commands"));
+    assert_eq!(names().await, every_profile);
+    assert_eq!(credential_files(home.path()).len(), 2);
+
+    // A login another profile still uses survives its profile's deletion.
+    let shared = run_cli(home.path(), &["profile", "delete", "alias", "--yes"]).await;
+    assert_success(&shared);
+    assert!(combined(&shared).contains("Profile deleted"));
+    assert_eq!(credential_files(home.path()).len(), 2);
+    let development_status = run_cli(home.path(), &["status"]).await;
+    assert_success(&development_status);
+    assert!(combined(&development_status).contains("Authentication: logged in"));
+
+    // A login no other profile uses goes with it.
+    assert_success(&run_cli(home.path(), &["profile", "delete", "prod", "--yes"]).await);
+    assert_eq!(credential_files(home.path()).len(), 1);
+
+    // A managed profile holds no stored login; deleting it touches none, and
+    // never echoes the credential its URL carried.
+    let managed = run_cli(home.path(), &["profile", "delete", "pipeline", "--yes"]).await;
+    assert_success(&managed);
+    assert_secrets_absent(&combined(&managed));
+    assert_eq!(credential_files(home.path()).len(), 1);
+    assert_eq!(names().await, ["dev"]);
+
+    // The last profile may go although it is the default, and the store
+    // returns to its state before the first `profile add`.
+    assert_success(&run_cli(home.path(), &["profile", "delete", "dev", "--yes"]).await);
+    assert!(credential_files(home.path()).is_empty());
+    assert!(!config.exists());
+    assert!(names().await.is_empty());
+    add_profile(home.path(), &production, "next", false).await;
+    let listed = run_cli(home.path(), &["profile", "list"]).await;
+    assert!(String::from_utf8_lossy(&listed.stdout).starts_with("* next"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn profile_updates_preserve_shared_human_state_and_remove_the_last_reference() {
     let development = start_services(DeviceResult::Success).await;
     let replacement = start_services(DeviceResult::Success).await;

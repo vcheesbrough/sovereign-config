@@ -14,7 +14,7 @@ use crate::session::credential_store;
 
 const MAX_CONNECTION_URL_BYTES: u64 = 16 * 1024;
 
-/// Adds, updates, or re-points the default profile.
+/// Adds, lists, updates, or deletes a profile, or re-points the default.
 ///
 /// # Errors
 ///
@@ -48,6 +48,44 @@ pub fn manage_profile(command: ProfileCommand, profiles: &ProfileStore) -> Resul
             println!("Default profile updated");
         }
         ProfileCommand::List { format } => list_profiles(&profiles.list()?, format)?,
+        ProfileCommand::Delete { name, yes } => {
+            // Refuse a missing profile, or the default while others remain,
+            // before asking, so the prompt is never answered for nothing.
+            let current = profiles.deletable(&name)?;
+            let managed = current.client_authentication().is_some();
+            if !yes {
+                confirm_profile_deletion(&name, managed)?;
+            }
+            // The refresh credential goes first, as on `update`: a failed
+            // write afterwards leaves the profile merely logged out, where the
+            // reverse order would leave a credential no profile can reach.
+            if !managed && !profiles.contains_other_human_identity(&name, &current)? {
+                credential_store(&current)?.delete()?;
+            }
+            profiles.delete(&name)?;
+            println!("Profile deleted");
+        }
+    }
+    Ok(())
+}
+
+fn confirm_profile_deletion(name: &str, managed: bool) -> Result<()> {
+    if !io::stdin().is_terminal() {
+        bail!("profile deletion requires --yes when standard input is not a terminal");
+    }
+    if managed {
+        // A managed profile's URL embeds its credential, which the service
+        // never shows again; deleting the profile may lose the only copy.
+        eprint!("Delete profile {name} and the access URL it stores? Type 'delete' to confirm: ");
+    } else {
+        eprint!("Delete profile {name}? Type 'delete' to confirm: ");
+    }
+    let mut confirmation = String::new();
+    io::stdin()
+        .read_line(&mut confirmation)
+        .map_err(|_| anyhow!("deletion confirmation is unavailable"))?;
+    if confirmation.trim_end() != "delete" {
+        bail!("deletion cancelled");
     }
     Ok(())
 }

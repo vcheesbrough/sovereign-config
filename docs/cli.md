@@ -41,6 +41,8 @@ Use `sovereign-config profile update <name>` to replace a URL and `sovereign-con
 
 `--format json` instead renders an array of `{ "name", "default", "endpoint", "root", "url" }`, where `url` is the whole connection URL with any managed credential replaced by `*`. **Nothing a listing prints is a secret** — but the file it reads is not safe to print, because a managed profile's stored URL embeds its credential. Use this command rather than reading `config.toml`. Listing succeeds with an empty result before the first profile is added.
 
+`sovereign-config profile delete <name>` removes a profile after you type `delete` at the prompt; `--yes` skips the prompt, and is required when standard input is not a terminal. The default profile cannot be deleted while other profiles remain — select another default first — but the last profile can be, which leaves no profiles at all, as before the first `profile add`. Deleting a profile also removes its stored login, unless another profile signs in to the same server with the same issuer and client and still uses it. Deleting a managed profile does not revoke its access URL on the server; revoke it there, and keep a copy of the URL first if you may need it again, because the server never shows it a second time.
+
 ## Reading and writing values
 
 Every value command reads `sovereign-config <verb> <ABSOLUTE_PATH> [OPTIONS]` — the path comes immediately after the verb — and acts on **exactly one value**. Add `--tree` and the same command acts on the whole subtree at that path instead: that is the only way to select subtree scope. `--format` then means one thing only, how a read is rendered: `plain` (the default) or `json`.
