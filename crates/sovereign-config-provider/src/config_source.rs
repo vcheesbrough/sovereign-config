@@ -6,6 +6,7 @@
 //! itself.
 
 use std::fmt;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use config::{ConfigError, Map, Source, Value, ValueKind};
 
@@ -47,6 +48,32 @@ const URL_VAR: &str = "SOVEREIGN_CONFIG_ACCESS_URL";
 /// runtime, so it is safe to call the `config` builder's `build()` from either a
 /// synchronous or an asynchronous context.
 ///
+/// # Protocol version
+///
+/// [`SovereignConfigSource::protocol_version`] reports the protocol version the
+/// load negotiated, which is the version the service's per-version counters
+/// attribute the application to. It is read *after* `build()`, so it can be
+/// logged once the application's subscriber is installed — usually later than
+/// the configuration is built, since the telemetry settings come from it.
+/// `config` stores a clone of every source it is given, and clones share this
+/// state, so keep a clone of the source and read the version from that:
+///
+/// ```no_run
+/// use config::Config;
+/// use sovereign_config_provider::SovereignConfigSource;
+///
+/// let source = SovereignConfigSource::initialise_from_default_environment();
+/// let settings = Config::builder()
+///     .add_source(source.clone())
+///     .build()
+///     .unwrap();
+/// // ...install the subscriber from `settings`, then:
+/// if let Some(version) = source.protocol_version() {
+///     println!("sovereign-config protocol {version}");
+/// }
+/// # let _ = settings;
+/// ```
+///
 /// # Redaction
 ///
 /// The connection URL is a secret; the [`fmt::Debug`] implementation never
@@ -54,6 +81,9 @@ const URL_VAR: &str = "SOVEREIGN_CONFIG_ACCESS_URL";
 #[derive(Clone)]
 pub struct SovereignConfigSource {
     connection: Connection,
+    /// Shared between clones: `config` collects from its own boxed clone, and
+    /// the caller reads the version from the handle it kept.
+    negotiated: Arc<Mutex<Option<&'static str>>>,
 }
 
 #[derive(Clone)]
@@ -70,6 +100,7 @@ impl SovereignConfigSource {
     pub fn initialise_from_url(url: impl Into<String>) -> Self {
         Self {
             connection: Connection::Url(url.into()),
+            negotiated: Arc::default(),
         }
     }
 
@@ -92,7 +123,26 @@ impl SovereignConfigSource {
     pub fn initialise_from_default_environment() -> Self {
         Self {
             connection: Connection::DefaultEnvironment,
+            negotiated: Arc::default(),
         }
+    }
+
+    /// The protocol version the most recent build's session was bound to — on a
+    /// successful build, the version its load travelled on, and what the
+    /// service's per-request counters attribute this application to.
+    ///
+    /// `None` until the configuration has been built, and `None` after a build
+    /// that failed before a session was negotiated. A build that negotiated and
+    /// then failed (token, read, or re-negotiation) still reports the version
+    /// the session was bound to. Shared between clones of
+    /// this source, so the handle kept by the caller reports what the `config`
+    /// builder's own clone loaded. Not secret; safe to log.
+    #[must_use]
+    pub fn protocol_version(&self) -> Option<&'static str> {
+        *self
+            .negotiated
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn resolve_url(&self) -> Result<String, ConfigError> {
@@ -189,8 +239,23 @@ impl Source for SovereignConfigSource {
     }
 
     fn collect(&self) -> Result<Map<String, Value>, ConfigError> {
+        // Cleared first, so a build that fails before negotiating never reports
+        // the version an earlier build negotiated.
+        *self
+            .negotiated
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         let url = self.resolve_url()?;
-        let tree = load_blocking(url).map_err(|error| ConfigError::Foreign(Box::new(error)))?;
+        let (negotiated, tree) = load_blocking(url);
+        // Recorded whether or not the load succeeded: once negotiated, the
+        // session is bound to this version, even if the token, the read, or a
+        // re-negotiation then failed. It is not evidence that the service
+        // counted an authenticated request on it.
+        *self
+            .negotiated
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = negotiated;
+        let tree = tree.map_err(|error| ConfigError::Foreign(Box::new(error)))?;
         match tree {
             Tree::Node(children) => Ok(children
                 .into_iter()
@@ -210,19 +275,29 @@ impl Source for SovereignConfigSource {
 /// Using a separate thread means the caller's runtime (if any) is never nested
 /// and never required to drive this work, so `build()` is safe from both sync
 /// and async contexts.
-fn load_blocking(url: String) -> Result<Tree, ProviderError> {
+///
+/// Returns the protocol version the load travelled on — read *after* the load,
+/// because a load re-negotiates if the version is retired under it — or `None`
+/// when no session was negotiated.
+fn load_blocking(url: String) -> (Option<&'static str>, Result<Tree, ProviderError>) {
     std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|_| ProviderError::Unavailable)?;
+        else {
+            return (None, Err(ProviderError::Unavailable));
+        };
         runtime.block_on(async move {
-            let provider = Provider::connect(&url).await?;
-            provider.load_tree().await
+            let provider = match Provider::connect(&url).await {
+                Ok(provider) => provider,
+                Err(error) => return (None, Err(error)),
+            };
+            let tree = provider.load_tree().await;
+            (Some(provider.protocol_version()), tree)
         })
     })
     .join()
-    .map_err(|_| ProviderError::Internal)?
+    .unwrap_or((None, Err(ProviderError::Internal)))
 }
 
 /// Transcodes the format-neutral tree straight into `config::Value` — no JSON.
@@ -244,6 +319,21 @@ mod tests {
     use std::io::{Error, ErrorKind};
 
     use super::{URL_FILE_VAR, URL_VAR, resolve_connection_url};
+
+    /// Clearing at the start of `collect` matters only on the early return from
+    /// `resolve_url`; every later path overwrites the value anyway.
+    #[test]
+    fn a_build_that_fails_to_resolve_the_url_clears_an_earlier_version() {
+        use config::Source;
+        assert!(
+            std::env::var_os(URL_FILE_VAR).is_none() && std::env::var_os(URL_VAR).is_none(),
+            "this test needs both access-URL variables unset"
+        );
+        let source = super::SovereignConfigSource::initialise_from_default_environment();
+        *source.negotiated.lock().unwrap() = Some("v3");
+        assert!(source.collect().is_err());
+        assert_eq!(source.protocol_version(), None);
+    }
 
     #[test]
     fn url_file_takes_precedence_and_is_trimmed() {

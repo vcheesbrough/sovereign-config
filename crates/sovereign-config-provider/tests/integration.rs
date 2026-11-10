@@ -459,6 +459,82 @@ async fn config_source_layers_the_managed_subtree() {
 }
 
 #[cfg(feature = "config")]
+#[tokio::test]
+async fn config_source_reports_the_negotiated_protocol_version_through_a_kept_clone() {
+    use config::Config;
+    use sovereign_config_provider::SovereignConfigSource;
+
+    let harness = Harness::start(Arc::new(MockState::happy())).await;
+    let source = SovereignConfigSource::initialise_from_url(harness.url.clone());
+    assert_eq!(
+        source.protocol_version(),
+        None,
+        "nothing is negotiated before build"
+    );
+
+    // `config` collects from its own boxed clone; the handle kept here must see
+    // what that clone negotiated, or the accessor is useless to a real caller.
+    let kept = source.clone();
+    tokio::task::spawn_blocking(move || {
+        Config::builder()
+            .add_source(source)
+            .build()
+            .unwrap()
+            .try_deserialize::<AppConfig>()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    // The mock serves only `sovereign.config.v3`, so a load that succeeded
+    // travelled on v3: the reported version is the one on the wire.
+    assert_eq!(kept.protocol_version(), Some("v3"));
+}
+
+#[cfg(feature = "config")]
+#[tokio::test]
+async fn config_source_reports_no_protocol_version_when_nothing_was_negotiated() {
+    use config::Config;
+    use sovereign_config_provider::SovereignConfigSource;
+
+    let mut state = MockState::happy();
+    // Every version this build speaks is retired, so the connect fails.
+    state.protocol_version = "v7".to_owned();
+    state.supported_protocol_versions = vec!["v6".to_owned(), "v7".to_owned()];
+    let harness = Harness::start(Arc::new(state)).await;
+    let source = SovereignConfigSource::initialise_from_url(harness.url.clone());
+
+    let kept = source.clone();
+    let built = tokio::task::spawn_blocking(move || Config::builder().add_source(source).build())
+        .await
+        .unwrap();
+
+    assert!(built.is_err(), "an incompatible server must fail the build");
+    assert_eq!(kept.protocol_version(), None);
+}
+
+#[cfg(feature = "config")]
+#[tokio::test]
+async fn config_source_reports_the_protocol_version_when_the_load_fails_after_negotiating() {
+    use config::Config;
+    use sovereign_config_provider::SovereignConfigSource;
+
+    let mut state = MockState::happy();
+    // The handshake succeeds; token acquisition then fails the load.
+    state.token_ok = false;
+    let harness = Harness::start(Arc::new(state)).await;
+    let source = SovereignConfigSource::initialise_from_url(harness.url.clone());
+
+    let kept = source.clone();
+    let built = tokio::task::spawn_blocking(move || Config::builder().add_source(source).build())
+        .await
+        .unwrap();
+
+    assert!(built.is_err(), "a rejected token must fail the build");
+    assert_eq!(kept.protocol_version(), Some("v3"));
+}
+
+#[cfg(feature = "config")]
 #[test]
 fn config_source_debug_does_not_leak_the_url() {
     use sovereign_config_provider::SovereignConfigSource;
