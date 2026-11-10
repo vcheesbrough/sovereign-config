@@ -121,6 +121,26 @@ configuration values always come from the Sovereign Config subtree):
 `build()` is safe from both synchronous and asynchronous contexts. The source's
 `Debug` output never prints the URL.
 
+`protocol_version()` returns the protocol version the load negotiated (`None`
+before `build()`, or when no session was negotiated). It is the version the
+service's per-version counters attribute your application to, so log it at
+startup. `config` stores its own clone of each source, and clones share this
+state. Keep a clone, add the other, and read the version once your subscriber is
+installed. That is usually after the build, because the telemetry settings come
+from the configuration:
+
+```rust,no_run
+use config::Config;
+use sovereign_config_provider::SovereignConfigSource;
+
+let source = SovereignConfigSource::initialise_from_default_environment();
+let settings = Config::builder().add_source(source.clone()).build().unwrap();
+// ...initialise tracing from `settings`, then:
+if let Some(version) = source.protocol_version() {
+    tracing::info!(sovereign_config.protocol_version = version, "configuration loaded");
+}
+```
+
 If you would rather load the subtree yourself — for example to add it as an
 in-memory JSON layer without the feature — [`Provider::load_json`] returns the
 revealed subtree as a JSON string ready for `config::File::from_str`. Either way
