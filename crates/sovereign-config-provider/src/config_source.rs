@@ -320,6 +320,21 @@ mod tests {
 
     use super::{URL_FILE_VAR, URL_VAR, resolve_connection_url};
 
+    /// Clearing at the start of `collect` matters only on the early return from
+    /// `resolve_url`; every later path overwrites the value anyway.
+    #[test]
+    fn a_build_that_fails_to_resolve_the_url_clears_an_earlier_version() {
+        use config::Source;
+        assert!(
+            std::env::var_os(URL_FILE_VAR).is_none() && std::env::var_os(URL_VAR).is_none(),
+            "this test needs both access-URL variables unset"
+        );
+        let source = super::SovereignConfigSource::initialise_from_default_environment();
+        *source.negotiated.lock().unwrap() = Some("v3");
+        assert!(source.collect().is_err());
+        assert_eq!(source.protocol_version(), None);
+    }
+
     #[test]
     fn url_file_takes_precedence_and_is_trimmed() {
         let url = resolve_connection_url(
