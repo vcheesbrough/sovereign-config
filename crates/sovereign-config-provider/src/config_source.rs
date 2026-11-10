@@ -127,11 +127,14 @@ impl SovereignConfigSource {
         }
     }
 
-    /// The protocol version the most recent load travelled on — what the
-    /// service's per-version counters attribute this application to.
+    /// The protocol version the most recent build's session was bound to — on a
+    /// successful build, the version its load travelled on, and what the
+    /// service's per-request counters attribute this application to.
     ///
     /// `None` until the configuration has been built, and `None` after a build
-    /// that failed before a connection was negotiated. Shared between clones of
+    /// that failed before a session was negotiated. A build that negotiated and
+    /// then failed (token, read, or re-negotiation) still reports the version
+    /// the session was bound to. Shared between clones of
     /// this source, so the handle kept by the caller reports what the `config`
     /// builder's own clone loaded. Not secret; safe to log.
     #[must_use]
@@ -236,10 +239,18 @@ impl Source for SovereignConfigSource {
     }
 
     fn collect(&self) -> Result<Map<String, Value>, ConfigError> {
+        // Cleared first, so a build that fails before negotiating never reports
+        // the version an earlier build negotiated.
+        *self
+            .negotiated
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         let url = self.resolve_url()?;
         let (negotiated, tree) = load_blocking(url);
-        // Recorded whether or not the read succeeded: a session that negotiated
-        // and then failed still spoke this version, and the counters saw it.
+        // Recorded whether or not the load succeeded: once negotiated, the
+        // session is bound to this version, even if the token, the read, or a
+        // re-negotiation then failed. It is not evidence that the service
+        // counted an authenticated request on it.
         *self
             .negotiated
             .lock()
