@@ -4,7 +4,7 @@
 
 **Self-hosted configuration and secrets, on infrastructure you control.**
 
-[![Latest release](https://img.shields.io/github/v/tag/vcheesbrough/sovereign-config?sort=semver&label=release&color=2ea44f)](docs/upgrading.md)
+[![Latest release](https://img.shields.io/github/v/tag/vcheesbrough/sovereign-config?sort=semver&label=release&color=2ea44f)](https://github.com/vcheesbrough/sovereign-config/releases)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust&logoColor=white)](docs/development.md)
 [![gRPC and gRPC-Web](https://img.shields.io/badge/API-gRPC%20%2B%20gRPC--Web-244c5a)](docs/protocol-versioning.md)
@@ -400,10 +400,10 @@ Metrics are pushed rather than scraped, and there is no `/metrics` endpoint. A c
 
 ## Upgrading
 
-Stop traffic and the old server, back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new release, and run `docker compose up -d`. Migrations are forward-only, so a downgrade means restoring the backup.
+Stop the server, back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new release, and run `docker compose up -d --pull always --wait`. Migrations are forward-only, so a downgrade means restoring the backup.
 
 > [!IMPORTANT]
-> Some releases need clients upgraded in a particular order. Read [Upgrading](docs/upgrading.md) for the procedure and the notes for every release between yours and the target.
+> Some releases need clients upgraded in a particular order. Read [Upgrading](docs/upgrading.md) for the procedure and the releases that need action.
 
 ## Compatibility
 
@@ -431,7 +431,7 @@ The project intends to extend Sovereign Config in these directions. They are sta
 | 🪪 | [Authentication](docs/authentication.md) | Authentik blueprints, grants, token verification, credential rotation, access URLs. |
 | 📜 | [Audit trail](docs/audit-trail.md) | What is recorded, failure policy, querying, the browser view. |
 | 📡 | [Observability](docs/observability.md) | Spans, metrics, logs, configuration, web UI telemetry. |
-| ⬆️ | [Upgrading](docs/upgrading.md) | The upgrade procedure and per-release notes. |
+| ⬆️ | [Upgrading](docs/upgrading.md) | The upgrade procedure and the releases that need action. |
 | 🤝 | [Protocol versioning](docs/protocol-versioning.md) | Version negotiation and the procedure for adding or retiring a version. |
 | 🛠️ | [Development](docs/development.md) | Workspace layout, building, testing and the release gate. |
 | 🏠 | [Project deployment](docs/project-deployment.md) | How the project's own instance is built and deployed. |
