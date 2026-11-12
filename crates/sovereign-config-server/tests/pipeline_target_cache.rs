@@ -1,16 +1,18 @@
 //! Guards the bound on the shared Rust target cache in the `.woodpecker/` workflows.
-//! Three steps share one `sovereign-config-contract-target` volume as
+//! The deploys' live Authentik steps share one `sovereign-config-contract-target` volume as
 //! `CARGO_TARGET_DIR`; cargo never garbage-collects artifacts from commits it
 //! no longer builds, so without these two measures the volume grows without
 //! limit — it reached 92.6 GB before card #326.
 //!
 //! The assertions are discovered from the pipeline rather than listed, so a
-//! fourth step that mounts the volume is covered the moment it is added.
+//! third step that mounts the volume is covered the moment it is added. The
+//! checks run on GitHub Actions (card #539), whose runners start empty; their
+//! cache is GitHub's, and only the `--locked` rule below applies to them.
 
 mod support;
 
 use serde_yaml::Value;
-use support::{Pipeline, pipeline};
+use support::{Pipeline, build, pipeline};
 
 /// The volume every shared-cache step mounts, and the path it mounts it at.
 const CACHE_VOLUME: &str = "sovereign-config-contract-target";
@@ -50,7 +52,7 @@ fn commands(step: &Value) -> Vec<&str> {
         .collect()
 }
 
-/// The three known steps, so a mount silently dropped from one of them fails
+/// The two known steps, so a mount silently dropped from one of them fails
 /// here rather than quietly shrinking what the checks below cover.
 #[test]
 fn the_shared_cache_is_mounted_by_the_steps_that_build_into_it() {
@@ -63,7 +65,6 @@ fn the_shared_cache_is_mounted_by_the_steps_that_build_into_it() {
     assert_eq!(
         names,
         vec![
-            "unit-test",
             "validate-authentik-manager-live",
             "validate-authentik-manager-live-prod",
         ],
@@ -123,8 +124,7 @@ fn steps_sharing_the_cache_prune_it_first() {
 /// actually be executed, or the bound rots silently.
 #[test]
 fn the_prune_script_is_linted_and_tested() {
-    let pipeline = pipeline();
-    let commands = commands(pipeline.step("script-validation")).join("\n");
+    let commands = build().run_text("script-validation");
 
     assert!(
         commands.contains("shellcheck -s sh") && commands.contains(PRUNE_SCRIPT),
@@ -136,57 +136,27 @@ fn the_prune_script_is_linted_and_tested() {
     );
 }
 
-/// The `BuildKit` cache mount the image builds compile into is bounded too, before
-/// either build writes to it.
-#[test]
-fn the_buildkit_cache_is_pruned_before_the_image_builds() {
-    let pipeline = pipeline();
-    let prune = pipeline.step_in("build", "prune-build-cache");
-    assert_eq!(
-        commands(prune),
-        ["sh scripts/ci-prune-buildkit-cache.sh"],
-        "prune-build-cache must run the BuildKit cache prune script"
-    );
-    for build in ["build-server", "build-broker", "build-cli"] {
-        let dependencies: Vec<&str> = pipeline
-            .step_in("build", build)
-            .get("depends_on")
-            .and_then(Value::as_sequence)
-            .expect("image build should list its dependencies")
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        assert!(
-            dependencies.contains(&"prune-build-cache"),
-            "{build} must wait for prune-build-cache"
-        );
-    }
-
-    let validation = commands(pipeline.step("script-validation")).join("\n");
-    assert!(
-        validation.contains("scripts/ci-prune-buildkit-cache.sh")
-            && validation.contains("scripts/ci-prune-buildkit-cache-test.sh"),
-        "script-validation must shellcheck the BuildKit prune script and its tests"
-    );
-    assert!(
-        validation.contains("sh scripts/ci-prune-buildkit-cache-test.sh"),
-        "script-validation must run the BuildKit prune script's test suite"
-    );
-}
-
-/// The image build resolves dependencies with --locked, so unit-test must too:
-/// otherwise an out-of-date Cargo.lock passes every check and fails only in build.
-#[test]
-fn unit_test_resolves_dependencies_with_the_lockfile() {
-    let pipeline = pipeline();
-    let cargo: Vec<&str> = commands(pipeline.step("unit-test"))
-        .into_iter()
+/// unit-test's cargo commands, one per `;`-separated command of its run.
+fn unit_test_cargo_commands() -> Vec<String> {
+    build()
+        .run_text("unit-test")
+        .split([';', '\'', '\n'])
+        .map(str::trim)
         .filter(|command| {
             ["cargo clippy", "cargo test", "cargo check", "cargo build"]
                 .iter()
                 .any(|prefix| command.starts_with(prefix))
         })
-        .collect();
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The image builds resolve dependencies with --locked, so unit-test must too:
+/// otherwise an out-of-date Cargo.lock passes every check and fails only in a
+/// build.
+#[test]
+fn unit_test_resolves_dependencies_with_the_lockfile() {
+    let cargo = unit_test_cargo_commands();
     assert!(
         cargo.len() >= 5,
         "expected unit-test's cargo commands, found {cargo:?}"
@@ -227,7 +197,7 @@ fn the_live_steps_run_the_authentik_crates_live_tests() {
         "the `live_` filter must still select the live tests"
     );
     assert!(
-        commands(pipeline.step("unit-test")).iter().any(|command| {
+        unit_test_cargo_commands().iter().any(|command| {
             command.contains("--ignored")
                 && command.contains("--package sovereign-config-authentik")
         }),

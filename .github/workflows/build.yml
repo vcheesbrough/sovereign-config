@@ -1,0 +1,266 @@
+# Build workflow: every push to a branch (or a manual run) checks the commit,
+# builds the three images, and — only once every check has passed — publishes
+# them to GHCR under one version. Nothing here deploys: dev and prod are
+# Woodpecker deployments on mini (.woodpecker/deploy-dev.yml, deploy-prod.yml),
+# which resolve the build this workflow published (card #539).
+#
+#   version ─┬─ script-validation
+#            ├─ web-bundle ─┬─ unit-test
+#            │              └─ client-playwright
+#            ├─ build-server ┐
+#            ├─ build-broker ├─ (saved, not pushed)
+#            └─ build-cli    ┘
+#   publish  needs all of the above, then pushes the three images
+#
+# Release mechanics are the shared release-flow contract, enforced by
+# woodpecker-plugin-release-versions: `version` claims MAJOR.MINOR (Cargo.toml)
+# plus the next patch on that line by creating refs/builds/<version>, and
+# `publish` refuses to push an image that lacks this version's labels or is
+# already published. A git tag is written by the first deploy, never here.
+#
+# Every tool runs in the same digest-pinned image the Woodpecker steps used,
+# through `docker run` on the runner, so the pins stay checkable
+# (crates/sovereign-config-server/tests/github_build_workflow.rs) and a job can
+# free the runner's disk first.
+
+name: build
+
+on:
+  push:
+    # Branches only: the deploys push git tags and the plugin pushes
+    # refs/builds/*, and neither is a build.
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Claims this run's version. Only here: every other job reads it from this
+  # job's output, so the run builds and publishes under one number.
+  version:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: version
+        uses: docker://ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.2.0@sha256:9d5b3541aa143727f8c68c8c8f1d36557d999d3c857c4581be43363c8ff78c94
+        with:
+          mode: version
+          major_minor_source: cargo
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: echo "Release $(cat .release-tag)"
+
+  script-validation:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: >-
+          docker run --rm --volume "$PWD:/src" --workdir /src --entrypoint sh
+          docker.io/koalaman/shellcheck-alpine@sha256:e19ed93c22423970d56568e171b4512c9244fc75dd9114045016b4a0073ac4b7
+          -euc 'shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh scripts/migrate-openbao-woodpecker-secrets.sh scripts/ci-prune-cargo-target.sh scripts/ci-prune-cargo-target-test.sh;
+          sh scripts/ci-prune-cargo-target-test.sh'
+
+  # Builds the release WebAssembly bundle into web-dist/, with the same
+  # docker/web.Dockerfile stages the server image builds it with. web-dist/ is
+  # not in the checkout (card #278).
+  web-bundle:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build -f docker/web.Dockerfile --output type=local,dest=web-dist .
+      # The bundle's .trunk-profile marker is a hidden file, and build.rs
+      # refuses a bundle without it.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-dist
+          path: web-dist
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  unit-test:
+    needs: web-bundle
+    runs-on: ubuntu-24.04
+    services:
+      postgres-test:
+        image: docker.io/library/postgres@sha256:22c89fe0d0f507606260237fd55e51f6137f58b2d5bcf6152242b96d9fe8f9a4
+        env:
+          POSTGRES_DB: sovereign_config_test
+          POSTGRES_USER: sovereign_config_test
+          POSTGRES_PASSWORD: sovereign_config_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sovereign_config_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      # A debug and test build of the whole workspace outgrows a hosted
+      # runner's free disk; these preinstalled toolchains are never used here.
+      - run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-dist
+          path: web-dist
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .cargo-home/registry
+            .cargo-home/git
+            target
+          key: unit-test-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: unit-test-
+      # --locked on every command that resolves dependencies, as the image
+      # builds do: a Cargo.lock that is out of date fails here, not later in
+      # build. CARGO_INCREMENTAL=0: every run is a fresh checkout, so
+      # incremental state would be written and never usefully read.
+      - run: >-
+          docker run --rm --network host --volume "$PWD:/src" --workdir /src
+          --volume "$PWD/.cargo-home/registry:/usr/local/cargo/registry"
+          --volume "$PWD/.cargo-home/git:/usr/local/cargo/git"
+          --env CARGO_INCREMENTAL=0
+          --env SOVEREIGN_CONFIG_TEST_DATABASE_URL=postgresql://sovereign_config_test:sovereign_config_test@127.0.0.1:5432/sovereign_config_test
+          docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
+          sh -euxc '
+          rustup component add clippy rustfmt;
+          cargo fmt --check;
+          cargo clippy --locked --workspace --all-targets -- -D warnings;
+          cargo clippy --locked --package sovereign-config-provider --all-targets --features config -- -D warnings;
+          cargo test --locked --workspace;
+          cargo test --locked --package sovereign-config-provider --features config;
+          cargo test --locked --package sovereign-config-server --package sovereign-config-authentik -- --ignored --test-threads=1;
+          rustup target add wasm32-unknown-unknown;
+          cargo check --locked --target wasm32-unknown-unknown --package sovereign-config-core --package sovereign-config-client --package sovereign-config-web'
+      # The container wrote as root; the cache step saves as the runner user.
+      - if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" .cargo-home target
+
+  # Runs the Playwright suite in Chromium and Firefox against the release bundle
+  # web-bundle built. The backend is mocked at the network layer
+  # (browser-tests/tests/helpers.js), so this is a client test, not end-to-end.
+  client-playwright:
+    needs: web-bundle
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-dist
+          path: web-dist
+      - run: |
+          CONTAINER=$(docker create --workdir /tests \
+            --env PLAYWRIGHT_STATIC=1 \
+            --env PLAYWRIGHT_STATIC_DIR=/web-dist \
+            mcr.microsoft.com/playwright:v1.61.1-noble@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48 \
+            sh -lc 'npm ci --ignore-scripts && npm test')
+          trap 'docker rm --force "$CONTAINER" >/dev/null 2>&1 || true' EXIT
+          docker cp browser-tests/. "$CONTAINER:/tests"
+          docker cp test-contracts/. "$CONTAINER:/test-contracts"
+          docker cp web-dist/. "$CONTAINER:/web-dist"
+          docker start --attach "$CONTAINER"
+
+  # Three images, one version — each built from its own docker/<image>.Dockerfile,
+  # which builds only what that image ships, and labelled with the version and
+  # commit `publish` checks. Built beside the checks and saved as an artifact,
+  # never pushed: only `publish` pushes, after every check has passed.
+  build-server:
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ needs.version.outputs.release_tag }}
+    steps:
+      - run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          IMAGE=ghcr.io/vcheesbrough/sovereign-config:$RELEASE_TAG
+          docker build --platform linux/amd64 -f docker/server.Dockerfile --build-arg RELEASE_VERSION="$RELEASE_TAG" --build-arg REVISION="$GITHUB_SHA" --label org.opencontainers.image.title=sovereign-config --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/README.md --label org.opencontainers.image.version="$RELEASE_TAG" --label org.opencontainers.image.revision="$GITHUB_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$IMAGE" .
+          docker save --output image.tar "$IMAGE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-server
+          path: image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  # The Woodpecker CI secrets extension. It compiles only the broker, with no
+  # web bundle or server.
+  build-broker:
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ needs.version.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          IMAGE=ghcr.io/vcheesbrough/sovereign-config-woodpecker-broker:$RELEASE_TAG
+          docker build --platform linux/amd64 -f docker/broker.Dockerfile --build-arg RELEASE_VERSION="$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config-woodpecker-broker --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/crates/sovereign-config-woodpecker-broker/README.md --label org.opencontainers.image.version="$RELEASE_TAG" --label org.opencontainers.image.revision="$GITHUB_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$IMAGE" .
+          docker save --output image.tar "$IMAGE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-broker
+          path: image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  # The CLI on the docker CLI base, for other repositories' Woodpecker steps
+  # (`sovereign-config render -- docker compose …`).
+  build-cli:
+    needs: version
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ needs.version.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          IMAGE=ghcr.io/vcheesbrough/sovereign-config-cli:$RELEASE_TAG
+          docker build --platform linux/amd64 -f docker/cli.Dockerfile --build-arg RELEASE_VERSION="$RELEASE_TAG" --label org.opencontainers.image.title=sovereign-config-cli --label org.opencontainers.image.licenses=PolyForm-Noncommercial-1.0.0 --label org.opencontainers.image.url=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.documentation=https://github.com/vcheesbrough/sovereign-config/blob/main/README.md --label org.opencontainers.image.version="$RELEASE_TAG" --label org.opencontainers.image.revision="$GITHUB_SHA" --label org.opencontainers.image.source=https://github.com/vcheesbrough/sovereign-config --label org.opencontainers.image.created="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --tag "$IMAGE" .
+          docker save --output image.tar "$IMAGE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-cli
+          path: image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  # Nothing is published until every check has passed and all three images are
+  # built. The plugin checks each image's version and revision labels and that
+  # none is published yet, before it pushes any.
+  publish:
+    needs:
+      - version
+      - script-validation
+      - web-bundle
+      - unit-test
+      - client-playwright
+      - build-server
+      - build-broker
+      - build-cli
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RELEASE_TAG: ${{ needs.version.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-*
+          path: images
+      - run: |
+          for IMAGE in server broker cli; do
+            docker load --input "images/image-$IMAGE/image.tar"
+          done
+          printf '%s' "$RELEASE_TAG" > .release-tag
+      - uses: docker://ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.2.0@sha256:9d5b3541aa143727f8c68c8c8f1d36557d999d3c857c4581be43363c8ff78c94
+        with:
+          mode: publish
+          images: ghcr.io/vcheesbrough/sovereign-config,ghcr.io/vcheesbrough/sovereign-config-woodpecker-broker,ghcr.io/vcheesbrough/sovereign-config-cli
+          registry_username: ${{ github.actor }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}

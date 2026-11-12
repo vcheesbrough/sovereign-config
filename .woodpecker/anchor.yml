@@ -1,0 +1,32 @@
+# Anchor workflow: the commit is checked, built and published by GitHub
+# Actions (.github/workflows/build.yml), not here. Woodpecker keeps only the
+# deployments, which run on mini, where the stacks, the docker socket and the
+# deploy secrets are (card #539):
+#
+#   push/manual: anchor                      (GitHub Actions builds and publishes)
+#   deployment:  deploy-dev    (dev target, from any branch)
+#                deploy-prod   (prod target, from main only)
+#
+# Woodpecker starts a deployment from an existing pipeline (its Deploy button),
+# and it drops a push that no workflow matches without recording a pipeline.
+# This workflow exists so every push still leaves a pipeline to deploy from. It
+# checks nothing and builds nothing: its green says only that Woodpecker saw
+# the push. Whether the commit can be deployed is the deployment's own resolve
+# step, which refuses a commit GitHub Actions has not published.
+#
+# Each step carries its own `when`, which
+# crates/sovereign-config-server/tests/pipeline_prod_gating.rs pins.
+
+when:
+  - event: [push, manual]
+
+# Nothing here reads the source.
+skip_clone: true
+
+steps:
+  anchor:
+    when:
+      - event: [push, manual]
+    image: docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
+    commands:
+      - echo "$$CI_COMMIT_SHA is built by GitHub Actions; deploy it from this pipeline once its build has published."

@@ -1,11 +1,11 @@
-# Deploy-prod workflow: production is a promotion of the exact image the
-# push already built, published, and git-tagged for this commit — triggered by
-# Woodpecker's Deploy feature, a `deployment` event targeting prod, only from
-# main. Nothing here rebuilds, republishes, or mints a new version:
-# resolve-release-tag reads the semver the push already tagged onto this commit
-# (NEVER allocates — that would mint an unbuilt tag; bored card #254),
-# verify-image pulls that exact published artifact, and deploy-prod deploys it.
-# See checks.yml for how the workflows fit together.
+# Deploy-prod workflow: production is a promotion of a build the GitHub
+# Actions workflow (.github/workflows/build.yml) already checked and published
+# to GHCR — triggered by Woodpecker's Deploy feature, a `deployment` event
+# targeting prod, only from main. Nothing here builds, publishes or allocates
+# a version: resolve chooses the build and proves its images are published,
+# deploy-prod deploys it, and tag records it. Deploy a main commit to dev
+# before promoting it here (AGENTS.md; the pipeline does not enforce it).
+# See anchor.yml for why a push still runs a Woodpecker pipeline.
 
 when:
   - event: deployment
@@ -41,86 +41,67 @@ steps:
         grep -q 'initial_permissions' /tmp/authentik-schema.json
         echo "Validated compatible Authentik $$VERSION"
 
-  # Resolve the semver the push already allocated and tagged onto this
-  # commit — a deployment must NEVER allocate (that mints an unbuilt tag; see
-  # bored card #254). Fail closed if the commit was never published by
-  # a push (no tag on the commit).
-  resolve-release-tag:
+  # Woodpecker takes a GitHub deployment whose ref is a bare commit as a
+  # deployment of main (its GitHub forge sets the branch to the default
+  # branch), so `branch: main` alone would let one ship a commit main never
+  # had. This refuses any commit main does not contain. It guards against an
+  # accident, not an attacker: the deployed commit supplies this file.
+  verify-commit-on-main:
     depends_on: []
     when:
       - event: deployment
         branch: main
         evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
-    # Digest-pinned image that already ships git — no runtime package install on
-    # the deploy path (repo policy: pin by digest, no undeclared outbound fetch).
-    image: docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
+    image: docker.io/curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
     environment:
       GITHUB_TOKEN:
         from_secret: github_token
     commands:
       - |
-        git config --global --add safe.directory '*'
-        # Fast path: a semver tag already on HEAD from the clone.
-        RELEASE_TAG=$$(git tag --points-at HEAD 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$$' | sort -V | tail -1)
-        # Fallback (private repo): query the remote without fetching objects;
-        # annotated tags carry the commit sha on the dereferenced (^{}) line.
-        if [ -z "$$RELEASE_TAG" ]; then
-          RELEASE_TAG=$$(git ls-remote --tags "https://x-access-token:$$GITHUB_TOKEN@github.com/$$CI_REPO" \
-            | awk -v sha="$$CI_COMMIT_SHA" '{ ref=$$2; sub("refs/tags/","",ref); sub(/\^\{\}$$/,"",ref) } $$1==sha && ref ~ /^[0-9]+\.[0-9]+\.[0-9]+$$/ { print ref }' \
-            | sort -V | tail -1)
-        fi
-        if [ -z "$$RELEASE_TAG" ]; then
-          echo "ERROR: commit $$CI_COMMIT_SHA has no release tag." >&2
-          echo "A commit must finish its push pipeline (checks + build + publish -> git tag) before it can be deployed." >&2
+        umask 077
+        printf 'header = "Authorization: Bearer %s"\n' "$$GITHUB_TOKEN" > /tmp/github-curl.conf
+        curl --fail --silent --show-error --config /tmp/github-curl.conf --header 'Accept: application/vnd.github+json' "https://api.github.com/repos/$$CI_REPO/compare/$$CI_COMMIT_SHA...main?per_page=1" > /tmp/compare.json
+        if ! grep -q '"behind_by": *0,' /tmp/compare.json; then
+          echo "ERROR: main does not contain $$CI_COMMIT_SHA; production deploys only commits on main." >&2
           exit 1
         fi
-        printf '%s' "$$RELEASE_TAG" > .release-tag
-        echo "Deploying release $$RELEASE_TAG (resolved from the push publish; no re-allocation)."
+        echo "main contains $$CI_COMMIT_SHA"
 
-  # Promote the artifact the push pipeline already built and published for this
-  # commit — do NOT rebuild. Pull the exact tag and fail closed if it is absent,
-  # which means this commit never completed its push build/publish.
-  verify-image:
-    depends_on:
-      - resolve-release-tag
+  # Chooses what this deployment ships, and never builds or allocates: the
+  # commit's release tag if it was deployed before, else its newest build that
+  # .github/workflows/build.yml published (release-flow). It refuses a target
+  # or branch outside the plugin's policy — dev from any branch, prod from
+  # main — and checks each image's version and revision labels in GHCR, so a
+  # commit with no green build fails here, before anything touches Authentik.
+  # All three images must be published: a server without its matching broker
+  # would leave CI resolving secrets against a stale extension, and a version
+  # without its CLI image is not a whole release for the pipelines that pin it.
+  # The images are public, so it needs no registry credentials.
+  resolve:
+    depends_on: []
     when:
       - event: deployment
         branch: main
         evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
-    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      REGISTRY_USER:
-        from_secret: zot_ci_user
-      REGISTRY_PASSWORD:
-        from_secret: zot_ci_password
-    commands:
-      - |
-        RELEASE_TAG=$$(cat .release-tag)
-        echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
-        # Fail closed if any image is missing: a promotion that shipped the
-        # server without its matching broker would leave CI resolving secrets
-        # against a stale extension, and a tag without its CLI image is not a
-        # whole release for the pipelines that pin it.
-        for IMAGE in \
-          registry.desync.link/sovereign-config:$$RELEASE_TAG \
-          registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG \
-          registry.desync.link/sovereign-config-cli:$$RELEASE_TAG; do
-          if ! docker pull "$$IMAGE"; then
-            echo "ERROR: $$IMAGE not found in the registry." >&2
-            echo "The push pipeline (checks + build + publish) must succeed for this commit before it can be deployed." >&2
-            exit 1
-          fi
-        done
+    pull: true
+    image: ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.2.0@sha256:9d5b3541aa143727f8c68c8c8f1d36557d999d3c857c4581be43363c8ff78c94
+    settings:
+      mode: resolve
+      images:
+        - ghcr.io/vcheesbrough/sovereign-config
+        - ghcr.io/vcheesbrough/sovereign-config-woodpecker-broker
+        - ghcr.io/vcheesbrough/sovereign-config-cli
+      github_token:
+        from_secret: github_token
 
-  # Waits for verify-image as well, so a commit that was never released — its
+  # Waits for resolve as well, so a commit with no published build — its
   # checks failed or have not finished — fails before anything touches
   # Authentik, and its blueprint and live tests never run.
   apply-authentik-blueprint-prod:
     depends_on:
       - validate-authentik-version
-      - verify-image
+      - resolve
+      - verify-commit-on-main
     # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
     # the `prod` environment, only from main.
     when:
@@ -184,7 +165,7 @@ steps:
   deploy-prod:
     depends_on:
       - validate-authentik-manager-live-prod
-      - verify-image
+      - resolve
     # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
     # the `prod` environment, only from main.
     when:
@@ -195,10 +176,6 @@ steps:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      REGISTRY_USER:
-        from_secret: zot_ci_user
-      REGISTRY_PASSWORD:
-        from_secret: zot_ci_password
       POSTGRES_PASSWORD:
         from_secret: sovereign_config_prod_postgres_password
       OIDC_ISSUER: https://auth.desync.link/application/o/sovereign-config/
@@ -207,7 +184,6 @@ steps:
       VALUE_ENCRYPTION_KEY:
         from_secret: sovereign_config_prod_value_encryption_key
     commands:
-      - echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
       - |
         # Telemetry (docs/project-deployment.md): non-secret, so kept here with the
         # deploy rather than in the store this deploy would have to read itself
@@ -237,3 +213,22 @@ steps:
         # started after the gate above and never part of it: its failure is a
         # warning, not a failed deploy (docs/observability.md).
         "$$COMPOSE" -p sovereign-config-prod --profile client-telemetry up -d --no-deps otlp-ingest || echo "WARNING: the client-telemetry ingest did not start; the deploy continues without it" >&2
+
+  # Records the deploy once it has succeeded: the annotated git tag named by
+  # .release-tag, so a tag means "this build was deployed". A no-op when the
+  # commit already carries it — a redeploy, or dev then prod — and the plugin
+  # refuses a second tag on a commit or a tag that would move. The deployment
+  # smoke check runs after the pipeline (AGENTS.md), so it never holds this up.
+  tag:
+    depends_on:
+      - deploy-prod
+    when:
+      - event: deployment
+        branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
+    pull: true
+    image: ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.2.0@sha256:9d5b3541aa143727f8c68c8c8f1d36557d999d3c857c4581be43363c8ff78c94
+    settings:
+      mode: tag
+      github_token:
+        from_secret: github_token

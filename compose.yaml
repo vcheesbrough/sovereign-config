@@ -29,7 +29,7 @@ services:
     restart: unless-stopped
 
   sovereign-config:
-    image: registry.desync.link/sovereign-config:${SOVEREIGN_CONFIG_IMAGE_TAG:-local}
+    image: ghcr.io/vcheesbrough/sovereign-config:${SOVEREIGN_CONFIG_IMAGE_TAG:-local}
     container_name: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}
     environment:
       SOVEREIGN_CONFIG_DATABASE_URL: ${SOVEREIGN_CONFIG_DATABASE_URL:-}
