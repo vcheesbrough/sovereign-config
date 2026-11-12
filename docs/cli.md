@@ -86,7 +86,7 @@ sovereign-config render /apps/api /apps/api/prod -- ./deploy.sh   # ordered, lat
 
 Paths are **layers**, read in the order given, with a later layer overriding an earlier one on a name collision. With no path at all, the layer is the connection's own root — the prefix the credential already encodes. Only the **direct children** of a layer become variables; a deeper descendant has no flat name and is ignored.
 
-**The variable name is the leaf, exactly as stored.** `/foo/AbC` holding `bAr` reaches the command as `AbC=bAr`, precisely as `export AbC=bAr` would. Nothing is uppercased, lowercased or otherwise transformed: paths are case-retentive (see [2.18.0 retains path letter case](upgrading.md#2180-retains-path-letter-case)), so the spelling a value was created under is the spelling the command sees, and it is the only one a deploy can predict. Uppercasing would leave `AbC` unreachable, because no path would produce it.
+**The variable name is the leaf, exactly as stored.** `/foo/AbC` holding `bAr` reaches the command as `AbC=bAr`, precisely as `export AbC=bAr` would. Nothing is uppercased, lowercased or otherwise transformed: paths are case-retentive (see [2.18.0 retains path letter case](upgrading.md#2180-paths-keep-their-letter-case)), so the spelling a value was created under is the spelling the command sees, and it is the only one a deploy can predict. Uppercasing would leave `AbC` unreachable, because no path would produce it.
 
 So the case has to be right where the value is created. `/apps/api/database_url` yields `database_url`, not `DATABASE_URL`; store leaves under the exact variable names the command expects.
 
