@@ -1,0 +1,66 @@
+# code-vitals: record this repo's trunk commits (vcheesbrough/code-vitals).
+#
+# Copied from code-vitals' deploy/measured-repo-workflow.yml, with this repo's
+# name (as in code-vitals' src/code_vitals/repos.py) and trunk filled in.
+# Change it there and re-copy; code-vitals'
+# tests/test_measured_repo_workflow.py pins it.
+#
+# A workflow of its own, so it never blocks or slows this repo's build: its
+# one step is `failure: ignore`, and a missed run is harmless — the next one
+# catches up every trunk commit not yet recorded. It needs no checkout
+# (skip_clone): the collector clones this public repo itself (`collect
+# --fetch`), with full history and tags.
+#
+# The collector runs through the docker socket because code-vitals' prod
+# Postgres is reachable only on the `code-vitals_default` network and the
+# OTLP collector only on `proxy-backend`. Its image is the moving tag
+# `:stable`, which code-vitals' prod deployment moves only after its checks
+# pass — the approved exception to digest pinning (code-vitals AGENTS.md
+# § Deviations register, "Moving collector tag in other repos").
+when:
+  - event: [push, manual]
+    branch: main
+
+skip_clone: true
+
+steps:
+  code-vitals:
+    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    failure: ignore
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      REGISTRY_USER:
+        from_secret: zot_ci_user
+      REGISTRY_PASSWORD:
+        from_secret: zot_ci_password
+      # code-vitals' prod writer, aliased into this repo's broker layer.
+      CODE_VITALS_WRITER_PASSWORD:
+        from_secret: code_vitals_prod_writer_password
+    commands:
+      - |
+        set -eu
+        # Woodpecker feeds this script to the shell on stdin: never redirect
+        # or read the shell's own stdin here, or the rest of the script is
+        # silently dropped and the step "succeeds" having done nothing. No
+        # command below reads stdin (login takes the pipe; --attach is
+        # stdout/stderr only).
+        echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
+        # Every value reaches the collector by name (-e NAME), so the
+        # password is on no command line.
+        export CODE_VITALS_DATABASE_URL="postgresql://code_vitals_writer:$$CODE_VITALS_WRITER_PASSWORD@code-vitals-db:5432/code_vitals"
+        export OTEL_EXPORTER_OTLP_ENDPOINT=http://monitor-alloy:4318
+        export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+        export OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=prod
+        # --rm: the daemon removes the container whenever it exits, even if
+        # this step is cancelled or times out first; the trap covers a failure
+        # before it starts.
+        cid=$$(docker create --rm --pull always --network code-vitals_default \
+          -e CODE_VITALS_DATABASE_URL -e OTEL_EXPORTER_OTLP_ENDPOINT \
+          -e OTEL_EXPORTER_OTLP_PROTOCOL -e OTEL_RESOURCE_ATTRIBUTES -e CI_PIPELINE_NUMBER \
+          registry.desync.link/code-vitals-collector:stable \
+          collect --repo sovereign-config --fetch --trigger push)
+        trap 'docker rm -f "$$cid" > /dev/null 2>&1 || true' EXIT
+        # `docker run` joins one network; the OTLP collector is on another.
+        docker network connect proxy-backend "$$cid"
+        docker start --attach "$$cid"

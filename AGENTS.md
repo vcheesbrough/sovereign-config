@@ -44,9 +44,12 @@ Run the **`ci-watch`** skill (baseline §4) with `OWNER=vcheesbrough`,
   checks, builds the three images and publishes them to GHCR. Watch that run
   (`gh run list --commit $SHA`, `gh run watch`). The commit-status API does
   not show it, because GitHub Actions reports check runs. On a push, Woodpecker
-  runs only `anchor.yml`, which is green as soon as Woodpecker sees the push and
-  says nothing about the build. Woodpecker runs the deployments, and those are
-  still watched there.
+  runs `anchor.yml`, which is green as soon as Woodpecker sees the push and
+  says nothing about the build. On `main` it also runs `code-vitals.yml`
+  (#560), which records the commit and can never fail the pipeline. Its
+  collector is the moving `code-vitals-collector:stable` tag, code-vitals'
+  approved exception to §2's digest pinning. Woodpecker runs the deployments,
+  and those are still watched there.
 - **Releases follow the release-flow skill** (#539). The Woodpecker deploys
   read it with `woodpecker-plugin-release-versions` (`resolve`, `tag`). The
   GitHub build keeps it with `scripts/ci-claim-build.sh` and

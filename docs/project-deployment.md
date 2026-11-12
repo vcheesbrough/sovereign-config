@@ -36,6 +36,8 @@ Each published package links to this repository through its `org.opencontainers.
 
 Woodpecker starts a deployment from an existing pipeline (its Deploy button), and it records no pipeline for a push that no workflow matches. So `.woodpecker/anchor.yml` runs on every push. It does nothing but give the push a pipeline to deploy from. Its green status means only that Woodpecker saw the push. Whether the commit has a build to deploy is the deployment's own `resolve` step, which refuses a commit GitHub Actions has not published.
 
+On `main`, a push also runs `.woodpecker/code-vitals.yml`, which records the commit in code-vitals. It is a copy of code-vitals' `deploy/measured-repo-workflow.yml`. Its one step is `failure: ignore`, and nothing waits for it, so it never blocks a build or a deploy.
+
 ## Deploying
 
 **A push never deploys.** Development is deployed with Woodpecker's **Deploy feature: a `deployment` event targeting the `dev` environment, from any branch**, started from that branch's anchor pipeline. Pushes from several branches therefore never queue behind each other's deploys or fight over the one dev environment. Production is deployed the same way, **targeting `prod`, from `main`**.

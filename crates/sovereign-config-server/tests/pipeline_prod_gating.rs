@@ -178,8 +178,8 @@ fn development_steps_deploy_to_dev_only_on_a_dev_deployment() {
     assert_eq!(checked, 6, "a deploy-dev step was added or removed");
 }
 
-/// The anchor is the only thing a push runs here, and it only gives the push
-/// a pipeline to deploy from: Woodpecker drops a push no workflow matches, and
+/// Besides the code-vitals recorder (`pipeline_code_vitals.rs`), the anchor is
+/// all a push runs here, and it only gives the push a pipeline to deploy from: Woodpecker drops a push no workflow matches, and
 /// its Deploy action starts from an existing pipeline (card #539). It reads no
 /// source, holds no secret, touches no Docker socket and runs no plugin, so it
 /// can neither build nor publish nor tag.
@@ -373,11 +373,16 @@ fn production_deploys_only_commits_main_contains() {
 
 /// The deploys pull the release from GHCR, where GitHub Actions published it,
 /// anonymously: no deploy step holds a registry credential or names the old
-/// registry, and the Compose file names the GHCR image.
+/// registry, and the Compose file names the GHCR image. (The code-vitals
+/// recorder pulls its collector from the estate's registry; it deploys
+/// nothing of this repository's.)
 #[test]
 fn deployments_pull_the_release_from_ghcr() {
     let pipeline = pipeline();
     for (workflow, name, step) in pipeline.steps() {
+        if !workflow.starts_with("deploy-") {
+            continue;
+        }
         let text = serde_yaml::to_string(step).expect("step serialises");
         for forbidden in ["registry.desync.link", "zot_ci_", "docker login"] {
             assert!(
@@ -534,8 +539,9 @@ fn workflow_events(pipeline: &Pipeline, workflow: &str) -> BTreeSet<String> {
 #[test]
 fn every_step_sits_in_its_workflow() {
     let pipeline = pipeline();
-    let expected: [(&str, &[&str]); 3] = [
+    let expected: [(&str, &[&str]); 4] = [
         ("anchor", &["anchor"]),
+        ("code-vitals", &["code-vitals"]),
         (
             "deploy-dev",
             &[
@@ -714,7 +720,8 @@ fn a_manual_run_matches_a_push() {
     for workflow in support::WORKFLOWS {
         let mut conditions = when_conditions(pipeline.workflow(workflow));
         for (owner, _, step) in pipeline.steps() {
-            if owner == workflow {
+            // A step without a `when` of its own runs under its workflow's.
+            if owner == workflow && step.get("when").is_some() {
                 conditions.extend(when_conditions(step));
             }
         }

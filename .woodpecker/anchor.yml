@@ -4,6 +4,7 @@
 # deploy secrets are (card #539):
 #
 #   push/manual: anchor                      (GitHub Actions builds and publishes)
+#                code-vitals   (main only: records the commit; never blocks)
 #   deployment:  deploy-dev    (dev target, from any branch)
 #                deploy-prod   (prod target, from main only)
 #
