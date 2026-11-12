@@ -400,7 +400,7 @@ Metrics are pushed rather than scraped, and there is no `/metrics` endpoint. A c
 
 ## Upgrading
 
-Stop traffic and the old server, back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new release, and run `docker compose up -d`. Migrations are forward-only, so a downgrade means restoring the backup.
+Stop the server, back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new release, and run `docker compose up -d --pull always --wait`. Migrations are forward-only, so a downgrade means restoring the backup.
 
 > [!IMPORTANT]
 > Some releases need clients upgraded in a particular order. Read [Upgrading](docs/upgrading.md) for the procedure and the releases that need action.

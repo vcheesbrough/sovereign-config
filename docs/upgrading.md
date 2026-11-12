@@ -5,13 +5,14 @@
 Run these where you run `docker compose` for the deployment, with its environment set.
 
 1. Read the [notes](#releases-that-need-action) for every release after yours, up to and including the target.
-2. Back up the database:
+2. Stop the server, so nothing is written after the backup, and back up the database:
 
    ```sh
+   docker compose stop sovereign-config
    docker compose exec -T postgres pg_dump -U sovereign_config -Fc sovereign_config > sovereign-config-backup.dump
    ```
 
-   Secret values in the dump are sealed with the value encryption key. Keep the key with the dump.
+   The dump holds plain values and the audit trail unencrypted, and secret values sealed with the value encryption key. Store it as securely as the key, but not with it. A restore needs both.
 3. Upgrade:
 
    ```sh
@@ -19,7 +20,7 @@ Run these where you run `docker compose` for the deployment, with its environmen
    docker compose up -d --pull always --wait
    ```
 
-   The server migrates the database before it reports healthy. `--wait` returns once it does, or fails.
+   The server migrates the database before it reports healthy. `--wait` returns once it does, or fails. With `OTEL_RESOURCE_ATTRIBUTES` set, run the Compose plugin binary instead of `docker compose` (see [Observability](../README.md#observability)).
 4. Check the running version: `curl -s https://<host>/dist/manifest.json` lists installers named for it.
 
 **Rolling back.** Migrations are forward-only, so an older image cannot run against a migrated database. Restore the backup into a new volume and start the older version there:
