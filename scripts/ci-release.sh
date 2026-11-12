@@ -46,10 +46,12 @@ trap 'rm -f "$notes"' EXIT
   printf 'Deployed build `%s` of %s. Its images:\n\n' "$tag" "$commit"
   printf '| Image | Pull |\n| --- | --- |\n'
   for image in "$@"; do
-    digest=$(docker buildx imagetools inspect "$image:$tag" --format '{{json .Manifest.Digest}}' | tr -d '"') || {
+    # No pipe here: its status would hide docker's.
+    inspected=$(docker buildx imagetools inspect "$image:$tag" --format '{{json .Manifest.Digest}}') || {
       echo "ERROR: $image:$tag is not in the registry; a Release names only images that can be pulled" >&2
       exit 1
     }
+    digest=$(printf '%s' "$inspected" | tr -d '"')
     case $digest in
       sha256:*) ;;
       *)
@@ -65,11 +67,20 @@ trap 'rm -f "$notes"' EXIT
   fi
 } > "$notes"
 
-# A new Release on main takes GitHub's automatic "latest"; an edit must also
-# clear a pre-release flag that no longer holds.
+# "Latest" goes to the highest version on main, never to whichever Release was
+# written last: left to itself, GitHub marks the newest Release latest, so a
+# backfill or a first deploy of an older build would take it. An edit must
+# also clear a pre-release flag that no longer holds.
 if [ "$behind" = 0 ]; then
-  create_flags=""
-  edit_flags="--prerelease=false"
+  highest=$(
+    {
+      gh release list --repo "$repo" --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName'
+      printf '%s\n' "$tag"
+    } | grep -Ex '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1
+  )
+  if [ "$highest" = "$tag" ]; then latest="--latest"; else latest="--latest=false"; fi
+  create_flags=$latest
+  edit_flags="--prerelease=false $latest"
 else
   create_flags="--prerelease --latest=false"
   edit_flags=$create_flags

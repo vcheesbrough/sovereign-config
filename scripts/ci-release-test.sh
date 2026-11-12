@@ -26,6 +26,7 @@ mkdir "$work/bin"
 #   commit             the tag's commit (absent: the tag does not exist)
 #   behind             main's behind_by for that commit
 #   release-exists     the Release already exists
+#   releases           the tags of the existing full (not pre-) Releases
 #   digest-<name>      the image's digest (absent: not in the registry)
 # gh appends each release create/edit to `calls`, and copies the notes to `notes`.
 cat > "$work/bin/gh" <<'STUB'
@@ -41,6 +42,9 @@ case "$1 $2" in
     ;;
   "release view")
     [ -f "$world/release-exists" ]
+    ;;
+  "release list")
+    cat "$world/releases" 2>/dev/null || true
     ;;
   "release create" | "release edit")
     echo "$*" >> "$world/calls"
@@ -83,7 +87,7 @@ world() {
 }
 
 run_release() {
-  PATH="$work/bin:$PATH" STUB_WORLD="$work/world" sh "$release" "$@" >/dev/null 2>&1
+  PATH="$work/bin:$PATH" STUB_WORLD="$work/world" sh "$release" "$@" >/dev/null 2>"$work/stderr"
 }
 
 calls() {
@@ -108,8 +112,9 @@ if run_release 2.50.3 owner/repo "$SERVER" "$CLI"; then
   else
     fail "the notes give each image's pinned pull and package page: $notes"
   fi
-  if contains "$(calls)" "release create 2.50.3 --repo owner/repo --verify-tag" && ! contains "$(calls)" "--prerelease"; then
-    pass "a tag on main gets a full Release on the existing tag"
+  if contains "$(calls)" "release create 2.50.3 --repo owner/repo --verify-tag" && ! contains "$(calls)" "--prerelease" \
+    && contains "$(calls)" "--latest" && ! contains "$(calls)" "--latest=false"; then
+    pass "a tag on main gets a full Release on the existing tag, latest"
   else
     fail "a tag on main gets a full Release on the existing tag: $(calls)"
   fi
@@ -136,8 +141,25 @@ else
 fi
 
 world
+printf '2.50.10\n2.49.3\n' > "$work/world/releases"
+if run_release 2.50.9 owner/repo "$SERVER" && contains "$(calls)" "--latest=false"; then
+  pass "an older version on main never takes latest from a higher one"
+else
+  fail "an older version on main never takes latest from a higher one: $(calls)"
+fi
+
+world
+printf '2.50.9\n2.49.3\n' > "$work/world/releases"
+if run_release 2.50.10 owner/repo "$SERVER" && ! contains "$(calls)" "--latest=false" && contains "$(calls)" "--latest"; then
+  pass "the highest version on main is latest, compared numerically"
+else
+  fail "the highest version on main is latest, compared numerically: $(calls)"
+fi
+
+world
 rm "$work/world/digest-cli"
-if ! run_release 2.50.3 owner/repo "$SERVER" "$CLI" && [ -z "$(calls)" ]; then
+if ! run_release 2.50.3 owner/repo "$SERVER" "$CLI" && [ -z "$(calls)" ] \
+  && contains "$(cat "$work/stderr")" "is not in the registry"; then
   pass "a version with a missing image gets no Release"
 else
   fail "a version with a missing image gets no Release: $(calls)"
