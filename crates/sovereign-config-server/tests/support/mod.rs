@@ -1,5 +1,6 @@
-//! Loads the Woodpecker pipeline, which is split into one workflow file per
-//! concern under `.woodpecker/` (see the header of `checks.yml`).
+//! Loads the two CI systems' pipelines: the Woodpecker deployments, one
+//! workflow file each under `.woodpecker/` (see the header of `anchor.yml`), and
+//! the GitHub Actions build, `.github/workflows/build.yml`.
 //!
 //! Each integration test binary compiles this module separately and uses a
 //! different subset of it.
@@ -9,9 +10,8 @@ use std::path::Path;
 
 use serde_yaml::Value;
 
-/// Every workflow file, in the order the pipeline reads: gates, the publish
-/// they guard, then the deploys.
-pub const WORKFLOWS: [&str; 5] = ["checks", "build", "publish", "deploy-dev", "deploy-prod"];
+/// Every Woodpecker workflow file: the push anchor, then the deploys.
+pub const WORKFLOWS: [&str; 3] = ["anchor", "deploy-dev", "deploy-prod"];
 
 pub struct Pipeline {
     workflows: Vec<(&'static str, Value)>,
@@ -91,5 +91,84 @@ impl Pipeline {
             .get("steps")
             .and_then(|steps| steps.get(name))
             .unwrap_or_else(|| panic!("step {name} should exist in {workflow}"))
+    }
+}
+
+/// The GitHub Actions build workflow, `.github/workflows/build.yml`.
+pub struct Build {
+    workflow: Value,
+}
+
+pub fn build() -> Build {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/build.yml");
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("workflow {} should be readable", path.display()));
+    let workflow =
+        serde_yaml::from_str(&contents).expect("the build workflow should be valid YAML");
+    Build { workflow }
+}
+
+impl Build {
+    pub fn workflow(&self) -> &Value {
+        &self.workflow
+    }
+
+    /// Every job's name, in file order.
+    pub fn job_names(&self) -> Vec<String> {
+        self.workflow
+            .get("jobs")
+            .and_then(Value::as_mapping)
+            .expect("the build workflow should have jobs")
+            .keys()
+            .map(|name| name.as_str().expect("job name").to_owned())
+            .collect()
+    }
+
+    pub fn job(&self, name: &str) -> &Value {
+        self.workflow
+            .get("jobs")
+            .and_then(|jobs| jobs.get(name))
+            .unwrap_or_else(|| panic!("job {name} should exist"))
+    }
+
+    pub fn steps(&self, job: &str) -> &[Value] {
+        self.job(job)
+            .get("steps")
+            .and_then(Value::as_sequence)
+            .unwrap_or_else(|| panic!("job {job} should have steps"))
+    }
+
+    /// The `run` scripts of a job's steps, joined in order.
+    pub fn run_text(&self, job: &str) -> String {
+        self.steps(job)
+            .iter()
+            .filter_map(|step| step.get("run").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The jobs a job waits for, whether `needs` is one name or a list.
+    pub fn needs(&self, job: &str) -> Vec<String> {
+        match self.job(job).get("needs") {
+            None => Vec::new(),
+            Some(Value::String(one)) => vec![one.clone()],
+            Some(Value::Sequence(many)) => many
+                .iter()
+                .map(|need| need.as_str().expect("job name").to_owned())
+                .collect(),
+            Some(other) => panic!("unexpected needs shape in {job}: {other:?}"),
+        }
+    }
+
+    /// The steps of a job that run the action `uses` starts with.
+    pub fn uses<'a>(&'a self, job: &str, prefix: &str) -> Vec<&'a Value> {
+        self.steps(job)
+            .iter()
+            .filter(|step| {
+                step.get("uses")
+                    .and_then(Value::as_str)
+                    .is_some_and(|uses| uses.starts_with(prefix))
+            })
+            .collect()
     }
 }

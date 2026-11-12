@@ -1,13 +1,10 @@
-# Deploy-dev workflow: development is a manual deployment of the exact images
-# the push pipeline already built, published and git-tagged for this commit —
-# triggered by Woodpecker's Deploy feature, a `deployment` event targeting dev,
-# from any branch. A push never deploys (card #466), so pushes from several
-# branches no longer queue behind each other's deploys or fight over the one
-# dev environment. Like deploy-prod, nothing here rebuilds, republishes, or
-# mints a version: resolve-release-tag reads the semver the push tagged onto
-# this commit (NEVER allocates — bored card #254), verify-image proves the
-# published images exist, and deploy-dev deploys them.
-# See checks.yml for how the workflows fit together.
+# Deploy-dev workflow: development is a deployment of a build the GitHub
+# Actions workflow (.github/workflows/build.yml) already checked and published
+# to GHCR — triggered by Woodpecker's Deploy feature, a `deployment` event
+# targeting dev, from any branch. A push never deploys (card #466). Nothing
+# here builds, publishes or allocates a version: resolve chooses the build and
+# proves its images are published, deploy-dev deploys it, and tag records it.
+# See anchor.yml for why a push still runs a Woodpecker pipeline.
 
 when:
   - event: deployment
@@ -41,84 +38,39 @@ steps:
         grep -q 'initial_permissions' /tmp/authentik-schema.json
         echo "Validated compatible Authentik $$VERSION"
 
-  # Resolve the semver the push already allocated and tagged onto this commit —
-  # a deployment must NEVER allocate (that mints an unbuilt tag; see bored card
-  # #254). Fail closed if the commit was never published by a push (no tag on
-  # the commit).
-  resolve-release-tag:
+  # Chooses what this deployment ships, and never builds or allocates: the
+  # commit's release tag if it was deployed before, else its newest build that
+  # .github/workflows/build.yml published (release-flow). It refuses a target
+  # or branch outside the plugin's policy — dev from any branch, prod from
+  # main — and checks each image's version and revision labels in GHCR, so a
+  # commit with no green build fails here, before anything touches Authentik.
+  # All three images must be published: a server without its matching broker
+  # would leave CI resolving secrets against a stale extension, and a version
+  # without its CLI image is not a whole release for the pipelines that pin it.
+  # The images are public, so it needs no registry credentials.
+  resolve:
     depends_on: []
     when:
       - event: deployment
         evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "dev"'
-    # Digest-pinned image that already ships git — no runtime package install on
-    # the deploy path (repo policy: pin by digest, no undeclared outbound fetch).
-    image: docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
-    environment:
-      GITHUB_TOKEN:
+    pull: true
+    image: ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.2.0@sha256:9d5b3541aa143727f8c68c8c8f1d36557d999d3c857c4581be43363c8ff78c94
+    settings:
+      mode: resolve
+      images:
+        - ghcr.io/vcheesbrough/sovereign-config
+        - ghcr.io/vcheesbrough/sovereign-config-woodpecker-broker
+        - ghcr.io/vcheesbrough/sovereign-config-cli
+      github_token:
         from_secret: github_token
-    commands:
-      - |
-        git config --global --add safe.directory '*'
-        # Fast path: a semver tag already on HEAD from the clone.
-        RELEASE_TAG=$$(git tag --points-at HEAD 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$$' | sort -V | tail -1)
-        # Fallback (private repo): query the remote without fetching objects;
-        # annotated tags carry the commit sha on the dereferenced (^{}) line.
-        if [ -z "$$RELEASE_TAG" ]; then
-          RELEASE_TAG=$$(git ls-remote --tags "https://x-access-token:$$GITHUB_TOKEN@github.com/$$CI_REPO" \
-            | awk -v sha="$$CI_COMMIT_SHA" '{ ref=$$2; sub("refs/tags/","",ref); sub(/\^\{\}$$/,"",ref) } $$1==sha && ref ~ /^[0-9]+\.[0-9]+\.[0-9]+$$/ { print ref }' \
-            | sort -V | tail -1)
-        fi
-        if [ -z "$$RELEASE_TAG" ]; then
-          echo "ERROR: commit $$CI_COMMIT_SHA has no release tag." >&2
-          echo "A commit must finish its push pipeline (checks + build + publish -> git tag) before it can be deployed." >&2
-          exit 1
-        fi
-        printf '%s' "$$RELEASE_TAG" > .release-tag
-        echo "Deploying release $$RELEASE_TAG (resolved from the push publish; no re-allocation)."
 
-  # Deploy the artifact the push pipeline already built and published for this
-  # commit — do NOT rebuild. Pull the exact tag and fail closed if it is absent,
-  # which means this commit never completed its push publish.
-  verify-image:
-    depends_on:
-      - resolve-release-tag
-    when:
-      - event: deployment
-        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "dev"'
-    image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      REGISTRY_USER:
-        from_secret: zot_ci_user
-      REGISTRY_PASSWORD:
-        from_secret: zot_ci_password
-    commands:
-      - |
-        RELEASE_TAG=$$(cat .release-tag)
-        echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
-        # Fail closed if any image is missing: a promotion that shipped the
-        # server without its matching broker would leave CI resolving secrets
-        # against a stale extension, and a tag without its CLI image is not a
-        # whole release for the pipelines that pin it.
-        for IMAGE in \
-          registry.desync.link/sovereign-config:$$RELEASE_TAG \
-          registry.desync.link/sovereign-config-woodpecker-broker:$$RELEASE_TAG \
-          registry.desync.link/sovereign-config-cli:$$RELEASE_TAG; do
-          if ! docker pull "$$IMAGE"; then
-            echo "ERROR: $$IMAGE not found in the registry." >&2
-            echo "The push pipeline (checks + build + publish) must succeed for this commit before it can be deployed." >&2
-            exit 1
-          fi
-        done
-
-  # Waits for verify-image as well, so a commit that was never released — its
+  # Waits for resolve as well, so a commit with no published build — its
   # checks failed or have not finished — fails before anything touches
   # Authentik, and its blueprint and live tests never run.
   apply-authentik-blueprint-dev:
     depends_on:
       - validate-authentik-version
-      - verify-image
+      - resolve
     when:
       - event: deployment
         evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "dev"'
@@ -176,7 +128,7 @@ steps:
   deploy-dev:
     depends_on:
       - validate-authentik-manager-live
-      - verify-image
+      - resolve
     when:
       - event: deployment
         evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "dev"'
@@ -184,10 +136,6 @@ steps:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      REGISTRY_USER:
-        from_secret: zot_ci_user
-      REGISTRY_PASSWORD:
-        from_secret: zot_ci_password
       POSTGRES_PASSWORD:
         from_secret: sovereign_config_dev_postgres_password
       OIDC_ISSUER: https://auth.desync.link/application/o/sovereign-config-dev/
@@ -196,7 +144,6 @@ steps:
       VALUE_ENCRYPTION_KEY:
         from_secret: sovereign_config_dev_value_encryption_key
     commands:
-      - echo "$$REGISTRY_PASSWORD" | docker login registry.desync.link -u "$$REGISTRY_USER" --password-stdin
       - |
         # Telemetry (docs/project-deployment.md): non-secret, so kept here with the
         # deploy rather than in the store this deploy would have to read itself
@@ -226,3 +173,21 @@ steps:
         # started after the gate above and never part of it: its failure is a
         # warning, not a failed deploy (docs/observability.md).
         "$$COMPOSE" -p sovereign-config-dev --profile client-telemetry up -d --no-deps otlp-ingest || echo "WARNING: the client-telemetry ingest did not start; the deploy continues without it" >&2
+
+  # Records the deploy once it has succeeded: the annotated git tag named by
+  # .release-tag, so a tag means "this build was deployed". A no-op when the
+  # commit already carries it — a redeploy, or dev then prod — and the plugin
+  # refuses a second tag on a commit or a tag that would move. The deployment
+  # smoke check runs after the pipeline (AGENTS.md), so it never holds this up.
+  tag:
+    depends_on:
+      - deploy-dev
+    when:
+      - event: deployment
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "dev"'
+    pull: true
+    image: ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.2.0@sha256:9d5b3541aa143727f8c68c8c8f1d36557d999d3c857c4581be43363c8ff78c94
+    settings:
+      mode: tag
+      github_token:
+        from_secret: github_token

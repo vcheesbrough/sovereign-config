@@ -12,8 +12,8 @@ It replaces [`woodpecker-openbao-broker`](https://github.com/vcheesbrough/woodpe
 and is wire-compatible with it, so **no pipeline YAML changes at the cutover** —
 `from_secret: github_token` keeps working.
 
-Published as `registry.desync.link/sovereign-config-woodpecker-broker:<semver>`
-under the same workspace tag as the server, so the two are protocol-matched by
+Published as `ghcr.io/vcheesbrough/sovereign-config-woodpecker-broker:<semver>`
+under the same version as the server, so the two are protocol-matched by
 construction.
 
 ## How a repository's secrets are chosen

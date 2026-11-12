@@ -1,8 +1,10 @@
 //! Guards the deployment-trigger policy encoded in the `.woodpecker/` workflows:
-//! a push (or manual run) checks, builds, tags and publishes, and never deploys;
-//! each environment deploys only on a `deployment` event (Woodpecker's Deploy)
-//! targeting it — production from main only (card #262), development from any
-//! branch (card #466). The pipeline file is not otherwise exercised by any test.
+//! a push (or manual run) only anchors a pipeline to deploy from, and never
+//! builds or deploys — GitHub Actions builds (card #539); each environment
+//! deploys only on a `deployment` event (Woodpecker's Deploy) targeting it —
+//! production from main only (card #262), development from any branch (card
+//! #466) — and ships only what the release-versions plugin resolves. The
+//! pipeline files are not otherwise exercised by any test.
 
 mod support;
 
@@ -11,8 +13,8 @@ use std::collections::BTreeSet;
 use serde_yaml::Value;
 use support::{Pipeline, pipeline};
 
-/// The events that build, tag and publish. A manual run from the Woodpecker UI
-/// does exactly what a push does.
+/// The events the anchor runs on. A manual run from the Woodpecker UI does
+/// exactly what a push does.
 fn push_events() -> BTreeSet<String> {
     BTreeSet::from(["push".to_owned(), "manual".to_owned()])
 }
@@ -81,17 +83,43 @@ fn when_conditions(step: &Value) -> Vec<Condition> {
         .collect()
 }
 
+/// The release-versions plugin, pinned by digest, which alone chooses what a
+/// deployment ships and records it.
+const RELEASE_VERSIONS: &str =
+    "ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.2.0@sha256:";
+
+/// The three images of one release, as GHCR publishes them.
+const RELEASE_IMAGES: [&str; 3] = [
+    "ghcr.io/vcheesbrough/sovereign-config",
+    "ghcr.io/vcheesbrough/sovereign-config-woodpecker-broker",
+    "ghcr.io/vcheesbrough/sovereign-config-cli",
+];
+
+fn depends_on(step: &Value) -> Vec<&str> {
+    step.get("depends_on")
+        .and_then(Value::as_sequence)
+        .expect("step should list its dependencies")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+fn setting<'a>(step: &'a Value, name: &str) -> Option<&'a Value> {
+    step.get("settings").and_then(|settings| settings.get(name))
+}
+
+/// Every step of the prod deploy runs only on a deployment targeting prod,
+/// from main.
 #[test]
 fn production_steps_deploy_to_prod_from_permitted_branches() {
     let permitted: BTreeSet<String> = PROD_BRANCHES.iter().map(|&b| b.to_owned()).collect();
-    for name in [
-        "resolve-release-tag",
-        "verify-image",
-        "apply-authentik-blueprint-prod",
-        "validate-authentik-manager-live-prod",
-        "deploy-prod",
-    ] {
-        let conditions = when_conditions(pipeline().step_in("deploy-prod", name));
+    let pipeline = pipeline();
+    let mut checked = 0;
+    for (workflow, name, step) in pipeline.steps() {
+        if workflow != "deploy-prod" {
+            continue;
+        }
+        let conditions = when_conditions(step);
         assert!(
             conditions.iter().all(|c| c.events == deployment_event()),
             "{name} must only ever run on a deployment event, never on push"
@@ -112,7 +140,9 @@ fn production_steps_deploy_to_prod_from_permitted_branches() {
             branches, permitted,
             "{name} must be branch-restricted to exactly the permitted branches"
         );
+        checked += 1;
     }
+    assert_eq!(checked, 7, "a deploy-prod step was added or removed");
 }
 
 /// Every step of the dev deploy runs only on a deployment targeting dev, from
@@ -148,33 +178,43 @@ fn development_steps_deploy_to_dev_only_on_a_dev_deployment() {
     assert_eq!(checked, 6, "a deploy-dev step was added or removed");
 }
 
+/// The anchor is the only thing a push runs here, and it only gives the push
+/// a pipeline to deploy from: Woodpecker drops a push no workflow matches, and
+/// its Deploy action starts from an existing pipeline (card #539). It reads no
+/// source, holds no secret, touches no Docker socket and runs no plugin, so it
+/// can neither build nor publish nor tag.
 #[test]
-fn build_and_publish_steps_never_run_on_a_deployment() {
-    // Everything that allocates a version, builds, tags or publishes runs on
-    // push and manual only, so a deployment never mints a new version and never
-    // rebuilds or republishes an image.
-    for name in [
-        "compute-version",
-        "script-validation",
-        "unit-test",
-        "client-playwright",
-        "prune-build-cache",
-        "build-server",
-        "build-broker",
-        "build-cli",
-        "promote-images",
-        "tag-release",
-    ] {
-        let pipeline = pipeline();
-        let workflows = pipeline.workflows_of(name);
-        assert!(!workflows.is_empty(), "step {name} should exist");
-        for workflow in workflows {
-            let conditions = when_conditions(pipeline.step_in(workflow, name));
-            assert!(
-                !conditions.is_empty() && conditions.iter().all(|c| c.events == push_events()),
-                "{name} in {workflow} must run on push and manual only, so a deployment never touches it"
-            );
-        }
+fn a_push_only_anchors_a_pipeline_to_deploy_from() {
+    let pipeline = pipeline();
+    assert_eq!(workflow_events(&pipeline, "anchor"), push_events());
+    assert_eq!(
+        pipeline
+            .workflow("anchor")
+            .get("skip_clone")
+            .and_then(Value::as_bool),
+        Some(true),
+        "the anchor reads no source"
+    );
+    let anchor = pipeline.step_in("anchor", "anchor");
+    assert!(
+        when_conditions(anchor)
+            .iter()
+            .all(|condition| condition.events == push_events()),
+        "the anchor runs on push and manual only"
+    );
+    for key in ["settings", "environment", "volumes"] {
+        assert!(
+            anchor.get(key).is_none(),
+            "the anchor must not carry `{key}`: it builds, publishes and deploys nothing"
+        );
+    }
+    let image = anchor.get("image").and_then(Value::as_str).expect("image");
+    assert!(
+        image.contains("@sha256:") && !image.starts_with(RELEASE_VERSIONS),
+        "the anchor runs a digest-pinned image that is not the release plugin"
+    );
+    for workflow in ["deploy-dev", "deploy-prod"] {
+        assert_eq!(workflow_events(&pipeline, workflow), deployment_event());
     }
 }
 
@@ -209,518 +249,152 @@ fn a_push_never_deploys() {
     assert!(checked > 0, "no push step was found to check");
 }
 
-/// Publish releases a checked build: promote-images copies each candidate to
-/// its release name inside the registry — never building, pushing from this
-/// host, or overwriting a release — and only then does tag-release push the
-/// git tag, a plain `git push` of a new tag, which refuses an existing one. It
-/// runs only after checks and build (`publish_waits_for_checks_and_build`).
+/// A deployment never builds, publishes or allocates: in both deploy
+/// workflows the plugin's `resolve` chooses the build — the commit's release
+/// tag, else its newest published build — and proves all three GHCR images
+/// carry its labels, before anything touches Authentik. Nothing else in
+/// Woodpecker names a version or runs the plugin's build-side modes.
 #[test]
-fn publish_promotes_the_candidates_then_tags() {
+fn a_deployment_resolves_a_published_build_and_never_allocates() {
     let pipeline = pipeline();
-    let depends_on = |name: &str| -> Vec<String> {
-        pipeline
-            .step_in("publish", name)
-            .get("depends_on")
-            .and_then(Value::as_sequence)
-            .expect("publish steps list their dependencies")
-            .iter()
-            .map(|dependency| dependency.as_str().expect("step name").to_owned())
-            .collect()
-    };
-    assert_eq!(depends_on("promote-images"), ["compute-version"]);
-    assert_eq!(depends_on("tag-release"), ["promote-images"]);
-
-    let promote = commands_text(pipeline.step_in("publish", "promote-images"));
-    for expected in [
-        "for NAME in sovereign-config sovereign-config-woodpecker-broker sovereign-config-cli; do",
-        "CANDIDATE=registry.desync.link/$$NAME-ci:$$RELEASE_TAG",
-        "RELEASE=registry.desync.link/$$NAME:$$RELEASE_TAG",
-        "docker buildx imagetools create --prefer-index=false --tag \"$$RELEASE\" \"$$CANDIDATE\"",
-    ] {
-        assert!(
-            promote.contains(expected),
-            "promote-images must contain `{expected}`"
-        );
-    }
-    let refusal = promote
-        .find("docker buildx imagetools inspect \"$$RELEASE\"")
-        .expect("promote-images must check for an existing release");
-    let copy = promote.find("imagetools create").expect("copies");
-    assert!(refusal < copy, "the existing-release check comes first");
-    for forbidden in ["docker build ", "docker push", "docker tag "] {
-        assert!(
-            !promote.contains(forbidden),
-            "promote-images copies inside the registry and must not run `{forbidden}`"
-        );
-    }
-
-    let tag = commands_text(pipeline.step_in("publish", "tag-release"));
-    assert!(
-        tag.contains("git tag \"$$RELEASE_TAG\" \"$$CI_COMMIT_SHA\"")
-            && tag.contains("\"refs/tags/$$RELEASE_TAG\"")
-            && !tag.contains("--force")
-            && !tag.contains(" -f "),
-        "tag-release must push this commit's release tag and never overwrite one"
-    );
-    assert_eq!(pipeline.workflows_of("tag-release"), ["publish"]);
-    assert_eq!(pipeline.workflows_of("promote-images"), ["publish"]);
-}
-
-/// The repository root, where the `docker/` build files live.
-fn repo_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn dockerfile(image: &str) -> String {
-    let path = repo_root().join(format!("docker/{image}.Dockerfile"));
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("{} should be readable: {error}", path.display()))
-}
-
-/// Every `docker/*.Dockerfile`, by file name.
-fn all_dockerfiles() -> Vec<(String, String)> {
-    let mut files: Vec<(String, String)> = std::fs::read_dir(repo_root().join("docker"))
-        .expect("docker/ should be readable")
-        .map(|entry| entry.expect("docker/ entry should be readable").path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "Dockerfile")
-        })
-        .map(|path| {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            let text = std::fs::read_to_string(&path).expect("Dockerfile should be readable");
-            (name, text)
-        })
-        .collect();
-    files.sort();
-    files
-}
-
-/// One named build stage of a Dockerfile: its `FROM … AS <name>` line up to the
-/// next `FROM`.
-///
-/// `ARG` is scoped to the stage that declares it, so an assertion against the
-/// whole file cannot tell "the server build receives this" from "some other
-/// stage does". Only a slice can.
-fn stage<'a>(dockerfile: &'a str, name: &str) -> &'a str {
-    let header = format!(" AS {name}\n");
-    let start = dockerfile
-        .find(&header)
-        .unwrap_or_else(|| panic!("the Dockerfile should have a stage named {name}"))
-        + header.len();
-    let rest = &dockerfile[start..];
-    match rest.find("\nFROM ") {
-        Some(end) => &rest[..end],
-        None => rest,
-    }
-}
-
-/// The digest-pinned references to `image@sha256:` in a Dockerfile.
-fn pinned_digests<'a>(dockerfile: &'a str, image: &str) -> BTreeSet<&'a str> {
-    dockerfile
-        .split_whitespace()
-        .filter(|word| word.contains(&format!("{image}@sha256:")))
-        .collect()
-}
-
-/// Each image builds from its own file, which has one final stage, so no build
-/// can pick the wrong image by omitting a `--target`.
-#[test]
-fn each_image_build_uses_its_own_dockerfile() {
-    let pipeline = pipeline();
-    for (name, image) in [
-        ("build-server", "server"),
-        ("build-broker", "broker"),
-        ("build-cli", "cli"),
-    ] {
-        let commands = commands_text(step(&pipeline, name));
-        let file = format!("-f docker/{image}.Dockerfile ");
-        assert!(
-            commands.contains("docker build") && commands.contains(&file),
-            "{name} must build with {file}"
-        );
-        assert!(
-            !commands.contains("--target"),
-            "{name} must not select a stage: its Dockerfile builds one image"
-        );
-        dockerfile(image);
-    }
-    assert!(
-        !repo_root().join("Dockerfile").exists(),
-        "there must be no root Dockerfile for an untargeted `docker build .` to pick up"
-    );
-}
-
-/// Every flag in an image build command must start a token of its own.
-///
-/// The build commands are single long shell lines, so an edit that drops one
-/// space glues a flag onto the value before it. Docker does not complain about
-/// an unknown flag — it takes the merged token as the build context path and
-/// fails with a usage error about the argument count, which names neither the
-/// flag nor the label that swallowed it. Nothing else here reads the command as
-/// tokens, so only this catches it, and it catches it before a pipeline run
-/// rather than after one.
-#[test]
-fn image_build_flags_are_never_glued_to_the_value_before_them() {
-    let pipeline = pipeline();
-    for name in ["build-server", "build-broker", "build-cli"] {
-        let commands = commands_text(step(&pipeline, name));
-        for (offset, _) in commands.match_indices("--") {
-            let preceding = commands[..offset].chars().next_back();
-            assert!(
-                matches!(preceding, None | Some(' ' | '\n' | '"')),
-                "{name}: a flag is glued to the token before it at {:?}",
-                &commands[offset.saturating_sub(40)..commands.len().min(offset + 20)]
-            );
-        }
-    }
-}
-
-/// The revision reaches the binary only if all four links hold: CI passes the
-/// commit as a build arg, the **server** stage declares that arg, that stage
-/// exports it to `cargo build`, and `build.rs` reads it into the compiled
-/// binary.
-///
-/// A broken link degrades silently to `revision="unknown"` — the same value a
-/// local build reports — so nothing fails and no unit test can tell the two
-/// apart. The chain is only visible to someone scraping a deployment.
-///
-/// The `ARG` assertion is scoped to the `builder` stage on purpose: Docker
-/// scopes `ARG` per stage, so an `ARG REVISION` sitting in `installer-builder`
-/// would satisfy a file-wide search while the server binary got nothing.
-#[test]
-fn the_server_image_is_stamped_with_the_commit_it_was_built_from() {
-    let commands = commands_text(step(&pipeline(), "build-server"));
-    assert!(
-        commands.contains("--build-arg REVISION=\"$$CI_COMMIT_SHA\""),
-        "the build must pass the commit to the image"
-    );
-
-    let server_dockerfile = dockerfile("server");
-    let builder = stage(&server_dockerfile, "builder");
-    assert!(
-        builder.contains("ARG REVISION"),
-        "the stage that builds the server must declare the arg it is passed"
-    );
-    assert!(
-        builder.contains("SOVEREIGN_CONFIG_REVISION=\"$REVISION\""),
-        "the stage must export the arg to cargo, or build.rs never sees it"
-    );
-
-    let build_script =
-        std::fs::read_to_string(repo_root().join("crates/sovereign-config-server/build.rs"))
-            .expect("build.rs should be readable");
-    assert!(
-        build_script.contains("SOVEREIGN_CONFIG_REVISION"),
-        "build.rs must read the variable the image build exports"
-    );
-}
-
-/// The builder stages are duplicated across the files, not shared, so their
-/// base images must not drift apart.
-#[test]
-fn every_dockerfile_pins_the_same_base_images() {
-    let files = all_dockerfiles();
-    assert!(
-        files.len() >= 4,
-        "expected web/server/broker/cli Dockerfiles, found {files:?}"
-    );
-    for image in [
-        "docker.io/library/rust",
-        "docker.io/library/debian",
-        "docker:27-cli",
-        "docker/dockerfile:1.7",
-    ] {
-        let digests: BTreeSet<&str> = files
-            .iter()
-            .flat_map(|(_, text)| pinned_digests(text, image))
-            .collect();
-        assert!(
-            digests.len() <= 1,
-            "every docker/*.Dockerfile must pin {image} to one digest, found {digests:?}"
-        );
-    }
-    for (name, text) in &files {
-        assert_eq!(
-            pinned_digests(text, "docker.io/library/rust").len(),
-            1,
-            "{name} must build from the pinned rust image"
-        );
-        let mut stages: Vec<&str> = Vec::new();
-        for from in text.lines().filter(|line| line.starts_with("FROM ")) {
-            let words: Vec<&str> = from
-                .split_whitespace()
-                .filter(|word| !word.starts_with("--"))
-                .collect();
-            let base = words.get(1).copied().unwrap_or_default();
-            assert!(
-                base == "scratch" || base.contains("@sha256:") || stages.contains(&base),
-                "{name}: {from} must pin its base image by digest or build on an earlier stage"
-            );
-            if let Some(stage) = words
-                .iter()
-                .position(|word| word.eq_ignore_ascii_case("AS"))
-                .and_then(|index| words.get(index + 1))
-            {
-                stages.push(stage);
-            }
-        }
-    }
-}
-
-/// The broker and CLI never ship the web bundle, and the broker never ships
-/// the server, so neither build pays for them.
-#[test]
-fn broker_and_cli_builds_compile_only_what_they_ship() {
-    for image in ["broker", "cli"] {
-        let text = dockerfile(image);
-        assert!(
-            !text.contains("trunk") && !text.contains("wasm32") && !text.contains("web-dist"),
-            "docker/{image}.Dockerfile must not build the web bundle"
-        );
-        assert!(
-            !text.contains("--package sovereign-config-server"),
-            "docker/{image}.Dockerfile must not compile the server"
-        );
-    }
-    assert!(
-        dockerfile("broker").contains("--package sovereign-config-woodpecker-broker"),
-        "the broker Dockerfile must compile the broker"
-    );
-    assert!(
-        dockerfile("cli").contains("--package sovereign-config-cli"),
-        "the CLI Dockerfile must compile the CLI"
-    );
-}
-
-/// `web-dist/` is not in the checkout (card #278), so the checks build the
-/// release bundle into it from `docker/web.Dockerfile` — the stages the server
-/// image builds it with — before anything that embeds or serves it runs; and no
-/// image build copies a `web-dist` from the build context, where a stale or
-/// debug bundle could stand in for the one the build makes.
-#[test]
-fn the_checks_build_the_web_bundle_the_server_embeds() {
-    let pipeline = pipeline();
-    assert_eq!(pipeline.workflows_of("web-bundle"), ["checks"]);
-    let bundle = commands_text(step(&pipeline, "web-bundle"));
-    assert!(
-        bundle.contains("docker build -f docker/web.Dockerfile")
-            && bundle.contains("--output type=local,dest=web-dist "),
-        "web-bundle must export docker/web.Dockerfile's bundle into web-dist: {bundle}"
-    );
-    for name in ["unit-test", "client-playwright"] {
-        let dependencies: Vec<&str> = step(&pipeline, name)
-            .get("depends_on")
-            .and_then(Value::as_sequence)
-            .unwrap_or_else(|| panic!("{name} should list its dependencies"))
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        assert!(
-            dependencies.contains(&"web-bundle"),
-            "{name} must wait for web-bundle"
-        );
-    }
-    let playwright = commands_text(step(&pipeline, "client-playwright"));
-    assert!(
-        !playwright.contains("docker build"),
-        "client-playwright must test the bundle web-bundle built, not build its own"
-    );
-    assert!(
-        playwright.contains("docker cp web-dist/."),
-        "client-playwright must serve the bundle web-bundle built"
-    );
-
-    for (name, text) in all_dockerfiles() {
-        assert!(
-            !text.lines().any(|line| {
-                let words: Vec<&str> = line.split_whitespace().collect();
-                words.first() == Some(&"COPY")
-                    && !words.iter().any(|word| word.starts_with("--from="))
-                    && words
-                        .iter()
-                        .any(|word| word.trim_start_matches("./").starts_with("web-dist"))
-            }),
-            "{name} must build the web bundle, never COPY web-dist from the build context"
-        );
-    }
-    for image in ["server", "web"] {
-        assert!(
-            stage(&dockerfile(image), "web-builder")
-                .contains("trunk build --release --dist ../../web-dist"),
-            "docker/{image}.Dockerfile must build the release bundle into web-dist explicitly"
-        );
-    }
-}
-
-/// The CLI image is the exact docker CLI image the pipeline's own docker steps
-/// run, plus the static CLI binary on `PATH` — so another repository's step can
-/// swap its image for it and gain `sovereign-config` without losing `docker`.
-#[test]
-fn the_cli_image_is_the_pipeline_docker_image_plus_the_cli() {
-    let dockerfile = dockerfile("cli");
-    let stage = dockerfile
-        .split("\nFROM ")
-        .find(|stage| {
-            stage
-                .lines()
-                .next()
-                .is_some_and(|from| from.ends_with(" AS cli-runtime"))
-        })
-        .expect("docker/cli.Dockerfile must define a cli-runtime stage");
-    assert!(
-        dockerfile.trim_end().ends_with(stage.trim_end()),
-        "cli-runtime must be the final stage, so the untargeted build produces it"
-    );
-    let base = stage
-        .split_whitespace()
-        .next()
-        .expect("cli-runtime needs a base image");
-    let pipeline = pipeline();
-    let build_image = step(&pipeline, "build-cli")
-        .get("image")
-        .and_then(Value::as_str)
-        .expect("build-cli needs an image");
-    assert!(
-        base.starts_with("docker:27-cli@sha256:") && base == build_image,
-        "cli-runtime must be based on the digest-pinned docker CLI image the pipeline uses, got {base}"
-    );
-    assert!(
-        stage.contains("COPY --from=builder /tmp/sovereign-config /usr/local/bin/sovereign-config"),
-        "cli-runtime must carry the static musl CLI"
-    );
-    assert!(
-        dockerfile.contains("--target x86_64-unknown-linux-musl"),
-        "the CLI must be built as a static musl binary"
-    );
-    // build-server strips and packages the same musl path in the shared target
-    // cache, possibly at the same time, so the CLI image builds elsewhere.
-    assert!(
-        dockerfile.contains("--target-dir /src/target/cli-image")
-            && dockerfile.contains(
-                "/src/target/cli-image/x86_64-unknown-linux-musl/release/sovereign-config"
-            ),
-        "the CLI image must build into its own target directory, not the server's musl output"
-    );
-    assert!(
-        !stage.contains("ENTRYPOINT") && !stage.contains("\nUSER "),
-        "cli-runtime keeps the base image's entrypoint and user so pipeline commands can drive Docker"
-    );
-    assert!(
-        stage.contains("sovereign-config --version") && stage.contains("$RELEASE_VERSION"),
-        "cli-runtime must gate on the binary reporting the release it was built for"
-    );
-}
-
-/// Server, broker and CLI ship as one release: the same commit, the same
-/// semver. Each build step builds its image straight to its `-ci` candidate
-/// name and pushes exactly that image — nothing re-reads a local image name
-/// another pipeline could have replaced, and nothing in build writes a release
-/// name; publish promotes candidates only after checks.
-#[test]
-fn every_image_is_pushed_as_a_candidate_as_it_is_built() {
-    let pipeline = pipeline();
-    for (build, published) in [
-        (
-            "build-server",
-            "registry.desync.link/sovereign-config-ci:$$RELEASE_TAG",
-        ),
-        (
-            "build-broker",
-            "registry.desync.link/sovereign-config-woodpecker-broker-ci:$$RELEASE_TAG",
-        ),
-        (
-            "build-cli",
-            "registry.desync.link/sovereign-config-cli-ci:$$RELEASE_TAG",
-        ),
-    ] {
-        let commands = commands_text(pipeline.step_in("build", build));
-        assert!(
-            commands.contains(&format!("IMAGE={published}\n")),
-            "{build} must build {published}"
-        );
-        assert!(
-            commands.contains("--tag \"$$IMAGE\""),
-            "{build} must tag its build as the published image"
-        );
-        assert_eq!(
-            commands.matches("docker push").count(),
-            1,
-            "{build} must push exactly its own image"
-        );
-        let built = commands.find("docker build").expect("builds");
-        let pushed = commands.find("docker push \"$$IMAGE\"").expect("pushes");
-        assert!(built < pushed, "{build} pushes what it just built");
-        assert!(
-            commands.contains("org.opencontainers.image.version=\"$$RELEASE_TAG\"")
-                && commands.contains("org.opencontainers.image.revision=\"$$CI_COMMIT_SHA\""),
-            "{build} must label its image with the release tag and commit"
-        );
-    }
-}
-
-#[test]
-fn a_promotion_resolves_the_existing_tag_and_never_allocates() {
-    let pipeline = pipeline();
-    // compute-version names the version after the running pipeline; it must be
-    // push/manual-only. A deployment is its own pipeline, so there it would name
-    // a version that was never built and the deploy would pull an image that
-    // was never published.
     assert_eq!(
-        pipeline.workflows_of("compute-version"),
-        ["build", "publish"]
+        pipeline.workflows_of("resolve"),
+        ["deploy-dev", "deploy-prod"]
     );
-    for workflow in ["build", "publish"] {
-        assert_eq!(
-            commands_text(pipeline.step_in(workflow, "compute-version"))
-                .lines()
-                .next(),
-            Some("sh scripts/ci-release-tag.sh Cargo.toml > .release-tag"),
-            "both workflows of a pipeline must derive the tag the same way"
-        );
-    }
-    // The deployment resolves the commit's already-built tag instead of
-    // allocating, and verify-image proves the artifact exists rather than
-    // rebuilding — so a deploy ships the exact image the push already
-    // published. Guard that both read/write `.release-tag` on the deploy path.
-    // Both deploy workflows carry the two steps;
-    // deploy_workflows_share_their_promotion_steps holds the dev copy to these.
-    let resolve = pipeline.step_in("deploy-prod", "resolve-release-tag");
-    let resolve_cmd = commands_text(resolve);
-    assert!(
-        resolve_cmd.contains("git tag --points-at HEAD") && resolve_cmd.contains("> .release-tag"),
-        "resolve-release-tag must resolve the commit's git tag into .release-tag, not allocate"
-    );
-    // The deploy path must not install packages at runtime; git comes from a
-    // digest-pinned image instead (repo policy: pin by digest, no undeclared fetch).
-    assert!(
-        !resolve_cmd.contains("apk add"),
-        "resolve-release-tag must not install git at runtime; use a digest-pinned git image"
-    );
+    let resolve = pipeline.step_in("deploy-prod", "resolve");
     assert!(
         resolve
             .get("image")
             .and_then(Value::as_str)
-            .is_some_and(|image| image.contains("alpine/git:") && image.contains("@sha256:")),
-        "resolve-release-tag must use a digest-pinned git image"
+            .is_some_and(|image| image.starts_with(RELEASE_VERSIONS)),
+        "resolve must run the digest-pinned release plugin"
     );
-    let verify_cmd = commands_text(pipeline.step_in("deploy-prod", "verify-image"));
-    assert!(
-        verify_cmd.contains("docker pull")
-            && verify_cmd.contains("registry.desync.link/sovereign-config:")
-            && !verify_cmd.contains("docker build"),
-        "verify-image must pull the already-published image and never build"
+    assert_eq!(
+        setting(resolve, "mode").and_then(Value::as_str),
+        Some("resolve")
     );
-    // A release publishes the server and the Woodpecker broker under one semver.
-    // Promoting the server without its matching broker would leave CI resolving
-    // secrets against a stale extension, so the gate must cover both.
-    assert!(
-        verify_cmd.contains("registry.desync.link/sovereign-config-woodpecker-broker:"),
-        "verify-image must also prove the broker image was published for this tag"
+    let images: Vec<&str> = setting(resolve, "images")
+        .and_then(Value::as_sequence)
+        .expect("resolve lists the release's images")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        images, RELEASE_IMAGES,
+        "resolve must prove all three images of the release are published"
     );
     assert!(
-        verify_cmd.contains("registry.desync.link/sovereign-config-cli:"),
-        "verify-image must also prove the CLI image was published for this tag"
+        depends_on(resolve).is_empty(),
+        "resolve starts the deployment"
+    );
+    // The images are public: a registry credential here would be one more
+    // secret the deploy holds for nothing.
+    for credential in ["registry_username", "registry_password"] {
+        assert!(setting(resolve, credential).is_none());
+    }
+    // The plugin's default policy is the repo's: dev from any branch, prod from
+    // main (its default branch). A local override could widen it.
+    assert!(setting(resolve, "environments").is_none());
+
+    for (workflow, name, step) in pipeline.steps() {
+        let mode = setting(step, "mode").and_then(Value::as_str);
+        assert!(
+            !matches!(mode, Some("version" | "publish")),
+            "{name} in {workflow}: Woodpecker never claims or publishes a version"
+        );
+        if step
+            .get("image")
+            .and_then(Value::as_str)
+            .is_some_and(|image| image.starts_with(RELEASE_VERSIONS))
+        {
+            assert!(
+                matches!(mode, Some("resolve" | "tag")),
+                "{name} in {workflow} runs the plugin outside resolve and tag"
+            );
+        }
+    }
+    for deploy in ["deploy-dev", "deploy-prod"] {
+        let step = step(&pipeline, deploy);
+        assert!(
+            depends_on(step).contains(&"resolve"),
+            "{deploy} must ship what resolve chose"
+        );
+    }
+}
+
+/// Each deploy records itself only once it has succeeded: `tag` waits for the
+/// deploy step alone, so a smoke check (run after the pipeline, AGENTS.md)
+/// never holds a tag back and a failed deploy is never tagged.
+#[test]
+fn each_deploy_is_tagged_once_it_has_succeeded() {
+    let pipeline = pipeline();
+    assert_eq!(pipeline.workflows_of("tag"), ["deploy-dev", "deploy-prod"]);
+    for (workflow, deploy) in [("deploy-dev", "deploy-dev"), ("deploy-prod", "deploy-prod")] {
+        let tag = pipeline.step_in(workflow, "tag");
+        assert_eq!(depends_on(tag), [deploy]);
+        assert_eq!(setting(tag, "mode").and_then(Value::as_str), Some("tag"));
+        assert!(
+            tag.get("image")
+                .and_then(Value::as_str)
+                .is_some_and(|image| image.starts_with(RELEASE_VERSIONS)),
+            "{workflow}: tag must run the digest-pinned release plugin"
+        );
+    }
+}
+
+/// Woodpecker takes a GitHub deployment whose ref is a bare commit as a
+/// deployment of main, so `branch: main` alone would let one ship a commit
+/// main never had. Production refuses any commit main does not contain,
+/// before its blueprint is applied.
+#[test]
+fn production_deploys_only_commits_main_contains() {
+    let pipeline = pipeline();
+    assert_eq!(
+        pipeline.workflows_of("verify-commit-on-main"),
+        ["deploy-prod"]
+    );
+    let check = commands_text(pipeline.step_in("deploy-prod", "verify-commit-on-main"));
+    assert!(
+        check.contains("/compare/$$CI_COMMIT_SHA...main")
+            && check.contains(r#"grep -q '"behind_by": *0,'"#)
+            && check.contains("exit 1"),
+        "verify-commit-on-main must refuse a commit main is behind: {check}"
+    );
+    assert!(
+        !check.contains("$$GITHUB_TOKEN@") && check.contains("--config /tmp/github-curl.conf"),
+        "the token travels in a curl config file, never in a URL"
+    );
+    assert!(
+        depends_on(pipeline.step_in("deploy-prod", "apply-authentik-blueprint-prod"))
+            .contains(&"verify-commit-on-main"),
+        "the production blueprint must wait for the on-main check"
+    );
+}
+
+/// The deploys pull the release from GHCR, where GitHub Actions published it,
+/// anonymously: no deploy step holds a registry credential or names the old
+/// registry, and the Compose file names the GHCR image.
+#[test]
+fn deployments_pull_the_release_from_ghcr() {
+    let pipeline = pipeline();
+    for (workflow, name, step) in pipeline.steps() {
+        let text = serde_yaml::to_string(step).expect("step serialises");
+        for forbidden in ["registry.desync.link", "zot_ci_", "docker login"] {
+            assert!(
+                !text.contains(forbidden),
+                "{name} in {workflow} must not use the old registry ({forbidden})"
+            );
+        }
+    }
+    let compose = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compose.yaml"),
+    )
+    .expect("compose.yaml should be readable");
+    assert!(
+        compose.contains(
+            "image: ghcr.io/vcheesbrough/sovereign-config:${SOVEREIGN_CONFIG_IMAGE_TAG:-local}"
+        ),
+        "compose.yaml must run the GHCR image at the resolved tag"
     );
 }
 
@@ -855,55 +529,34 @@ fn workflow_events(pipeline: &Pipeline, workflow: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Workflows share nothing, so the order of the pipeline rests on each step
-/// sitting in the right workflow and on the workflow-level `depends_on`.
+/// Workflows share nothing, so the order of a deployment rests on each step
+/// sitting in the right workflow.
 #[test]
 fn every_step_sits_in_its_workflow() {
     let pipeline = pipeline();
-    let expected: [(&str, &[&str]); 5] = [
-        (
-            "checks",
-            &[
-                "script-validation",
-                "web-bundle",
-                "unit-test",
-                "client-playwright",
-            ],
-        ),
-        (
-            "build",
-            &[
-                "compute-version",
-                "prune-build-cache",
-                "build-server",
-                "build-broker",
-                "build-cli",
-            ],
-        ),
-        (
-            "publish",
-            &["compute-version", "promote-images", "tag-release"],
-        ),
+    let expected: [(&str, &[&str]); 3] = [
+        ("anchor", &["anchor"]),
         (
             "deploy-dev",
             &[
                 "validate-authentik-version",
-                "resolve-release-tag",
-                "verify-image",
+                "resolve",
                 "apply-authentik-blueprint-dev",
                 "validate-authentik-manager-live",
                 "deploy-dev",
+                "tag",
             ],
         ),
         (
             "deploy-prod",
             &[
                 "validate-authentik-version",
-                "resolve-release-tag",
-                "verify-image",
+                "verify-commit-on-main",
+                "resolve",
                 "apply-authentik-blueprint-prod",
                 "validate-authentik-manager-live-prod",
                 "deploy-prod",
+                "tag",
             ],
         ),
     ];
@@ -920,33 +573,6 @@ fn every_step_sits_in_its_workflow() {
         actual, expected,
         "a step was added, removed, or moved workflow"
     );
-}
-
-/// Nothing is tagged or published unless every check passed — the tests, the
-/// browser suite, and the script checks — and all three images are built.
-#[test]
-fn publish_waits_for_checks_and_build() {
-    let pipeline = pipeline();
-    let dependencies: Vec<&str> = pipeline
-        .workflow("publish")
-        .get("depends_on")
-        .and_then(Value::as_sequence)
-        .expect("publish should depend on checks and build")
-        .iter()
-        .map(|dependency| {
-            dependency
-                .as_str()
-                .expect("publish's dependencies must be required, not optional")
-        })
-        .collect();
-    assert_eq!(dependencies, ["checks", "build"]);
-    for workflow in ["checks", "build", "publish"] {
-        assert_eq!(
-            workflow_events(&pipeline, workflow),
-            push_events(),
-            "{workflow} must run on push and manual alike, so publish's required dependencies always run with it"
-        );
-    }
 }
 
 /// The dev workflow is itself restricted to a dev deployment, from any branch.
@@ -967,17 +593,13 @@ fn dev_workflow_is_gated_as_a_whole() {
     }
 }
 
-/// Both deploy workflows promote the same way — resolve the commit's tag,
-/// prove its images exist — and check Authentik the same way. Workflows cannot
-/// share a step, so each is defined in both and identical but for its `when`.
+/// Both deploy workflows choose their build and check Authentik the same way.
+/// Workflows cannot share a step, so each is defined in both and identical
+/// but for its `when`.
 #[test]
 fn deploy_workflows_share_their_promotion_steps() {
     let pipeline = pipeline();
-    for name in [
-        "validate-authentik-version",
-        "resolve-release-tag",
-        "verify-image",
-    ] {
+    for name in ["validate-authentik-version", "resolve"] {
         assert_eq!(pipeline.workflows_of(name), ["deploy-dev", "deploy-prod"]);
         let copies: Vec<_> = ["deploy-dev", "deploy-prod"]
             .iter()
@@ -1022,8 +644,8 @@ fn prod_workflow_is_gated_as_a_whole() {
     }
 }
 
-/// Each deploy workflow checks Authentik compatibility, and that the commit is
-/// released, before applying its blueprint: workflows cannot share a step, so the check is defined in
+/// Each deploy workflow checks Authentik compatibility, and that the commit has
+/// a published build, before applying its blueprint: workflows cannot share a step, so the check is defined in
 /// both and runs only with the deploy it guards (and
 /// `deploy_workflows_share_their_promotion_steps` holds the copies identical).
 #[test]
@@ -1045,11 +667,11 @@ fn each_blueprint_apply_waits_for_the_authentik_version_check() {
             dependencies.contains(&"validate-authentik-version"),
             "{apply} must wait for validate-authentik-version"
         );
-        // verify-image follows resolve-release-tag, so an unreleased commit
-        // fails before its blueprint or live tests touch Authentik.
+        // resolve refuses a commit with no published build, so it fails
+        // before its blueprint or live tests touch Authentik.
         assert!(
-            dependencies.contains(&"verify-image"),
-            "{apply} must wait for the release check (verify-image)"
+            dependencies.contains(&"resolve"),
+            "{apply} must wait for the release check (resolve)"
         );
         let check = pipeline.step_in(workflow, "validate-authentik-version");
         assert!(

@@ -39,20 +39,27 @@ After initialization, follow the baseline feature-branch workflow (§2–§3).
 Run the **`ci-watch`** skill (baseline §4) with `OWNER=vcheesbrough`,
 `REPO=sovereign-config`. Repo specifics:
 
-- **Release patch = Woodpecker pipeline number** (#466), overriding baseline
-  §2's patch rule. `Cargo.toml` supplies only `major.minor` (bump the minor at
-  iteration start, keep patch `0` in the manifest); the published release is
-  `major.minor.<CI_PIPELINE_NUMBER>` (`scripts/ci-release-tag.sh`), sparse and
-  shared across branches. A card's **Version** records the `major.minor`.
-- **A push never deploys** (#466). A push pipeline is green once checks,
-  build and publish pass; its images are in the registry and its git tag —
-  the release — is pushed.
-  Dev is deployed only by a Woodpecker Deploy targeting `dev` (any branch), and
-  the one dev environment runs whichever branch was deployed last — so trigger
-  a dev deployment only when the user asks for one.
+- **A push's CI is GitHub Actions** (#539), overriding baseline §4's
+  Woodpecker default for pushes. `.github/workflows/build.yml` runs the
+  checks, builds the three images and publishes them to GHCR. Watch that run
+  (`gh run list --commit $SHA`, `gh run watch`). The commit-status API does
+  not show it, because GitHub Actions reports check runs. On a push, Woodpecker
+  runs only `anchor.yml`, which is green as soon as Woodpecker sees the push and
+  says nothing about the build. Woodpecker runs the deployments, and those are
+  still watched there.
+- **Releases follow the release-flow skill** (#539), enforced by
+  `woodpecker-plugin-release-versions`. `Cargo.toml` supplies `major.minor`
+  (bump the minor at iteration start, keep patch `0`), and each build claims
+  the next patch. The first deploy of a build writes its git tag, so a tag
+  means "deployed". A card's **Version** records the `major.minor`.
+- **A push never deploys** (#466). A push is green once the GitHub Actions
+  build has published its images. Dev is deployed only by a Woodpecker Deploy
+  targeting `dev` (any branch), started from that push's anchor pipeline. The
+  one dev environment runs whichever branch was deployed last, so trigger a
+  dev deployment only when the user asks for one.
 - **Deploy a main commit to dev before promoting it to prod.** This is an
-  operator rule; the pipeline does not enforce it. A release tag means only
-  that checks passed, so only a dev deploy proves a release against the
+  operator rule; the pipeline does not enforce it. A published build means
+  only that checks passed, so only a dev deploy proves a release against the
   long-lived database and live Authentik (`docs/project-deployment.md`).
 - **Deployment smoke check** (post-pipeline, not part of `ci-watch`): for a
   successful development deployment, directly
