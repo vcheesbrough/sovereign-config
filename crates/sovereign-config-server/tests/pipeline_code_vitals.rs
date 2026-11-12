@@ -63,6 +63,12 @@ fn it_can_never_block_a_build_or_a_deploy() {
     assert_eq!(steps, ["code-vitals"]);
     let step = pipeline.step_in(WORKFLOW, "code-vitals");
     assert_eq!(step["failure"].as_str(), Some("ignore"));
+    assert!(
+        step["image"]
+            .as_str()
+            .is_some_and(|image| image.contains("@sha256:")),
+        "the step image is pinned by digest; only the collector tag moves"
+    );
     assert!(step.get("depends_on").is_none());
     assert!(pipeline.workflow(WORKFLOW).get("depends_on").is_none());
     for workflow in WORKFLOWS {
