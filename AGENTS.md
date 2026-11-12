@@ -47,11 +47,15 @@ Run the **`ci-watch`** skill (baseline §4) with `OWNER=vcheesbrough`,
   runs only `anchor.yml`, which is green as soon as Woodpecker sees the push and
   says nothing about the build. Woodpecker runs the deployments, and those are
   still watched there.
-- **Releases follow the release-flow skill** (#539), enforced by
-  `woodpecker-plugin-release-versions`. `Cargo.toml` supplies `major.minor`
-  (bump the minor at iteration start, keep patch `0`), and each build claims
-  the next patch. The first deploy of a build writes its git tag, so a tag
-  means "deployed". A card's **Version** records the `major.minor`.
+- **Releases follow the release-flow skill** (#539). The Woodpecker deploys
+  read it with `woodpecker-plugin-release-versions` (`resolve`, `tag`). The
+  GitHub build keeps it with `scripts/ci-claim-build.sh` and
+  `scripts/ci-publish-images.sh`, and **no GitHub workflow runs a Woodpecker
+  plugin** (#550). `Cargo.toml` supplies `major.minor` (bump the minor at
+  iteration start, keep patch `0`), and each build claims the next patch. The
+  first deploy of a build writes its git tag, so a tag means "deployed".
+  `release.yml` then gives the tag a GitHub Release that lists its images. A
+  card's **Version** records the `major.minor`.
 - **A push never deploys** (#466). A push is green once the GitHub Actions
   build has published its images. Dev is deployed only by a Woodpecker Deploy
   targeting `dev` (any branch), started from that push's anchor pipeline. The

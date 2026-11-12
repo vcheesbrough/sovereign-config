@@ -1,20 +1,19 @@
-//! Guards the GitHub Actions build, `.github/workflows/build.yml` (card #539):
-//! every push to a branch checks the commit and builds its three images, and
-//! only once every check has passed does the release-versions plugin publish
-//! them to GHCR under the one version it claimed for the run. Nothing here
-//! deploys; the deploys are Woodpecker's (`pipeline_prod_gating.rs`). Also
-//! guards the `docker/` files the image builds use.
+//! Guards the GitHub Actions workflows (cards #539, #550). `build.yml`: every
+//! push to a branch checks the commit and builds its three images, and only
+//! once every check has passed are they published to GHCR under the one
+//! version the run claimed — by the repository's own scripts, which keep the
+//! release-flow contract the Woodpecker deploys' plugin reads; no GitHub
+//! workflow runs a Woodpecker plugin. `release.yml`: a deployed version's tag
+//! gets a Release naming its images. Nothing here deploys; the deploys are
+//! Woodpecker's (`pipeline_prod_gating.rs`). Also guards the `docker/` files
+//! the image builds use.
 
 mod support;
 
 use std::collections::BTreeSet;
 
 use serde_yaml::Value;
-use support::{Build, build, pipeline};
-
-/// The release-versions plugin as a digest-pinned container action.
-const RELEASE_VERSIONS: &str =
-    "docker://ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.2.0@sha256:";
+use support::{Build, build, github_workflow, github_workflows, pipeline};
 
 /// Each image build job, the Dockerfile it builds, and the image it names.
 const IMAGE_BUILDS: [(&str, &str, &str); 3] = [
@@ -120,25 +119,31 @@ fn the_build_never_deploys() {
     }
 }
 
-/// One run, one version: only `version` claims it, with the plugin, and every
-/// job that names it reads that job's output. It is the only job that may
-/// write to the repository (the claim is a `refs/builds/<version>` ref).
+/// One run, one version: only `version` claims it, with the repository's own
+/// claim script (no Woodpecker plugin, card #550), and every job that names it
+/// reads that job's output. It is the only job that may write to the
+/// repository (the claim is a `refs/builds/<version>` ref).
 #[test]
-fn the_version_is_claimed_once_by_the_plugin() {
+fn the_version_is_claimed_once_by_the_claim_script() {
     let build = build();
     let claims: Vec<String> = build
         .job_names()
         .into_iter()
         .filter(|job| {
             build
-                .uses(job, RELEASE_VERSIONS)
-                .iter()
-                .any(|step| with(step, "mode") == Some("version"))
+                .run_text(job)
+                .contains("sh scripts/ci-claim-build.sh Cargo.toml")
         })
         .collect();
     assert_eq!(claims, ["version"]);
-    let claim = build.uses("version", RELEASE_VERSIONS)[0];
-    assert_eq!(with(claim, "major_minor_source"), Some("cargo"));
+    let claim = build.run_text("version");
+    assert!(
+        claim.contains(
+            r#"sh scripts/ci-claim-build.sh Cargo.toml origin "$GITHUB_SHA" "$GITHUB_REF_NAME" "gha-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT""#
+        ),
+        "version must claim for this commit, branch and run attempt: {claim}"
+    );
+    assert!(claim.contains(r#"echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT""#));
     assert_eq!(
         build.job("version")["outputs"]["release_tag"].as_str(),
         Some("${{ steps.version.outputs.release_tag }}")
@@ -170,8 +175,8 @@ fn the_version_is_claimed_once_by_the_plugin() {
 }
 
 /// Nothing is published unless every check passed and all three images were
-/// built, and only the plugin pushes: it refuses an image that lacks this
-/// version's labels or is already published, before it pushes any.
+/// built, and only the publish script pushes: it refuses an image that lacks
+/// this version's labels or is already published, before it pushes any.
 #[test]
 fn publish_waits_for_every_check_and_build() {
     let build = build();
@@ -189,49 +194,147 @@ fn publish_waits_for_every_check_and_build() {
         assert!(expected.contains(*job), "{job} should exist");
     }
 
-    let publish = build.uses("publish", RELEASE_VERSIONS);
-    assert_eq!(publish.len(), 1);
-    assert_eq!(with(publish[0], "mode"), Some("publish"));
-    let images: Vec<&str> = with(publish[0], "images")
-        .expect("publish lists the images")
-        .split(',')
-        .collect();
     let release: Vec<&str> = IMAGE_BUILDS.iter().map(|(_, _, image)| *image).collect();
-    assert_eq!(
-        images, release,
-        "publish must push all three images, together"
-    );
+    let publish = build.run_text("publish");
     assert!(
-        build.run_text("publish").contains("docker load"),
+        publish.contains(&format!(
+            r#"sh scripts/ci-publish-images.sh "$RELEASE_TAG" "$GITHUB_SHA" {}"#,
+            release.join(" ")
+        )),
+        "publish must push all three images, together, for this version and commit: {publish}"
+    );
+    let loaded = publish
+        .find("docker load")
+        .expect("publish loads the built images");
+    let pushed = publish
+        .find("scripts/ci-publish-images.sh")
+        .expect("publishes");
+    assert!(
+        loaded < pushed,
         "publish pushes the images the build jobs built"
     );
     for job in build.job_names() {
         let run = build.run_text(&job);
         assert!(
-            !run.contains("docker push") && !run.contains("docker login"),
-            "{job}: only the plugin pushes, from publish"
+            !run.contains("docker push"),
+            "{job}: only scripts/ci-publish-images.sh pushes"
+        );
+        assert_eq!(
+            run.contains("docker login"),
+            job == "publish",
+            "{job}: only publish holds a registry login"
         );
     }
 }
 
-/// Every action is pinned to a commit, and every container action to a
-/// digest, so the build runs what was reviewed.
+/// The GitHub workflows run no Woodpecker plugin (card #550): GitHub Actions
+/// keeps the release-flow contract with the repository's own scripts.
+#[test]
+fn no_github_workflow_runs_a_woodpecker_plugin() {
+    for (name, workflow) in github_workflows() {
+        let text = serde_yaml::to_string(workflow.workflow()).expect("workflow serialises");
+        assert!(
+            !text.contains("woodpecker-plugin"),
+            "{name}.yml must not run a Woodpecker plugin"
+        );
+    }
+}
+
+/// Every shell script is linted, and every script's test suite runs.
+#[test]
+fn every_script_is_linted_and_tested() {
+    let validation = build().run_text("script-validation");
+    let scripts = std::fs::read_dir(repo_root().join("scripts")).expect("scripts/ is readable");
+    for entry in scripts {
+        let name = entry
+            .expect("script entry")
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if std::path::Path::new(&name)
+            .extension()
+            .is_none_or(|extension| extension != "sh")
+        {
+            continue;
+        }
+        assert!(
+            validation.contains(&format!("scripts/{name}")),
+            "script-validation must shellcheck scripts/{name}"
+        );
+        if let Some(stem) = name.strip_suffix("-test.sh") {
+            assert!(
+                validation.contains(&format!("sh scripts/{stem}-test.sh")),
+                "script-validation must run scripts/{name}"
+            );
+        }
+    }
+}
+
+/// A deployed version's tag gets a Release naming its images: the tag push by
+/// the deploy's `tag` step runs it, and a manual run backfills one tag. It
+/// names the images `publish` pushes, and it is the only thing that writes.
+#[test]
+fn a_deployed_tag_gets_a_release_naming_its_images() {
+    let release = github_workflow("release");
+    let on = release
+        .workflow()
+        .get("on")
+        .and_then(Value::as_mapping)
+        .expect("the release workflow names its triggers");
+    let triggers: BTreeSet<&str> = on.keys().filter_map(Value::as_str).collect();
+    assert_eq!(triggers, BTreeSet::from(["push", "workflow_dispatch"]));
+    let push = on.get("push").expect("push trigger");
+    assert!(
+        push.get("branches").is_none(),
+        "a branch push is not a release"
+    );
+    assert_eq!(push["tags"][0].as_str(), Some("[0-9]*.[0-9]*.[0-9]*"));
+    assert_eq!(
+        on["workflow_dispatch"]["inputs"]["tag"]["required"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        release.workflow()["permissions"]["contents"].as_str(),
+        Some("read")
+    );
+    assert_eq!(release.job_names(), ["release"]);
+    assert_eq!(permissions(&release, "release"), Some("contents"));
+    assert_eq!(
+        release.job("release")["env"]["TAG"].as_str(),
+        Some("${{ inputs.tag || github.ref_name }}")
+    );
+    let images: Vec<&str> = IMAGE_BUILDS.iter().map(|(_, _, image)| *image).collect();
+    assert!(
+        release.run_text("release").contains(&format!(
+            r#"sh scripts/ci-release.sh "$TAG" "$GITHUB_REPOSITORY" {}"#,
+            images.join(" ")
+        )),
+        "the Release must name the images publish pushes"
+    );
+}
+
+/// Every action in every workflow is pinned to a commit, and every container
+/// action to a digest, so CI runs what was reviewed.
 #[test]
 fn every_action_is_pinned() {
-    let build = build();
-    for job in build.job_names() {
-        for step in build.steps(&job) {
-            let Some(uses) = step.get("uses").and_then(Value::as_str) else {
-                continue;
-            };
-            let pinned = if let Some(image) = uses.strip_prefix("docker://") {
-                image.contains("@sha256:")
-            } else {
-                uses.rsplit_once('@').is_some_and(|(_, reference)| {
-                    reference.len() == 40 && reference.chars().all(|c| c.is_ascii_hexdigit())
-                })
-            };
-            assert!(pinned, "{job}: {uses} must be pinned to a commit or digest");
+    for (name, workflow) in github_workflows() {
+        for job in workflow.job_names() {
+            for step in workflow.steps(&job) {
+                let Some(uses) = step.get("uses").and_then(Value::as_str) else {
+                    continue;
+                };
+                let pinned = if let Some(image) = uses.strip_prefix("docker://") {
+                    image.contains("@sha256:")
+                } else {
+                    uses.rsplit_once('@').is_some_and(|(_, reference)| {
+                        reference.len() == 40 && reference.chars().all(|c| c.is_ascii_hexdigit())
+                    })
+                };
+                assert!(
+                    pinned,
+                    "{name}.yml {job}: {uses} must be pinned to a commit or digest"
+                );
+            }
         }
     }
 }

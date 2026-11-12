@@ -21,10 +21,10 @@ Every push to a branch (or a manual run of the workflow) does the following:
 2. In parallel, the checks run and the three images build.
 3. Once every check has passed and all three images are built, `publish` pushes them to GHCR.
 
-The images are `ghcr.io/vcheesbrough/sovereign-config`, `sovereign-config-woodpecker-broker` and `sovereign-config-cli`, all public. Versioning and publishing follow the shared release-flow contract, enforced by [`woodpecker-plugin-release-versions`](https://github.com/vcheesbrough/woodpecker-plugin-release-versions):
+The images are `ghcr.io/vcheesbrough/sovereign-config`, `sovereign-config-woodpecker-broker` and `sovereign-config-cli`, all public. Versioning and publishing follow the shared release-flow contract. The Woodpecker deploys read that contract with [`woodpecker-plugin-release-versions`](https://github.com/vcheesbrough/woodpecker-plugin-release-versions). The GitHub build keeps it with the repository's own scripts and runs no Woodpecker plugin (card #550):
 
-- `version` reads `major.minor` from `Cargo.toml`. It claims the next patch on that line by creating `refs/builds/<version>` on GitHub.
-- `publish` refuses an image that lacks this version's `org.opencontainers.image.version` and `.revision` labels, or one that is already published. It refuses before pushing anything.
+- `version` runs `scripts/ci-claim-build.sh`. It reads `major.minor` from `Cargo.toml` and claims the next patch on that line by creating `refs/builds/<version>` on GitHub. The ref is an annotated tag object that peels to the commit, created by a create-only push. A build that loses a race claims the next number. This is the record the deploys' `resolve` step matches to commits.
+- `publish` runs `scripts/ci-publish-images.sh`. It refuses an image that lacks this version's `org.opencontainers.image.version` and `.revision` labels, or one that is already published, and it refuses before pushing anything.
 
 A failed build uses its number up, so gaps in the patch sequence mark failed builds. The image builds save their images as workflow artifacts rather than pushing them, so a name in GHCR only ever holds a checked build. Nothing is pushed under a second name.
 
@@ -48,6 +48,8 @@ Both deploy workflows run the same sequence:
 4. They validate the connection manager against live Authentik.
 5. They deploy onto the environment's stack.
 6. **`tag`** pushes the annotated git tag. A git tag therefore means **"this build was deployed"**, not "this build passed its checks". The first deploy of a commit, to either environment, writes the tag, and every later deploy of that commit reuses the build the tag names.
+
+The tag push runs `.github/workflows/release.yml`, which gives the version a **GitHub Release**. The Release lists the three images at that version, each with its pinned `docker pull …@sha256:` and its package page, so a reader of the tag can find what was deployed. A tag whose commit `main` does not contain (a branch deployed to dev) becomes a pre-release, never "latest", so the Releases page leads with what `main` ships. A manual run of the workflow for an existing tag rewrites that tag's Release, which is how tags from before #550 get one.
 
 A deployment never builds, publishes or claims a version.
 
