@@ -115,7 +115,6 @@ jobs:
             .cargo-home/git
             target
           key: unit-test-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: unit-test-
       # --locked on every command that resolves dependencies, as the image
       # builds do: a Cargo.lock that is out of date fails here, not later in
       # build. CARGO_INCREMENTAL=0: every run is a fresh checkout, so

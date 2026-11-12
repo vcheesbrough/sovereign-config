@@ -30,7 +30,7 @@ A failed build uses its number up, so gaps in the patch sequence mark failed bui
 
 The checks keep one Cargo cache in GitHub's Actions cache, keyed on `Cargo.lock`. The image builds start cold on every run: their BuildKit cache mounts do not outlive a hosted runner.
 
-Each published package links to this repository through its `org.opencontainers.image.source` label. The packages must be public: deployments and other repositories' pipelines pull them anonymously. A package GitHub has just created starts private. Make it public once, in the package's settings. Releases from before #539 are in GHCR only where they were copied from Zot by digest. Every other pre-#539 release stays in Zot (`registry.desync.link`), which no deployment reads any more.
+Each published package links to this repository through its `org.opencontainers.image.source` label. The packages must be public: deployments and other repositories' pipelines pull them anonymously. A package GitHub has just created starts private. Make it public once, in the package's settings. Releases from before #539 are in GHCR only where they were copied from Zot by digest, for a restore by hand. A Woodpecker deploy of a pre-#539 commit runs that commit's own workflows, which still pull from Zot (`registry.desync.link`) with the `zot_ci_*` secrets. Rolling back past #539 through the pipeline therefore needs both to stay.
 
 ### Why a push still runs a Woodpecker pipeline
 
