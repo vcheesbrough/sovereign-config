@@ -10,8 +10,9 @@ use std::path::Path;
 
 use serde_yaml::Value;
 
-/// Every Woodpecker workflow file: the push anchor, then the deploys.
-pub const WORKFLOWS: [&str; 3] = ["anchor", "deploy-dev", "deploy-prod"];
+/// Every Woodpecker workflow file: the push anchor, the code-vitals recorder,
+/// then the deploys.
+pub const WORKFLOWS: [&str; 4] = ["anchor", "code-vitals", "deploy-dev", "deploy-prod"];
 
 pub struct Pipeline {
     workflows: Vec<(&'static str, Value)>,
