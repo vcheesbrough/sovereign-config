@@ -94,18 +94,45 @@ impl Pipeline {
     }
 }
 
-/// The GitHub Actions build workflow, `.github/workflows/build.yml`.
+/// A GitHub Actions workflow under `.github/workflows/`.
 pub struct Build {
     workflow: Value,
 }
 
+/// The build workflow, `.github/workflows/build.yml`.
 pub fn build() -> Build {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/build.yml");
+    github_workflow("build")
+}
+
+/// `.github/workflows/<name>.yml`.
+pub fn github_workflow(name: &str) -> Build {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.github/workflows")
+        .join(format!("{name}.yml"));
     let contents = std::fs::read_to_string(&path)
         .unwrap_or_else(|_| panic!("workflow {} should be readable", path.display()));
-    let workflow =
-        serde_yaml::from_str(&contents).expect("the build workflow should be valid YAML");
+    let workflow = serde_yaml::from_str(&contents)
+        .unwrap_or_else(|_| panic!("workflow {name} should be valid YAML"));
     Build { workflow }
+}
+
+/// Every workflow under `.github/workflows/`, by file stem.
+pub fn github_workflows() -> Vec<(String, Build)> {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
+    let mut names: Vec<String> = std::fs::read_dir(&directory)
+        .expect(".github/workflows should be readable")
+        .map(|entry| entry.expect("workflow entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "yml"))
+        .map(|path| path.file_stem().unwrap().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let workflow = github_workflow(&name);
+            (name, workflow)
+        })
+        .collect()
 }
 
 impl Build {

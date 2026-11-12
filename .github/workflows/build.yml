@@ -12,11 +12,14 @@
 #            └─ build-cli    ┘
 #   publish  needs all of the above, then pushes the three images
 #
-# Release mechanics are the shared release-flow contract, enforced by
-# woodpecker-plugin-release-versions: `version` claims MAJOR.MINOR (Cargo.toml)
-# plus the next patch on that line by creating refs/builds/<version>, and
-# `publish` refuses to push an image that lacks this version's labels or is
-# already published. A git tag is written by the first deploy, never here.
+# Release mechanics are the shared release-flow contract. The Woodpecker
+# deploys read it with woodpecker-plugin-release-versions (`resolve`, `tag`);
+# this side keeps it with two scripts of its own, so the GitHub build runs no
+# Woodpecker plugin (card #550). scripts/ci-claim-build.sh claims MAJOR.MINOR
+# (Cargo.toml) plus the next patch by creating refs/builds/<version>, and
+# scripts/ci-publish-images.sh refuses to push an image that lacks this
+# version's labels or is already published. A git tag is written by the first
+# deploy, never here; .github/workflows/release.yml then gives it a Release.
 #
 # Every tool runs in the same digest-pinned image the Woodpecker steps used,
 # through `docker run` on the runner, so the pins stay checkable
@@ -27,7 +30,7 @@ name: build
 
 on:
   push:
-    # Branches only: the deploys push git tags and the plugin pushes
+    # Branches only: the deploys push git tags and `version` pushes
     # refs/builds/*, and neither is a build.
     branches: ["**"]
   workflow_dispatch:
@@ -46,13 +49,12 @@ jobs:
       release_tag: ${{ steps.version.outputs.release_tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The claim pushes refs/builds/<version> with the checkout's token.
       - id: version
-        uses: docker://ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.2.0@sha256:9d5b3541aa143727f8c68c8c8f1d36557d999d3c857c4581be43363c8ff78c94
-        with:
-          mode: version
-          major_minor_source: cargo
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-      - run: echo "Release $(cat .release-tag)"
+        run: |
+          RELEASE_TAG=$(sh scripts/ci-claim-build.sh Cargo.toml origin "$GITHUB_SHA" "$GITHUB_REF_NAME" "gha-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT")
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Release $RELEASE_TAG"
 
   script-validation:
     runs-on: ubuntu-24.04
@@ -61,8 +63,13 @@ jobs:
       - run: >-
           docker run --rm --volume "$PWD:/src" --workdir /src --entrypoint sh
           docker.io/koalaman/shellcheck-alpine@sha256:e19ed93c22423970d56568e171b4512c9244fc75dd9114045016b4a0073ac4b7
-          -euc 'shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh scripts/migrate-openbao-woodpecker-secrets.sh scripts/ci-prune-cargo-target.sh scripts/ci-prune-cargo-target-test.sh;
+          -euc 'shellcheck -s sh scripts/installer-header.sh scripts/make-installer.sh scripts/migrate-openbao-woodpecker-secrets.sh scripts/ci-prune-cargo-target.sh scripts/ci-prune-cargo-target-test.sh scripts/ci-claim-build.sh scripts/ci-claim-build-test.sh scripts/ci-publish-images.sh scripts/ci-publish-images-test.sh scripts/ci-release.sh scripts/ci-release-test.sh;
           sh scripts/ci-prune-cargo-target-test.sh'
+      # The release scripts' tests need git, which the shellcheck image lacks.
+      - run: >-
+          docker run --rm --volume "$PWD:/src" --workdir /src --entrypoint sh
+          docker.io/alpine/git:2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
+          -euc 'sh scripts/ci-claim-build-test.sh; sh scripts/ci-publish-images-test.sh; sh scripts/ci-release-test.sh'
 
   # Builds the release WebAssembly bundle into web-dist/, with the same
   # docker/web.Dockerfile stages the server image builds it with. web-dist/ is
@@ -228,8 +235,8 @@ jobs:
           retention-days: 1
 
   # Nothing is published until every check has passed and all three images are
-  # built. The plugin checks each image's version and revision labels and that
-  # none is published yet, before it pushes any.
+  # built. scripts/ci-publish-images.sh checks each image's version and revision
+  # labels and that none is published yet, before it pushes any.
   publish:
     needs:
       - version
@@ -256,10 +263,8 @@ jobs:
           for IMAGE in server broker cli; do
             docker load --input "images/image-$IMAGE/image.tar"
           done
-          printf '%s' "$RELEASE_TAG" > .release-tag
-      - uses: docker://ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.2.0@sha256:9d5b3541aa143727f8c68c8c8f1d36557d999d3c857c4581be43363c8ff78c94
-        with:
-          mode: publish
-          images: ghcr.io/vcheesbrough/sovereign-config,ghcr.io/vcheesbrough/sovereign-config-woodpecker-broker,ghcr.io/vcheesbrough/sovereign-config-cli
-          registry_username: ${{ github.actor }}
-          registry_password: ${{ secrets.GITHUB_TOKEN }}
+      - env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          sh scripts/ci-publish-images.sh "$RELEASE_TAG" "$GITHUB_SHA" ghcr.io/vcheesbrough/sovereign-config ghcr.io/vcheesbrough/sovereign-config-woodpecker-broker ghcr.io/vcheesbrough/sovereign-config-cli
