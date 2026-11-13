@@ -143,6 +143,10 @@ pub(crate) async fn load_current_configuration() {
     let Route::Configuration(path) = route_from_location() else {
         return;
     };
+    // Without a session the view is the sign-in card; there is nothing to read.
+    if !crate::session::session_held() {
+        return;
+    }
     clear_error();
     set_text("value-state", "Loading");
     let json_mode = JSON_MODE.get();

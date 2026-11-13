@@ -16,6 +16,7 @@ mod path_selector;
 mod route;
 mod session;
 mod shell;
+mod sign_in;
 mod telemetry;
 mod transport;
 mod tree;
@@ -46,18 +47,20 @@ use crate::route::{
     restore_current_url, route_from_location,
 };
 use crate::session::{
-    begin_login, clear_browser_session, finish_login, refresh_status, render_identity,
-    restore_tokens,
+    begin_login, callback_pending, clear_browser_session, finish_login, refresh_status,
+    render_identity, restore_tokens, set_callback_pending,
 };
 use crate::shell::{
     close_brand_menu, install_brand_menu, install_route_link, install_sidebar_resizer,
     install_unsaved_guard, restore_sidebar_width,
 };
+use crate::sign_in::sign_in_shown;
 use crate::tree::{TREE_LOAD_GENERATION, TREE_NODES, install_tree_actions, load_tree, render_tree};
 use crate::value_rows::clear_value_rows;
 
 #[wasm_bindgen(start)]
 pub fn start() {
+    set_callback_pending(location_search().is_some_and(|search| search.contains("code=")));
     install_actions();
     render_route(&route_from_location());
     // The Downloads view needs no authentication; load it independently of the
@@ -70,14 +73,19 @@ pub fn start() {
             Ok(config) => {
                 telemetry::init(config.telemetry.as_ref());
                 restore_tokens();
-                let callback_error =
-                    if location_search().is_some_and(|search| search.contains("code=")) {
-                        finish_login(&config).await.err()
-                    } else {
-                        None
-                    };
+                let callback_error = if callback_pending() {
+                    let result = finish_login(&config).await.err();
+                    set_callback_pending(false);
+                    result
+                } else {
+                    None
+                };
                 render_route(&route_from_location());
                 let authenticated = refresh_status(&config).await;
+                // The status check can end a session the page still held (a
+                // rejected or expired token), which turns a view into the
+                // sign-in card.
+                render_route(&route_from_location());
                 if let Some(error) = callback_error {
                     show_error(error.message());
                 } else if authenticated {
@@ -88,6 +96,22 @@ pub fn start() {
                 } else {
                     // Renders the sidebar's logged-out hint in place of a tree.
                     load_tree().await;
+                }
+            }
+            Err(error) => {
+                set_callback_pending(false);
+                show_error(error.message());
+            }
+        }
+    });
+}
+
+fn start_login() {
+    spawn_local(ActionKind::LogIn, async {
+        match app_config() {
+            Ok(config) => {
+                if let Err(error) = begin_login(&config).await {
+                    show_error(error.message());
                 }
             }
             Err(error) => show_error(error.message()),
@@ -134,18 +158,10 @@ pub(crate) fn install_actions() {
             .add_event_listener_with_callback("popstate", callback.as_ref().unchecked_ref());
         callback.forget();
     }
-    on_element_id(&document, "login", "click", |_: web_sys::Event| {
-        spawn_local(ActionKind::LogIn, async {
-            match app_config() {
-                Ok(config) => {
-                    if let Err(error) = begin_login(&config).await {
-                        show_error(error.message());
-                    }
-                }
-                Err(error) => show_error(error.message()),
-            }
-        });
-    });
+    for id in ["login", "sign-in-login"] {
+        on_element_id(&document, id, "click", |_: web_sys::Event| start_login());
+    }
+    install_route_link(&document, "sign-in-downloads", Route::Downloads);
     on_element_id(&document, "logout", "click", |_: web_sys::Event| {
         CONFIGURATION_LOAD_GENERATION.set(CONFIGURATION_LOAD_GENERATION.get().wrapping_add(1));
         CONNECTIONS_LOAD_GENERATION.set(CONNECTIONS_LOAD_GENERATION.get().wrapping_add(1));
@@ -170,7 +186,14 @@ pub(crate) fn install_actions() {
         reset_audit();
         set_text("audit-state", "Log in to view the audit trail");
         close_brand_menu();
-        focus("login");
+        // Without a session a protected view is the sign-in card, whose Log in
+        // takes the place of the header's.
+        render_route(&route_from_location());
+        focus(if sign_in_shown() {
+            "sign-in-login"
+        } else {
+            "login"
+        });
     });
     install_configuration_actions(&document);
     install_connections_actions(&document);

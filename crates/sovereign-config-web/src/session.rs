@@ -7,7 +7,10 @@ use js_sys::{Date, Reflect};
 use sha2::{Digest, Sha256};
 use sovereign_config_client::{Client, Session};
 use sovereign_config_core::{ClientError, ErrorKind, Secret};
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Response, Url, UrlSearchParams, window};
@@ -22,6 +25,14 @@ use crate::transport::{BrowserHandshake, BrowserTransport, MemoryAuthentication,
 
 thread_local! {
     pub(crate) static TOKENS: RefCell<Option<MemoryTokens>> = const { RefCell::new(None) };
+
+    /// Set while an access-token refresh holds the tokens out of `TOKENS`: the
+    /// session is still the page's, though the slot reads empty.
+    pub(crate) static REFRESHING: Cell<bool> = const { Cell::new(false) };
+
+    /// Set from page start until `finish_login` has read an OIDC callback:
+    /// a login is under way that holds no session yet.
+    static CALLBACK_PENDING: Cell<bool> = const { Cell::new(false) };
 
     /// The session this page negotiated — and therefore the only version its
     /// requests may travel on — or the error that stopped it.
@@ -140,6 +151,22 @@ pub(crate) fn logged_in() -> bool {
     TOKENS.with_borrow(Option::is_some)
 }
 
+/// Whether the page holds a session, counting one whose tokens a refresh has
+/// out of `TOKENS` for the moment. What the shell shows — the sign-in card,
+/// the menu's disabled entries — and whether a view loads follow this, so a
+/// refresh in flight never reads as being signed out.
+pub(crate) fn session_held() -> bool {
+    logged_in() || REFRESHING.get()
+}
+
+pub(crate) fn set_callback_pending(pending: bool) {
+    CALLBACK_PENDING.set(pending);
+}
+
+pub(crate) fn callback_pending() -> bool {
+    CALLBACK_PENDING.get()
+}
+
 pub(crate) async fn refresh_status(config: &AppConfig) -> bool {
     clear_error();
     let session = match Session::open(BrowserHandshake).await {
@@ -196,11 +223,23 @@ pub(crate) async fn refresh_status(config: &AppConfig) -> bool {
     // `System.GetVersion` on the route this page just settled on.
     let transport = BrowserTransport::for_session();
     match transport.service_version().await {
-        Ok(reply) => set_text("version-value", &reply.application_version),
+        Ok(reply) => {
+            set_text("version-value", &reply.application_version);
+            set_text("sign-in-version", &reply.application_version);
+        }
         // Not fatal: the header loses a version it cannot confirm, and the
         // session below is unaffected. The identity check that follows reports
         // anything genuinely wrong with the service.
         Err(_) => set_text("version-value", ""),
+    }
+    // A page holding no session has nothing to check: asking anyway only
+    // earns an "authentication required" that is not news to a visitor who
+    // has not logged in yet.
+    if !session_held() {
+        set_hidden("login", false);
+        set_hidden("logout", true);
+        render_identity(false);
+        return false;
     }
     let client = Client::new(
         transport,

@@ -254,6 +254,7 @@ pub(crate) fn render_route(route: &Route) {
         set_text("path-connection-root", path.as_str());
         render_path_connections();
     }
+    crate::sign_in::render_sign_in(route);
     let nodes = TREE_NODES.with_borrow(Clone::clone);
     if let Err(error) = render_tree(&nodes) {
         show_error(error.message());

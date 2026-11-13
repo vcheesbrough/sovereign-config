@@ -88,7 +88,7 @@ header {
   z-index: 20;
   top: calc(100% + 6px);
   left: 0;
-  min-width: 220px;
+  min-width: 240px;
   padding: 6px;
   background: var(--surface-2);
   border: 1px solid var(--border);
@@ -105,6 +105,14 @@ header {
 }
 .brand-menu-panel a:hover { background: var(--surface-3); }
 .brand-menu-panel a.active { color: var(--yellow); background: var(--surface-3); }
+/* Without a session the views that need one stay listed and working —
+   picking one opens the sign-in card — with a quiet hint that they need a
+   login. The hint is decorative; the link's title carries it. */
+.brand-menu-panel a[data-needs-login] { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; white-space: nowrap; }
+.brand-menu-panel a[data-needs-login]::after { content: "log in" / ""; color: var(--text-muted); font-family: var(--mono); font-size: 11px; opacity: .8; }
+.brand-menu-panel .menu-separator { margin: 6px 4px; border: 0; border-top: 1px solid var(--border-soft); }
+.brand-menu-panel .external-link { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.external-icon { flex: 0 0 auto; width: 13px; height: 13px; color: var(--text-muted); }
 
 .session-actions { display: flex; align-items: center; gap: 12px; min-width: 0; font-size: 12px; }
 .identity-name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 22ch; }
@@ -420,6 +428,43 @@ dialog .actions { justify-content: flex-end; }
 .audit-feed-status .field-error { margin: 0; }
 /* Height enough to intersect reliably; it draws nothing. */
 .audit-sentinel { height: 1px; }
+/* ── Signed out (card #565) ─────────────────────── */
+/* No session, no tree: the main column takes the whole width. While the card
+   is on screen its own Log in is the one on offer, so the header's steps back. */
+body[data-session="signed-out"] .layout { grid-template-columns: minmax(0, 1fr); }
+body[data-session="signed-out"] .sidebar { display: none; }
+body[data-sign-in="shown"] #login, body[data-sign-in="pending"] #login { display: none; }
+
+/* A `section` for its landmark, without the rule every other section opens with. */
+.sign-in-page { display: flex; justify-content: center; padding: min(8vh, 72px) 0 0; border-top: 0; }
+.sign-in-card {
+  width: min(100%, 600px);
+  padding: 40px 44px 36px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 18px 40px rgb(1 12 8 / 45%);
+}
+.sign-in-mark { width: 30px; height: 28px; grid-template-columns: repeat(3, 7px); gap: 4px; margin-bottom: 18px; }
+.sign-in-mark span:nth-child(1) { height: 13px; }
+.sign-in-mark span:nth-child(2) { height: 24px; }
+.sign-in-mark span:nth-child(3) { height: 18px; }
+.sign-in-card h1 { color: var(--text-muted); font-size: 13px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+/* The tagline is the card's headline: three beats, one to a line, the last a
+   size up and in the heading amber. */
+.tagline { margin: 14px 0 22px; font-family: var(--mono); font-size: 28px; font-weight: 800; line-height: 1.12; letter-spacing: -.02em; }
+.tagline span { display: block; }
+.tagline .tagline-punch { margin-top: 6px; color: var(--yellow); font-size: 32px; }
+.sign-in-summary { margin: 0 0 24px; color: var(--text-muted); font-size: 14px; line-height: 1.55; }
+.sign-in-facts { display: grid; gap: 8px; margin: 0 0 28px; padding: 14px 16px; background: var(--bg); border: 1px solid var(--border-soft); border-radius: var(--radius); font-size: 13px; }
+.sign-in-facts div { display: grid; grid-template-columns: 11ch minmax(0, 1fr); gap: 12px; }
+.sign-in-facts dt { color: var(--text-muted); }
+.sign-in-facts dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+.sign-in-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; }
+.sign-in-actions button { min-height: 40px; padding: 8px 28px; font-size: 14px; }
+.sign-in-link { color: var(--accent-text); font-size: 13px; font-weight: 600; text-underline-offset: 3px; }
+.sign-in-link:hover { color: var(--text); }
+
 [hidden] { display: none !important; }
 
 @media (max-width: 760px) {
@@ -459,6 +504,10 @@ dialog .actions { justify-content: flex-end; }
   .audit-table thead th:nth-child(4) { width: 24%; }
   .identity-name { max-width: 12ch; }
   .watermark { display: none; }
+  .sign-in-page { padding-top: 0; }
+  .sign-in-card { padding: 28px 22px 24px; }
+  .tagline { font-size: 24px; }
+  .tagline .tagline-punch { font-size: 28px; }
 }
 
 @media (max-width: 400px) {

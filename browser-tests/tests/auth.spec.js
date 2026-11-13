@@ -28,9 +28,11 @@ test.describe('auth', () => {
     await expect(page.locator('header').getByText(/protocol/i)).toHaveCount(0);
     await expect(page.locator('#service-value')).toBeHidden();
     await expect(signedOut(page)).toBeVisible();
-    // `/` is the configuration root now that the System view is gone.
+    // `/` is the configuration root now that the System view is gone; signed
+    // out, that view is the sign-in card (card #565).
     await expect(page).toHaveURL(/\/configuration\/$/);
-    await expect(page.getByRole('heading', { name: 'Configuration values' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Sovereign Config', level: 1 })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Configuration values' })).toBeHidden();
 
     const accessibility = await new AxeBuilder({ page }).analyze();
     expect(accessibility.violations).toEqual([]);

@@ -141,6 +141,41 @@ fn the_readme_leaves_the_projects_own_deployment_to_its_own_document() {
     assert!(readme.contains("docs/project-deployment.md"));
 }
 
+/// The README leads with the tagline banner (card #565), in the web UI's dark
+/// palette whatever the reader's colour scheme, with the tagline as its text
+/// alternative. GitHub strips CSS and loads no font for an image, so the
+/// banner carries its words as outlines, and nothing it could fetch.
+#[test]
+fn the_readme_leads_with_the_tagline_banner() {
+    const TAGLINE: &str = "Your keys. Your box. Nobody else's business.";
+    let readme = fs::read_to_string(workspace_root().join("README.md")).expect("read README");
+    let image = format!(r#"<img src="docs/assets/tagline.svg" alt="{TAGLINE}""#);
+    let banner = readme
+        .find(&image)
+        .expect("the README opens with the tagline banner");
+    assert!(
+        banner
+            < readme
+                .find("**Self-hosted")
+                .expect("the README's summary line"),
+        "the banner sits under the title, above the summary"
+    );
+    let svg =
+        fs::read_to_string(workspace_root().join("docs/assets/tagline.svg")).expect("read banner");
+    assert!(svg.contains(&format!(r#"aria-label="{TAGLINE}""#)));
+    assert!(svg.contains(&format!("<title>{TAGLINE}</title>")));
+    assert!(
+        !svg.contains("<text"),
+        "the banner's words must be outlines"
+    );
+    for external in ["href", "url(", "@import", "<image", "<script", "<style"] {
+        assert!(
+            !svg.contains(external),
+            "the banner must reference nothing ({external})"
+        );
+    }
+}
+
 /// The docker 27 CLI overwrites `OTEL_RESOURCE_ATTRIBUTES` when it execs the
 /// compose plugin, which fails startup. The README turns telemetry on, so it
 /// has to carry the workaround where the reader does that.

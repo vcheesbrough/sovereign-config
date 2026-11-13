@@ -2,6 +2,8 @@
 
 # Sovereign Config
 
+<img src="docs/assets/tagline.svg" alt="Your keys. Your box. Nobody else's business." width="640">
+
 **Self-hosted configuration and secrets, on infrastructure you control.**
 
 [![Latest release](https://img.shields.io/github/v/tag/vcheesbrough/sovereign-config?sort=semver&label=release&color=2ea44f)](https://github.com/vcheesbrough/sovereign-config/releases)
