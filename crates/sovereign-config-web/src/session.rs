@@ -196,11 +196,23 @@ pub(crate) async fn refresh_status(config: &AppConfig) -> bool {
     // `System.GetVersion` on the route this page just settled on.
     let transport = BrowserTransport::for_session();
     match transport.service_version().await {
-        Ok(reply) => set_text("version-value", &reply.application_version),
+        Ok(reply) => {
+            set_text("version-value", &reply.application_version);
+            set_text("sign-in-version", &reply.application_version);
+        }
         // Not fatal: the header loses a version it cannot confirm, and the
         // session below is unaffected. The identity check that follows reports
         // anything genuinely wrong with the service.
         Err(_) => set_text("version-value", ""),
+    }
+    // A page holding no session has nothing to check: asking anyway only
+    // earns an "authentication required" that is not news to a visitor who
+    // has not logged in yet.
+    if !logged_in() {
+        set_hidden("login", false);
+        set_hidden("logout", true);
+        render_identity(false);
+        return false;
     }
     let client = Client::new(
         transport,

@@ -22,12 +22,14 @@
         </button>
         <!-- A plain disclosure rather than an ARIA menu: these are ordinary
              links, and a real `role="menu"` would owe a roving tab stop and
-             arrow-key traversal that buy a short list of four links nothing. -->
+             arrow-key traversal that buy a short list of links nothing. -->
         <nav id="brand-menu" class="brand-menu-panel" aria-label="Views" hidden>
           <a id="configuration-values-link" href="/configuration/">Configuration values</a>
           <a id="managed-connections-link" href="/connections/">Access URLs</a>
           <a id="audit-trail-link" href="/audit/">Audit trail</a>
           <a id="downloads-link" href="/downloads">Downloads</a>
+          <hr class="menu-separator">
+          <a id="github-link" class="external-link" href="https://github.com/vcheesbrough/sovereign-config" target="_blank" rel="noopener noreferrer">Project on GitHub<span class="visually-hidden"> (opens in a new tab)</span><svg class="external-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M9.5 2.5h4v4M13.5 2.5 7 9M11.5 9.5v3a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h3"></path></svg></a>
         </nav>
       </div>
       <div class="session-actions">
@@ -55,6 +57,25 @@
       </nav>
       <main id="main">
         <p id="error" class="error" role="alert" hidden></p>
+
+        <!-- Without a session, every view but Downloads is this card (card #565). -->
+        <section id="sign-in-page" class="page sign-in-page" aria-labelledby="sign-in-title" hidden>
+          <div class="sign-in-card">
+            <span class="brand-mark sign-in-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+            <h1 id="sign-in-title">Sovereign Config</h1>
+            <p class="tagline"><span>Your keys.</span> <span>Your box.</span> <span class="tagline-punch">Nobody else's business.</span></p>
+            <p class="sign-in-summary">Configuration values and secrets for your services, on your own servers &mdash; with access URLs for applications and an audit trail of every read and change.</p>
+            <dl class="sign-in-facts">
+              <div><dt>Server</dt><dd id="sign-in-host"></dd></div>
+              <div><dt>Version</dt><dd id="sign-in-version">-</dd></div>
+              <div><dt>Sign in with</dt><dd id="sign-in-issuer"></dd></div>
+            </dl>
+            <div class="sign-in-actions">
+              <button id="sign-in-login" type="button">Log in</button>
+              <a id="sign-in-downloads" class="sign-in-link" href="/downloads">Get the CLI and MCP server</a>
+            </div>
+          </div>
+        </section>
 
         <div id="configuration-page" class="page" hidden>
           <div class="page-heading configuration-heading">

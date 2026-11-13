@@ -559,6 +559,10 @@ pub(crate) async fn load_audit() {
         reset_audit();
         return;
     };
+    // Without a session the view is the sign-in card; there is nothing to read.
+    if !crate::session::logged_in() {
+        return;
+    }
     // Always part of the action that loads the view: navigating, the page
     // load, or a history pop.
     if let Some(query) = form_query(element_path.as_ref()) {
