@@ -435,7 +435,7 @@ dialog .actions { justify-content: flex-end; }
    is on screen its own Log in is the one on offer, so the header's steps back. */
 body[data-session="signed-out"] .layout { grid-template-columns: minmax(0, 1fr); }
 body[data-session="signed-out"] .sidebar { display: none; }
-body[data-sign-in="shown"] #login { display: none; }
+body[data-sign-in="shown"] #login, body[data-sign-in="pending"] #login { display: none; }
 
 /* A `section` for its landmark, without the rule every other section opens with. */
 .sign-in-page { display: flex; justify-content: center; padding: min(8vh, 72px) 0 0; border-top: 0; }

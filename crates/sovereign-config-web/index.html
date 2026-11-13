@@ -10,7 +10,9 @@
     <script src="/app-config.js"></script>
     <link data-trunk rel="rust">
   </head>
-  <body>
+  <!-- `pending` until the first render knows the session (sign_in.rs), so the
+       header's Log in never shows for a moment before the card replaces it. -->
+  <body data-sign-in="pending">
     <header>
       <!-- The brand mark is the app's only top-level navigation: the views that
            are not the configuration tree hang off this menu. -->
