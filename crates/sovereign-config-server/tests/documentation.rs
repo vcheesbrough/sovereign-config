@@ -141,16 +141,17 @@ fn the_readme_leaves_the_projects_own_deployment_to_its_own_document() {
     assert!(readme.contains("docs/project-deployment.md"));
 }
 
-/// The README leads with the tagline banner (card #565): a dark and a light
-/// variant chosen by the reader's colour scheme, with the tagline as its text
+/// The README leads with the tagline banner (card #565), in the web UI's dark
+/// palette whatever the reader's colour scheme, with the tagline as its text
 /// alternative. GitHub strips CSS and loads no font for an image, so the
-/// banners carry their words as outlines, and nothing they could fetch.
+/// banner carries its words as outlines, and nothing it could fetch.
 #[test]
 fn the_readme_leads_with_the_tagline_banner() {
     const TAGLINE: &str = "Your keys. Your box. Nobody else's business.";
     let readme = fs::read_to_string(workspace_root().join("README.md")).expect("read README");
+    let image = format!(r#"<img src="docs/assets/tagline.svg" alt="{TAGLINE}""#);
     let banner = readme
-        .find("<picture>")
+        .find(&image)
         .expect("the README opens with the tagline banner");
     assert!(
         banner
@@ -159,28 +160,19 @@ fn the_readme_leads_with_the_tagline_banner() {
                 .expect("the README's summary line"),
         "the banner sits under the title, above the summary"
     );
-    assert!(readme.contains(
-        r#"<source media="(prefers-color-scheme: dark)" srcset="docs/assets/tagline-dark.svg">"#
-    ));
-    assert!(readme.contains(&format!(
-        r#"<img src="docs/assets/tagline-light.svg" alt="{TAGLINE}""#
-    )));
-    for theme in ["dark", "light"] {
-        let svg =
-            fs::read_to_string(workspace_root().join(format!("docs/assets/tagline-{theme}.svg")))
-                .expect("read banner");
-        assert!(svg.contains(&format!(r#"aria-label="{TAGLINE}""#)));
-        assert!(svg.contains(&format!("<title>{TAGLINE}</title>")));
+    let svg =
+        fs::read_to_string(workspace_root().join("docs/assets/tagline.svg")).expect("read banner");
+    assert!(svg.contains(&format!(r#"aria-label="{TAGLINE}""#)));
+    assert!(svg.contains(&format!("<title>{TAGLINE}</title>")));
+    assert!(
+        !svg.contains("<text"),
+        "the banner's words must be outlines"
+    );
+    for external in ["href", "url(", "@import", "<image", "<script", "<style"] {
         assert!(
-            !svg.contains("<text"),
-            "the {theme} banner's words must be outlines"
+            !svg.contains(external),
+            "the banner must reference nothing ({external})"
         );
-        for external in ["href", "url(", "@import", "<image", "<script", "<style"] {
-            assert!(
-                !svg.contains(external),
-                "the {theme} banner must reference nothing ({external})"
-            );
-        }
     }
 }
 

@@ -220,13 +220,8 @@ pub(crate) fn close_brand_menu() {
 }
 
 pub(crate) fn install_route_link(document: &Document, id: &str, route: Route) {
-    let link = id.to_owned();
     on_element_id(document, id, "click", move |event: Event| {
         event.prevent_default();
-        // A view that needs a session is listed but inert without one.
-        if crate::sign_in::link_disabled(&link) {
-            return;
-        }
         guarded_navigate(route.clone());
     });
 }

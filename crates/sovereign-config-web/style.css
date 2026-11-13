@@ -105,13 +105,11 @@ header {
 }
 .brand-menu-panel a:hover { background: var(--surface-3); }
 .brand-menu-panel a.active { color: var(--yellow); background: var(--surface-3); }
-/* Without a session the views that need one stay listed but inert, so the menu
-   still says what the app holds; the hint is decorative, `aria-disabled` and
-   the link's title carry it to assistive technology. */
-.brand-menu-panel a[aria-disabled="true"] { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; color: var(--text-muted); cursor: not-allowed; }
-.brand-menu-panel a[aria-disabled="true"], .brand-menu-panel a[aria-disabled="true"].active { white-space: nowrap; }
-.brand-menu-panel a[aria-disabled="true"]:hover, .brand-menu-panel a[aria-disabled="true"].active { color: var(--text-muted); background: transparent; }
-.brand-menu-panel a[aria-disabled="true"]::after { content: "log in" / ""; font-family: var(--mono); font-size: 11px; opacity: .8; }
+/* Without a session the views that need one stay listed and working —
+   picking one opens the sign-in card — with a quiet hint that they need a
+   login. The hint is decorative; the link's title carries it. */
+.brand-menu-panel a[data-needs-login] { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; white-space: nowrap; }
+.brand-menu-panel a[data-needs-login]::after { content: "log in" / ""; color: var(--text-muted); font-family: var(--mono); font-size: 11px; opacity: .8; }
 .brand-menu-panel .menu-separator { margin: 6px 4px; border: 0; border-top: 1px solid var(--border-soft); }
 .brand-menu-panel .external-link { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .external-icon { flex: 0 0 auto; width: 13px; height: 13px; color: var(--text-muted); }

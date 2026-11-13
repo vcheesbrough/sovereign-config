@@ -2,10 +2,7 @@
 
 # Sovereign Config
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tagline-dark.svg">
-  <img src="docs/assets/tagline-light.svg" alt="Your keys. Your box. Nobody else's business." width="640">
-</picture>
+<img src="docs/assets/tagline.svg" alt="Your keys. Your box. Nobody else's business." width="640">
 
 **Self-hosted configuration and secrets, on infrastructure you control.**
 

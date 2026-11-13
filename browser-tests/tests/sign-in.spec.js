@@ -3,8 +3,8 @@ const AxeBuilder = require('@axe-core/playwright').default;
 const { signedOut, signedIn, tokenEndpoint, openCallback, mockApplication, mockDiscovery } = require('./helpers');
 
 // Card #565: without a session, every view but Downloads is a sign-in card that
-// says what is being logged in to, and the brand menu lists every view with
-// those needing a session disabled.
+// says what is being logged in to. The brand menu lists every view; picking
+// one that needs a session opens the card.
 
 const REPOSITORY = 'https://github.com/vcheesbrough/sovereign-config';
 const AMBER = 'rgb(251, 191, 36)';
@@ -76,15 +76,20 @@ test.describe('sign-in', () => {
     });
   }
 
-  test('the menu lists every view, with those needing a session disabled', async ({ page }, testInfo) => {
+  test('the menu lists every view, and picking one that needs a session opens the card', async ({ page }, testInfo) => {
+    // From Downloads, the one view that needs no session (the test server
+    // serves only `/`, so it is reached by its link).
     await page.goto('/');
-    const menu = await openMenu(page);
+    await page.getByRole('link', { name: 'Get the CLI and MCP server' }).click();
+    await expect(page.getByRole('heading', { name: 'Downloads', level: 1 })).toBeVisible();
+    let menu = await openMenu(page);
     for (const name of ['Configuration values', 'Access URLs', 'Audit trail']) {
       const link = menu.getByRole('link', { name, exact: true });
-      await expect(link).toHaveAttribute('aria-disabled', 'true');
+      await expect(link).toHaveAttribute('data-needs-login', '');
       await expect(link).toHaveAttribute('title', 'Log in to open');
+      await expect(link).not.toHaveAttribute('aria-disabled');
     }
-    await expect(menu.getByRole('link', { name: 'Downloads', exact: true })).not.toHaveAttribute('aria-disabled');
+    await expect(menu.getByRole('link', { name: 'Downloads', exact: true })).not.toHaveAttribute('data-needs-login');
 
     expect((await new AxeBuilder({ page }).include('#brand-menu').analyze()).violations).toEqual([]);
     await page.screenshot({
@@ -92,17 +97,24 @@ test.describe('sign-in', () => {
       animations: 'disabled'
     });
 
-    // A disabled entry goes nowhere.
-    await menu.getByRole('link', { name: 'Audit trail', exact: true }).click({ force: true });
-    await expect(page).toHaveURL(/\/configuration\/$/);
-    await expect(card(page)).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('navigation', { name: 'Views' })).toBeHidden();
+    for (const [name, url] of [['Audit trail', /\/audit\/$/], ['Access URLs', /\/connections\/$/], ['Configuration values', /\/configuration\/$/]]) {
+      menu = await openMenu(page);
+      await menu.getByRole('link', { name, exact: true }).click();
+      await expect(page).toHaveURL(url);
+      await expect(card(page)).toBeVisible();
+      await expect(page.locator('#error')).toBeHidden();
+    }
   });
 
-  test('keyboard focus skips the disabled entries', async ({ page }) => {
+  test('keyboard reaches every menu entry', async ({ page }) => {
     await page.goto('/');
     await openMenu(page);
-    await page.keyboard.press('Tab');
-    await expect(page.getByRole('link', { name: 'Downloads', exact: true })).toBeFocused();
+    for (const name of ['Configuration values', 'Access URLs', 'Audit trail', 'Downloads']) {
+      await page.keyboard.press('Tab');
+      await expect(page.getByRole('link', { name, exact: true })).toBeFocused();
+    }
     await page.keyboard.press('Tab');
     await expect(page.getByRole('link', { name: /Project on GitHub/ })).toBeFocused();
   });
@@ -154,7 +166,7 @@ test.describe('sign-in', () => {
       await expect(github).toHaveAttribute('rel', 'noopener noreferrer');
       await expect(github).toHaveAccessibleName('Project on GitHub (opens in a new tab)');
       if (session === 'signed in') {
-        await expect(menu.getByRole('link', { name: 'Audit trail', exact: true })).not.toHaveAttribute('aria-disabled');
+        await expect(menu.getByRole('link', { name: 'Audit trail', exact: true })).not.toHaveAttribute('data-needs-login');
       }
     });
   }
@@ -186,7 +198,7 @@ test.describe('sign-in', () => {
     const during = { timeout: 1500 };
     const menu = await openMenu(page);
     const accessUrls = menu.getByRole('link', { name: 'Access URLs', exact: true });
-    await expect(accessUrls).not.toHaveAttribute('aria-disabled', during);
+    await expect(accessUrls).not.toHaveAttribute('data-needs-login', during);
     await accessUrls.click();
     await expect(page).toHaveURL(/\/connections\/$/, during);
     await expect(card(page)).toBeHidden(during);

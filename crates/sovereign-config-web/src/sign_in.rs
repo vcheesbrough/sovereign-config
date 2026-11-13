@@ -2,7 +2,8 @@
 //! but Downloads is a sign-in card that says what is being logged in to — this
 //! server, its version, and the identity provider — instead of an empty editor
 //! and an "authentication required" banner. The brand menu still lists every
-//! view, with those needing a session disabled.
+//! view; those needing a session carry a "log in" hint, and picking one opens
+//! the card.
 //!
 //! The session state is the browser's own token state (`session_held`): it
 //! is known before anything is asked of the server, so a signed-out visit
@@ -27,7 +28,7 @@ const PROTECTED_PAGES: [&str; 3] = ["configuration-page", "connections-page", "a
 
 /// Applies the session state to the shell for `route`: the card in place of a
 /// protected view, the sidebar only with a session, and the menu's protected
-/// links disabled without one. Runs after the route's own page is shown.
+/// links marked as needing a login without one. Runs after the route's own page is shown.
 pub(crate) fn render_sign_in(route: &Route) {
     let signed_out = !session_held();
     // An OIDC callback holds no session until `finish_login` has read its
@@ -53,19 +54,13 @@ pub(crate) fn render_sign_in(route: &Route) {
     }
     set_hidden("sign-in-page", !show);
     for id in PROTECTED_LINKS {
-        set_link_disabled(id, signed_out);
+        mark_needs_login(id, signed_out);
     }
 }
 
 /// Whether the sign-in card is what the page is showing.
 pub(crate) fn sign_in_shown() -> bool {
     !element_is_hidden("sign-in-page")
-}
-
-/// Whether a brand-menu link is disabled for want of a session.
-pub(crate) fn link_disabled(id: &str) -> bool {
-    document_element(id)
-        .is_some_and(|link| link.get_attribute("aria-disabled").as_deref() == Some("true"))
 }
 
 /// The server this page came from, as its address bar names it.
@@ -86,17 +81,17 @@ fn issuer_host() -> String {
         .unwrap_or_default()
 }
 
-fn set_link_disabled(id: &str, disabled: bool) {
+/// A protected view stays a working link without a session — it opens the
+/// sign-in card — and only wears a hint that it needs a login.
+fn mark_needs_login(id: &str, needs_login: bool) {
     let Some(link) = document_element(id) else {
         return;
     };
-    if disabled {
-        let _ = link.set_attribute("aria-disabled", "true");
-        let _ = link.set_attribute("tabindex", "-1");
+    if needs_login {
+        let _ = link.set_attribute("data-needs-login", "");
         let _ = link.set_attribute("title", "Log in to open");
     } else {
-        let _ = link.remove_attribute("aria-disabled");
-        let _ = link.remove_attribute("tabindex");
+        let _ = link.remove_attribute("data-needs-login");
         let _ = link.remove_attribute("title");
     }
 }
