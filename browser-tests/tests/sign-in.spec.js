@@ -1,6 +1,6 @@
 const { test, expect } = require('@playwright/test');
 const AxeBuilder = require('@axe-core/playwright').default;
-const { signedOut, openCallback, mockApplication, mockDiscovery } = require('./helpers');
+const { signedOut, signedIn, tokenEndpoint, openCallback, mockApplication, mockDiscovery } = require('./helpers');
 
 // Card #565: without a session, every view but Downloads is a sign-in card that
 // says what is being logged in to, and the brand menu lists every view with
@@ -158,6 +158,37 @@ test.describe('sign-in', () => {
       }
     });
   }
+
+  test('a session that ends while the page loads turns the view into the card', async ({ page }) => {
+    // The stored session is past its absolute expiry, which the status check
+    // discovers only after the first render.
+    await openCallback(page, 'success', 'expected-state', 0, true);
+    await expect(card(page)).toBeVisible();
+    await expect(page.getByText('authentication required')).toBeVisible();
+    await expect(page.locator('#configuration-page')).toBeHidden();
+  });
+
+  test('a failed login callback still ends on the card', async ({ page }) => {
+    await openCallback(page, 'success', 'wrong-state');
+    await expect(page.getByText('login response did not match this browser')).toBeVisible();
+    await expect(card(page)).toBeVisible();
+  });
+
+  test('a refresh in flight is not mistaken for being signed out', async ({ page }) => {
+    const refresh = page.waitForRequest(request => request.url() === tokenEndpoint
+      && (request.postData() || '').includes('grant_type=refresh_token'));
+    await openCallback(page, 'success', 'expected-state', 0, false, undefined, 2000);
+    await refresh;
+    // While the identity provider is still answering, navigate.
+    const menu = await openMenu(page);
+    const accessUrls = menu.getByRole('link', { name: 'Access URLs', exact: true });
+    await expect(accessUrls).not.toHaveAttribute('aria-disabled');
+    await accessUrls.click();
+    await expect(page).toHaveURL(/\/connections\/$/);
+    await expect(card(page)).toBeHidden();
+    await expect(page.locator('#connections-page')).toBeVisible();
+    await expect(signedIn(page)).toBeVisible();
+  });
 
   test('logging out returns a protected view to the card, focused on its Log in', async ({ page }) => {
     await openCallback(page);

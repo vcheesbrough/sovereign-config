@@ -4,16 +4,16 @@
 //! and an "authentication required" banner. The brand menu still lists every
 //! view, with those needing a session disabled.
 //!
-//! The session state is the browser's own token state (`logged_in`): it is
-//! known before anything is asked of the server, so a signed-out visit never
-//! flashes the editor.
+//! The session state is the browser's own token state (`session_held`): it
+//! is known before anything is asked of the server, so a signed-out visit
+//! never flashes the editor.
 
 use web_sys::{Url, window};
 
-use crate::browser::{app_config, location_search};
+use crate::browser::app_config;
 use crate::dom::{element_is_hidden, set_hidden, set_text};
 use crate::route::Route;
-use crate::session::logged_in;
+use crate::session::{callback_pending, session_held};
 
 /// The brand-menu links to views that need a session.
 const PROTECTED_LINKS: [&str; 3] = [
@@ -29,12 +29,11 @@ const PROTECTED_PAGES: [&str; 3] = ["configuration-page", "connections-page", "a
 /// protected view, the sidebar only with a session, and the menu's protected
 /// links disabled without one. Runs after the route's own page is shown.
 pub(crate) fn render_sign_in(route: &Route) {
-    let signed_out = !logged_in();
-    // An OIDC callback holds no session yet for the moment before
-    // `finish_login` reads its code; showing the card then would flash it on
-    // every login.
-    let callback = location_search().is_some_and(|search| search.contains("code="));
-    let show = signed_out && !callback && !matches!(route, Route::Downloads);
+    let signed_out = !session_held();
+    // An OIDC callback holds no session until `finish_login` has read its
+    // code; showing the card then would flash it on every login. Once it has
+    // read it, success or not, the card follows the session again.
+    let show = signed_out && !callback_pending() && !matches!(route, Route::Downloads);
 
     set_body_state(
         "data-session",

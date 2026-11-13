@@ -560,7 +560,7 @@ pub(crate) async fn load_audit() {
         return;
     };
     // Without a session the view is the sign-in card; there is nothing to read.
-    if !crate::session::logged_in() {
+    if !crate::session::session_held() {
         return;
     }
     // Always part of the action that loads the view: navigating, the page

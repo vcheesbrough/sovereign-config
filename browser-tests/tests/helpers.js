@@ -785,7 +785,8 @@ async function openCallback(
   state = 'expected-state',
   identityStatus = 0,
   expireRefresh = false,
-  claims = { sub: 'operator-subject', preferred_username: 'avc', name: 'A Vincent' }
+  claims = { sub: 'operator-subject', preferred_username: 'avc', name: 'A Vincent' },
+  refreshDelayMs = 0
 ) {
   await page.addInitScript(({ expireRefresh }) => {
     sessionStorage.setItem('sovereign-config.pkce-state', 'expected-state');
@@ -841,6 +842,9 @@ async function openCallback(
         body: JSON.stringify({ error: 'server_error' })
       });
     }
+    // A slow refresh keeps the session's tokens out of the page's slot for a
+    // while, as a real identity provider can.
+    if (refreshDelayMs) await new Promise(resolve => setTimeout(resolve, refreshDelayMs));
     return route.fulfill({
       contentType: 'application/json',
       headers: { 'access-control-allow-origin': '*' },

@@ -144,7 +144,7 @@ pub(crate) async fn load_current_configuration() {
         return;
     };
     // Without a session the view is the sign-in card; there is nothing to read.
-    if !crate::session::logged_in() {
+    if !crate::session::session_held() {
         return;
     }
     clear_error();

@@ -41,7 +41,7 @@ use web_sys::{Headers, Request, RequestCache, RequestInit, Response, window};
 
 use crate::browser::{AppConfig, browser_error};
 use crate::session::{
-    TOKENS, clear_persisted_refresh_token, negotiated_session, persist_refresh_token,
+    REFRESHING, TOKENS, clear_persisted_refresh_token, negotiated_session, persist_refresh_token,
     refresh_tokens,
 };
 use crate::telemetry;
@@ -355,7 +355,12 @@ impl AccessTokenProvider for MemoryAuthentication {
             clear_persisted_refresh_token();
             return Ok(None);
         }
-        match refresh_tokens(&self.client_id, &tokens).await {
+        // The tokens are out of `TOKENS` for the await; say the session is
+        // still held, or the shell would show this page as signed out.
+        REFRESHING.set(true);
+        let refreshed = refresh_tokens(&self.client_id, &tokens).await;
+        REFRESHING.set(false);
+        match refreshed {
             Ok(refreshed) => {
                 let access_token = refreshed.access_token.clone();
                 persist_refresh_token(&refreshed);

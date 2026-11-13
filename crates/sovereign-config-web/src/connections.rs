@@ -592,7 +592,7 @@ pub(crate) async fn load_current_connections() {
     let generation = CONNECTIONS_LOAD_GENERATION.get().wrapping_add(1);
     CONNECTIONS_LOAD_GENERATION.set(generation);
     // Without a session the view is the sign-in card; there is nothing to read.
-    if !matches!(route_from_location(), Route::Connections) || !crate::session::logged_in() {
+    if !matches!(route_from_location(), Route::Connections) || !crate::session::session_held() {
         return;
     }
     clear_connection_rows(&ESTATE_CONNECTION_TABLE);

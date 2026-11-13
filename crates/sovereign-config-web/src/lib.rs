@@ -47,8 +47,8 @@ use crate::route::{
     restore_current_url, route_from_location,
 };
 use crate::session::{
-    begin_login, clear_browser_session, finish_login, refresh_status, render_identity,
-    restore_tokens,
+    begin_login, callback_pending, clear_browser_session, finish_login, refresh_status,
+    render_identity, restore_tokens, set_callback_pending,
 };
 use crate::shell::{
     close_brand_menu, install_brand_menu, install_route_link, install_sidebar_resizer,
@@ -60,6 +60,7 @@ use crate::value_rows::clear_value_rows;
 
 #[wasm_bindgen(start)]
 pub fn start() {
+    set_callback_pending(location_search().is_some_and(|search| search.contains("code=")));
     install_actions();
     render_route(&route_from_location());
     // The Downloads view needs no authentication; load it independently of the
@@ -72,12 +73,13 @@ pub fn start() {
             Ok(config) => {
                 telemetry::init(config.telemetry.as_ref());
                 restore_tokens();
-                let callback_error =
-                    if location_search().is_some_and(|search| search.contains("code=")) {
-                        finish_login(&config).await.err()
-                    } else {
-                        None
-                    };
+                let callback_error = if callback_pending() {
+                    let result = finish_login(&config).await.err();
+                    set_callback_pending(false);
+                    result
+                } else {
+                    None
+                };
                 render_route(&route_from_location());
                 let authenticated = refresh_status(&config).await;
                 // The status check can end a session the page still held (a
@@ -96,7 +98,10 @@ pub fn start() {
                     load_tree().await;
                 }
             }
-            Err(error) => show_error(error.message()),
+            Err(error) => {
+                set_callback_pending(false);
+                show_error(error.message());
+            }
         }
     });
 }
