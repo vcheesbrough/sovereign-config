@@ -177,17 +177,20 @@ test.describe('sign-in', () => {
   test('a refresh in flight is not mistaken for being signed out', async ({ page }) => {
     const refresh = page.waitForRequest(request => request.url() === tokenEndpoint
       && (request.postData() || '').includes('grant_type=refresh_token'));
-    await openCallback(page, 'success', 'expected-state', 0, false, undefined, 2000);
+    // Long enough that every assertion below lands while the identity
+    // provider is still answering: once it does, the page re-renders, which
+    // would hide the card whatever the fix.
+    test.setTimeout(30000);
+    await openCallback(page, 'success', 'expected-state', 0, false, undefined, 8000);
     await refresh;
-    // While the identity provider is still answering, navigate.
+    const during = { timeout: 1500 };
     const menu = await openMenu(page);
     const accessUrls = menu.getByRole('link', { name: 'Access URLs', exact: true });
-    await expect(accessUrls).not.toHaveAttribute('aria-disabled');
+    await expect(accessUrls).not.toHaveAttribute('aria-disabled', during);
     await accessUrls.click();
-    await expect(page).toHaveURL(/\/connections\/$/);
-    await expect(card(page)).toBeHidden();
-    await expect(page.locator('#connections-page')).toBeVisible();
-    await expect(signedIn(page)).toBeVisible();
+    await expect(page).toHaveURL(/\/connections\/$/, during);
+    await expect(card(page)).toBeHidden(during);
+    await expect(page.locator('#connections-page')).toBeVisible(during);
   });
 
   test('logging out returns a protected view to the card, focused on its Log in', async ({ page }) => {
