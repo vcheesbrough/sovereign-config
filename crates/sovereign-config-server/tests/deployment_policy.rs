@@ -503,6 +503,20 @@ fn every_service_runs_unprivileged_with_no_capabilities() {
                     is_unprivileged(user),
                     "{name} must run as a numeric non-root uid:gid, not {user:?}"
                 );
+                assert_eq!(
+                    user, CONTAINER_USER,
+                    "{name} must run as the documented {CONTAINER_USER}"
+                );
+                assert_eq!(
+                    service["read_only"].as_bool(),
+                    Some(true),
+                    "{name} runs as {CONTAINER_USER} and must have a read-only root filesystem"
+                );
+                assert_eq!(
+                    strings(&service["tmpfs"]),
+                    ["/tmp"],
+                    "{name} has a read-only root and gets a tmpfs on /tmp only"
+                );
                 assert!(
                     service.get("cap_add").is_none(),
                     "{name} runs unprivileged and must add no capability back"
