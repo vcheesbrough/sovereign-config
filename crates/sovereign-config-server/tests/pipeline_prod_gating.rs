@@ -374,7 +374,7 @@ fn production_deploys_only_commits_main_contains() {
 /// The deploys pull the release from GHCR, where GitHub Actions published it,
 /// anonymously: no deploy step holds a registry credential or names the old
 /// registry, and the Compose file names the GHCR image. (The code-vitals
-/// recorder pulls its collector from the estate's registry; it deploys
+/// recorder's plugin comes from the estate's registry; it deploys
 /// nothing of this repository's.)
 #[test]
 fn deployments_pull_the_release_from_ghcr() {
