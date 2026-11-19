@@ -345,8 +345,11 @@ async fn replaces_the_credential(
             matches!(previous, Some(Err(_))),
             "a replaced credential's previous value no longer obtains a token"
         );
-        if let Some(Err(refused)) = authenticates(target, &replacement).await {
-            panic!("a replaced credential's new value obtains a token: {refused:?}");
+        // A target that checked the first credential checks this one too:
+        // no token, for any reason, is a failure.
+        match authenticates(target, &replacement).await {
+            Some(Ok(_)) => {}
+            other => panic!("a replaced credential's new value obtains a token, not {other:?}"),
         }
     }
     replacement
@@ -574,7 +577,64 @@ async fn failure_is_classified(
 
 #[cfg(test)]
 mod tests {
-    use super::TokenRefused;
+    use async_trait::async_trait;
+
+    use super::{ConformanceTarget, Operation, TokenRefused, lifecycle};
+    use crate::{
+        ClientCredential, ManagedIdentityProvider, ProviderError, fake::FakeIdentityProvider,
+    };
+
+    /// The fake, except that its token hook goes quiet for every credential
+    /// after the first one it is shown: a target that checked a created
+    /// credential and then says nothing about its replacement.
+    #[derive(Default)]
+    struct SilentAfterFirst {
+        fake: FakeIdentityProvider,
+        first: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl ConformanceTarget for SilentAfterFirst {
+        fn provider(&self) -> &dyn ManagedIdentityProvider {
+            &self.fake
+        }
+
+        async fn fail_next(&self, operation: Operation, error: ProviderError) -> bool {
+            self.fake.fail_next(operation, error);
+            true
+        }
+
+        async fn obtain_token(
+            &self,
+            username: &str,
+            credential: &ClientCredential,
+        ) -> Option<Result<String, TokenRefused>> {
+            let secret = credential.secret().expose().to_owned();
+            let first = self
+                .first
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| secret.clone())
+                .clone();
+            if first == secret {
+                self.fake.obtain_token(username, credential).await
+            } else {
+                None
+            }
+        }
+
+        async fn token_grants(&self, token: &str) -> Option<Vec<super::ClaimedGrant>> {
+            self.fake.token_grants(token).await
+        }
+    }
+
+    /// Once a target has checked tokens, a replaced credential that obtains
+    /// none — even with no answer at all — fails the lifecycle.
+    #[tokio::test]
+    #[should_panic(expected = "a replaced credential's new value obtains a token, not None")]
+    async fn a_replacement_with_no_token_fails_the_lifecycle() {
+        lifecycle(&SilentAfterFirst::default()).await;
+    }
 
     /// A refusal keeps the status and a well-formed OAuth error code, and
     /// nothing else the response said.
