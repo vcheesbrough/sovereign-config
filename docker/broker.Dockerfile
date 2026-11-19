@@ -28,8 +28,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-RUN useradd --system --uid 10001 --create-home sovereign-config-broker
-USER sovereign-config-broker
+# The ids are the convention in docs/project-deployment.md (*Container
+# users*), stated as numbers so `compose.yaml` can restate them and a shared
+# volume can be group-owned without looking inside the image.
+RUN groupadd --system --gid 10001 sovereign-config-broker \
+    && useradd --system --uid 10001 --gid 10001 --create-home sovereign-config-broker
+USER 10001:10001
 COPY --from=builder /tmp/sovereign-config-woodpecker-broker /usr/local/bin/sovereign-config-woodpecker-broker
 HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=12 \
     CMD ["/usr/local/bin/sovereign-config-woodpecker-broker", "healthcheck"]
