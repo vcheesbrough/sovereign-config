@@ -119,6 +119,17 @@ fn it_is_one_plugin_step() {
     );
 }
 
+/// The tag moves, so the agent must pull it on every run. Without `pull:
+/// true` Woodpecker reuses a cached `:stable` plugin after a code-vitals
+/// prod deploy, and that plugin starts the collector of its own, stale
+/// version (code-vitals #573).
+#[test]
+fn it_pulls_the_moving_tag_every_run() {
+    let pipeline = pipeline();
+    let step = pipeline.step_in(WORKFLOW, "code-vitals");
+    assert_eq!(step["pull"].as_bool(), Some(true));
+}
+
 /// The plugin is the only moving tag in the Woodpecker workflows (code-vitals'
 /// approved exception); every other step image is pinned by digest.
 #[test]
