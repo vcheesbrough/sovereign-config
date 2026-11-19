@@ -132,7 +132,7 @@ Every component is released together from one source tag under one version.
 | :---: | --- | --- |
 | 🐳 | **Docker with Compose**, linux/amd64 | The reference stack is [`compose.yaml`](compose.yaml). |
 | 🐘 | **PostgreSQL** | The reference stack runs its own, pinned by digest. A deployment needs `CREATE` on its database, which the bundled role has. |
-| 🪪 | **Authentik 2026.5.2 or newer** | The repository ships Authentik blueprints that create everything the service needs (see [Authentication](docs/authentication.md)). Authentik is the only supported identity provider today; support for other OIDC providers is planned (see [Roadmap](#roadmap)). |
+| 🪪 | **Authentik 2026.5.2 or newer** | The repository ships Authentik blueprints that create everything the service needs (see [Authentik](docs/authentik.md)). Authentik is the only identity provider the server is built with today. What any other would have to provide is written down as [the realm contract](docs/authentication.md#the-realm-contract), and support for more is planned (see [Roadmap](#roadmap)). |
 | 🔀 | **A TLS-terminating reverse proxy** | It must forward HTTP/2 cleartext (h2c) to the service. The reference stack is currently labelled for the author's own Traefik setup (see [step 4](#4-configure-and-start)). |
 | 💾 | **Encrypted storage** | For the database volume and for every backup. |
 
@@ -150,7 +150,9 @@ Every component is released together from one source tag under one version.
 
 ### 1. Set up the identity provider
 
-Apply the matching Authentik blueprint (`authentik/blueprint.yaml` for production, `authentik/blueprint-dev.yaml` for development) to your Authentik instance, substituting its `${VARIABLE}` placeholders first. It creates the OIDC provider, the grant scope mapping, the contributor group, and the restricted connection-manager service account and its API token. [Authentication](docs/authentication.md) lists every object it creates and the variables it needs.
+The server takes its identity provider from `SOVEREIGN_CONFIG_IDENTITY_PROVIDER`, which defaults to `authentik`, the one provider it is built with. Each provider has a chapter that says how to set it up and which variables it reads; Authentik's is [Authentik](docs/authentik.md).
+
+Apply the matching Authentik blueprint (`authentik/blueprint.yaml` for production, `authentik/blueprint-dev.yaml` for development) to your Authentik instance, substituting its `${VARIABLE}` placeholders first. It creates the OIDC provider, the grant scope mapping, the contributor group, and the restricted connection-manager service account and its API token. [Authentik](docs/authentik.md) lists every object it creates and the variables it needs.
 
 > [!TIP]
 > Note the blueprint's **issuer URL**, its **client id** (the audience) and the **connection-manager API token**. The server needs all three.
@@ -224,6 +226,7 @@ The server is configured entirely through environment variables. `compose.yaml` 
 | Variable | Required | Purpose |
 | --- | :---: | --- |
 | `SOVEREIGN_CONFIG_DATABASE_URL` / `_FILE` | ✅ | The PostgreSQL connection URL. |
+| `SOVEREIGN_CONFIG_IDENTITY_PROVIDER` | — | The identity provider the server starts with. Unset means `authentik`, the only one it is built with; any other name fails startup. The provider's own variables follow: the `SOVEREIGN_CONFIG_OIDC_*` and `SOVEREIGN_CONFIG_MANAGER_*` rows below are Authentik's ([Authentik](docs/authentik.md#server-variables)). A deployment keeps the provider its first start recorded ([Authentication](docs/authentication.md#choosing-the-identity-provider)). |
 | `SOVEREIGN_CONFIG_OIDC_ISSUER` | ✅ | The Authentik provider's issuer URL. The Authentik administration origin is derived from it, so the API and issuer origins can never diverge. |
 | `SOVEREIGN_CONFIG_OIDC_AUDIENCE` | ✅ | The `aud` every access token must carry; tokens for any other audience are refused. With Authentik it is the application's client id. |
 | `SOVEREIGN_CONFIG_PUBLIC_ORIGIN` | ✅ | The exact canonical HTTPS origin embedded in generated access URLs. No userinfo, no path other than `/`, no query and no fragment. |
@@ -420,7 +423,7 @@ The project intends to extend Sovereign Config in these directions. They are sta
 | | Direction | Intent |
 | :---: | --- | --- |
 | 🧭 | **An infrastructure-neutral deployment** | `compose.yaml` still names the author's own Traefik setup (see [step 4](#4-configure-and-start)). The intent is to make the proxy network, entrypoint, certificate resolver and middlewares configurable, or to ship them as an example rather than defaults, so the stack needs no editing. |
-| 🪪 | **More identity providers** | Authentication is built on standard OIDC access tokens, verified locally against the issuer's published keys, but the setup, grant mapping and managed connections currently depend on Authentik. The intent is to support other OIDC identity providers as well. |
+| 🪪 | **More identity providers** | The server is provider-neutral: the provider is chosen by `SOVEREIGN_CONFIG_IDENTITY_PROVIDER`, tokens are read by rules the provider supplies, and what a provider must offer is the [realm contract](docs/authentication.md#the-realm-contract). Authentik is the only provider built in so far. The intent is to add others, each as its own crate and setup file. |
 | 🧩 | **Providers for more languages** | Applications currently read configuration through the Rust `sovereign-config-provider` crate, or through `sovereign-config render` from any language. The intent is to offer native providers for other ecosystems, starting with .NET, with the same guarantees: a scoped access URL, protocol negotiation, and no caching of revealed secrets. |
 
 ## Documentation
@@ -430,7 +433,8 @@ The project intends to extend Sovereign Config in these directions. They are sta
 | ⌨️ | [CLI](docs/cli.md) | Profiles, commands, output formats, `render`, CI use. |
 | 🖥️ | [Web UI](docs/web-ui.md) | Sessions and the behaviour of each view. |
 | 🤖 | [MCP server](docs/mcp.md) | Installing, configuring and the tool surface. |
-| 🪪 | [Authentication](docs/authentication.md) | Authentik blueprints, grants, token verification, credential rotation, access URLs. |
+| 🪪 | [Authentication](docs/authentication.md) | Choosing the identity provider, the realm contract any provider must meet, token verification, credential rotation, access URLs. |
+| 🧩 | [Authentik](docs/authentik.md) | How Authentik meets the realm contract: blueprints, the objects they create, grants, its server variables. |
 | 📜 | [Audit trail](docs/audit-trail.md) | What is recorded, failure policy, querying, the browser view. |
 | 📡 | [Observability](docs/observability.md) | Spans, metrics, logs, configuration, web UI telemetry. |
 | ⬆️ | [Upgrading](docs/upgrading.md) | The upgrade procedure and the releases that need action. |

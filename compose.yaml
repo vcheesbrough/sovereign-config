@@ -53,6 +53,9 @@ services:
       # The internal health listener (`/readyz`); the name predates metrics
       # moving to OTLP, and is kept rather than churn an operator variable.
       SOVEREIGN_CONFIG_METRICS_ADDR: 0.0.0.0:9090
+      # The identity provider; unset means `authentik`. The OIDC and MANAGER
+      # variables below are that provider's own (docs/authentik.md).
+      SOVEREIGN_CONFIG_IDENTITY_PROVIDER: ${SOVEREIGN_CONFIG_IDENTITY_PROVIDER:-}
       SOVEREIGN_CONFIG_OIDC_ISSUER: ${SOVEREIGN_CONFIG_OIDC_ISSUER:?Set SOVEREIGN_CONFIG_OIDC_ISSUER}
       SOVEREIGN_CONFIG_OIDC_AUDIENCE: ${SOVEREIGN_CONFIG_OIDC_AUDIENCE:?Set SOVEREIGN_CONFIG_OIDC_AUDIENCE}
       SOVEREIGN_CONFIG_PUBLIC_ORIGIN: ${SOVEREIGN_CONFIG_PUBLIC_ORIGIN:?Set SOVEREIGN_CONFIG_PUBLIC_ORIGIN}

@@ -12,9 +12,11 @@
 //! generated types. Review would let that erode one convenient import at a
 //! time; this does not.
 //!
-//! And it guards the identity-provider seam (bored card #381): managed
-//! connections depend on the `ManagedIdentityProvider` trait, and only the
-//! startup wiring may name the Authentik implementation behind it.
+//! And it guards the identity-provider seam (bored cards #381 and #576): the
+//! server depends on the identity-provider contract, only provider selection
+//! may name an implementation behind it, and no other server source may
+//! carry what belongs to one provider — its paths, its claims, its setup
+//! file's values.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,10 +46,35 @@ const VERSION_AWARE: [&str; 3] = ["main.rs", "system.rs", "handshake.rs"];
 /// The one implementation of the identity-provider trait, as a path segment.
 const AUTHENTIK_CRATE: &str = "sovereign_config_authentik";
 
-/// Server sources, relative to `src/`, that may name it: `config.rs` parses
-/// the `SOVEREIGN_CONFIG_MANAGER_*` variables into its configuration, and
-/// `main.rs` builds it and hands the service the trait object.
-const BUILDS_THE_PROVIDER: [&str; 2] = ["main.rs", "config.rs"];
+/// The server source, relative to `src/`, that may name it: provider
+/// selection, which matches the configured name to an implementation and
+/// hands everything else the contract's types.
+const BUILDS_THE_PROVIDER: [&str; 1] = ["identity.rs"];
+
+/// What belongs to one identity provider, and so to no server source but
+/// provider selection — compared without regard to case. A new provider adds
+/// its own here, as it adds its crate to [`BUILDS_THE_PROVIDER`]'s module.
+///
+/// - the provider's name, in prose as much as in code;
+/// - its URL layout: Authentik's per-provider issuer path and key-set path;
+/// - its claim layout: the grants claim and the display-name claims;
+/// - its variables, which its own crate parses;
+/// - its setup file, and the values the realm contract takes from it (those
+///   live in `sovereign_config_identity::contract`).
+const PROVIDER_SPECIFIC: [&str; 12] = [
+    "authentik",
+    "/application/o/",
+    "jwks/",
+    "sovereign_config_grants",
+    "preferred_username",
+    "\"username\"",
+    "sovereign_config_oidc_",
+    "sovereign_config_manager_",
+    "blueprint",
+    "(access url)",
+    "access_token_validity",
+    "refresh_token_validity",
+];
 
 /// The server modules split at the protocol seam. Each holds one shared
 /// implementation, `<module>/service.rs`, and a `<module>/vN.rs` shim per
@@ -271,26 +298,45 @@ fn only_startup_names_the_identity_provider_implementation() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "only startup may name the Authentik implementation; depend on \
-         `sovereign_config_identity::ManagedIdentityProvider` instead: {offenders:?}"
+        "only provider selection may name the Authentik implementation; depend on \
+         `sovereign_config_identity` instead: {offenders:?}"
+    );
+}
+
+/// Card #576: outside provider selection the server is provider-neutral, in
+/// its prose as much as in its code — a comment naming a provider is a sign
+/// of an assumption the contract does not make. Test code may still name
+/// one: the verifier's and the managed service's tests drive the Authentik
+/// implementation through the seam on purpose.
+#[test]
+fn no_server_source_carries_what_belongs_to_one_identity_provider() {
+    let mut carried: Vec<String> = Vec::new();
+    for (relative, contents) in server_sources() {
+        if BUILDS_THE_PROVIDER.contains(&relative.as_str()) {
+            continue;
+        }
+        let product = contents
+            .split_once("#[cfg(test)]\nmod tests {")
+            .map_or(contents.as_str(), |(product, _)| product)
+            .to_lowercase();
+        for specific in PROVIDER_SPECIFIC {
+            if product.contains(specific) {
+                carried.push(format!("{relative} names {specific:?}"));
+            }
+        }
+    }
+    assert!(
+        carried.is_empty(),
+        "a server source must not name a provider's paths, claims, variables or setup \
+         values; say \"the identity provider\" and read them through \
+         `sovereign_config_identity`: {carried:#?}"
     );
 
-    // The managed service is provider-neutral in its prose too: a comment
-    // naming Authentik is a sign of an assumption the trait does not make.
-    // An in-file test module may still name it (the blueprint checks do).
-    let named: Vec<&str> = sources
-        .iter()
-        .filter(|(relative, _)| relative.starts_with("managed/"))
-        .filter(|(_, contents)| {
-            let product = contents
-                .split_once("#[cfg(test)]\nmod tests {")
-                .map_or(contents.as_str(), |(product, _)| product);
-            product.to_lowercase().contains("authentik")
-        })
-        .map(|(relative, _)| relative.as_str())
-        .collect();
-    assert!(
-        named.is_empty(),
-        "the managed service must not name a provider; say \"the identity provider\": {named:?}"
-    );
+    // The check has teeth only while provider selection really is where
+    // those things would otherwise be named.
+    let (_, selection) = server_sources()
+        .into_iter()
+        .find(|(relative, _)| relative == BUILDS_THE_PROVIDER[0])
+        .expect("provider selection exists");
+    assert!(selection.to_lowercase().contains(PROVIDER_SPECIFIC[0]));
 }

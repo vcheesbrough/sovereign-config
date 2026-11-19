@@ -40,6 +40,10 @@ docker compose up -d --wait
 
 Newest first. A release not listed needs nothing beyond the procedure.
 
+### 2.56: the identity provider is chosen by configuration
+
+No action. `SOVEREIGN_CONFIG_IDENTITY_PROVIDER` selects the identity provider and defaults to `authentik`, so a deployment that does not set it starts exactly as before, with the same variables, the same access URLs and the same tokens. Migration `0016` adds one small table, in which the first start records `authentik` as the deployment's provider; from then on the server refuses to start under a different provider name ([Authentication](authentication.md#choosing-the-identity-provider)). Clients need no change, and no protocol version changed.
+
 ### 2.55: containers run with less privilege
 
 Take `compose.yaml` from 2.55 or later. The server now runs with a read-only root filesystem, no capabilities and `no-new-privileges`. PostgreSQL keeps five capabilities and loses the rest. Nothing in the database volume changes owner.

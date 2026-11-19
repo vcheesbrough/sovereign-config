@@ -70,7 +70,7 @@ Metrics are **pushed over OTLP** with the same resource identity as spans and lo
 | `sovereign_config_protocol_client_versions_total` | counter | `version` | Versions named in handshake client lists |
 | `sovereign_config_authentication_total` | counter | `outcome`, `reason` | Authentication results, bounded reasons only: `accepted`, `missing_bearer`, `malformed_bearer`, `wrong_algorithm`, `bad_signature` (no published key verifies it, including an unknown `kid`), `inactive` (expired or not yet valid), `invalid_claims`, `dependency_unavailable` (an uncached key that could not be fetched) |
 | `sovereign_config_managed_connection_operations_total` | counter | `operation`, `result` | Managed-connection operations |
-| `sovereign_config_managed_dependency_total` | counter | `call`, `outcome` | Authentik calls made for managed connections |
+| `sovereign_config_managed_dependency_total` | counter | `call`, `outcome` | Identity provider calls made for managed connections |
 | `sovereign_config_audit_events_total` | counter | `kind`, `outcome` | Audit writes; `outcome="failed"` is the alert series ([Audit trail](audit-trail.md)) |
 | `sovereign_config_audit_retention_swept_total`, `…_sweep_failures_total` | counter | — | The retention sweep |
 

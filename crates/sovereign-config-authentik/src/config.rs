@@ -1,6 +1,6 @@
-//! What the Authentik implementation needs, validated once at startup. The
-//! server parses the `SOVEREIGN_CONFIG_MANAGER_*` variables into it; no error
-//! message quotes a value.
+//! What the Authentik implementation needs, validated once at startup.
+//! `settings` parses the `SOVEREIGN_CONFIG_MANAGER_*` variables into it; no
+//! error message quotes a value.
 
 use std::time::Duration;
 
@@ -38,7 +38,7 @@ impl AuthentikConfig {
     ///
     /// The client id differs from the audience, the client id, grants
     /// attribute or group name is not permitted, or the issuer has no usable
-    /// origin. No message quotes a value; the server, which knows where the
+    /// origin. No message quotes a value; `settings`, which knows where the
     /// client id came from, checks its form first and names its variable.
     pub fn new(
         issuer: &Url,

@@ -61,7 +61,7 @@ Dev runs whichever branch was deployed last. A migration deployed from a branch 
 
 The pipeline does not require a dev deployment before a promotion, but **deploy the main commit to dev before promoting it to prod**. That is an operator rule, not a gate. A published build means the checks passed. CI's migration checks run against a fresh PostgreSQL, and `deploy-prod` runs its own live connection-manager check. Only a dev deployment proves the release against a long-lived database and against live Authentik with the development blueprint. Skipping it is an accepted risk, not an oversight.
 
-Each deployment applies its environment's blueprint before starting the stack; production applies only the production blueprint. Before applying, the pipeline checks the Authentik instance's authenticated version endpoint and schema against the minimum version the blueprints need ([Authentication](authentication.md)).
+Each deployment applies its environment's blueprint before starting the stack; production applies only the production blueprint. Before applying, the pipeline checks the Authentik instance's authenticated version endpoint and schema against the minimum version the blueprints need ([Authentik](authentik.md#blueprints)).
 
 ### Production prerequisites
 

@@ -9,6 +9,12 @@
 //! documented here and enforced by the `conformance` feature's suite, which
 //! every implementation runs.
 //!
+//! Beside it sits the rest of what a provider owns: how its access tokens are
+//! verified ([`VerificationRules`]), what clients need to sign in
+//! ([`LoginDescription`]), and its own configuration, which it reads from
+//! [`Variables`]. [`IdentityProvider`] is all of it together, and [`contract`]
+//! holds the terms the server relies on whatever the provider.
+//!
 //! Server-side only, and free of any transport: an implementation brings its
 //! own.
 
@@ -18,6 +24,15 @@ use core::fmt;
 
 use async_trait::async_trait;
 pub use sovereign_config_core::Secret;
+
+pub mod contract;
+mod provider;
+mod variables;
+mod verification;
+
+pub use provider::{IdentityProvider, LoginDescription};
+pub use variables::{ProcessEnvironment, Variables};
+pub use verification::{ClaimedGrant, Claims, GrantsEncoding, InvalidRules, VerificationRules};
 
 #[cfg(any(test, feature = "conformance"))]
 pub mod conformance;

@@ -220,8 +220,8 @@ fn bounded_path(path: &str) -> String {
 }
 
 /// Stamps the authenticated caller on the request's span: `user.id` is the
-/// token's `sub`, `user.name` the identity provider's display name
-/// (`preferred_username`, else `username`). Span attributes only — never a
+/// token's `sub`, `user.name` the identity provider's display name (the
+/// first display-name claim its verification rules find). Span attributes only — never a
 /// metric label, never a log field (docs/observability.md says what
 /// holding them in the trace store obliges).
 pub(crate) fn stamp_user(span: &Span, principal: &AuthenticatedPrincipal) {

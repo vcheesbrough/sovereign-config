@@ -11,9 +11,9 @@ use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
 
-use crate::conformance::{ConformanceTarget, Operation};
+use crate::conformance::{ConformanceTarget, Operation, TokenRefused, presented_secret};
 use crate::{
-    AccountGrant, AccountId, ClientCredential, CredentialId, ManagedIdentityProvider,
+    AccountGrant, AccountId, ClaimedGrant, ClientCredential, CredentialId, ManagedIdentityProvider,
     ProviderError, ProvisionedAccount, Secret,
 };
 
@@ -308,7 +308,47 @@ impl ConformanceTarget for FakeIdentityProvider {
         Self::fail_next(self, operation, error);
         true
     }
+
+    /// The fake's token endpoint: a credential obtains a token when it is
+    /// the account's current one, presented as a client presents it, and the
+    /// account is in the browsing group — as the development Authentik admits
+    /// an account to the application only through that group. The token is
+    /// the account's identifier, which only the fake can read.
+    async fn obtain_token(
+        &self,
+        username: &str,
+        credential: &ClientCredential,
+    ) -> Option<Result<String, TokenRefused>> {
+        let presented = presented_secret(username, credential);
+        let token = self
+            .account(username)
+            .filter(|account| {
+                account.in_browse_group
+                    && account.client_id == credential.client_id()
+                    && presented == presented_secret(username, &account.client_credential())
+            })
+            .map(|account| format!("{FAKE_TOKEN_PREFIX}{}", account.account.as_str()));
+        Some(token.ok_or_else(TokenRefused::default))
+    }
+
+    async fn token_grants(&self, token: &str) -> Option<Vec<ClaimedGrant>> {
+        let account = token.strip_prefix(FAKE_TOKEN_PREFIX)?;
+        let state = self.state();
+        let account = state.accounts.get(account)?;
+        Some(
+            account
+                .root
+                .iter()
+                .map(|root| ClaimedGrant {
+                    prefix: root.clone(),
+                    permissions: account.permissions.clone(),
+                })
+                .collect(),
+        )
+    }
 }
+
+const FAKE_TOKEN_PREFIX: &str = "fake-token-";
 
 #[cfg(test)]
 mod tests {
@@ -319,6 +359,7 @@ mod tests {
     async fn the_fake_conforms_and_produces_every_class() {
         let report = run_conformance(|| async { FakeIdentityProvider::new() }).await;
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert!(report.tokens_checked, "the fake implements the token hooks");
         assert_eq!(
             report.produced.len(),
             Operation::ALL.len() * ProviderError::ALL.len()

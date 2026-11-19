@@ -3,6 +3,7 @@ mod auth;
 mod config;
 mod encryption;
 mod handshake;
+mod identity;
 mod managed;
 mod metrics;
 mod protocol;
@@ -49,7 +50,6 @@ use metrics::{
 };
 use opentelemetry::metrics::Meter;
 use protocol::ProtocolVersionLayer;
-use sovereign_config_authentik::AuthentikProvider;
 use sovereign_config_identity::ManagedIdentityProvider;
 use sovereign_config_proto::sovereign::config::{
     handshake_server::HandshakeServer,
@@ -125,8 +125,10 @@ async fn serve(meter: &Meter) -> Result<()> {
     let protocol_metrics = Arc::new(ProtocolMetrics::new(SERVED_PROTOCOL_LABELS));
     let audit_metrics = Arc::new(AuditMetrics::default());
     let audit = AuditRecorder::new(Arc::clone(&audit_metrics), config.audit.coalesce_window);
-    let (managed_provider, managed_settings) = managed_dependencies(config.managed)?;
+    let (managed_provider, managed_settings) = managed_dependencies(config.managed);
     let database = connect_database(&config.database_url).await?;
+    // Before anything acts on a stored account: they belong to one provider.
+    identity::claim_deployment(&database, config.identity_provider).await?;
     let value_cipher = Arc::new(config.value_cipher);
     encrypt_stored_secrets(&database, &value_cipher).await?;
 
@@ -172,6 +174,7 @@ async fn serve(meter: &Meter) -> Result<()> {
         grpc_addr = %config.grpc_addr,
         metrics_addr = %config.metrics_addr,
         protocol_versions = SERVED_PROTOCOL_LABELS.join(","),
+        identity_provider = config.identity_provider,
         "sovereign-config started"
     );
     let router = Server::builder()
@@ -265,21 +268,19 @@ fn add_versioned_services<L>(router: GrpcRouter<L>, shared: &Implementations) ->
 }
 
 /// The identity provider and the non-secret settings the managed connection
-/// service builds URLs from. The only place an implementation is chosen:
-/// everything past this sees the trait.
+/// service builds URLs from. Which provider it is was settled in `identity`:
+/// everything from here on sees the trait.
 fn managed_dependencies(
     managed: ManagedConnectionConfig,
-) -> Result<(Arc<dyn ManagedIdentityProvider>, ManagedSettings)> {
-    // Comfortably longer than the bounded provider call, so an expired lease
-    // proves the previous rotation attempt has ended.
-    let rotation_lease = managed.provider.timeout() * 6;
-    let provider = Arc::new(AuthentikProvider::new(managed.provider)?);
+) -> (Arc<dyn ManagedIdentityProvider>, ManagedSettings) {
     let settings = ManagedSettings {
         public_origin: managed.public_origin,
         issuer: managed.issuer,
-        rotation_lease,
+        // Comfortably longer than the bounded provider call, so an expired
+        // lease proves the previous rotation attempt has ended.
+        rotation_lease: managed.call_timeout * 6,
     };
-    Ok((provider, settings))
+    (managed.accounts, settings)
 }
 
 /// Connects to the required `PostgreSQL` dependency and applies the

@@ -163,6 +163,79 @@ fn malformed_value_encryption_key_fails_startup_without_echoing_values() {
     );
 }
 
+fn rendered(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// Card #576: `SOVEREIGN_CONFIG_IDENTITY_PROVIDER` selects the provider. A
+/// name this server does not have stops startup at the selection, naming the
+/// variable and the providers there are, and never repeating what was set.
+#[test]
+fn an_unknown_identity_provider_fails_startup_naming_the_variable() {
+    const UNKNOWN: &str = "provider-sentinel-5b1e";
+    let mut environment = configured_environment("127.0.0.1:50051");
+    environment.push(("SOVEREIGN_CONFIG_IDENTITY_PROVIDER", UNKNOWN.to_owned()));
+    let output = run_server(&environment);
+
+    assert_secret_is_redacted(&output);
+    let rendered = rendered(&output);
+    assert!(
+        rendered.contains(
+            "SOVEREIGN_CONFIG_IDENTITY_PROVIDER names no identity provider this server has; \
+             it has: authentik"
+        ),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(UNKNOWN), "{rendered}");
+}
+
+/// Unset, as every deployment before 2.56.0 has it, and set to `authentik`
+/// are the same provider: both get past the selection and the provider's
+/// own settings, and fail only on the database this test does not run.
+#[test]
+fn an_unset_identity_provider_is_authentik() {
+    for selection in [None, Some("authentik")] {
+        let mut environment = configured_environment("127.0.0.1:50051");
+        if let Some(selection) = selection {
+            environment.push(("SOVEREIGN_CONFIG_IDENTITY_PROVIDER", selection.to_owned()));
+        }
+        let output = run_server(&environment);
+
+        assert_secret_is_redacted(&output);
+        let rendered = rendered(&output);
+        assert!(
+            rendered.contains("unable to connect to required PostgreSQL dependency"),
+            "{selection:?}: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SOVEREIGN_CONFIG_IDENTITY_PROVIDER"),
+            "{selection:?}: {rendered}"
+        );
+    }
+}
+
+/// The chosen provider's own settings are its to require: without one,
+/// startup fails naming it.
+#[test]
+fn the_chosen_providers_missing_setting_fails_startup_by_name() {
+    let environment = configured_environment("127.0.0.1:50051")
+        .into_iter()
+        .filter(|(name, _)| *name != "SOVEREIGN_CONFIG_MANAGER_GROUP")
+        .collect::<Vec<_>>();
+    let output = run_server(&environment);
+
+    assert_secret_is_redacted(&output);
+    let rendered = rendered(&output);
+    assert!(
+        rendered.contains("required configuration SOVEREIGN_CONFIG_MANAGER_GROUP is missing"),
+        "{rendered}"
+    );
+}
+
 /// Telemetry configuration can carry a credential (`OTEL_EXPORTER_OTLP_HEADERS`)
 /// and names internal addresses, so no `OTEL_*` value may reach a log line —
 /// on the path where telemetry starts and exports, and the server then fails
