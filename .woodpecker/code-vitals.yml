@@ -29,6 +29,9 @@ steps:
     # it replaces, this image holds the docker socket: moving `:stable` runs
     # new code with the agent host's Docker daemon, without a change here.
     image: registry.desync.link/code-vitals-plugin:stable
+    # The tag moves: without this an agent keeps running its cached plugin,
+    # and the collector of that plugin's version (code-vitals #573).
+    pull: true
     failure: ignore
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
