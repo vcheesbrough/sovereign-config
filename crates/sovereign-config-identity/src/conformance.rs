@@ -89,9 +89,39 @@ pub trait ConformanceTarget: Send + Sync {
     }
 }
 
-/// The token endpoint refused the credential.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TokenRefused;
+/// The token endpoint refused the credential, and what it said: enough for a
+/// failed run to explain itself, and never the response body.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TokenRefused {
+    /// The HTTP status, when the refusal came over HTTP.
+    pub status: Option<u16>,
+    /// The OAuth `error` code (RFC 6749 §5.2), such as `invalid_grant`,
+    /// when the response carried one in the expected form.
+    pub error: Option<String>,
+}
+
+impl TokenRefused {
+    /// A refusal over HTTP. `error` is the response's `error` field, kept only
+    /// when it is a short code of the shape RFC 6749 gives it (lower-case
+    /// letters and `_`), so no description, token or other text from the
+    /// response is ever carried.
+    #[must_use]
+    pub fn http(status: u16, error: Option<&str>) -> Self {
+        let error = error
+            .filter(|code| {
+                !code.is_empty()
+                    && code.len() <= 64
+                    && code
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            })
+            .map(str::to_owned);
+        Self {
+            status: Some(status),
+            error,
+        }
+    }
+}
 
 /// The `client_secret` a deployed client posts for `credential`: it takes the
 /// connection URL the server would hand out for the account and presents
@@ -242,21 +272,6 @@ async fn grants_the_account(target: &impl ConformanceTarget, created: &Provision
             "a {attempt} grant succeeds: grant is idempotent"
         );
     }
-    let tokens_checked = match authenticates(target, &created.credential).await {
-        None => false,
-        Some(token) => {
-            let token = token.expect("a created account's credential obtains an access token");
-            assert_eq!(
-                target.token_grants(&token).await,
-                Some(vec![ClaimedGrant {
-                    prefix: grant().root.to_owned(),
-                    permissions: PERMISSIONS.map(str::to_owned).to_vec(),
-                }]),
-                "the account's access token carries exactly the grant it was given"
-            );
-            true
-        }
-    };
     assert_eq!(
         provider
             .rename_account(&created.account, "Renamed pipeline")
@@ -269,7 +284,27 @@ async fn grants_the_account(target: &impl ConformanceTarget, created: &Provision
         Ok(()),
         "assign_browse_group succeeds when the group exists"
     );
-    tokens_checked
+    // Only once the account is set up as the server sets it up — granted and
+    // in its group — is its credential what an access URL hands out. An
+    // identity provider may admit an account to the application only through
+    // that group, as the development Authentik does.
+    match authenticates(target, &created.credential).await {
+        None => false,
+        Some(token) => {
+            let token = token.unwrap_or_else(|refused| {
+                panic!("a provisioned account's credential obtains an access token: {refused:?}")
+            });
+            assert_eq!(
+                target.token_grants(&token).await,
+                Some(vec![ClaimedGrant {
+                    prefix: grant().root.to_owned(),
+                    permissions: PERMISSIONS.map(str::to_owned).to_vec(),
+                }]),
+                "the account's access token carries exactly the grant it was given"
+            );
+            true
+        }
+    }
 }
 
 /// The credential's value is replaced: the same credential, the same client,
@@ -305,15 +340,14 @@ async fn replaces_the_credential(
         "replacing a credential's value keeps the credential"
     );
     if tokens_checked {
-        assert_eq!(
-            authenticates(target, &created.credential).await,
-            Some(Err(TokenRefused)),
+        let previous = authenticates(target, &created.credential).await;
+        assert!(
+            matches!(previous, Some(Err(_))),
             "a replaced credential's previous value no longer obtains a token"
         );
-        assert!(
-            matches!(authenticates(target, &replacement).await, Some(Ok(_))),
-            "a replaced credential's new value obtains a token"
-        );
+        if let Some(Err(refused)) = authenticates(target, &replacement).await {
+            panic!("a replaced credential's new value obtains a token: {refused:?}");
+        }
     }
     replacement
 }
@@ -345,9 +379,8 @@ async fn deletes_the_account(
         "a deleted account is not found, not {found:?}"
     );
     if tokens_checked {
-        assert_eq!(
-            authenticates(target, replacement).await,
-            Some(Err(TokenRefused)),
+        assert!(
+            matches!(authenticates(target, replacement).await, Some(Err(_))),
             "a deleted account's credential no longer obtains a token"
         );
     }
@@ -537,4 +570,37 @@ async fn failure_is_classified(
         );
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenRefused;
+
+    /// A refusal keeps the status and a well-formed OAuth error code, and
+    /// nothing else the response said.
+    #[test]
+    fn a_refusal_keeps_only_the_status_and_an_error_code() {
+        assert_eq!(
+            TokenRefused::http(400, Some("invalid_grant")),
+            TokenRefused {
+                status: Some(400),
+                error: Some("invalid_grant".to_owned()),
+            }
+        );
+        for unusable in [
+            None,
+            Some(""),
+            Some("User not authenticated"),
+            Some("invalid_grant: token-sentinel"),
+            Some("INVALID_GRANT"),
+        ] {
+            assert_eq!(
+                TokenRefused::http(401, unusable).error,
+                None,
+                "{unusable:?}"
+            );
+        }
+        let long = "a".repeat(65);
+        assert_eq!(TokenRefused::http(400, Some(&long)).error, None);
+    }
 }

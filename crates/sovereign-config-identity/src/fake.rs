@@ -310,8 +310,10 @@ impl ConformanceTarget for FakeIdentityProvider {
     }
 
     /// The fake's token endpoint: a credential obtains a token when it is
-    /// the account's current one, presented as a client presents it. The
-    /// token is the account's identifier, which only the fake can read.
+    /// the account's current one, presented as a client presents it, and the
+    /// account is in the browsing group — as the development Authentik admits
+    /// an account to the application only through that group. The token is
+    /// the account's identifier, which only the fake can read.
     async fn obtain_token(
         &self,
         username: &str,
@@ -321,11 +323,12 @@ impl ConformanceTarget for FakeIdentityProvider {
         let token = self
             .account(username)
             .filter(|account| {
-                account.client_id == credential.client_id()
+                account.in_browse_group
+                    && account.client_id == credential.client_id()
                     && presented == presented_secret(username, &account.client_credential())
             })
             .map(|account| format!("{FAKE_TOKEN_PREFIX}{}", account.account.as_str()));
-        Some(token.ok_or(TokenRefused))
+        Some(token.ok_or_else(TokenRefused::default))
     }
 
     async fn token_grants(&self, token: &str) -> Option<Vec<ClaimedGrant>> {

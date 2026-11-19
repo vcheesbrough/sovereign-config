@@ -90,8 +90,13 @@ impl ConformanceTarget for Live {
             .send()
             .await
             .expect("the token endpoint answers");
-        if !response.status().is_success() {
-            return Some(Err(TokenRefused));
+        let status = response.status();
+        if !status.is_success() {
+            // The status and the OAuth `error` code only: the rest of the
+            // body is the provider's text, and stays out of the output.
+            let body: Option<Value> = response.json().await.ok();
+            let error = body.as_ref().and_then(|body| body["error"].as_str());
+            return Some(Err(TokenRefused::http(status.as_u16(), error)));
         }
         let body: Value = response.json().await.expect("a token response is JSON");
         assert!(

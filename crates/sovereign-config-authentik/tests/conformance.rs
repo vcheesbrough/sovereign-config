@@ -413,7 +413,7 @@ impl ConformanceTarget for Target {
         let backend = self.state.lock().unwrap();
         Some(
             mint_token(&backend, &self.issuer, credential.client_id(), &presented)
-                .ok_or(TokenRefused),
+                .ok_or_else(|| TokenRefused::http(400, Some("invalid_grant"))),
         )
     }
 
