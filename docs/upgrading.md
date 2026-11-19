@@ -40,6 +40,14 @@ docker compose up -d --wait
 
 Newest first. A release not listed needs nothing beyond the procedure.
 
+### 2.55: containers run with less privilege
+
+Take `compose.yaml` from 2.55 or later. The server now runs with a read-only root filesystem, no capabilities and `no-new-privileges`. PostgreSQL keeps five capabilities and loses the rest. Nothing in the database volume changes owner.
+
+- **Secret files.** The server still runs as uid `10001`, so a secret file it owns stays readable. Its group id changed from `999` to `10001`. A secret file the server could read only through group `999` must be re-owned: `chown 10001:10001 <file>`. Files owned and moded as the [README](../README.md#3-create-the-secrets) says need nothing.
+- **Your own `compose.yaml`.** Nothing is required: the image runs as `10001:10001` by itself. To harden the server, copy `user:`, `cap_drop:`, `read_only:`, `tmpfs:` and `security_opt:` from the reference file.
+- **Extra mounts.** A volume you added to the server must be writable by `10001:10001`, because nothing else in the container is writable.
+
 ### 2.49.3: the image moved to GHCR
 
 The image is `ghcr.io/vcheesbrough/sovereign-config`, public. Take `compose.yaml` from 2.49.3 or later, or change your own `image:` line. Releases before 2.49 are not on GHCR, except 2.48.428 and 2.46.418.
