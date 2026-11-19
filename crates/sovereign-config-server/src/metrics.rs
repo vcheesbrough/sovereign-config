@@ -803,7 +803,7 @@ impl CounterFamily for ManagedConnectionMetrics {
         },
         Instrument {
             name: names::MANAGED_DEPENDENCY,
-            description: "Managed connection Authentik dependency outcomes.",
+            description: "Managed connection identity provider dependency outcomes.",
         },
     ];
 

@@ -1,18 +1,16 @@
-use std::{env, fs, net::IpAddr, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{env, net::IpAddr, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
-use sovereign_config_authentik::AuthentikConfig;
-use sovereign_config_core::Secret;
-use sovereign_config_identity::ClientCredential;
+use sovereign_config_identity::{
+    ManagedIdentityProvider, ProcessEnvironment, Variables, VerificationRules,
+};
 
 use crate::encryption::{ValueCipher, decode_key};
+use crate::identity;
 
 /// For one fetch of an issuer's signing keys (docs/authentication.md, "Request authentication").
 const JWKS_TIMEOUT: Duration = Duration::from_secs(3);
-const MANAGER_TIMEOUT: Duration = Duration::from_secs(5);
-/// Optional: the OAuth client access URLs name, when it is not the audience.
-const MANAGER_CLIENT_ID: &str = "SOVEREIGN_CONFIG_MANAGER_CLIENT_ID";
 
 const SECONDS_PER_HOUR: u64 = 60 * 60;
 const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
@@ -21,6 +19,9 @@ pub(crate) struct Config {
     pub(crate) database_url: String,
     pub(crate) grpc_addr: SocketAddr,
     pub(crate) metrics_addr: SocketAddr,
+    /// The name of the identity provider this server was started with: one
+    /// of a compiled-in set, never the configured text.
+    pub(crate) identity_provider: &'static str,
     pub(crate) authentication: AuthenticationConfig,
     pub(crate) web: WebConfig,
     pub(crate) managed: ManagedConnectionConfig,
@@ -62,9 +63,12 @@ fn audit_page_size(value: Option<&str>) -> Result<u32> {
 
 pub(crate) struct ManagedConnectionConfig {
     pub(crate) public_origin: String,
+    /// The issuer every access URL names: the one clients are handed.
     pub(crate) issuer: String,
     /// The identity provider managed connections are provisioned in.
-    pub(crate) provider: AuthentikConfig,
+    pub(crate) accounts: Arc<dyn ManagedIdentityProvider>,
+    /// The longest one call to it may take.
+    pub(crate) call_timeout: Duration,
 }
 
 pub(crate) struct WebConfig {
@@ -84,15 +88,11 @@ pub(crate) struct WebConfig {
 }
 
 pub(crate) struct AuthenticationConfig {
-    pub(crate) accepted_identities: Vec<AcceptedIdentity>,
+    /// How each accepted issuer's access tokens are verified and read, as
+    /// its identity provider describes them.
+    pub(crate) rules: Vec<VerificationRules>,
     /// For one fetch of an issuer's signing keys.
     pub(crate) timeout: Duration,
-}
-
-#[derive(Clone)]
-pub(crate) struct AcceptedIdentity {
-    pub(crate) issuer: String,
-    pub(crate) audience: String,
 }
 
 impl Config {
@@ -109,12 +109,9 @@ impl Config {
             bail!("gRPC and metrics listeners must use different addresses");
         }
 
-        let issuer = required_env("SOVEREIGN_CONFIG_OIDC_ISSUER")?;
-        let issuer_url = issuer
-            .parse::<Url>()
-            .context("SOVEREIGN_CONFIG_OIDC_ISSUER must be a valid URL")?;
-        validate_issuer_url(&issuer, &issuer_url)?;
-        let audience = required_identifier("SOVEREIGN_CONFIG_OIDC_AUDIENCE")?;
+        // The provider reads and validates its own variables; nothing about
+        // any one provider is known here.
+        let provider = identity::from_variables(&ProcessEnvironment)?;
 
         let public_origin =
             validated_public_origin(&required_env("SOVEREIGN_CONFIG_PUBLIC_ORIGIN")?)?;
@@ -125,17 +122,6 @@ impl Config {
         let client_telemetry_endpoint = validated_client_telemetry_endpoint(
             env::var(CLIENT_TELEMETRY_ENDPOINT).ok().as_deref(),
             &public_origin,
-        )?;
-        let manager_client_id =
-            manager_client_id(env::var(MANAGER_CLIENT_ID).ok().as_deref(), &audience)?;
-        let provider = AuthentikConfig::new(
-            &issuer_url,
-            Secret::new(required_secret("SOVEREIGN_CONFIG_MANAGER_API_TOKEN")?),
-            &manager_client_id,
-            &audience,
-            &required_env("SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE")?,
-            &required_env("SOVEREIGN_CONFIG_MANAGER_GROUP")?,
-            MANAGER_TIMEOUT,
         )?;
         let value_cipher = value_cipher_from_env()?;
         let audit = AuditConfig {
@@ -160,23 +146,22 @@ impl Config {
             database_url,
             grpc_addr,
             metrics_addr,
+            identity_provider: provider.name,
             authentication: AuthenticationConfig {
-                accepted_identities: vec![AcceptedIdentity {
-                    issuer: issuer.clone(),
-                    audience: audience.clone(),
-                }],
+                rules: vec![provider.verification],
                 timeout: JWKS_TIMEOUT,
             },
             web: WebConfig {
-                issuer: issuer.clone(),
-                client_id: audience.clone(),
+                issuer: provider.login.issuer.clone(),
+                client_id: provider.login.web_client_id,
                 dist_dir,
                 client_telemetry_endpoint,
             },
             managed: ManagedConnectionConfig {
                 public_origin,
-                issuer,
-                provider,
+                issuer: provider.login.issuer,
+                accounts: provider.accounts,
+                call_timeout: provider.call_timeout,
             },
             audit,
             value_cipher,
@@ -187,7 +172,7 @@ impl Config {
 /// Builds the value cipher from the operator-supplied encryption key.
 ///
 /// The key is required unconditionally, exactly like the database URL and the
-/// manager token. Making it conditional on secrets already being stored would
+/// identity provider's credentials. Making it conditional on secrets already being stored would
 /// only move the failure to the first secret write, long after startup, where
 /// it is far harder to diagnose and far easier to miss.
 fn value_cipher_from_env() -> Result<ValueCipher> {
@@ -263,37 +248,6 @@ fn validated_client_telemetry_endpoint(
     Ok(Some(public_origin.to_owned()))
 }
 
-/// The OAuth client every access URL names, which managed accounts
-/// authenticate through: `SOVEREIGN_CONFIG_MANAGER_CLIENT_ID` when set, else
-/// the token audience. With Authentik the two must be equal — a token minted
-/// through any other client carries that client's id as its `aud` and would
-/// be refused — and the audience is then also what a connection URL must be
-/// able to carry. Every refusal names the variable to change, never a value.
-/// The Authentik crate checks the same rule again; this is the check that can
-/// name the variables.
-fn manager_client_id(explicit: Option<&str>, audience: &str) -> Result<String> {
-    if let Some(client_id) = explicit.map(str::trim).filter(|value| !value.is_empty()) {
-        if !ClientCredential::admits_client_id(client_id) {
-            bail!("{MANAGER_CLIENT_ID} is not a client id a connection URL can carry");
-        }
-        if client_id != audience {
-            bail!(
-                "{MANAGER_CLIENT_ID} must equal SOVEREIGN_CONFIG_OIDC_AUDIENCE with Authentik, \
-                 whose tokens carry the client id they were minted through as their audience; \
-                 leave it unset"
-            );
-        }
-    }
-    if !ClientCredential::admits_client_id(audience) {
-        bail!(
-            "SOVEREIGN_CONFIG_OIDC_AUDIENCE is not a client id a connection URL can carry; \
-             with Authentik it is also the client id access URLs name, so it must be the \
-             application's client id"
-        );
-    }
-    Ok(audience.to_owned())
-}
-
 /// An optional whole-number setting: `default` when unset or blank, otherwise
 /// a value from `1` to `maximum`.
 fn optional_bounded(name: &str, default: u32, maximum: u32) -> Result<u32> {
@@ -313,64 +267,19 @@ fn bounded_setting(name: &str, value: Option<&str>, default: u32, maximum: u32) 
     }
 }
 
-/// Rejects issuers that are valid URLs but not in the exact canonical form
-/// `ConnectionUrl::managed` requires when it later reparses the same string:
-/// accepting a non-canonical issuer here would only surface as a failure
-/// after Authentik has already been mutated by a create or rotate.
-fn validate_issuer_url(raw: &str, url: &Url) -> Result<()> {
-    if url.scheme() != "https"
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || !url.path().starts_with("/application/o/")
-        || !url.path().ends_with('/')
-    {
-        bail!("SOVEREIGN_CONFIG_OIDC_ISSUER is not a permitted issuer URL");
-    }
-    if url.as_str() != raw {
-        bail!("SOVEREIGN_CONFIG_OIDC_ISSUER must be in canonical form (expected {url})");
-    }
-    Ok(())
-}
-
-fn required_identifier(name: &str) -> Result<String> {
-    let value = required_env(name)?;
-    if value.bytes().any(|byte| byte.is_ascii_whitespace()) {
-        bail!("required configuration {name} must not contain whitespace");
-    }
-    Ok(value)
-}
-
 pub(crate) fn required_env(name: &str) -> Result<String> {
-    match env::var(name) {
-        Ok(value) if !value.trim().is_empty() => Ok(value),
-        _ => bail!("required configuration {name} is missing or empty"),
-    }
+    ProcessEnvironment.required(name)
 }
 
 pub(crate) fn required_secret(name: &str) -> Result<String> {
-    if let Ok(value) = env::var(name)
-        && !value.trim().is_empty()
-    {
-        return Ok(value);
-    }
-
-    let file_name = format!("{name}_FILE");
-    let path = required_env(&file_name)?;
-    let value = fs::read_to_string(&path).with_context(|| format!("unable to read {file_name}"))?;
-    if value.trim().is_empty() {
-        bail!("{file_name} points to an empty secret file");
-    }
-    Ok(value.trim().to_owned())
+    ProcessEnvironment.secret(name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        audit_page_size, bounded_setting, manager_client_id, required_env, validate_issuer_url,
-        validated_client_telemetry_endpoint, validated_public_origin,
+        audit_page_size, bounded_setting, required_env, validated_client_telemetry_endpoint,
+        validated_public_origin,
     };
 
     /// Absent is off; present is the public origin and nothing else, because
@@ -512,93 +421,5 @@ mod tests {
                 "{unusable:?}: {error}"
             );
         }
-    }
-
-    #[test]
-    fn the_access_url_client_id_defaults_to_the_audience() {
-        assert_eq!(
-            manager_client_id(None, "sovereign-config").unwrap(),
-            "sovereign-config"
-        );
-        for blank in ["", "   "] {
-            assert_eq!(
-                manager_client_id(Some(blank), "sovereign-config").unwrap(),
-                "sovereign-config"
-            );
-        }
-    }
-
-    /// With Authentik the client id is the audience: setting it to anything
-    /// else, or to a value of the wrong form, is refused, as is an audience a
-    /// URL can't carry. Each refusal names the variable to change and quotes
-    /// no value.
-    #[test]
-    fn the_access_url_client_id_is_checked_and_names_its_variable() {
-        assert_eq!(
-            manager_client_id(Some("sovereign-config"), "sovereign-config").unwrap(),
-            "sovereign-config"
-        );
-
-        let mismatch = format!(
-            "{:#}",
-            manager_client_id(Some("other-sentinel"), "audience-sentinel").unwrap_err()
-        );
-        assert!(
-            mismatch.starts_with(
-                "SOVEREIGN_CONFIG_MANAGER_CLIENT_ID must equal SOVEREIGN_CONFIG_OIDC_AUDIENCE"
-            ),
-            "{mismatch}"
-        );
-
-        let malformed = format!(
-            "{:#}",
-            manager_client_id(Some("bad sentinel/id"), "sovereign-config").unwrap_err()
-        );
-        assert!(
-            malformed.starts_with("SOVEREIGN_CONFIG_MANAGER_CLIENT_ID is not"),
-            "{malformed}"
-        );
-
-        let audience = format!(
-            "{:#}",
-            manager_client_id(None, "urn:sentinel:audience").unwrap_err()
-        );
-        assert!(
-            audience.starts_with("SOVEREIGN_CONFIG_OIDC_AUDIENCE is not"),
-            "{audience}"
-        );
-        assert!(
-            !audience.contains("set SOVEREIGN_CONFIG_MANAGER_CLIENT_ID"),
-            "{audience}"
-        );
-
-        for message in [mismatch, malformed, audience] {
-            assert!(!message.contains("sentinel"), "{message}");
-        }
-    }
-
-    #[test]
-    fn issuer_requires_an_https_per_provider_url() {
-        let canonical = "https://example.test/application/o/sovereign-config/";
-        assert!(validate_issuer_url(canonical, &canonical.parse().unwrap()).is_ok());
-        let no_provider_path = "https://example.test/";
-        assert!(validate_issuer_url(no_provider_path, &no_provider_path.parse().unwrap()).is_err());
-        let insecure = "http://example.test/application/o/sovereign-config/";
-        assert!(validate_issuer_url(insecure, &insecure.parse().unwrap()).is_err());
-    }
-
-    /// Regression: a valid-but-non-canonical issuer must be rejected at
-    /// startup rather than accepted and later fail managed URL generation
-    /// after Authentik has already been mutated by a create or rotate.
-    #[test]
-    fn issuer_must_already_be_in_canonical_form() {
-        let raw = "HTTPS://Example.test:443/application/o/sovereign-config/";
-        let url: reqwest::Url = raw.parse().unwrap();
-        assert_ne!(
-            url.as_str(),
-            raw,
-            "the test issuer must actually be non-canonical"
-        );
-        assert!(validate_issuer_url(raw, &url).is_err());
     }
 }

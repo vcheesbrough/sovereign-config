@@ -7,6 +7,11 @@
 //! scripted failure is produced as Authentik would produce it (a status code,
 //! a redirect, a garbled body, a commit whose response is a 500), so the
 //! classification under test is the implementation's own.
+//!
+//! The mock also stands in for the token endpoint, for the suite's token
+//! hooks: it accepts what a deployed client presents for an app password, and
+//! mints a token whose claims are what the blueprint's grants mapping signs.
+//! `tests/live.rs` runs the same hooks against a real Authentik.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -22,27 +27,43 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, patch, post},
 };
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use serde_json::{Value, json};
-use sovereign_config_authentik::{AuthentikConfig, AuthentikProvider};
-use sovereign_config_core::Secret;
+use sovereign_config_authentik::{AuthentikConfig, AuthentikProvider, verification_rules};
+use sovereign_config_core::{ConfigPath, ConnectionUrl, Secret};
 use sovereign_config_identity::{
-    ManagedIdentityProvider, ProviderError,
-    conformance::{ConformanceTarget, Operation, run_conformance},
+    ClaimedGrant, ClientCredential, ManagedIdentityProvider, ProviderError,
+    conformance::{ConformanceTarget, Operation, TokenRefused, presented_secret, run_conformance},
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 
 const GROUP_NAME: &str = "sovereign-config-conformance";
 const GROUP_PK: &str = "22222222-2222-2222-2222-222222222222";
+const CLIENT_ID: &str = "sovereign-config";
+const GRANTS_ATTRIBUTE: &str = "sovereign_config_conformance_grants";
+const ISSUER_PATH: &str = "/application/o/sovereign-config/";
 
 struct User {
     username: String,
+    /// The attributes last patched onto the user, which the grants mapping
+    /// reads.
+    attributes: Value,
+}
+
+/// An app-password token: its owner and its current key.
+struct Token {
+    owner: i64,
+    key: String,
 }
 
 #[derive(Default)]
 struct Backend {
     users: BTreeMap<i64, User>,
-    /// Token identifier → owning user.
-    tokens: BTreeMap<String, i64>,
+    /// Token identifier → the token.
+    tokens: BTreeMap<String, Token>,
     next_pk: i64,
     faults: HashMap<Operation, VecDeque<ProviderError>>,
 }
@@ -118,9 +139,16 @@ async fn create_account(State(state): State<Shared>, Json(body): Json<Value>) ->
             pk,
             User {
                 username: username.clone(),
+                attributes: json!({}),
             },
         );
-        backend.tokens.insert(format!("token-{pk}"), pk);
+        backend.tokens.insert(
+            format!("token-{pk}"),
+            Token {
+                owner: pk,
+                key: format!("app-password-{pk}"),
+            },
+        );
         Json(json!({
             "username": username,
             "user_uid": format!("uid-{pk}"),
@@ -149,7 +177,14 @@ async fn patch_user(
     };
     let outcome = take_fault(&state, operation, false);
     respond(outcome, || {
-        existing(&state, pk, || Json(json!({})).into_response())
+        let mut backend = state.lock().unwrap();
+        let Some(user) = backend.users.get_mut(&pk) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if let Some(attributes) = body.get("attributes") {
+            user.attributes = attributes.clone();
+        }
+        Json(json!({})).into_response()
     })
 }
 
@@ -170,7 +205,7 @@ async fn delete_user(State(state): State<Shared>, Path(pk): Path<i64>) -> Respon
             return StatusCode::NOT_FOUND.into_response();
         }
         // Authentik deletes a user's tokens with it.
-        backend.tokens.retain(|_, owner| *owner != pk);
+        backend.tokens.retain(|_, token| token.owner != pk);
         StatusCode::NO_CONTENT.into_response()
     })
 }
@@ -206,9 +241,9 @@ async fn list_tokens(
         let results: Vec<Value> = backend
             .tokens
             .iter()
-            .filter(|(_, owner)| {
+            .filter(|(_, token)| {
                 query.get("intent").map(String::as_str) == Some("app_password")
-                    && backend.users.get(owner).map(|user| &user.username) == username
+                    && backend.users.get(&token.owner).map(|user| &user.username) == username
             })
             .map(|(identifier, _)| json!({ "identifier": identifier }))
             .collect();
@@ -233,19 +268,72 @@ async fn list_groups(
 }
 
 #[allow(clippy::unused_async, clippy::needless_pass_by_value)]
-async fn set_key(State(state): State<Shared>, Path(identifier): Path<String>) -> Response {
+async fn set_key(
+    State(state): State<Shared>,
+    Path(identifier): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
     let outcome = take_fault(&state, Operation::ReplaceCredential, false);
     respond(outcome, || {
-        if state.lock().unwrap().tokens.contains_key(&identifier) {
-            Json(json!({})).into_response()
-        } else {
-            StatusCode::NOT_FOUND.into_response()
-        }
+        let mut backend = state.lock().unwrap();
+        let Some(token) = backend.tokens.get_mut(&identifier) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        body["key"]
+            .as_str()
+            .unwrap_or_default()
+            .clone_into(&mut token.key);
+        Json(json!({})).into_response()
     })
+}
+
+/// Authentik's token endpoint for the `client_credentials` grant, as far as
+/// a managed account uses it: `client_secret` is the standard base64 of
+/// `<username>:<app password>`, presented through the application's client.
+/// The token is unsigned — the server's verifier has its own tests — and
+/// carries the claims the blueprint's grants mapping signs.
+fn mint_token(
+    backend: &Backend,
+    issuer: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> Option<String> {
+    let decoded = String::from_utf8(STANDARD.decode(client_secret).ok()?).ok()?;
+    let (username, password) = decoded.split_once(':')?;
+    let (pk, user) = backend
+        .users
+        .iter()
+        .find(|(_, user)| user.username == username)?;
+    let authenticated = client_id == CLIENT_ID
+        && backend
+            .tokens
+            .values()
+            .any(|token| token.owner == *pk && token.key == password);
+    if !authenticated {
+        return None;
+    }
+    let grants = user
+        .attributes
+        .get(GRANTS_ATTRIBUTE)
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let claims = json!({
+        "iss": issuer,
+        "aud": CLIENT_ID,
+        "sub": format!("uid-{pk}"),
+        "scope": "sovereign-config",
+        "sovereign_config_grants": grants,
+    });
+    Some(format!(
+        "{}.{}.unsigned",
+        URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","kid":"mock"}"#),
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    ))
 }
 
 struct Target {
     provider: AuthentikProvider,
+    issuer: String,
     state: Shared,
     task: JoinHandle<()>,
 }
@@ -274,21 +362,20 @@ async fn target() -> Target {
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let issuer = format!("http://{address}/application/o/sovereign-config/")
-        .parse()
-        .unwrap();
+    let issuer = format!("http://{address}{ISSUER_PATH}");
     let config = AuthentikConfig::new(
-        &issuer,
+        &issuer.parse().unwrap(),
         Secret::new("conformance-api-token"),
-        "sovereign-config",
-        "sovereign-config",
-        "sovereign_config_conformance_grants",
+        CLIENT_ID,
+        CLIENT_ID,
+        GRANTS_ATTRIBUTE,
         GROUP_NAME,
         Duration::from_secs(2),
     )
     .unwrap();
     Target {
         provider: AuthentikProvider::new(config).unwrap(),
+        issuer,
         state,
         task,
     }
@@ -315,6 +402,26 @@ impl ConformanceTarget for Target {
             .push_back(error);
         true
     }
+
+    async fn obtain_token(
+        &self,
+        username: &str,
+        credential: &ClientCredential,
+    ) -> Option<Result<String, TokenRefused>> {
+        let presented = presented_secret(username, credential)
+            .expect("a credential the provider returned forms a connection URL");
+        let backend = self.state.lock().unwrap();
+        Some(
+            mint_token(&backend, &self.issuer, credential.client_id(), &presented)
+                .ok_or(TokenRefused),
+        )
+    }
+
+    async fn token_grants(&self, token: &str) -> Option<Vec<ClaimedGrant>> {
+        let payload = URL_SAFE_NO_PAD.decode(token.split('.').nth(1)?).ok()?;
+        let claims = serde_json::from_slice(&payload).ok()?;
+        verification_rules(&self.issuer, CLIENT_ID).grants(&claims)
+    }
 }
 
 #[tokio::test]
@@ -325,8 +432,49 @@ async fn authentik_conforms_to_the_identity_provider_contract() {
         .map(|operation| (operation, ProviderError::Unavailable))
         .collect();
     assert_eq!(report.skipped, expected_skips);
+    assert!(
+        report.tokens_checked,
+        "the mock token endpoint lets a credential and a grant be checked in a token"
+    );
     assert_eq!(
         report.produced.len(),
         Operation::ALL.len() * (ProviderError::ALL.len() - 1)
     );
+}
+
+/// An Authentik access URL, byte for byte: the application's client id for
+/// every account, and the account's username and app password in the
+/// version-1 `client_secret`. Deployed clients hold URLs of exactly this
+/// form, and decode them into what Authentik's token endpoint accepts.
+#[tokio::test]
+async fn an_authentik_access_url_is_byte_identical() {
+    const USERNAME: &str = "sc-managed-pipeline-conformanceconnection0000000001";
+    let target = target().await;
+    let created = target.provider.create_account(USERNAME).await.unwrap();
+    // Exactly the server's call (`managed/provisioning.rs`).
+    let url = ConnectionUrl::managed(
+        "https://config.example.test",
+        &ConfigPath::parse("/apps/pipeline").unwrap(),
+        "https://auth.example.test/application/o/sovereign-config/",
+        created.credential.client_id(),
+        USERNAME,
+        created.credential.secret(),
+    )
+    .unwrap();
+    assert_eq!(
+        url.canonical().expose(),
+        "https://config.example.test/apps/pipeline#v=1\
+         &issuer=https%3A%2F%2Fauth.example.test%2Fapplication%2Fo%2Fsovereign-config%2F\
+         &client_id=sovereign-config\
+         &client_secret=c2MtbWFuYWdlZC1waXBlbGluZS1jb25mb3JtYW5jZWNvbm5lY3Rpb24wMDAwMDAwMDAxOmFwcC1wYXNzd29yZC0x"
+    );
+    // What a deployed client then presents is what the token endpoint takes.
+    assert_eq!(
+        url.client_authentication().unwrap().expose(),
+        STANDARD.encode(format!("{USERNAME}:app-password-1"))
+    );
+    assert!(matches!(
+        target.obtain_token(USERNAME, &created.credential).await,
+        Some(Ok(_))
+    ));
 }

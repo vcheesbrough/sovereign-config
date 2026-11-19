@@ -18,7 +18,10 @@
 use std::time::Duration;
 
 use sovereign_config_core::{ConnectionId, ManagedConnectionState};
-use sovereign_config_identity::ProviderError;
+use sovereign_config_identity::{
+    ProviderError,
+    contract::{ACCESS_TOKEN_LIFETIME, ACCESS_URL_NAME_MARKER},
+};
 use tracing::{Instrument, field::Empty, info, warn};
 
 use super::ManagedConnectionsService;
@@ -29,21 +32,18 @@ use crate::audit::{self, ActorRename};
 use crate::metrics::{ManagedDependencyCall, ManagedDependencyOutcome};
 use crate::spans;
 
-/// What the scope mapping in each environment's blueprint appends to a
-/// managed account's name when it signs it as `preferred_username`, so an
-/// access URL can never read as a person. A test holds the blueprints to it.
-pub(crate) const ACCESS_URL_MARKER: &str = " (access URL)";
-
-/// How long after renaming the accounts the trail is repaired: the provider's
-/// access-token lifetime (`access_token_validity: minutes=5` in both
-/// blueprints, which a test holds to this) plus a minute's margin. Until then a
-/// token minted under an account's old name can still record an event under
-/// it, and the repair would miss it.
-pub(crate) const TRAIL_REPAIR_DELAY: Duration = Duration::from_mins(6);
+/// How long after renaming the accounts the trail is repaired: the longest an
+/// access token lives under the realm contract, plus a minute's margin. Until
+/// then a token minted under an account's old name can still record an event
+/// under it, and the repair would miss it.
+pub(crate) const TRAIL_REPAIR_DELAY: Duration =
+    Duration::from_secs(ACCESS_TOKEN_LIFETIME.as_secs() + 60);
 
 /// The name an account's tokens carry: its connection's display name, marked.
 pub(super) fn marked(name: &str) -> String {
-    format!("{name}{ACCESS_URL_MARKER}")
+    // What the realm contract has the identity provider append when it signs
+    // a managed account's name, so an access URL can never read as a person.
+    format!("{name}{ACCESS_URL_NAME_MARKER}")
 }
 
 impl ManagedConnectionsService {
@@ -220,27 +220,14 @@ fn actor_rename(account: &AccountRow) -> Option<ActorRename> {
 mod tests {
     use super::*;
 
-    const BLUEPRINTS: [&str; 2] = [
-        include_str!("../../../../authentik/blueprint.yaml"),
-        include_str!("../../../../authentik/blueprint-dev.yaml"),
-    ];
-
     #[test]
-    fn the_blueprints_mark_a_managed_name_as_the_repair_does() {
-        let signed = format!(
-            "claims[\"preferred_username\"] = f\"{{request.user.name}}{ACCESS_URL_MARKER}\""
-        );
-        for blueprint in BLUEPRINTS {
-            assert!(blueprint.contains(&signed), "{signed}");
-        }
+    fn a_managed_name_is_marked_as_an_access_urls() {
         assert_eq!(marked("Pipeline reader"), "Pipeline reader (access URL)");
     }
 
     #[test]
     fn the_trail_is_repaired_only_after_every_old_token_has_expired() {
-        for blueprint in BLUEPRINTS {
-            assert!(blueprint.contains("access_token_validity: minutes=5"));
-        }
-        assert!(TRAIL_REPAIR_DELAY > Duration::from_mins(5));
+        assert!(TRAIL_REPAIR_DELAY > ACCESS_TOKEN_LIFETIME);
+        assert_eq!(TRAIL_REPAIR_DELAY, Duration::from_mins(6));
     }
 }

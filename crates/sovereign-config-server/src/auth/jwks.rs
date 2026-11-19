@@ -1,15 +1,17 @@
 //! The issuers' signing keys, held in memory so a request is verified without
-//! a round-trip to Authentik (docs/authentication.md, "Request authentication").
+//! a round-trip to the identity provider (docs/authentication.md, "Request
+//! authentication").
 //!
-//! Keys come from one place only: `<issuer>jwks/` for each configured issuer —
-//! the `jwks_uri` Authentik's discovery document names for a per-provider
-//! issuer. A token's own `jku`, `x5u` or embedded `jwk` header is never
-//! consulted, so a token cannot name the key that verifies it.
+//! Keys come from one place only: the key location each issuer's
+//! verification rules name, which its identity provider supplied at startup.
+//! A token's own `jku`, `x5u` or embedded `jwk` header is never consulted, so
+//! a token cannot name the key that verifies it.
 //!
-//! A successful fetch **replaces** the issuer's key set, so a key Authentik
-//! drops stops being trusted at the next fetch: within [`PERIODIC_REFRESH`]. A
-//! failed fetch keeps the last good set, because a key that verified a token a
-//! minute ago has not become less trustworthy by Authentik being unreachable.
+//! A successful fetch **replaces** the issuer's key set, so a key the
+//! provider drops stops being trusted at the next fetch: within
+//! [`PERIODIC_REFRESH`]. A failed fetch keeps the last good set, because a key
+//! that verified a token a minute ago has not become less trustworthy by the
+//! provider being unreachable.
 
 use std::{
     collections::HashMap,
@@ -30,14 +32,14 @@ use super::read_bounded_response;
 use crate::spans;
 
 /// How often every issuer's key set is re-read while the server runs: the
-/// longest a key Authentik removes is still trusted.
+/// longest a key the identity provider removes is still trusted.
 pub(crate) const PERIODIC_REFRESH: Duration = Duration::from_mins(10);
 /// How soon a failed periodic fetch is tried again — at startup, until the
-/// keys first load, and whenever Authentik is unreachable.
+/// keys first load, and whenever the identity provider is unreachable.
 pub(crate) const RETRY_INTERVAL: Duration = Duration::from_secs(15);
 /// The fewest seconds between two fetches of one issuer's keys prompted by
 /// tokens naming a key not in the cache. Without it, a stream of tokens with
-/// invented `kid`s would be a stream of requests to Authentik.
+/// invented `kid`s would be a stream of requests to the identity provider.
 ///
 /// Only such a fetch starts the interval; the periodic re-read and the startup
 /// retry do not, so they never delay picking up a newly rotated key. Inside
@@ -116,20 +118,20 @@ struct Jwk {
 }
 
 impl KeySets {
+    /// One key set per issuer, each read from the location given with it.
     pub(crate) fn new<'a>(
-        issuers: impl IntoIterator<Item = &'a str>,
+        issuers: impl IntoIterator<Item = (&'a str, &'a str)>,
         timeout: Duration,
         min_refresh_interval: Duration,
     ) -> Result<Self> {
         let mut sets: Vec<IssuerKeys> = Vec::new();
-        for issuer in issuers {
+        for (issuer, jwks_uri) in issuers {
             if sets.iter().any(|set| set.issuer == issuer) {
                 continue;
             }
-            let jwks_url = issuer
+            let jwks_url = jwks_uri
                 .parse::<Url>()
-                .and_then(|url| url.join("jwks/"))
-                .context("the issuer does not form a JWKS URL")?;
+                .context("the issuer's signing-key location is not a URL")?;
             sets.push(IssuerKeys {
                 issuer: issuer.to_owned(),
                 jwks_url,
@@ -140,7 +142,7 @@ impl KeySets {
         let client = Client::builder()
             .timeout(timeout)
             .https_only(sets.iter().all(|set| set.jwks_url.scheme() == "https"))
-            // The key set is read from the configured issuer and nowhere else.
+            // The key set is read from the configured location and nowhere else.
             .redirect(redirect::Policy::none())
             .build()
             .context("unable to configure the JWKS client")?;

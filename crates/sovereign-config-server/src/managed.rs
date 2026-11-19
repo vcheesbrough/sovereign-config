@@ -3,7 +3,7 @@
 //! Implements the `ManagedConnections` gRPC service: listing safe metadata,
 //! and creating, rotating, and revoking machine connections whose credentials
 //! live only in the identity provider (`ManagedIdentityProvider`, which
-//! `main.rs` alone builds — Authentik today). Each connection carries an operator-selected
+//! provider selection alone builds). Each connection carries an operator-selected
 //! permission set (read/write/manage) on its root. Sovereign Config persists
 //! non-secret lifecycle metadata and returns each connection URL exactly once.
 //!

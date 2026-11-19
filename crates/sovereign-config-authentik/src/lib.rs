@@ -1,7 +1,10 @@
-//! Authentik as the identity provider managed connections are provisioned
-//! in: the one implementation of
-//! [`sovereign_config_identity::ManagedIdentityProvider`].
+//! Authentik as the server's identity provider: everything the server
+//! takes from one ([`sovereign_config_identity::IdentityProvider`]), and
+//! everything it knows about Authentik.
 //!
+//! - `settings` — [`from_variables`]: Authentik's variables, parsed and
+//!   validated into the whole provider, and [`verification_rules`]: how its
+//!   access tokens are read.
 //! - `config` — [`AuthentikConfig`]: the administration origin (derived from
 //!   the issuer), token, grants attribute, browsing group and timeout, and
 //!   their validation.
@@ -11,7 +14,11 @@
 //!   [`sovereign_config_identity::AccountId`]s.
 //! - `password` — the replacement app passwords it generates.
 //!
-//! Only the server's `main.rs` builds one; everything else sees the trait.
+//! - `tests/blueprints.rs` holds the setup files (`authentik/blueprint*.yaml`)
+//!   to the realm contract's terms.
+//!
+//! Only the server's provider selection names this crate; everything else
+//! sees the contract.
 
 #![forbid(unsafe_code)]
 
@@ -19,6 +26,8 @@ mod client;
 mod config;
 mod password;
 mod provider;
+mod settings;
 
 pub use config::AuthentikConfig;
 pub use provider::AuthentikProvider;
+pub use settings::{NAME, from_variables, verification_rules};

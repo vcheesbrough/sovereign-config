@@ -108,6 +108,15 @@ steps:
       CARGO_INCREMENTAL: "0"
       SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL: https://auth.desync.link/
       SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP: sovereign-config-dev-connections
+      # The development application itself, for the live conformance check
+      # (`tests/live.rs`): a credential the manager returns must obtain a
+      # token at the real token endpoint, carrying the grant it set. It is
+      # the one live test that sets a real grant, on `/conformance/`, on an
+      # account it deletes, so production's gate does not name these and
+      # the test skips there.
+      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_ISSUER: https://auth.desync.link/application/o/sovereign-config-dev/
+      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_AUDIENCE: sovereign-config-dev
+      SOVEREIGN_CONFIG_LIVE_GRANTS_ATTRIBUTE: sovereign_config_dev_grants
       SOVEREIGN_CONFIG_LIVE_AUTHENTIK_TOKEN:
         from_secret: sovereign_config_dev_manager_api_token
       # Elevated credential used only to create and clean up a disposable

@@ -16,6 +16,9 @@ use http::{
 use http_body_util::BodyExt;
 use serde::Deserialize;
 use sovereign_config_core::ConfigPath;
+use sovereign_config_identity::{
+    ClaimedGrant, Claims, VerificationRules, contract::REQUIRED_SCOPE,
+};
 use tokio::task::JoinHandle;
 use tonic::{
     Status,
@@ -30,7 +33,7 @@ use tracing::{info, warn};
 
 use self::jwks::{KeyLookup, KeySets};
 use crate::{
-    config::{AcceptedIdentity, AuthenticationConfig},
+    config::AuthenticationConfig,
     metrics::{AuthenticationMetrics, AuthenticationResult, ProtocolMetrics},
     protocol::{NegotiatedProtocolVersion, UnservedVersionLayer},
     spans::{self, GrpcStatusLayer, RequestSpan},
@@ -39,13 +42,12 @@ use crate::{
 
 mod jwks;
 
-const REQUIRED_SCOPE: &str = "sovereign-config";
-/// The largest JWKS document read. Authentik's carries one key per signing
-/// certificate, each with its chain, which is a few kilobytes.
+/// The largest JWKS document read. A key set carries one key per signing
+/// certificate, each perhaps with its chain, which is a few kilobytes.
 const MAX_JWKS_RESPONSE_BYTES: usize = 64 * 1024;
 /// How far a token's `exp`, `nbf` and `iat` may disagree with this server's
 /// clock and still be accepted. Fixed, not a setting: it absorbs clock skew
-/// between Authentik and this host, and nothing else.
+/// between the identity provider and this host, and nothing else.
 const CLOCK_LEEWAY: Duration = Duration::from_secs(30);
 /// The unversioned handshake.
 ///
@@ -65,7 +67,9 @@ const OPERATIONAL_RPCS: [&str; 3] = [
 
 #[derive(Clone)]
 pub(crate) struct Authenticator {
-    accepted_identities: Arc<[AcceptedIdentity]>,
+    /// How each accepted issuer's tokens are read, as its identity provider
+    /// described them at startup. Nothing here is asked of a provider again.
+    rules: Arc<[VerificationRules]>,
     keys: Arc<KeySets>,
 }
 
@@ -90,6 +94,18 @@ pub(crate) enum Permission {
     Read,
     Write,
     Manage,
+}
+
+impl Permission {
+    /// The permission a grant names, in the one spelling a token may use.
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "read" => Some(Self::Read),
+            "write" => Some(Self::Write),
+            "manage" => Some(Self::Manage),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -154,24 +170,27 @@ struct Jwt<'a> {
 /// The access token's claims. Each is a raw JSON value so that a claim of an
 /// unexpected type is judged by the rule that reads it — a name claim that is
 /// not a string is no name, never a failed authentication.
+///
+/// `iss`, `aud`, `sub`, `exp`, `nbf` and `iat` mean what the standards say for
+/// every identity provider. Every other claim is read through the issuer's
+/// [`VerificationRules`].
 #[derive(Deserialize)]
-struct TokenClaims {
-    iss: Option<serde_json::Value>,
-    aud: Option<serde_json::Value>,
-    sub: Option<serde_json::Value>,
-    scope: Option<serde_json::Value>,
-    exp: Option<serde_json::Value>,
-    nbf: Option<serde_json::Value>,
-    iat: Option<serde_json::Value>,
-    sovereign_config_grants: Option<serde_json::Value>,
-    preferred_username: Option<serde_json::Value>,
-    username: Option<serde_json::Value>,
-}
+#[serde(transparent)]
+struct TokenClaims(Claims);
 
-#[derive(Deserialize)]
-struct RawGrant {
-    prefix: String,
-    permissions: Vec<Permission>,
+impl TokenClaims {
+    fn get(&self, claim: &str) -> Option<&serde_json::Value> {
+        self.0.get(claim)
+    }
+
+    fn text(&self, claim: &str) -> Option<&str> {
+        self.get(claim).and_then(serde_json::Value::as_str)
+    }
+
+    #[cfg(test)]
+    fn set(&mut self, claim: &str, value: serde_json::Value) {
+        self.0.insert(claim.to_owned(), value);
+    }
 }
 
 impl Authenticator {
@@ -183,16 +202,19 @@ impl Authenticator {
         config: AuthenticationConfig,
         min_refresh_interval: Duration,
     ) -> Result<Self> {
+        for rules in &config.rules {
+            rules.validate()?;
+        }
         let keys = KeySets::new(
             config
-                .accepted_identities
+                .rules
                 .iter()
-                .map(|identity| identity.issuer.as_str()),
+                .map(|rules| (rules.issuer.as_str(), rules.jwks_uri.as_str())),
             config.timeout,
             min_refresh_interval,
         )?;
         Ok(Self {
-            accepted_identities: config.accepted_identities.into(),
+            rules: config.rules.into(),
             keys: Arc::new(keys),
         })
     }
@@ -200,8 +222,8 @@ impl Authenticator {
     /// Loads the issuers' keys now and keeps them current for as long as the
     /// server runs. Serving does not wait for it: until the keys first load,
     /// an authenticated call fetches them itself or fails `UNAVAILABLE`, so an
-    /// unreachable Authentik at startup is an outage of authenticated calls,
-    /// not a crash loop.
+    /// unreachable identity provider at startup is an outage of authenticated
+    /// calls, not a crash loop.
     pub(crate) fn spawn_key_refresh(&self) -> JoinHandle<()> {
         self.spawn_key_refresh_every(jwks::PERIODIC_REFRESH, jwks::RETRY_INTERVAL)
     }
@@ -231,14 +253,8 @@ impl Authenticator {
         // this server fetch from anywhere else.
         let issuer = jwt
             .claims
-            .iss
-            .as_ref()
-            .and_then(serde_json::Value::as_str)
-            .filter(|issuer| {
-                self.accepted_identities
-                    .iter()
-                    .any(|identity| identity.issuer == *issuer)
-            })
+            .text("iss")
+            .filter(|issuer| self.rules.iter().any(|rules| rules.issuer == *issuer))
             .ok_or_else(|| {
                 AuthenticationFailure::unauthenticated(AuthenticationResult::InvalidClaims)
             })?;
@@ -257,7 +273,7 @@ impl Authenticator {
             ));
         }
         require_current(&jwt.claims, SystemTime::now())?;
-        validate_claims(jwt.claims, &self.accepted_identities)
+        validate_claims(&jwt.claims, &self.rules)
     }
 }
 
@@ -368,9 +384,9 @@ fn require_current(claims: &TokenClaims, now: SystemTime) -> Result<(), Authenti
         .unwrap_or_default()
         .as_secs_f64();
     let leeway = CLOCK_LEEWAY.as_secs_f64();
-    let time = |claim: &Option<serde_json::Value>| -> Result<Option<f64>, AuthenticationFailure> {
-        claim
-            .as_ref()
+    let time = |claim: &str| -> Result<Option<f64>, AuthenticationFailure> {
+        claims
+            .get(claim)
             .map(|value| {
                 value.as_f64().ok_or_else(|| {
                     AuthenticationFailure::unauthenticated(AuthenticationResult::InvalidClaims)
@@ -378,11 +394,11 @@ fn require_current(claims: &TokenClaims, now: SystemTime) -> Result<(), Authenti
             })
             .transpose()
     };
-    let expires = time(&claims.exp)?.ok_or_else(|| {
+    let expires = time("exp")?.ok_or_else(|| {
         AuthenticationFailure::unauthenticated(AuthenticationResult::InvalidClaims)
     })?;
-    let not_before = time(&claims.nbf)?;
-    let issued = time(&claims.iat)?;
+    let not_before = time("nbf")?;
+    let issued = time("iat")?;
     if now > expires + leeway
         || not_before.is_some_and(|not_before| not_before > now + leeway)
         || issued.is_some_and(|issued| issued > now + leeway)
@@ -394,75 +410,36 @@ fn require_current(claims: &TokenClaims, now: SystemTime) -> Result<(), Authenti
     Ok(())
 }
 
-#[cfg(test)]
-fn validate_for(
-    claims: TokenClaims,
-    expected_issuer: &str,
-    expected_audience: &str,
-) -> Result<AuthenticatedPrincipal, AuthenticationFailure> {
-    validate_claims(
-        claims,
-        &[AcceptedIdentity {
-            issuer: expected_issuer.to_owned(),
-            audience: expected_audience.to_owned(),
-        }],
-    )
-}
-
 /// The authorization claims of a token whose signature and validity window
-/// have already been checked.
+/// have already been checked, read by the rules of the issuer it names.
 ///
-/// **The required `scope` claim is also what refuses an ID token.** Authentik
-/// signs its ID tokens with the same key, issuer and audience as its access
-/// tokens, and the grants mapping writes into both; it adds `scope` only when
-/// it turns those claims into an access token. Introspection refused ID tokens
-/// by not knowing them; here, a token without `scope` fails as
-/// `invalid_claims`. `nonce` and `at_hash` do not tell the two apart — an
-/// Authentik access token copies them from its ID token.
+/// **The required scope claim is also what refuses an ID token.** An identity
+/// provider may sign its ID tokens with the same key, issuer and audience as
+/// its access tokens, and write the grants into both; the realm contract
+/// (docs/authentication.md) has it leave the scope claim out of an ID token,
+/// so a token without it fails here as `invalid_claims`.
 fn validate_claims(
-    claims: TokenClaims,
-    accepted_identities: &[AcceptedIdentity],
+    claims: &TokenClaims,
+    accepted: &[VerificationRules],
 ) -> Result<AuthenticatedPrincipal, AuthenticationFailure> {
-    let valid_identity = accepted_identities.iter().any(|identity| {
-        claims.iss.as_ref().and_then(serde_json::Value::as_str) == Some(&identity.issuer)
-            && claims
-                .aud
-                .as_ref()
-                .is_some_and(|audience| audience_contains(audience, &identity.audience))
-    });
-    let valid_claims = valid_identity
-        && claims
-            .scope
-            .as_ref()
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|scopes| {
-                scopes
-                    .split_ascii_whitespace()
-                    .any(|scope| scope == REQUIRED_SCOPE)
-            })
-        && claims
-            .sub
-            .as_ref()
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|subject| !subject.is_empty());
-    if !valid_claims {
-        return Err(AuthenticationFailure::unauthenticated(
-            AuthenticationResult::InvalidClaims,
-        ));
-    }
-
-    let raw_grants = serde_json::from_value(claims.sovereign_config_grants.ok_or_else(|| {
-        AuthenticationFailure::unauthenticated(AuthenticationResult::InvalidClaims)
-    })?)
-    .map_err(|_| AuthenticationFailure::unauthenticated(AuthenticationResult::InvalidClaims))?;
-    let grants = validate_grants(raw_grants)?;
-    let name = display_name(claims.preferred_username.as_ref(), claims.username.as_ref());
+    let invalid = || AuthenticationFailure::unauthenticated(AuthenticationResult::InvalidClaims);
+    let rules = accepted
+        .iter()
+        .find(|rules| {
+            claims.text("iss") == Some(&rules.issuer)
+                && claims
+                    .get("aud")
+                    .is_some_and(|audience| audience_contains(audience, &rules.audience))
+        })
+        .ok_or_else(invalid)?;
+    let subject = claims
+        .text("sub")
+        .filter(|subject| !subject.is_empty() && rules.has_scope(&claims.0, REQUIRED_SCOPE))
+        .ok_or_else(invalid)?;
+    let grants = validate_grants(rules.grants(&claims.0).ok_or_else(invalid)?)?;
     Ok(AuthenticatedPrincipal {
-        subject: claims
-            .sub
-            .and_then(|subject| subject.as_str().map(str::to_owned))
-            .expect("subject was validated as a non-empty string"),
-        name,
+        subject: subject.to_owned(),
+        name: display_name(rules.names(&claims.0)),
         grants,
     })
 }
@@ -470,8 +447,8 @@ fn validate_claims(
 /// The longest display name kept. It is shown in a list, not relied on.
 const MAX_DISPLAY_NAME_CHARACTERS: usize = 128;
 
-/// The name the audit trail shows for an identity: `preferred_username`, else
-/// `username`, made safe to store and to print.
+/// The name the audit trail shows for an identity: the first of the issuer's
+/// display-name claims that holds one, made safe to store and to print.
 ///
 /// **It can never fail authentication.** The name decides nothing — the
 /// subject is the identity and the grants are the authority — so a claim that
@@ -479,13 +456,9 @@ const MAX_DISPLAY_NAME_CHARACTERS: usize = 128;
 /// characters are dropped because the value is stored and later rendered in a
 /// list, and comes from the identity provider rather than from anything this
 /// server validated.
-fn display_name(
-    preferred_username: Option<&serde_json::Value>,
-    username: Option<&serde_json::Value>,
-) -> Option<String> {
-    [preferred_username, username]
+fn display_name<'a>(candidates: impl IntoIterator<Item = &'a serde_json::Value>) -> Option<String> {
+    candidates
         .into_iter()
-        .flatten()
         .filter_map(serde_json::Value::as_str)
         .map(|claim| {
             claim
@@ -509,23 +482,24 @@ fn audience_contains(audience: &serde_json::Value, expected: &str) -> bool {
         })
 }
 
-fn validate_grants(raw_grants: Vec<RawGrant>) -> Result<Vec<Grant>, AuthenticationFailure> {
+/// The grants a token claims, as this server holds them: every prefix a
+/// selection path, every permission one it knows, and none empty. One grant
+/// that is not fails the whole token rather than being dropped.
+fn validate_grants(claimed: Vec<ClaimedGrant>) -> Result<Vec<Grant>, AuthenticationFailure> {
+    let invalid = || AuthenticationFailure::unauthenticated(AuthenticationResult::InvalidClaims);
     let mut grants: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();
-    for raw_grant in raw_grants {
-        let Some(prefix) = canonical_prefix(&raw_grant.prefix) else {
-            return Err(AuthenticationFailure::unauthenticated(
-                AuthenticationResult::InvalidClaims,
-            ));
-        };
-        if raw_grant.permissions.is_empty() {
-            return Err(AuthenticationFailure::unauthenticated(
-                AuthenticationResult::InvalidClaims,
-            ));
+    for claimed_grant in claimed {
+        let prefix = canonical_prefix(&claimed_grant.prefix).ok_or_else(invalid)?;
+        if claimed_grant.permissions.is_empty() {
+            return Err(invalid());
         }
-        grants
-            .entry(prefix)
-            .or_default()
-            .extend(raw_grant.permissions);
+        let permissions = claimed_grant
+            .permissions
+            .iter()
+            .map(|permission| Permission::parse(permission))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(invalid)?;
+        grants.entry(prefix).or_default().extend(permissions);
     }
     Ok(grants
         .into_iter()
@@ -537,7 +511,7 @@ fn validate_grants(raw_grants: Vec<RawGrant>) -> Result<Vec<Grant>, Authenticati
 }
 
 /// Folds a grant prefix to its fold key, accepting any letter case so an
-/// operator writing `/apps/Example` in an Authentik grant attribute gets the
+/// operator writing `/apps/Example` in a grant at the identity provider gets the
 /// same coverage as `/apps/example`. `Grant::prefix` is always the fold key:
 /// [`AuthenticatedPrincipal::allows`] compares it byte-exact against a fold
 /// key, never a display form.

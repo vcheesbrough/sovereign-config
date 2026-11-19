@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The identity-provider contract managed connections are provisioned through: the trait, its types and its conformance suite"
+description = "The identity-provider contract: managed accounts, token verification rules, the login description, and the conformance suite"
 publish = false
 
 [features]
@@ -14,7 +14,10 @@ publish = false
 conformance = []
 
 [dependencies]
+anyhow.workspace = true
 async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sovereign-config-core = { path = "../sovereign-config-core" }
 
 [dev-dependencies]

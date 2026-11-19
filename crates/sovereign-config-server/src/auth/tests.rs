@@ -20,19 +20,21 @@ use ring::{
     signature::{RSA_PKCS1_SHA256, RsaKeyPair, RsaPublicKeyComponents},
 };
 use serde_json::{Value, json};
+use sovereign_config_authentik::verification_rules;
 use sovereign_config_core::ConfigPath;
+use sovereign_config_identity::{GrantsEncoding, VerificationRules};
 use tokio::{net::TcpListener, task::JoinHandle, time::sleep};
 use tonic::body::{BoxBody, empty_body};
 use tower::{Layer, ServiceExt, service_fn};
 
 use super::{
-    AuthenticatedPrincipal, AuthenticationLayer, Authenticator, CLOCK_LEEWAY, Grant, HANDSHAKE_RPC,
-    MAX_DISPLAY_NAME_CHARACTERS, MAX_JWKS_RESPONSE_BYTES, Permission, TokenClaims, bearer_token,
-    canonical_prefix, display_name, grpc_service_layer, is_operational_rpc, is_web_asset_request,
-    parse_jwt, require_current, validate_for,
+    AuthenticatedPrincipal, AuthenticationFailure, AuthenticationLayer, Authenticator,
+    CLOCK_LEEWAY, Grant, HANDSHAKE_RPC, MAX_DISPLAY_NAME_CHARACTERS, MAX_JWKS_RESPONSE_BYTES,
+    Permission, TokenClaims, bearer_token, canonical_prefix, display_name, grpc_service_layer,
+    is_operational_rpc, is_web_asset_request, parse_jwt, require_current, validate_claims,
 };
 use crate::{
-    config::{AcceptedIdentity, AuthenticationConfig},
+    config::AuthenticationConfig,
     metrics::{AuthenticationMetrics, ProtocolMetrics},
     protocol::ProtocolVersionLayer,
     system::SERVED_PROTOCOL_VERSIONS,
@@ -205,10 +207,7 @@ impl FakeJwks {
     ) -> Authenticator {
         Authenticator::with_refresh_interval(
             AuthenticationConfig {
-                accepted_identities: vec![AcceptedIdentity {
-                    issuer: self.issuer.clone(),
-                    audience: "sovereign-config".to_owned(),
-                }],
+                rules: vec![verification_rules(&self.issuer, "sovereign-config")],
                 timeout,
             },
             min_refresh_interval,
@@ -295,6 +294,23 @@ fn unsigned(header: &Value) -> String {
         "{}.{}.c2lnbmF0dXJl",
         URL_SAFE_NO_PAD.encode(header.to_string()),
         URL_SAFE_NO_PAD.encode(r#"{"iss":"x"}"#)
+    )
+}
+
+/// The claims judged as an Authentik application's: these tests are the
+/// Authentik rules, driven through the verifier every provider's rules use.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "every caller hands over claims it built for this one check"
+)]
+fn validate_for(
+    claims: TokenClaims,
+    expected_issuer: &str,
+    expected_audience: &str,
+) -> Result<AuthenticatedPrincipal, AuthenticationFailure> {
+    validate_claims(
+        &claims,
+        &[verification_rules(expected_issuer, expected_audience)],
     )
 }
 
@@ -438,7 +454,11 @@ fn valid_claims_merge_duplicate_prefix_permissions() {
 #[test]
 fn the_display_name_prefers_preferred_username_and_falls_back_to_username() {
     let name = |preferred: Option<Value>, username: Option<Value>| {
-        display_name(preferred.as_ref(), username.as_ref())
+        display_name(
+            [preferred.as_ref(), username.as_ref()]
+                .into_iter()
+                .flatten(),
+        )
     };
 
     assert_eq!(
@@ -464,7 +484,7 @@ fn the_display_name_prefers_preferred_username_and_falls_back_to_username() {
 
 #[test]
 fn the_display_name_is_stripped_of_control_characters_trimmed_and_bounded() {
-    let name = |claim: &str| display_name(Some(&json!(claim)), None);
+    let name = |claim: &str| display_name([&json!(claim)]);
 
     assert_eq!(name("  ali\u{7}ce\n ").as_deref(), Some("alice"));
     let long = "x".repeat(MAX_DISPLAY_NAME_CHARACTERS + 50);
@@ -538,18 +558,18 @@ fn wrong_environment_tokens_are_rejected() {
 #[test]
 fn audience_arrays_are_supported_without_partial_matches() {
     let mut response = valid_response();
-    response.aud = Some(json!(["another-service", "sovereign-config"]));
+    response.set("aud", json!(["another-service", "sovereign-config"]));
     assert!(validate_for(response, ISSUER, "sovereign-config",).is_ok());
 }
 
 #[test]
 fn missing_or_malformed_required_claims_are_rejected() {
     let mut missing_scope = valid_response();
-    missing_scope.scope = Some(json!("openid profile"));
+    missing_scope.set("scope", json!("openid profile"));
     let mut empty_subject = valid_response();
-    empty_subject.sub = Some(json!(""));
+    empty_subject.set("sub", json!(""));
     let mut malformed_audience = valid_response();
-    malformed_audience.aud = Some(json!(["sovereign-config", 42]));
+    malformed_audience.set("aud", json!(["sovereign-config", 42]));
 
     for response in [missing_scope, empty_subject, malformed_audience] {
         assert_eq!(
@@ -576,8 +596,10 @@ fn grants_require_canonical_prefixes_and_known_permissions() {
     // coverage as `/apps/api`.
     assert_eq!(canonical_prefix("/Apps/api").as_deref(), Some("/apps/api"));
     let mut response = valid_response();
-    response.sovereign_config_grants =
-        Some(json!([{"prefix": "/Apps/api", "permissions": ["read"]}]));
+    response.set(
+        "sovereign_config_grants",
+        json!([{"prefix": "/Apps/api", "permissions": ["read"]}]),
+    );
     let principal = validate_for(response, ISSUER, "sovereign-config").unwrap();
     assert_eq!(principal.grants.len(), 1);
     assert_eq!(principal.grants[0].prefix, "/apps/api");
@@ -587,8 +609,10 @@ fn grants_require_canonical_prefixes_and_known_permissions() {
     assert!(principal.allows(&mixed_case_child, Permission::Read));
 
     let mut response = valid_response();
-    response.sovereign_config_grants =
-        Some(json!([{"prefix": "/apps/api", "permissions": ["owner"]}]));
+    response.set(
+        "sovereign_config_grants",
+        json!([{"prefix": "/apps/api", "permissions": ["owner"]}]),
+    );
     assert_eq!(
         validate_for(response, ISSUER, "sovereign-config",)
             .unwrap_err()
@@ -1667,4 +1691,127 @@ fn assert_every_call_timed_with_its_status(
         );
     }
     assert_eq!(duration.points.len(), 4, "{:?}", duration.points);
+}
+
+/// A second identity provider's rules, which share nothing with Authentik's
+/// but the standards: keys published away from the issuer, an `iss` with no
+/// trailing slash, and its own claim names, with the grants as text.
+fn other_rules(origin: &str) -> VerificationRules {
+    VerificationRules {
+        issuer: format!("{origin}/realms/config"),
+        jwks_uri: format!("{origin}{OTHER_KEYS_PATH}"),
+        audience: "config-api".to_owned(),
+        scope_claim: "scp".to_owned(),
+        grants_claim: "config_grants".to_owned(),
+        grants_encoding: GrantsEncoding::JsonText,
+        name_claims: vec!["display".to_owned()],
+    }
+}
+
+const OTHER_KEYS_PATH: &str = "/keys/realm-config.json";
+
+/// The verifier reads a token by the rules its provider supplied, and by
+/// nothing else: the same code that verifies an Authentik token verifies one
+/// whose keys, issuer form and claims are all different — and a token that
+/// carries Authentik's claims under this provider's issuer has, by these
+/// rules, no scope and no grants.
+#[tokio::test]
+async fn a_second_rule_set_is_verified_by_the_same_verifier() {
+    let state = FakeJwksState {
+        status: Arc::new(Mutex::new(StatusCode::OK)),
+        body: Arc::new(Mutex::new(key_set(&[KID_A]))),
+        delay: Duration::ZERO,
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let app = Router::new()
+        .route(OTHER_KEYS_PATH, get(jwks))
+        .with_state(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rules = other_rules(&format!("http://{}", listener.local_addr().unwrap()));
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let authenticator = Authenticator::with_refresh_interval(
+        AuthenticationConfig {
+            rules: vec![rules.clone()],
+            timeout: Duration::from_secs(1),
+        },
+        Duration::from_secs(60),
+    )
+    .unwrap();
+
+    let claims = json!({
+        "iss": rules.issuer,
+        "aud": ["account", "config-api"],
+        "sub": "realm-subject",
+        "scp": "openid sovereign-config",
+        "exp": now() + 300,
+        "config_grants": r#"[{"prefix": "/Apps", "permissions": ["read", "manage"]}]"#,
+        "display": "Realm User",
+        // Authentik's names, which these rules must not read.
+        "preferred_username": "not-read",
+    });
+    let principal = authenticator
+        .authenticate(&bearer(&token_with(&claims)))
+        .await
+        .unwrap();
+    assert_eq!(
+        principal,
+        AuthenticatedPrincipal {
+            subject: "realm-subject".into(),
+            name: Some("Realm User".into()),
+            grants: vec![Grant {
+                prefix: "/apps".into(),
+                permissions: BTreeSet::from([Permission::Read, Permission::Manage]),
+            }],
+        }
+    );
+    assert_eq!(
+        state.calls.load(Ordering::Relaxed),
+        1,
+        "the keys came from the location the rules name"
+    );
+
+    let mut authentik_shaped = claims.clone();
+    let object = authentik_shaped.as_object_mut().unwrap();
+    for (theirs, authentik) in [
+        ("scp", "scope"),
+        ("config_grants", "sovereign_config_grants"),
+    ] {
+        let value = object.remove(theirs).unwrap();
+        object.insert(authentik.to_owned(), value);
+    }
+    object.insert(
+        "sovereign_config_grants".to_owned(),
+        json!([{"prefix": "/", "permissions": ["manage"]}]),
+    );
+    // Each difference alone is enough to refuse the token.
+    let mut array_grants = claims.clone();
+    array_grants["config_grants"] = json!([{"prefix": "/", "permissions": ["manage"]}]);
+    let mut slashed_issuer = claims.clone();
+    slashed_issuer["iss"] = json!(format!("{}/", rules.issuer));
+    for (refused, reason) in [
+        (authentik_shaped, "Authentik's claim names"),
+        (array_grants, "grants in another encoding"),
+        (slashed_issuer, "an issuer spelled differently"),
+    ] {
+        let failure = authenticator
+            .authenticate(&bearer(&token_with(&refused)))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.result.reason(), "invalid_claims", "{reason}");
+    }
+    task.abort();
+}
+
+/// Rules that name nothing to verify against never build a verifier.
+#[test]
+fn incomplete_rules_fail_at_startup() {
+    let mut rules = other_rules("https://idp.example.test");
+    rules.scope_claim.clear();
+    let refused = Authenticator::new(AuthenticationConfig {
+        rules: vec![rules],
+        timeout: Duration::from_secs(1),
+    });
+    assert!(refused.is_err());
 }
