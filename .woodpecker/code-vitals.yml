@@ -25,7 +25,9 @@ steps:
   code-vitals:
     # The moving tag `:stable`, which code-vitals' prod deployment moves only
     # after its checks pass — the approved exception to digest pinning
-    # (code-vitals AGENTS.md § Deviations register).
+    # (code-vitals AGENTS.md § Deviations register). Unlike the collector tag
+    # it replaces, this image holds the docker socket: moving `:stable` runs
+    # new code with the agent host's Docker daemon, without a change here.
     image: registry.desync.link/code-vitals-plugin:stable
     failure: ignore
     volumes:
