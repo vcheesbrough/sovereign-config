@@ -88,6 +88,16 @@ pub(crate) fn from_variables(variables: &dyn Variables) -> Result<IdentityProvid
 /// start a server whose access URLs no client accepts.
 fn admit(provider: &IdentityProvider) -> Result<()> {
     provider.verification.validate()?;
+    // Whoever can answer the key fetch can mint accepted tokens, so the
+    // signing keys are only ever read over TLS.
+    if !provider
+        .verification
+        .jwks_uri
+        .parse::<Url>()
+        .is_ok_and(|url| url.scheme() == "https")
+    {
+        bail!("the signing-key location must be an https URL");
+    }
     if !ClientCredential::admits_client_id(&provider.login.web_client_id) {
         bail!("the web client id is not one a connection URL can carry");
     }
@@ -287,6 +297,21 @@ mod tests {
         let mut incomplete = described("https://idp.example.test/realms/config/", "web");
         incomplete.verification.grants_claim.clear();
         assert!(admit(&incomplete).is_err());
+
+        // The issuer is fine; the keys would be fetched in the clear.
+        for jwks_uri in [
+            "http://idp.example.test/realms/config/keys",
+            "http://127.0.0.1:8080/realms/config/keys",
+            "not a url",
+        ] {
+            let mut plaintext_keys = described("https://idp.example.test/realms/config/", "web");
+            plaintext_keys.verification.jwks_uri = jwks_uri.to_owned();
+            let message = format!("{:#}", admit(&plaintext_keys).unwrap_err());
+            assert_eq!(
+                message, "the signing-key location must be an https URL",
+                "{jwks_uri}"
+            );
+        }
     }
 
     /// The first start records the provider; the same provider starts again
