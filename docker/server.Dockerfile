@@ -91,8 +91,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-RUN useradd --system --uid 10001 --create-home sovereign-config
-USER sovereign-config
+# The ids are the convention in docs/project-deployment.md (*Container
+# users*), stated as numbers so `compose.yaml` can restate them and a shared
+# volume can be group-owned without looking inside the image.
+RUN groupadd --system --gid 10001 sovereign-config \
+    && useradd --system --uid 10001 --gid 10001 --create-home sovereign-config
+USER 10001:10001
 COPY --from=builder /tmp/sovereign-config-server /usr/local/bin/sovereign-config-server
 COPY --from=installer-builder /tmp/dist /usr/local/share/sovereign-config/dist
 ENV SOVEREIGN_CONFIG_DIST_DIR=/usr/local/share/sovereign-config/dist

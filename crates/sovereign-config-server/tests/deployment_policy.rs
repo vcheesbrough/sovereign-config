@@ -430,3 +430,229 @@ fn deploys_turn_client_telemetry_on_for_their_own_origin() {
         "SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT: ${SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT:-}"
     ));
 }
+
+/// The user every image this repository builds runs as, and the group a
+/// shared volume is owned by (docs/project-deployment.md, *Container users*).
+const CONTAINER_USER: &str = "10001:10001";
+
+/// The services that run without a `user:` line, each with its reason. An
+/// entry is a decision recorded in docs/project-deployment.md, not a waiver.
+const SERVICES_WITHOUT_A_USER: [(&str, &str); 1] = [(
+    "postgres",
+    "the upstream entrypoint starts as root to own the data directory, then drops to postgres",
+)];
+
+/// What the root part of the Postgres entrypoint uses: taking ownership of
+/// the data directory (`CHOWN`, `FOWNER`), reading a password file and
+/// writing a directory it does not own (`DAC_OVERRIDE`), and dropping to
+/// `postgres` (`SETGID`, `SETUID`).
+const POSTGRES_CAPABILITIES: [&str; 5] = ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
+
+fn strings(value: &serde_yaml::Value) -> Vec<&str> {
+    value
+        .as_sequence()
+        .map(|items| items.iter().filter_map(serde_yaml::Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// Whether `user` is `uid:gid` with both numeric and neither root. A name
+/// would be resolved inside the image, which is the dependency `user:` is
+/// here to remove.
+fn is_unprivileged(user: &str) -> bool {
+    user.split_once(':').is_some_and(|(uid, gid)| {
+        [uid, gid]
+            .iter()
+            .all(|id| id.parse::<u32>().is_ok_and(|id| id != 0))
+    })
+}
+
+/// No service may run with more privilege than it was decided it needs
+/// (bored card #579). Before this, the server's user came only from its
+/// image, so a Dockerfile change could have made it root with nothing here
+/// noticing.
+#[test]
+fn every_service_runs_unprivileged_with_no_capabilities() {
+    let compose: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../../../compose.yaml")).expect("compose parses");
+    let services = compose["services"].as_mapping().expect("services");
+    for (name, service) in services {
+        let name = name.as_str().expect("service name");
+        assert_eq!(
+            strings(&service["cap_drop"]),
+            ["ALL"],
+            "{name} must drop every capability"
+        );
+        assert!(
+            strings(&service["security_opt"]).contains(&"no-new-privileges:true"),
+            "{name} must set no-new-privileges"
+        );
+        assert!(
+            service.get("privileged").is_none(),
+            "{name} must not be privileged"
+        );
+        let excepted = SERVICES_WITHOUT_A_USER
+            .iter()
+            .any(|(service, _)| *service == name);
+        match service.get("user").and_then(serde_yaml::Value::as_str) {
+            Some(user) => {
+                assert!(
+                    !excepted,
+                    "{name} sets a user, so it no longer belongs in SERVICES_WITHOUT_A_USER"
+                );
+                assert!(
+                    is_unprivileged(user),
+                    "{name} must run as a numeric non-root uid:gid, not {user:?}"
+                );
+                assert_eq!(
+                    user, CONTAINER_USER,
+                    "{name} must run as the documented {CONTAINER_USER}"
+                );
+                assert_eq!(
+                    service["read_only"].as_bool(),
+                    Some(true),
+                    "{name} runs as {CONTAINER_USER} and must have a read-only root filesystem"
+                );
+                assert_eq!(
+                    strings(&service["tmpfs"]),
+                    ["/tmp"],
+                    "{name} has a read-only root and gets a tmpfs on /tmp only"
+                );
+                assert!(
+                    service.get("cap_add").is_none(),
+                    "{name} runs unprivileged and must add no capability back"
+                );
+            }
+            None => assert!(
+                excepted,
+                "{name} must set a non-root `user:`, or be a decided exception"
+            ),
+        }
+    }
+    for (service, reason) in SERVICES_WITHOUT_A_USER {
+        assert!(
+            services.contains_key(service),
+            "{service} is excepted ({reason}) but is not a service"
+        );
+    }
+    assert_eq!(
+        strings(&compose_service("postgres")["cap_add"]),
+        POSTGRES_CAPABILITIES,
+        "postgres keeps exactly what its entrypoint needs before it drops to `postgres`"
+    );
+}
+
+#[test]
+fn only_numeric_non_root_ids_count_as_unprivileged() {
+    assert!(is_unprivileged(CONTAINER_USER));
+    for user in ["0:0", "10001:0", "0:10001", "10001", "root", "app:app", ""] {
+        assert!(!is_unprivileged(user), "{user:?} must not pass");
+    }
+}
+
+/// The server restates the image's user and has a read-only root filesystem:
+/// it writes no file, so anything that tries to is a fault or an intruder.
+#[test]
+fn the_server_runs_as_the_documented_user_on_a_read_only_filesystem() {
+    let server = compose_service("sovereign-config");
+    assert_eq!(server["user"].as_str(), Some(CONTAINER_USER));
+    assert_eq!(server["read_only"].as_bool(), Some(true));
+    assert_eq!(strings(&server["tmpfs"]), ["/tmp"]);
+    let doc = include_str!("../../../docs/project-deployment.md");
+    assert!(
+        doc.contains("## Container users") && doc.contains(CONTAINER_USER),
+        "docs/project-deployment.md states the convention the compose file follows"
+    );
+}
+
+/// The Dockerfiles whose last stage does not end on [`CONTAINER_USER`], each
+/// with its reason.
+const DOCKERFILES_WITHOUT_THE_USER: [(&str, &str); 2] = [
+    (
+        "cli.Dockerfile",
+        "pipeline steps drive the host Docker socket and a root-owned workspace as root",
+    ),
+    (
+        "web.Dockerfile",
+        "its last stage is a scratch artifact that is exported, never run",
+    ),
+];
+
+/// The `USER` in force at the end of a Dockerfile's last stage, if it sets
+/// one. A stage does not inherit the `USER` of an earlier stage unless it is
+/// built `FROM` it, which no runtime stage here is.
+fn final_user(dockerfile: &str) -> Option<&str> {
+    let mut user = None;
+    for line in dockerfile.lines() {
+        let mut words = line.split_whitespace();
+        match words.next() {
+            Some("FROM") => user = None,
+            Some("USER") => user = words.next(),
+            _ => {}
+        }
+    }
+    user
+}
+
+/// Each image that runs as a service ends on the documented numeric user
+/// with an explicit group, so the image is unprivileged even where a
+/// deployment sets no `user:` (the broker's, outside this repository).
+#[test]
+fn every_runtime_image_ends_on_the_documented_user() {
+    let docker = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker");
+    let mut seen = Vec::new();
+    for entry in std::fs::read_dir(&docker).expect("docker/ is readable") {
+        let path = entry.expect("dir entry").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("file name")
+            .to_owned();
+        if !name.ends_with(".Dockerfile") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("Dockerfile readable");
+        let user = final_user(&text);
+        if DOCKERFILES_WITHOUT_THE_USER
+            .iter()
+            .any(|(file, _)| *file == name)
+        {
+            assert_eq!(
+                user, None,
+                "{name} sets a user, so it no longer belongs in DOCKERFILES_WITHOUT_THE_USER"
+            );
+        } else {
+            assert_eq!(
+                user,
+                Some(CONTAINER_USER),
+                "{name} must end on `USER {CONTAINER_USER}`"
+            );
+            assert!(
+                text.contains("groupadd --system --gid 10001 ")
+                    && text.contains("useradd --system --uid 10001 --gid 10001 "),
+                "{name} must create its group and user with the documented ids"
+            );
+        }
+        seen.push(name);
+    }
+    for (file, reason) in DOCKERFILES_WITHOUT_THE_USER {
+        assert!(
+            seen.iter().any(|name| name == file),
+            "{file} is excepted ({reason}) but does not exist"
+        );
+    }
+    assert!(seen.iter().any(|name| name == "server.Dockerfile"));
+    assert!(seen.iter().any(|name| name == "broker.Dockerfile"));
+}
+
+#[test]
+fn the_last_stage_decides_a_dockerfiles_user() {
+    assert_eq!(
+        final_user("FROM a\nUSER 10001:10001\n"),
+        Some("10001:10001")
+    );
+    assert_eq!(
+        final_user("FROM a AS b\nUSER app\nFROM c\nRUN true\n"),
+        None
+    );
+    assert_eq!(final_user("FROM a\nUSER app\nUSER root\n"), Some("root"));
+}

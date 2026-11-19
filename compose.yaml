@@ -19,6 +19,21 @@ services:
       start_period: 10s
     networks:
       - sovereign_config_private
+    # No `user:` (docs/project-deployment.md, *Container users*): the upstream
+    # entrypoint starts as root to take ownership of the data directory and
+    # read the password file, then drops to `postgres` (999:999) for good.
+    # These are the capabilities that start needs and no others; the database
+    # process itself holds none.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
     # Without these the database's stdout reaches Loki under its container name,
     # so dev and prod look like two unrelated services and neither answers to
     # `deployment_environment`. Nothing here is scraped: the server pushes its
@@ -85,6 +100,18 @@ services:
     networks:
       - sovereign_config_private
       - traefik
+    # The image's own user, restated so the deployment does not depend on the
+    # image for it (docs/project-deployment.md, *Container users*). The server
+    # writes no file: its state is the database, and its logs go to stdout and
+    # OTLP. `/tmp` is there for a library that expects one.
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=proxy-backend"

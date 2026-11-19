@@ -46,10 +46,15 @@ Run the **`ci-watch`** skill (baseline §4) with `OWNER=vcheesbrough`,
   not show it, because GitHub Actions reports check runs. On a push, Woodpecker
   runs `anchor.yml`, which is green as soon as Woodpecker sees the push and
   says nothing about the build. On `main` it also runs `code-vitals.yml`
-  (#560), which records the commit and can never fail the pipeline. Its
-  collector is the moving `code-vitals-collector:stable` tag, code-vitals'
-  approved exception to §2's digest pinning. Woodpecker runs the deployments,
-  and those are still watched there.
+  (#560, #568), one plugin step that records the commit and can never fail
+  the pipeline. Its image is the moving `code-vitals-plugin:stable` tag,
+  code-vitals' approved exception to §2's digest pinning. That exception now
+  carries host-level access: the image holds the docker socket, so moving
+  `:stable` runs new code with the agent host's Docker daemon (and the
+  writer password) without a change here. Its `settings:` are
+  how code-vitals measures this repo: changing the area rules needs a new
+  `areas.version`, which re-measures the whole history. Woodpecker runs the
+  deployments, and those are still watched there.
 - **Releases follow the release-flow skill** (#539). The Woodpecker deploys
   read it with `woodpecker-plugin-release-versions` (`resolve`, `tag`). The
   GitHub build keeps it with `scripts/ci-claim-build.sh` and

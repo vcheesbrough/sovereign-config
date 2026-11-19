@@ -36,7 +36,7 @@ Each published package links to this repository through its `org.opencontainers.
 
 Woodpecker starts a deployment from an existing pipeline (its Deploy button), and it records no pipeline for a push that no workflow matches. So `.woodpecker/anchor.yml` runs on every push. It does nothing but give the push a pipeline to deploy from. Its green status means only that Woodpecker saw the push. Whether the commit has a build to deploy is the deployment's own `resolve` step, which refuses a commit GitHub Actions has not published.
 
-On `main`, a push also runs `.woodpecker/code-vitals.yml`, which records the commit in code-vitals. It is a copy of code-vitals' `deploy/measured-repo-workflow.yml`. Its one step is `failure: ignore`, and nothing waits for it, so it never blocks a build or a deploy.
+On `main`, a push also runs `.woodpecker/code-vitals.yml`, which records the commit in code-vitals. Its one step is code-vitals' Woodpecker plugin (`registry.desync.link/code-vitals-plugin:stable`), which starts the collector through the docker socket. The step's `settings:` tell code-vitals how to measure this repository: its trunk, where its version is, and which paths belong to which area. code-vitals' deployments read the same settings from this file at the head of `main`. The step is `failure: ignore`, and nothing waits for it, so it never blocks a build or a deploy.
 
 ## Deploying
 
@@ -72,6 +72,41 @@ Before the first promotion the operator provides the production Woodpecker secre
 Sovereign Config's own deploy steps deliberately do **not** consume their configuration through `render`, and keep their Woodpecker secrets. Reading `/sovereign-config/prod/...` in order to deploy Sovereign Config would create a circular availability dependency: a broken production deployment could not be redeployed through a path that requires production to be readable. Other repositories and the homelab stacks are the intended consumers.
 
 The build sits outside the estate for the same reason. If its images lived in the estate's registry, restoring Sovereign Config would need the devops stack, so that stack could never render its own secrets from Sovereign Config. With the images in GHCR, the stacks Sovereign Config needs at run time are Traefik and Authentik alone. The deploys' Woodpecker secrets still come through the broker from Sovereign Config itself. A rebuilt host is therefore brought up by hand once, from `compose.yaml`, and Woodpecker takes over after that (mini-config `RECOVERY.md`, step 11a).
+
+## Container users
+
+Every container runs as a stated, unprivileged user (card #579). `tests/deployment_policy.rs` fails if a service in `compose.yaml` or a Dockerfile under `docker/` departs from this table.
+
+| Container | Runs as | Hardening | Where it is set |
+| --- | --- | --- | --- |
+| Server (`sovereign-config`) | `10001:10001` | `cap_drop: ALL`, `no-new-privileges`, read-only root filesystem, `tmpfs` on `/tmp` | `docker/server.Dockerfile` and `user:` in `compose.yaml` |
+| Client-telemetry ingest (`otlp-ingest`) | `10001:10001` | The same | `user:` in `compose.yaml` (a published image) |
+| Woodpecker broker | `10001:10001` | See below | `docker/broker.Dockerfile` |
+| PostgreSQL (`postgres`) | Starts as root, runs as `postgres`, `999:999` | `cap_drop: ALL` with five capabilities added back, `no-new-privileges` | The upstream image's entrypoint |
+| CLI image | Root | None | `docker/cli.Dockerfile` sets no `USER` |
+
+**One id for every image this repository builds: uid `10001`, gid `10001`.** The server, the broker and the ingest already ran as uid 10001, so no secret file changes owner. The containers share no volume, so a uid each would separate nothing today. The images name the ids as numbers (`USER 10001:10001`), and `compose.yaml` restates them, so the deployment does not depend on the image for its user.
+
+**A volume shared between containers is owned by group `10001`**, with its directory group-writable and setgid (`chown 10001:10001`, `chmod 2770`). A container from another image that must share it either runs as `10001:10001` or adds the group with `group_add: ["10001"]`. The identity-provider socket (card #578) is the first such volume.
+
+**The server's root filesystem is read-only.** The server writes no file: its state is the database, and its logs go to stdout and OTLP. `/tmp` is a `tmpfs` only so that a library expecting one finds it. Secret files are mounted read-only and are read as uid 10001, as before.
+
+**PostgreSQL keeps the upstream image's own user handling**, and sets no `user:`. Its entrypoint starts as root to take ownership of the data directory and to read the password file, then drops to `postgres` for good. With `user: "999:999"` it could do neither. A pre-created volume owned by root would then fail its first start, and the documented `root:root`, `0400` password file would be unreadable. That is too much risk to a long-lived database for the gain. What the entrypoint needs as root is five capabilities: `CHOWN` and `FOWNER` for the data directory, `DAC_OVERRIDE` to read and write what root does not own, and `SETGID` and `SETUID` to drop to `postgres`. `compose.yaml` drops every other capability. The database process itself runs as `999:999` and holds none. `docker exec` into that container still starts as root, so read the database process's user from `/proc/1/status`, not from `id`.
+
+**The CLI image stays root.** It is an operator tool that pipeline steps run, not a service. Those steps drive the host's Docker socket, whose group id differs from host to host, and write in a workspace Woodpecker creates as root. An unprivileged user would break every pipeline that uses the image.
+
+**The broker is deployed from `mini-config`** (`devops-stack/docker-compose.yml`), so its hardening is that repository's to apply. Its image runs as `10001:10001` whether or not the service says so. It writes no file either, so its service can carry the server's lines unchanged:
+
+```yaml
+user: "10001:10001"
+cap_drop:
+  - ALL
+read_only: true
+tmpfs:
+  - /tmp
+security_opt:
+  - no-new-privileges:true
+```
 
 ## Telemetry platform
 
