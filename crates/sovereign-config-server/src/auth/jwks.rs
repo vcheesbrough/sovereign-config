@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::Method;
 use reqwest::{Client, Url, redirect};
@@ -119,6 +119,12 @@ struct Jwk {
 
 impl KeySets {
     /// One key set per issuer, each read from the location given with it.
+    ///
+    /// An issuer given twice with the same location shares one key set. Given
+    /// twice with different locations, it is refused: a token names only its
+    /// issuer, so one location would silently go unread and the issuer's
+    /// tokens be checked against the other's keys alone. The message names
+    /// neither location, which is configuration from the identity provider.
     pub(crate) fn new<'a>(
         issuers: impl IntoIterator<Item = (&'a str, &'a str)>,
         timeout: Duration,
@@ -126,12 +132,17 @@ impl KeySets {
     ) -> Result<Self> {
         let mut sets: Vec<IssuerKeys> = Vec::new();
         for (issuer, jwks_uri) in issuers {
-            if sets.iter().any(|set| set.issuer == issuer) {
-                continue;
-            }
             let jwks_url = jwks_uri
                 .parse::<Url>()
                 .context("the issuer's signing-key location is not a URL")?;
+            if let Some(known) = sets.iter().find(|set| set.issuer == issuer) {
+                ensure!(
+                    known.jwks_url == jwks_url,
+                    "two verification rule sets name the same issuer but different \
+                     signing-key locations"
+                );
+                continue;
+            }
             sets.push(IssuerKeys {
                 issuer: issuer.to_owned(),
                 jwks_url,

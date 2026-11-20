@@ -1815,3 +1815,53 @@ fn incomplete_rules_fail_at_startup() {
     });
     assert!(refused.is_err());
 }
+
+/// One issuer, two places to read its keys: a token names only its issuer, so
+/// one of them would never be read. That is refused at startup, in a message
+/// that names neither location, and in either order.
+#[test]
+fn one_issuer_with_two_key_locations_fails_at_startup() {
+    let first = other_rules("https://idp.example.test");
+    let mut second = first.clone();
+    second.jwks_uri = "https://keys.example.test/elsewhere.json".to_owned();
+    for rules in [
+        vec![first.clone(), second.clone()],
+        vec![second.clone(), first.clone()],
+    ] {
+        let Err(refused) = Authenticator::new(AuthenticationConfig {
+            rules,
+            timeout: Duration::from_secs(1),
+        }) else {
+            panic!("an issuer with two key locations was accepted");
+        };
+        let message = format!("{refused:#}");
+        assert!(
+            message.contains("same issuer but different signing-key locations"),
+            "{message}"
+        );
+        for location in [&first.issuer, &first.jwks_uri, &second.jwks_uri] {
+            assert!(!message.contains(location.as_str()), "{message}");
+        }
+    }
+}
+
+/// The same issuer and key location given twice is one key set: read once per
+/// refresh, and verifying the issuer's tokens.
+#[tokio::test]
+async fn one_issuer_given_twice_with_one_key_location_shares_one_key_set() {
+    let server = issuer().await;
+    let rules = verification_rules(&server.issuer, "sovereign-config");
+    let authenticator = Authenticator::with_refresh_interval(
+        AuthenticationConfig {
+            rules: vec![rules.clone(), rules],
+            timeout: Duration::from_secs(1),
+        },
+        Duration::from_secs(60),
+    )
+    .unwrap();
+
+    assert!(authenticator.keys.refresh().await);
+    assert_eq!(server.calls(), 1, "one key set, fetched once");
+    authenticator.authenticate(&server.headers()).await.unwrap();
+    assert_eq!(server.calls(), 1, "the token was verified from that set");
+}
