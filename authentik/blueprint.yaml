@@ -118,6 +118,9 @@ entries:
       name: Sovereign Config
       slug: sovereign-config
       provider: !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config]]
+      # Sign-in is admitted when any binding below passes: an operator in
+      # `admins`, or a managed account in the connections group.
+      policy_engine_mode: any
 
   # Isolated identity used only to provision managed application connections.
   # It may create users and tokens, and administer only the objects it created
@@ -140,10 +143,10 @@ entries:
         # metadata only: view_token_key is deliberately never granted, so no key is
         # ever readable.
         - authentik_core.view_token
-        # Global so the manager can resolve the browsing group below by name
-        # even once it holds no object-level permission on any managed
-        # account. Grants nothing: group membership carries no permissions
-        # here and authorization is granted directly on the service account.
+        # Global so the manager can resolve the connections group below by
+        # name even once it holds no object-level permission on any managed
+        # account. Viewing a group grants nothing; the grant itself is set
+        # directly on the service account.
         - authentik_core.view_group
 
   - model: authentik_core.group
@@ -155,15 +158,47 @@ entries:
       roles:
         - !Find [authentik_rbac.role, [name, sovereign-config-connection-manager]]
 
-  # Purely organizational: every managed connection's service account is added
-  # here so an operator can browse them together in Authentik. Carries no
-  # roles and grants no permissions.
+  # Every managed connection's service account is added here. The group
+  # carries no roles and no grant attribute, but it gates sign-in: the
+  # application admits only this group and `admins` (bindings below), so an
+  # account outside it cannot obtain a token, and the server fails a create
+  # whose account it cannot add.
   - model: authentik_core.group
     state: present
     identifiers:
       name: sovereign-config-connections
     attrs:
       is_superuser: false
+
+  # Who may sign in to the application. These record bindings first made by
+  # hand, with the values they already hold, so applying the blueprint
+  # changes nothing on an instance that has them. `admins` is an existing
+  # group this blueprint references but does not create. A binding is
+  # identified by its application and group, so a binding at another order
+  # is updated, not duplicated.
+  - model: authentik_policies.policybinding
+    state: present
+    identifiers:
+      target: !Find [authentik_core.application, [slug, sovereign-config]]
+      group: !Find [authentik_core.group, [name, admins]]
+    attrs:
+      order: 0
+      enabled: true
+      negate: false
+      timeout: 30
+      failure_result: false
+
+  - model: authentik_policies.policybinding
+    state: present
+    identifiers:
+      target: !Find [authentik_core.application, [slug, sovereign-config]]
+      group: !Find [authentik_core.group, [name, sovereign-config-connections]]
+    attrs:
+      order: 1
+      enabled: true
+      negate: false
+      timeout: 30
+      failure_result: false
 
   - model: authentik_rbac.initialpermissions
     state: present

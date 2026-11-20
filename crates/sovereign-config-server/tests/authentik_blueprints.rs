@@ -82,6 +82,119 @@ fn the_web_ui_provider_carries_the_telemetry_scope() {
     }
 }
 
+/// Sign-in to each application is gated on two groups, as the live
+/// Authentik already has it (#588): `admins` for operators and the
+/// connections group for managed accounts, either one sufficing. The
+/// bindings carry the values the hand-made ones hold, so applying a
+/// blueprint changes nothing live, and the connections group is the one the
+/// server is told to add accounts to.
+#[test]
+fn the_applications_admit_only_operators_and_managed_accounts() {
+    for (blueprint, application, managed_group) in [
+        (
+            "blueprint-dev.yaml",
+            "sovereign-config-dev",
+            "sovereign-config-dev-connections",
+        ),
+        (
+            "blueprint.yaml",
+            "sovereign-config",
+            "sovereign-config-connections",
+        ),
+    ] {
+        let document = load_blueprint(blueprint);
+        let entries = sequence(field(mapping(&document), "entries"));
+
+        let app = mapping(entry_by(
+            entries,
+            "authentik_core.application",
+            "slug",
+            application,
+        ));
+        assert_eq!(string(field(app, "state")), "present");
+        assert_eq!(
+            string(field(mapping(field(app, "attrs")), "policy_engine_mode")),
+            "any",
+            "{blueprint}: any one binding admits"
+        );
+        let app_position = position(entries, app);
+        let group_position = position(
+            entries,
+            present_entry(entries, "authentik_core.group", managed_group),
+        );
+
+        let bindings = entries
+            .iter()
+            .map(mapping)
+            .filter(|entry| string(field(entry, "model")) == "authentik_policies.policybinding")
+            .collect::<Vec<_>>();
+        let mut bound = Vec::new();
+        for binding in &bindings {
+            assert_eq!(string(field(binding, "state")), "present");
+            let identifiers = mapping(field(binding, "identifiers"));
+            assert_eq!(
+                identifiers.len(),
+                2,
+                "{blueprint}: a binding is identified by its target and group alone"
+            );
+            assert_eq!(
+                found(field(identifiers, "target")),
+                ("authentik_core.application", "slug", application),
+                "{blueprint}: every binding targets this environment's application"
+            );
+            let (model, key, group) = found(field(identifiers, "group"));
+            assert_eq!((model, key), ("authentik_core.group", "name"));
+
+            let attrs = mapping(field(binding, "attrs"));
+            assert_eq!(field(attrs, "enabled"), &Value::Bool(true));
+            assert_eq!(field(attrs, "negate"), &Value::Bool(false));
+            assert_eq!(field(attrs, "timeout"), &Value::from(30));
+            assert_eq!(field(attrs, "failure_result"), &Value::Bool(false));
+            for absent in ["policy", "user"] {
+                assert!(
+                    attrs.get(Value::String(absent.to_owned())).is_none()
+                        && identifiers.get(Value::String(absent.to_owned())).is_none(),
+                    "{blueprint}: a group binding names no {absent}"
+                );
+            }
+            // `!Find` resolves when its entry is applied, so a binding must
+            // come after the application and the group it names.
+            let binding_position = position(entries, binding);
+            assert!(binding_position > app_position && binding_position > group_position);
+
+            let order = field(attrs, "order")
+                .as_u64()
+                .expect("a binding's order is a number");
+            bound.push((order, group));
+        }
+        assert_eq!(
+            bound,
+            [(0, "admins"), (1, managed_group)],
+            "{blueprint}: operators at order 0, managed accounts at order 1, nothing else"
+        );
+    }
+}
+
+/// The position of `entry` among `entries`, by identity.
+fn position(entries: &[Value], entry: &Mapping) -> usize {
+    entries
+        .iter()
+        .position(|candidate| std::ptr::eq(mapping(candidate), entry))
+        .expect("the entry is one of the entries")
+}
+
+/// A `!Find [model, [key, value]]` lookup, as `(model, key, value)`.
+fn found(value: &Value) -> (&str, &str, &str) {
+    let Value::Tagged(tagged) = value else {
+        panic!("a reference to another object must be a !Find")
+    };
+    assert_eq!(tagged.tag.to_string(), "!Find");
+    let lookup = sequence(&tagged.value);
+    assert_eq!(lookup.len(), 2, "one lookup field");
+    let field = sequence(&lookup[1]);
+    (string(&lookup[0]), string(&field[0]), string(&field[1]))
+}
+
 fn assert_environment(environment: &Environment<'_>) {
     let blueprint = load_blueprint(environment.blueprint);
     let entries = sequence(field(mapping(&blueprint), "entries"));
@@ -186,8 +299,9 @@ fn assert_connection_manager(entries: &[Value], environment: &Environment<'_>) {
         environment.manager
     ));
 
-    // The browsing group is a distinct, plain group: no roles, no permissions,
-    // separate from the manager's own RBAC group above.
+    // The connections group is a distinct, plain group: no roles and no grant
+    // attribute, separate from the manager's own RBAC group above. It gates
+    // sign-in through the application's bindings, checked above.
     assert_ne!(environment.managed_group, environment.manager);
     let managed_group = present_entry(entries, "authentik_core.group", environment.managed_group);
     let managed_group_attrs = mapping(field(managed_group, "attrs"));
@@ -199,7 +313,7 @@ fn assert_connection_manager(entries: &[Value], environment: &Environment<'_>) {
         managed_group_attrs
             .get(Value::String("roles".to_owned()))
             .is_none(),
-        "the browsing group must carry no roles"
+        "the connections group must carry no roles"
     );
 
     let user = mapping(entry_by(

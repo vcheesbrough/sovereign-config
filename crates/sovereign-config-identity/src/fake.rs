@@ -102,7 +102,7 @@ impl FakeIdentityProvider {
             .push_back(Scripted { error, applied });
     }
 
-    /// Makes the browsing group absent, so assigning it is `NotFound`.
+    /// Makes the connections group absent, so assigning it is `NotFound`.
     pub fn remove_browse_group(&self) {
         self.state().browse_group_missing = true;
     }
@@ -311,8 +311,8 @@ impl ConformanceTarget for FakeIdentityProvider {
 
     /// The fake's token endpoint: a credential obtains a token when it is
     /// the account's current one, presented as a client presents it, and the
-    /// account is in the browsing group — as the development Authentik admits
-    /// an account to the application only through that group. The token is
+    /// account is in the connections group — as both Authentik applications
+    /// admit a managed account only through that group. The token is
     /// the account's identifier, which only the fake can read.
     async fn obtain_token(
         &self,

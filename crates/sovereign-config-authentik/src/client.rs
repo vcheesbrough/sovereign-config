@@ -175,9 +175,10 @@ impl AuthentikAdminClient {
         .map(|_| ())
     }
 
-    /// Locates a group by exact name, purely to group managed service
-    /// accounts together for browsing in Authentik. Never authorizes
-    /// anything: authorization is granted directly on the service account.
+    /// Locates a group by exact name: the connections group every managed
+    /// service account joins. It carries no grant (that is set directly on
+    /// the service account), but the application's policy bindings admit an
+    /// account to sign in only through it.
     pub(crate) async fn find_group_by_name(
         &self,
         name: &str,
@@ -211,8 +212,9 @@ impl AuthentikAdminClient {
 
     /// Adds the exact managed service account to one group, replacing any
     /// existing membership. Safe because the account is freshly created with
-    /// no prior group membership. Best-effort: failure here must never block
-    /// or roll back connection creation.
+    /// no prior group membership. Required: the application admits a
+    /// managed account only through this group, so a failure fails the
+    /// create.
     pub(crate) async fn add_user_to_group(
         &self,
         user_id: i64,

@@ -30,6 +30,17 @@ The repository ships two isolated Authentik blueprints, one per environment, tha
 
 Each environment has one public issuing provider shared by the browser, the human CLI and MCP server, and managed application connections. It permits authorization-code, device-code, refresh-token, and client-credentials grants, uses an exact same-origin browser callback through `SOVEREIGN_CONFIG_BROWSER_REDIRECT_URI` or `SOVEREIGN_CONFIG_DEV_BROWSER_REDIRECT_URI`. Tokens must never cross environments: each server accepts only its own environment's issuer and audience. Each blueprint also deletes the confidential `sovereign-config-introspection[-dev]` provider earlier releases introspected tokens through; nothing uses it since access tokens are verified locally (see [Request authentication](authentication.md#request-authentication)). Wildcard and first-use registration are not allowed.
 
+### Who may sign in
+
+Each blueprint binds its application to two groups, with policy engine mode `any`, so a member of either may sign in and nobody else can:
+
+| Order | Group | Who it admits |
+| --- | --- | --- |
+| 0 | `admins` | Operators. An existing group the blueprint references with `!Find` and never creates; applying a blueprint fails if it does not exist. |
+| 1 | `sovereign-config-connections` / `sovereign-config-dev-connections` | Managed accounts, which the server adds to the group named by `SOVEREIGN_CONFIG_MANAGER_GROUP` when it creates an access URL. |
+
+Both bindings are enabled, not negated, with a 30-second timeout and a failure result of "deny". A binding is identified by its application and group, so applying a blueprint to an instance where these were made by hand, with these values, changes nothing. Neither group carries a grant: what a principal may do is still only its grants claim ([Configuration grants](#configuration-grants)). Being admitted is what lets its credential obtain a token at all, which is why the server fails a create whose account it cannot add to the connections group.
+
 Both blueprints own the authenticated `sovereign-config-device-code` Stage Configuration flow and assign it to the exact brand selected by `AUTHENTIK_BRAND_DOMAIN` or `AUTHENTIK_DEV_BRAND_DOMAIN`. Supply the domain of the brand active for the Authentik public hostname; do not point this at a different tenant or create a second active brand accidentally. Apply an environment's blueprint before starting that environment's server, and never apply one environment's blueprint to the other's deployment.
 
 Authentik 2026.5.2 or newer is required. That version includes configurable grant allowlists along with the device-authorization scope clipping fix needed by this design. Check the instance's version before applying a blueprint.
@@ -58,21 +69,23 @@ Authentik's own variables, which `sovereign-config-authentik` reads and validate
 | `SOVEREIGN_CONFIG_OIDC_AUDIENCE` | ✅ | The `aud` every access token must carry: the provider's client id, `sovereign-config` or `sovereign-config-dev`. It is also the client id the web UI signs in through and the one access URLs name, so it may hold only ASCII letters, digits, `-`, `.`, `_` and `~`. |
 | `SOVEREIGN_CONFIG_MANAGER_API_TOKEN` / `_FILE` | ✅ | The connection-manager API token. |
 | `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE` | ✅ | The user and group attribute that carries this environment's grants, matching the blueprint's scope mapping (`sovereign_config_prod_grants` or `sovereign_config_dev_grants`). |
-| `SOVEREIGN_CONFIG_MANAGER_GROUP` | ✅ | The group each access URL's service account is added to so an operator can browse them. It grants no permissions and must match the blueprint (`sovereign-config-connections` or `sovereign-config-dev-connections`). |
+| `SOVEREIGN_CONFIG_MANAGER_GROUP` | ✅ | The group each access URL's service account is added to. It carries no grant, but it gates sign-in ([Who may sign in](#who-may-sign-in)), so a create whose account cannot be added to it fails. It must match the blueprint (`sovereign-config-connections` or `sovereign-config-dev-connections`). |
 | `SOVEREIGN_CONFIG_MANAGER_CLIENT_ID` | — | The OAuth client id every access URL names. Unset means the audience. With Authentik it must equal the audience, because a token minted through another client would carry that client's id as its `aud` and be refused; any other value fails startup. Leave it unset. |
 
 ## Authentik objects by environment
 
 Every Authentik object this application relies on is created by that environment's blueprint, and **the two environments share nothing that carries authorization**. Each name below exists in exactly one environment; a principal added to a production object has no development access and vice versa. The only objects both blueprints own are the `sovereign-config-device-code` flow and the brand assignment that references it, which are identical in each and carry no permissions.
 
-Nothing here is created by Sovereign Config itself except the per-connection service accounts noted at the end of each table — the server never seeds users, groups, roles, or authorization state.
+Nothing here is created by Sovereign Config itself except the per-connection service accounts noted at the end of each table — the server never seeds users, groups, roles, or authorization state. The one object a blueprint relies on without creating is the `admins` group its policy bindings name, which both environments share; it admits a person to sign in but grants nothing on the tree.
 
 ### Production — `authentik/blueprint.yaml`
 
 | Object | Authentik kind | Purpose | Confers permission? |
 | --- | --- | --- | --- |
-| `sovereign-config-production-config-contributor` | Group | The contributor group. Carries the attribute `sovereign_config_prod_grants` set to `[{prefix: "/", permissions: [read, write, manage]}]`, so its members hold every permission on the whole production tree. **Add human operators here.** | Yes — through its grant attribute, not through the group name |
-| `sovereign-config-connections` | Group | Organizational only. Every managed access-URL service account Sovereign Config provisions is added here so an operator can browse them together in Authentik. Carries no roles and no attributes. Named by `SOVEREIGN_CONFIG_MANAGER_GROUP`; membership failure is best-effort and never blocks a connection. | No — deliberately none |
+| `sovereign-config-production-config-contributor` | Group | The contributor group. Carries the attribute `sovereign_config_prod_grants` set to `[{prefix: "/", permissions: [read, write, manage]}]`, so its members hold every permission on the whole production tree. **Add human operators here**, and to `admins` so they can sign in. | Yes — through its grant attribute, not through the group name |
+| `sovereign-config-connections` | Group | Every managed access-URL service account Sovereign Config provisions is added here. Carries no roles and no attributes, but the application admits managed accounts only through it, so a create whose account cannot be added fails and the account is deleted. Named by `SOVEREIGN_CONFIG_MANAGER_GROUP`. | No grant; gates sign-in |
+| `admins` → `sovereign-config`, order 0 | Policy binding | Admits members of the existing `admins` group (operators) to the application. The blueprint references `admins`; it does not create it. | Gates sign-in |
+| `sovereign-config-connections` → `sovereign-config`, order 1 | Policy binding | Admits members of `sovereign-config-connections` (managed accounts) to the application. | Gates sign-in |
 | `sovereign-config-connection-manager` | Group | Binds the RBAC role of the same name to the connection-manager service account, which is its only member. Not for human membership. | Yes — Authentik RBAC, via its role |
 | `sovereign-config-connection-manager` | RBAC role | Global `authentik_core.add_user`, `add_token`, `view_token`, and `view_group` — metadata only. `view_token_key` is deliberately never granted, so no token key is ever readable, and the role is not a superuser and has no Admin UI access. | Yes — global, narrow |
 | `sovereign-config-connection-manager-objects` | Initial-permissions policy | Attaches object-level `view_user`, `change_user`, `delete_user`, `view_token`, and `set_token_key` to the role above **for the objects it creates only**, so it cannot read, change, or delete an unrelated user or token. | Yes — per object created |
@@ -88,7 +101,9 @@ Nothing here is created by Sovereign Config itself except the per-connection ser
 | Object | Authentik kind | Purpose | Confers permission? |
 | --- | --- | --- | --- |
 | `sovereign-config-development-config-contributor` | Group | The development contributor group. Carries `sovereign_config_dev_grants` set to `[{prefix: "/", permissions: [read, write, manage]}]`. | Yes — through its grant attribute |
-| `sovereign-config-dev-connections` | Group | Browsing group for development managed access-URL service accounts. No roles, no attributes. Named by `SOVEREIGN_CONFIG_MANAGER_GROUP` in the development deployment. | No — deliberately none |
+| `sovereign-config-dev-connections` | Group | Every development managed access-URL service account is added here. No roles, no attributes; the application admits managed accounts only through it. Named by `SOVEREIGN_CONFIG_MANAGER_GROUP` in the development deployment. | No grant; gates sign-in |
+| `admins` → `sovereign-config-dev`, order 0 | Policy binding | As in production, for the development application. | Gates sign-in |
+| `sovereign-config-dev-connections` → `sovereign-config-dev`, order 1 | Policy binding | Admits development managed accounts to the development application. | Gates sign-in |
 | `sovereign-config-dev-connection-manager` | Group | Binds the development RBAC role to the development connection-manager service account, its only member. | Yes — Authentik RBAC, via its role |
 | `sovereign-config-dev-connection-manager` | RBAC role | Same narrow global permissions as production: `add_user`, `add_token`, `view_token`, `view_group`. No `view_token_key`, not a superuser. | Yes — global, narrow |
 | `sovereign-config-dev-connection-manager-objects` | Initial-permissions policy | Same per-object `view`/`change`/`delete_user`, `view_token`, `set_token_key` attachment as production. | Yes — per object created |
@@ -133,4 +148,4 @@ When upgrading from the shared `sovereign-config grants` scope mapping, apply bo
 - **The connection-manager API token.** To rotate it, update the environment's blueprint secret and the `MANAGER_API_TOKEN_FILE` contents together, apply the blueprint, then redeploy. Only managed-connection operations are affected while the two disagree; configuration reads and writes do not use it. Verify by listing managed connections after redeployment.
 - **Revoking an access URL.** Revocation deletes the service account and removes the connection only after deletion is confirmed by the app password's absence: Authentik denies at the permission layer before object lookup once the manager holds no remaining visible account, so "gone" and "not permitted" cannot be told apart on the user object itself.
 - **The connection manager's reach.** It holds global `add_user`, `add_token`, `view_token`, and `view_group` — no key or user content is exposed by any of these, only metadata needed to discover and label an account it created — plus object-level `view`/`change`/`delete` on the users and `set_key` on the tokens it creates. It is not a superuser, cannot view any token key, and cannot touch unrelated Authentik objects.
-- **Account names.** Each service account's Authentik username embeds a slug of its connection's display name, with the opaque connection ID appended, and the account is added to the `SOVEREIGN_CONFIG_MANAGER_GROUP` group purely for browsing.
+- **Account names.** Each service account's Authentik username embeds a slug of its connection's display name, with the opaque connection ID appended, and the account is added to the `SOVEREIGN_CONFIG_MANAGER_GROUP` group, which admits it to sign in ([Who may sign in](#who-may-sign-in)). That step is required: if it fails, the create fails as any other provisioning step's failure does and the account is deleted, rather than returning an access URL that cannot obtain a token.

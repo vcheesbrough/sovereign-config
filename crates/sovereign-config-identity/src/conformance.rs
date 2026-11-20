@@ -287,7 +287,7 @@ async fn grants_the_account(target: &impl ConformanceTarget, created: &Provision
     // Only once the account is set up as the server sets it up — granted and
     // in its group — is its credential what an access URL hands out. An
     // identity provider may admit an account to the application only through
-    // that group, as the development Authentik does.
+    // that group, as both Authentik applications do.
     match authenticates(target, &created.credential).await {
         None => false,
         Some(token) => {

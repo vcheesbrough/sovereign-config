@@ -92,7 +92,7 @@ struct Script {
     /// Whether the caller may see the service account's app password,
     /// reproducing Authentik's token ownership and permission rules.
     credentials_visible: bool,
-    /// Whether the configured browsing group exists in the directory.
+    /// Whether the configured connections group exists in the directory.
     group_exists: bool,
     set_credential_delay: Duration,
     /// Delay applied before the account is registered in the mock,
@@ -319,7 +319,8 @@ async fn list_tokens(
     Json(json!({ "results": results })).into_response()
 }
 
-/// Serves the group name lookup used for best-effort browsing membership.
+/// Serves the group name lookup for the connections group a new account
+/// joins.
 async fn list_groups(
     State(state): State<MockState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
@@ -725,7 +726,7 @@ async fn create_provisions_exactly_one_read_only_grant_and_returns_one_url() {
         json!(true)
     );
 
-    // The new account is added to the configured browsing group.
+    // The new account is added to the configured connections group.
     let assignments = mock.group_assignments();
     assert_eq!(assignments.len(), 1);
     assert_eq!(assignments[0].1, TEST_GROUP_ID);
@@ -924,34 +925,73 @@ async fn create_cannot_grant_a_permission_the_caller_lacks() {
     .expect("granting only held permissions must succeed");
 }
 
-/// Group membership is a pure operator convenience and must never block or
-/// roll back an otherwise-successful connection, whether the configured
-/// group cannot be resolved or the assignment itself is rejected.
+/// The connections group gates sign-in to the application (#588), so an
+/// account that cannot join it holds a dead credential: whether the group
+/// cannot be resolved or the assignment itself is rejected, the create fails
+/// with the status every other provisioning step's failure returns, the
+/// account is deleted and the connection discarded. No access URL leaves.
 #[tokio::test]
 #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
-async fn group_assignment_failure_does_not_block_creation() {
+async fn group_assignment_failure_fails_creation_and_deletes_the_account() {
     let mock = mock_authentik().await;
-    let service = service_or_skip!(&mock);
+    let metrics = Arc::new(ManagedConnectionMetrics::default());
+    let Some(service) = service_with_metrics(&mock, Arc::clone(&metrics)).await else {
+        return;
+    };
 
-    mock.script(|script| script.group_exists = false);
-    let (connection_id, _) = create(&service, "No group", "/apps/api", &operator("/"))
+    // A failed grant: the status clients already meet from a create.
+    mock.script(|script| script.set_attributes = Behavior::Status(StatusCode::FORBIDDEN));
+    let grant_failure = create(&service, "No grant", "/apps/api", &operator("/"))
         .await
-        .expect("a missing browsing group must not fail creation");
-    assert_eq!(rows(&service).await[0].connection_id, connection_id);
+        .expect_err("a failed grant must fail creation");
+    mock.script(|script| script.set_attributes = Behavior::Ok);
+
+    for (case, missing_group) in [("missing group", true), ("rejected assignment", false)] {
+        mock.script(|script| {
+            script.group_exists = !missing_group;
+            script.add_to_group = if missing_group {
+                Behavior::Ok
+            } else {
+                Behavior::Status(StatusCode::FORBIDDEN)
+            };
+        });
+        let deleted_before = mock.deleted_users().len();
+        let status = create(&service, "Ungrouped", "/apps/api", &operator("/"))
+            .await
+            .expect_err("a failed group assignment must fail creation");
+        assert_bounded(&status);
+        assert_eq!(status.code(), grant_failure.code(), "{case}");
+        assert_eq!(status.message(), grant_failure.message(), "{case}");
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{case}");
+        assert!(rows(&service).await.is_empty(), "{case}: row discarded");
+        assert_eq!(
+            mock.deleted_users().len(),
+            deleted_before + 1,
+            "{case}: the created account is deleted"
+        );
+    }
     assert!(mock.group_assignments().is_empty());
 
+    let rendered = metrics.series();
+    for series in [
+        "sovereign_config_managed_dependency_total{call=\"assign_group\",outcome=\"not_found\"} 1",
+        "sovereign_config_managed_dependency_total{call=\"assign_group\",outcome=\"rejected\"} 1",
+        "sovereign_config_managed_dependency_total{call=\"assign_group\",outcome=\"ok\"} 0",
+        "sovereign_config_managed_dependency_total{call=\"delete_user\",outcome=\"ok\"} 3",
+    ] {
+        assert!(rendered.contains(series), "{series}\n{rendered}");
+    }
+
+    // Once the group can be joined again, creation succeeds.
     mock.script(|script| {
         script.group_exists = true;
-        script.add_to_group = Behavior::Status(StatusCode::FORBIDDEN);
+        script.add_to_group = Behavior::Ok;
     });
-    let (connection_id, _) = create(&service, "Rejected group", "/apps/api", &operator("/"))
+    let (connection_id, _) = create(&service, "Grouped", "/apps/api", &operator("/"))
         .await
-        .expect("a rejected group assignment must not fail creation");
-    let rows = rows(&service).await;
-    assert!(
-        rows.iter()
-            .any(|row| row.connection_id == connection_id && row.state == "active")
-    );
+        .expect("create must succeed once the group can be joined");
+    assert_eq!(rows(&service).await[0].connection_id, connection_id);
+    assert_eq!(mock.group_assignments().len(), 1);
 }
 
 #[tokio::test]
