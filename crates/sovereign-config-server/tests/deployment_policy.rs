@@ -602,13 +602,14 @@ fn final_user(dockerfile: &str) -> Option<String> {
 }
 
 /// A Dockerfile's logical lines: each line ending in `\` is joined to the
-/// next, and comment lines inside a continuation are dropped, as Docker
-/// drops them.
+/// next. Comment lines are dropped wherever they appear, so a comment ending
+/// in `\` never continues, and a blank line inside a continuation is
+/// skipped rather than ending it, both as Docker does.
 fn instructions(dockerfile: &str) -> Vec<String> {
     let mut instructions = Vec::new();
     let mut pending: Option<String> = None;
     for line in dockerfile.lines() {
-        if pending.is_some() && line.trim_start().starts_with('#') {
+        if line.trim_start().starts_with('#') || (pending.is_some() && line.trim().is_empty()) {
             continue;
         }
         let trimmed = line.trim_end();
@@ -731,5 +732,25 @@ fn a_dockerfiles_user_follows_line_continuations() {
     assert_eq!(
         final_user("FROM a\nUSER app\nRUN echo \\\n  from b\n").as_deref(),
         Some("app")
+    );
+    // A comment ending in `\` does not continue, so the instruction after it
+    // is still read.
+    assert_eq!(
+        final_user("FROM a\nUSER 10001:10001\n# RUN apt-get install \\\n#     foo\nUSER root\n")
+            .as_deref(),
+        Some("root")
+    );
+    assert_eq!(
+        final_user("FROM a\nUSER 10001:10001\n# note \\\nUSER root\n").as_deref(),
+        Some("root")
+    );
+    // A blank line inside a continuation is skipped, not the end of it.
+    assert_eq!(
+        final_user("FROM a\nUSER root\nRUN x \\\n\nUSER 10001:10001\n").as_deref(),
+        Some("root")
+    );
+    assert_eq!(
+        final_user("FROM a\nUSER root\nRUN x \\\n   \nUSER 10001:10001\n").as_deref(),
+        Some("root")
     );
 }
