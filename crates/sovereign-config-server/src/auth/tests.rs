@@ -1846,14 +1846,19 @@ fn one_issuer_with_two_key_locations_fails_at_startup() {
 }
 
 /// The same issuer and key location given twice is one key set: read once per
-/// refresh, and verifying the issuer's tokens.
+/// refresh, and verifying the issuer's tokens. Locations are compared as URLs,
+/// so another spelling of the same one is the same location.
 #[tokio::test]
 async fn one_issuer_given_twice_with_one_key_location_shares_one_key_set() {
     let server = issuer().await;
     let rules = verification_rules(&server.issuer, "sovereign-config");
+    // Another spelling of the same location: compared as URLs, it is one.
+    let mut respelled = rules.clone();
+    respelled.jwks_uri = rules.jwks_uri.replacen("http://", "HTTP://", 1);
+    assert_ne!(respelled.jwks_uri, rules.jwks_uri);
     let authenticator = Authenticator::with_refresh_interval(
         AuthenticationConfig {
-            rules: vec![rules.clone(), rules],
+            rules: vec![rules, respelled],
             timeout: Duration::from_secs(1),
         },
         Duration::from_secs(60),
