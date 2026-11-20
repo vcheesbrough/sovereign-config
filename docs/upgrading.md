@@ -42,7 +42,7 @@ Newest first. A release not listed needs nothing beyond the procedure.
 
 ### 2.59: the connections group is required
 
-- **Blueprint.** Apply the 2.59 blueprint. It now declares the application's policy bindings: the `admins` group at order 0 and the connections group (`SOVEREIGN_CONFIG_MANAGER_GROUP`) at order 1 ([Who may sign in](authentik.md#who-may-sign-in)). Where those bindings already exist with those values, nothing changes. Where they do not, only members of `admins` and managed accounts can sign in from then on, and the `admins` group must exist or the blueprint does not apply.
+- **Blueprint.** Apply the 2.59 blueprint. It now declares the application's policy bindings: the `admins` group at order 0 and the connections group (`SOVEREIGN_CONFIG_MANAGER_GROUP`) at order 1 ([Who may sign in](authentik.md#who-may-sign-in)). Where those bindings already exist with those values, nothing changes. Where they do not, only members of `admins` and managed accounts can sign in from then on, and the `admins` group must exist. Without it Authentik refuses the binding and rolls back the whole import, so nothing in the blueprint is applied ([Who may sign in](authentik.md#who-may-sign-in)).
 - **Creating an access URL.** A create now fails with the same "dependency is unavailable" error as any other provisioning failure, and deletes the account, when the account cannot be added to the connections group. Before, the create succeeded and returned an access URL that could not obtain a token. Clients need no change, and no protocol version changed.
 
 ### 2.56: the identity provider is chosen by configuration

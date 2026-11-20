@@ -36,8 +36,10 @@ Each blueprint binds its application to two groups, with policy engine mode `any
 
 | Order | Group | Who it admits |
 | --- | --- | --- |
-| 0 | `admins` | Operators. An existing group the blueprint references with `!Find` and never creates; applying a blueprint fails if it does not exist. |
+| 0 | `admins` | Operators. An existing group the blueprint references with `!Find` and never creates. Authentik's own default admin group is `authentik Admins`, so a fresh instance has no `admins` until an operator creates it. |
 | 1 | `sovereign-config-connections` / `sovereign-config-dev-connections` | Managed accounts, which the server adds to the group named by `SOVEREIGN_CONFIG_MANAGER_GROUP` when it creates an access URL. |
+
+**If `admins` does not exist, the blueprint does not apply, and nothing in it changes.** A `!Find` that matches nothing resolves to null in Authentik (`Find.resolve`, `authentik/blueprints/v1/common.py`). The binding's identifiers then become the application and a null group, which would match a policy or user binding already on the application. Either way, the entry reaches Authentik's binding validation with neither a group, a policy nor a user set, and is refused ("One of 'group', 'policy', 'user' must be set"). An existing policy or user binding is therefore never rewritten. A refused entry stops the import, and Authentik applies a blueprint in one transaction, so the whole import is rolled back and every entry before the binding is undone too. This is Authentik 2026.5.2's behaviour, read from its source.
 
 Both bindings are enabled, not negated, with a 30-second timeout and a failure result of "deny". A binding is identified by its application and group, so applying a blueprint to an instance where these were made by hand, with these values, changes nothing. Neither group carries a grant: what a principal may do is still only its grants claim ([Configuration grants](#configuration-grants)). Being admitted is what lets its credential obtain a token at all, which is why the server fails a create whose account it cannot add to the connections group.
 

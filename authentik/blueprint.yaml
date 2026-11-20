@@ -173,7 +173,10 @@ entries:
   # Who may sign in to the application. These record bindings first made by
   # hand, with the values they already hold, so applying the blueprint
   # changes nothing on an instance that has them. `admins` is an existing
-  # group this blueprint references but does not create. A binding is
+  # group this blueprint references but does not create. If it is absent,
+  # the `!Find` resolves to null, Authentik refuses the binding (it names no
+  # group, policy or user) and the whole import is rolled back; a policy or
+  # user binding on the application is never rewritten. A binding is
   # identified by its application and group, so a binding at another order
   # is updated, not duplicated.
   - model: authentik_policies.policybinding
