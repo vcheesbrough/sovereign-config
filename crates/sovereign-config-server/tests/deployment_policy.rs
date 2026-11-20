@@ -580,17 +580,58 @@ const DOCKERFILES_WITHOUT_THE_USER: [(&str, &str); 2] = [
 /// The `USER` in force at the end of a Dockerfile's last stage, if it sets
 /// one. A stage does not inherit the `USER` of an earlier stage unless it is
 /// built `FROM` it, which no runtime stage here is.
-fn final_user(dockerfile: &str) -> Option<&str> {
+///
+/// Instructions are matched in any letter case, as Docker reads them, and a
+/// line ending in the default `\` escape continues onto the next one, so
+/// neither `user root` nor `USER \` + `root` slips past. This is not a
+/// Dockerfile parser: a parser directive changing the escape character, or a
+/// heredoc, is not understood.
+fn final_user(dockerfile: &str) -> Option<String> {
     let mut user = None;
-    for line in dockerfile.lines() {
-        let mut words = line.split_whitespace();
+    for instruction in instructions(dockerfile) {
+        let mut words = instruction.split_whitespace();
         match words.next() {
-            Some("FROM") => user = None,
-            Some("USER") => user = words.next(),
+            Some(word) if word.eq_ignore_ascii_case("FROM") => user = None,
+            Some(word) if word.eq_ignore_ascii_case("USER") => {
+                user = words.next().map(str::to_owned);
+            }
             _ => {}
         }
     }
     user
+}
+
+/// A Dockerfile's logical lines: each line ending in `\` is joined to the
+/// next, and comment lines inside a continuation are dropped, as Docker
+/// drops them.
+fn instructions(dockerfile: &str) -> Vec<String> {
+    let mut instructions = Vec::new();
+    let mut pending: Option<String> = None;
+    for line in dockerfile.lines() {
+        if pending.is_some() && line.trim_start().starts_with('#') {
+            continue;
+        }
+        let trimmed = line.trim_end();
+        let (text, continues) = match trimmed.strip_suffix('\\') {
+            Some(text) => (text, true),
+            None => (trimmed, false),
+        };
+        let joined = match pending.take() {
+            Some(mut so_far) => {
+                so_far.push(' ');
+                so_far.push_str(text);
+                so_far
+            }
+            None => text.to_owned(),
+        };
+        if continues {
+            pending = Some(joined);
+        } else {
+            instructions.push(joined);
+        }
+    }
+    instructions.extend(pending);
+    instructions
 }
 
 /// Each image that runs as a service ends on the documented numeric user
@@ -612,6 +653,7 @@ fn every_runtime_image_ends_on_the_documented_user() {
         }
         let text = std::fs::read_to_string(&path).expect("Dockerfile readable");
         let user = final_user(&text);
+        let user = user.as_deref();
         if DOCKERFILES_WITHOUT_THE_USER
             .iter()
             .any(|(file, _)| *file == name)
@@ -647,12 +689,47 @@ fn every_runtime_image_ends_on_the_documented_user() {
 #[test]
 fn the_last_stage_decides_a_dockerfiles_user() {
     assert_eq!(
-        final_user("FROM a\nUSER 10001:10001\n"),
+        final_user("FROM a\nUSER 10001:10001\n").as_deref(),
         Some("10001:10001")
     );
     assert_eq!(
         final_user("FROM a AS b\nUSER app\nFROM c\nRUN true\n"),
         None
     );
-    assert_eq!(final_user("FROM a\nUSER app\nUSER root\n"), Some("root"));
+    assert_eq!(
+        final_user("FROM a\nUSER app\nUSER root\n").as_deref(),
+        Some("root")
+    );
+    // Docker reads instructions in any letter case and after leading
+    // whitespace, so a lower-case or indented `USER` or `FROM` still counts.
+    assert_eq!(final_user("from a\nuser root\n").as_deref(), Some("root"));
+    assert_eq!(final_user("FROM a\n  USER root\n").as_deref(), Some("root"));
+    assert_eq!(
+        final_user("FROM a\nUsEr app\n\tuser root\n").as_deref(),
+        Some("root")
+    );
+    assert_eq!(final_user("FROM a\nUSER app\n  from b\n"), None);
+}
+
+/// A `USER` split by a `\` continuation still names its user, and a
+/// continuation line of another instruction is never read as `USER` or
+/// `FROM`.
+#[test]
+fn a_dockerfiles_user_follows_line_continuations() {
+    assert_eq!(
+        final_user("FROM a\nUSER \\\n  root\n").as_deref(),
+        Some("root")
+    );
+    assert_eq!(
+        final_user("FROM a\nUSER \\\n# a comment\n  root\n").as_deref(),
+        Some("root")
+    );
+    assert_eq!(
+        final_user("FROM a\nUSER app\nRUN true \\\n  user root\n").as_deref(),
+        Some("app")
+    );
+    assert_eq!(
+        final_user("FROM a\nUSER app\nRUN echo \\\n  from b\n").as_deref(),
+        Some("app")
+    );
 }
