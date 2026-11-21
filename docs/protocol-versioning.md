@@ -4,7 +4,7 @@ Applications embedding `sovereign-config-provider` are deployed independently of
 
 ## How negotiation works
 
-1. The client calls the **handshake** — `/sovereign.config.Handshake/Negotiate` — sending every protocol version it speaks. The handshake is the one operation that is **not versioned and not routed by version**, and the only one a client may call before a version is agreed. It is served over **every transport the server speaks**: Connect, native gRPC and gRPC-Web. A client from 3.60 on asks over Connect first.
+1. The client calls the **handshake** — `/sovereign.config.Handshake/Negotiate` — sending every protocol version it speaks. The handshake is the one operation that is **not versioned and not routed by version**, and the only one a client may call before a version is agreed. It is served over **every transport the server speaks**: Connect, native gRPC and gRPC-Web. A client from 3.0 on asks over Connect first.
 2. The client's list exists for the server's **usage records only**. The server never filters or reorders its answer by it, never rejects on it, and treats it as untrusted input: it is counted under compiled-in labels, bounded in how much is examined, and can never mint a metric label of its own.
 3. The server answers with **every version it serves, most preferred first**, whatever the client asked for, and **never rejects**. Each version may carry a `deprecation_date` — an RFC 3339 UTC timestamp before which the server does not expect to retire it. That is a statement of intent, not a guarantee: a version may be served well past it, and a security flaw may retire one before it.
 4. The client selects the first version in the **server's** order that it also speaks, passing over a version carrying a deprecation date while one without is still to come. A selected deprecation date **warns and never fails** — the CLI to stderr, the MCP `status` tool in its output, the provider and broker through `tracing`, the browser in the header slot it already uses to report trouble with the service. With no version in common the client aborts with a bounded incompatible-protocol error that **names both lists**, so an operator can tell which end has to move.
@@ -17,7 +17,7 @@ The handshake is **unauthenticated**, and this is the recorded reason: a client 
 
 ### Reaching a server older than `v6`
 
-A server older than 3.60 serves no Connect at all, so it answers a Connect handshake in some other shape. It might send a bare `400` from the gRPC-Web layer, a gRPC answer, or close the connection. A native client takes any answer that is not a Connect answer, and any failure short of a timeout, as "this server predates `v6`". It asks the handshake again over gRPC, exactly as clients before 3.60 did, and selects `v5` or earlier: a version only Connect carries is dropped from that answer, because a server reached that way may serve `v6` behind something that does not pass Connect. A Connect answer is a `200` with `application/proto`, or an error status with a JSON body naming a Connect code. A timeout is reported as itself, because asking again would only double it. The web UI has no fallback: it is served by the server it calls, so that server always speaks Connect. Retiring `v3`–`v5` (#594) removes the fallback.
+A server older than 3.0 serves no Connect at all, so it answers a Connect handshake in some other shape. It might send a bare `400` from the gRPC-Web layer, a gRPC answer, or close the connection. A native client takes any answer that is not a Connect answer, and any failure short of a timeout, as "this server predates `v6`". It asks the handshake again over gRPC, exactly as clients before 3.0 did, and selects `v5` or earlier: a version only Connect carries is dropped from that answer, because a server reached that way may serve `v6` behind something that does not pass Connect. A Connect answer is a `200` with `application/proto`, or an error status with a JSON body naming a Connect code. A timeout is reported as itself, because asking again would only double it. The web UI has no fallback: it is served by the server it calls, so that server always speaks Connect. Retiring `v3`–`v5` (#594) removes the fallback.
 
 ### Reaching a server that has no handshake
 
@@ -116,7 +116,7 @@ Note the converse: a change can break clients *without* being a protocol change.
 | `v4` | third | gRPC, gRPC-Web | 2027-01-01 | `v3`'s whole surface plus the `Audit` service. Validates a request's shape before authorizing it. |
 | `v3` | fourth | gRPC, gRPC-Web | 2027-01-01 | The original surface. |
 
-`v3`–`v5` were deprecated in 3.60 (`2027-01-01T00:00:00Z`). Retiring them is #594.
+`v3`–`v5` were deprecated in 3.0 (`2027-01-01T00:00:00Z`). Retiring them is #594.
 
 `v4` differs from `v3` in exactly three ways, each recorded in `proto/sovereign/config/v4/service.proto`:
 

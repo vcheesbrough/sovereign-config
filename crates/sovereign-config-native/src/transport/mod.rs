@@ -4,7 +4,7 @@
 //! A connection is opened as a [`TonicChannel`], which can do exactly one
 //! thing: ask a service which protocol versions it serves. It asks over
 //! Connect first; a service that does not answer in Connect's shape predates
-//! `v6`, and is asked again over gRPC, as every client before 3.60 asked it. Only
+//! `v6`, and is asked again over gRPC, as every client before 3.0 asked it. Only
 //! [`TonicChannel::speaking`] — handed the version negotiation settled on —
 //! produces a [`TonicTransport`] that can carry configuration traffic. The
 //! version an operator is shown and the version on the wire are therefore the

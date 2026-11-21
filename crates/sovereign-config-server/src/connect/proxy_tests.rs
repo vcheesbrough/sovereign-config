@@ -1,7 +1,7 @@
 //! The native client — the transport the CLI, the MCP server, the provider
 //! and the broker share — through a proxy that forwards **HTTP/1.1 only**,
 //! in front of the Connect stack: what a deployment without h2c offers a
-//! client from 3.60 on.
+//! client from 3.0 on.
 //!
 //! The proxy refuses any request that is not HTTP/1.1 and speaks HTTP/1.1
 //! upstream, so nothing in a session that reaches the end can have needed

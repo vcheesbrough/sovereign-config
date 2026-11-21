@@ -39,7 +39,7 @@ pub(crate) enum WireTransport {
     Connect,
 }
 
-/// The `deprecation_date` announced for `v3`–`v5` in 3.60.0 (#582): the
+/// The `deprecation_date` announced for `v3`–`v5` in 3.0.0 (#582): the
 /// retirement of native gRPC, gRPC-Web and the h2c requirement with them
 /// (#594), which may start once it has passed and each version's
 /// `outcome="authenticated"` series reads zero.
