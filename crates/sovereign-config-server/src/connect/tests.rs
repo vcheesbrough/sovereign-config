@@ -122,7 +122,11 @@ where
             }
             _ if is_operational_rpc(request.uri().path()) => {}
             _ => {
-                let refusal = Status::unauthenticated("authentication failed").into_http();
+                // In the real layer's shape: the status in trailers, after an
+                // empty body, which is the branch of the shape layer that
+                // reads them.
+                let refusal =
+                    crate::auth::status_response(&Status::unauthenticated("authentication failed"));
                 return Box::pin(async move { Ok(refusal) });
             }
         }
@@ -131,7 +135,7 @@ where
 }
 
 /// The shared implementations the `v6` shims run over, on `database_url`.
-pub(super) fn connect_services(database_url: &str) -> ConnectServices {
+pub(crate) fn connect_services(database_url: &str) -> ConnectServices {
     let pool = PgPoolOptions::new()
         .acquire_timeout(Duration::from_secs(30))
         .connect_lazy(database_url)

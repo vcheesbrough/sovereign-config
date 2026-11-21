@@ -73,6 +73,15 @@ fn dialer(version: ProtocolVersion, channels: &Channels) -> Box<dyn SessionTrans
     }
 }
 
+/// Whether `version` travels on Connect rather than native gRPC — the same
+/// fact [`dialer`] encodes, for the handshake's gRPC fallback.
+const fn speaks_connect(version: ProtocolVersion) -> bool {
+    match version {
+        ProtocolVersion::V6 => true,
+        ProtocolVersion::V5 | ProtocolVersion::V4 | ProtocolVersion::V3 => false,
+    }
+}
+
 /// The handshake's one route, which every transport serves.
 const NEGOTIATE: &str = "/sovereign.config.Handshake/Negotiate";
 
@@ -168,11 +177,22 @@ impl Handshake for TonicChannel {
             // A service that predates `v6` answers a Connect call in some
             // other shape. Asked over gRPC, it answers as it always has, and
             // the session selects `v5` or earlier (#594 removes this).
-            Err(ConnectFailure::NotConnect) => HandshakeClient::new(self.channels.grpc.clone())
-                .negotiate(Request::new(request))
-                .await
-                .map_err(|status| map_status(&status))?
-                .into_inner(),
+            //
+            // A server that answers there and not over Connect may still be
+            // one that serves `v6` — behind something that does not pass
+            // Connect — so a version only Connect carries is no candidate.
+            Err(ConnectFailure::NotConnect) => {
+                let mut served = HandshakeClient::new(self.channels.grpc.clone())
+                    .negotiate(Request::new(request))
+                    .await
+                    .map_err(|status| map_status(&status))?
+                    .into_inner();
+                served.served_protocol_versions.retain(|entry| {
+                    ProtocolVersion::parse(&entry.protocol_version)
+                        .is_none_or(|version| !speaks_connect(version))
+                });
+                served
+            }
         };
 
         Ok(served
@@ -493,6 +513,56 @@ mod tests {
         ) -> Result<Response<GetIdentityResponse>, Status> {
             pending().await
         }
+    }
+
+    /// A handshake that serves `v6` and `v5`, over gRPC only.
+    struct GrpcOnlyNewServer;
+
+    #[tonic::async_trait]
+    impl HandshakeService for GrpcOnlyNewServer {
+        async fn negotiate(
+            &self,
+            _: Request<NegotiateRequest>,
+        ) -> Result<Response<NegotiateResponse>, Status> {
+            let entry =
+                |version: &str| sovereign_config_proto::sovereign::config::ServedProtocolVersion {
+                    protocol_version: version.to_owned(),
+                    deprecation_date: None,
+                };
+            Ok(Response::new(NegotiateResponse {
+                served_protocol_versions: vec![entry("v6"), entry("v5")],
+            }))
+        }
+    }
+
+    /// When only the gRPC fallback reached the server, a version only
+    /// Connect carries is not offered for selection, even if the server lists
+    /// it: the session settles on `v5`, which the fallback just proved works.
+    #[tokio::test]
+    async fn a_grpc_fallback_never_selects_a_connect_version() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // HTTP/2 only, so the Connect handshake (HTTP/1.1) gets no answer.
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(HandshakeServer::new(GrpcOnlyNewServer))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let channel = TonicChannel::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+
+        let served = channel.served_versions(ProtocolVersion::ALL).await.unwrap();
+        assert_eq!(
+            served
+                .iter()
+                .map(|entry| entry.version.as_str())
+                .collect::<Vec<_>>(),
+            ["v5"]
+        );
+        let status = sovereign_config_client::negotiate(&channel).await.unwrap();
+        assert_eq!(status.protocol_version, ProtocolVersion::V5);
+        server.abort();
     }
 
     #[test]

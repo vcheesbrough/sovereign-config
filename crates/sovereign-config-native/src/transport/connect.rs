@@ -77,6 +77,10 @@ impl ConnectChannel {
             .timeout(timeout)
             // A redirect would replay a bearer to wherever it pointed.
             .redirect(reqwest::redirect::Policy::none())
+            // Straight to the endpoint, as the gRPC transport goes: an
+            // `HTTP_PROXY` in the environment must not take the bearer on an
+            // undeclared route, in clear text for a loopback endpoint.
+            .no_proxy()
             .build()?;
         Ok(Self {
             http,

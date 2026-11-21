@@ -739,7 +739,7 @@ where
     }
 }
 
-fn status_response(status: &Status) -> Response<BoxBody> {
+pub(crate) fn status_response(status: &Status) -> Response<BoxBody> {
     let mut trailers = HeaderMap::new();
     status
         .add_header(&mut trailers)
