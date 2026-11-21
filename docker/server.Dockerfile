@@ -20,6 +20,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY test-consumers ./test-consumers
 COPY proto ./proto
+# The blueprints `migrate` applies are compiled into the server (#615), so the
+# one an image applies is the one it was built with.
+COPY authentik ./authentik
 RUN --mount=type=cache,id=sovereign-config-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=sovereign-config-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=sovereign-config-cargo-target,target=/src/target \

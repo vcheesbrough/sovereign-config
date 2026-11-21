@@ -11,7 +11,8 @@
 //! - `paths` — pure fold-path arithmetic (collision, parents, ancestors).
 //! - `subtree` — pure validation of a `ReplaceSubTree` mutation.
 //! - `content` — mapping a stored value onto its masked representation.
-//! - `startup` — the start-of-day secret encryption pass.
+//! - `startup` — `migrate`'s secret encryption pass, and the server's check
+//!   that it has run.
 
 mod authz;
 mod content;
@@ -27,7 +28,7 @@ mod v5;
 mod v6;
 
 pub(crate) use service::ConfigurationService;
-pub(crate) use startup::encrypt_stored_secrets;
+pub(crate) use startup::{encrypt_stored_secrets, verify_stored_secrets};
 pub(crate) use v3::V3Configuration;
 pub(crate) use v4::V4Configuration;
 pub(crate) use v5::V5Configuration;

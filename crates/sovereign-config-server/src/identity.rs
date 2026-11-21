@@ -10,8 +10,12 @@
 //!
 //! A deployment has one provider for life: the accounts and subjects the
 //! database records belong to the provider that issued them. So the first
-//! start records its name ([`claim_deployment`]), and a start under another
-//! name fails rather than orphan them.
+//! `migrate` records its name ([`claim_deployment`]), and a `migrate` or a
+//! server start under another name fails rather than orphan them
+//! ([`verify_deployment`]).
+//!
+//! `migrate`'s last step is the provider's own setup in itself
+//! ([`ExternalSetup`]): with Authentik, its blueprint.
 
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
@@ -60,6 +64,58 @@ impl Kind {
     fn build(self, variables: &dyn Variables) -> Result<IdentityProvider> {
         match self {
             Self::Authentik => sovereign_config_authentik::from_variables(variables),
+        }
+    }
+}
+
+/// The name of the identity provider the deployment's variables select,
+/// without building it: all `migrate` needs to claim the deployment.
+///
+/// # Errors
+///
+/// The selection names no provider.
+pub(crate) fn selected_name(variables: &dyn Variables) -> Result<&'static str> {
+    Kind::named(variables.get(IDENTITY_PROVIDER).as_deref()).map(Kind::name)
+}
+
+/// What `migrate` sets up in the identity provider itself, if anything.
+pub(crate) enum ExternalSetup {
+    /// The deployment selected no setup: the operator owns the provider's
+    /// configuration.
+    None,
+    Authentik(sovereign_config_authentik::Setup),
+}
+
+impl ExternalSetup {
+    /// The setup the deployment's variables select for its provider.
+    ///
+    /// # Errors
+    ///
+    /// The selection names no provider, or the provider refuses its setup
+    /// variables.
+    pub(crate) fn from_variables(variables: &dyn Variables) -> Result<Self> {
+        match Kind::named(variables.get(IDENTITY_PROVIDER).as_deref())? {
+            Kind::Authentik => Ok(
+                sovereign_config_authentik::Setup::from_variables(variables)?
+                    .map_or(Self::None, Self::Authentik),
+            ),
+        }
+    }
+
+    /// Applies the setup; idempotent, so a second run changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The provider is unreachable, too old, or refuses the setup.
+    pub(crate) async fn apply(&self) -> Result<()> {
+        match self {
+            Self::None => {
+                tracing::info!(
+                    "no identity provider setup selected; the provider's configuration is left as it is"
+                );
+                Ok(())
+            }
+            Self::Authentik(setup) => setup.apply().await,
         }
     }
 }
@@ -125,7 +181,7 @@ fn admit(provider: &IdentityProvider) -> Result<()> {
 }
 
 /// Records `provider` as this deployment's identity provider at its first
-/// start, and refuses a start under any other afterwards.
+/// `migrate`, and refuses a `migrate` under any other afterwards.
 ///
 /// # Errors
 ///
@@ -138,30 +194,78 @@ fn admit(provider: &IdentityProvider) -> Result<()> {
     fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "claim_deployment", db.collection.name = "identity_provider")
 )]
 pub(crate) async fn claim_deployment(database: &PgPool, provider: &'static str) -> Result<()> {
-    let unavailable = |_| {
-        spans::record_error("unavailable");
-        anyhow::anyhow!("unable to read the deployment's identity provider")
-    };
-    // The table holds at most one row, so the first start's insert is the
-    // only one that ever lands.
-    sqlx::query("INSERT INTO identity_provider (name) VALUES ($1) ON CONFLICT DO NOTHING")
-        .bind(provider)
-        .execute(database)
+    // The table holds at most one row, so the first insert is the only one
+    // that ever lands.
+    let claimed =
+        sqlx::query("INSERT INTO identity_provider (name) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(provider)
+            .execute(database)
+            .await
+            .map_err(unavailable)?
+            .rows_affected();
+    if claimed > 0 {
+        tracing::info!(
+            identity_provider = provider,
+            "recorded this deployment's identity provider"
+        );
+    }
+    match recorded(database).await? {
+        Some(recorded) => refuse_another(&recorded, provider),
+        None => bail!("the deployment's identity provider was not recorded"),
+    }
+}
+
+/// The server's check of what [`claim_deployment`] recorded: it changes
+/// nothing, and refuses to start on a database no `migrate` has claimed.
+///
+/// # Errors
+///
+/// The database cannot be reached, records no provider, or records another.
+#[instrument(
+    name = "verify_deployment identity_provider",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "verify_deployment", db.collection.name = "identity_provider")
+)]
+pub(crate) async fn verify_deployment(database: &PgPool, provider: &'static str) -> Result<()> {
+    if let Some(recorded) = recorded(database).await? {
+        return refuse_another(&recorded, provider);
+    }
+    spans::record_error("unclaimed");
+    Err(spans::classified(
+        "unclaimed",
+        "no identity provider is recorded for this deployment; \
+         run `sovereign-config-server migrate` before starting the server",
+    ))
+}
+
+fn unavailable(_: sqlx::Error) -> anyhow::Error {
+    spans::record_error("unavailable");
+    spans::classified(
+        "unavailable",
+        "unable to read the deployment's identity provider",
+    )
+}
+
+async fn recorded(database: &PgPool) -> Result<Option<String>> {
+    sqlx::query_scalar("SELECT name FROM identity_provider")
+        .fetch_optional(database)
         .await
-        .map_err(unavailable)?;
-    let recorded: String = sqlx::query_scalar("SELECT name FROM identity_provider")
-        .fetch_one(database)
-        .await
-        .map_err(unavailable)?;
+        .map_err(unavailable)
+}
+
+fn refuse_another(recorded: &str, provider: &'static str) -> Result<()> {
     if recorded != provider {
         spans::record_error("provider_mismatch");
         // Both names are from compiled-in sets: the recorded one was written
-        // by this function, from the same kind of value.
-        bail!(
-            "this deployment's accounts belong to the {recorded} identity provider, and \
-             {IDENTITY_PROVIDER} selects {provider}; changing provider is a migration, not a \
-             setting (docs/authentication.md)"
-        );
+        // by `claim_deployment`, from the same kind of value.
+        return Err(spans::classified(
+            "provider_mismatch",
+            format!(
+                "this deployment's accounts belong to the {recorded} identity provider, and \
+                 {IDENTITY_PROVIDER} selects {provider}; changing provider is a migration, \
+                 not a setting (docs/authentication.md)"
+            ),
+        ));
     }
     Ok(())
 }

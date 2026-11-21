@@ -64,10 +64,7 @@ fn the_shared_cache_is_mounted_by_the_steps_that_build_into_it() {
 
     assert_eq!(
         names,
-        vec![
-            "validate-authentik-manager-live",
-            "validate-authentik-manager-live-prod",
-        ],
+        vec!["validate-authentik-manager-live"],
         "the set of steps sharing the target cache changed"
     );
 }
@@ -178,10 +175,8 @@ fn the_live_steps_run_the_authentik_crates_live_tests() {
     const LIVE_RUN: &str =
         "cargo test --package sovereign-config-authentik live_ -- --ignored --test-threads=1";
     let pipeline = pipeline();
-    for step in [
-        "validate-authentik-manager-live",
-        "validate-authentik-manager-live-prod",
-    ] {
+    {
+        let step = "validate-authentik-manager-live";
         assert!(
             commands(pipeline.step(step)).contains(&LIVE_RUN),
             "{step} must run the Authentik crate's live tests"

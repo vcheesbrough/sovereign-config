@@ -19,28 +19,141 @@ fn compose_requires_an_operator_provisioned_volume() {
     assert!(readme.contains("All backup and staging storage must be encrypted too."));
 }
 
-#[test]
-fn compose_delivers_the_value_encryption_key_like_every_other_secret() {
-    let compose = include_str!("../../../compose.yaml");
+/// The credentials each container is given, as `/run/secrets/<name>` files,
+/// and the variable it reads each from. Nothing else carries a credential.
+const CREDENTIALS: [(&str, &[(&str, &str)]); 3] = [
+    (
+        "postgres",
+        &[("postgres_password", "POSTGRES_PASSWORD_FILE")],
+    ),
+    (
+        "migrate",
+        &[
+            ("database_url", "SOVEREIGN_CONFIG_DATABASE_URL_FILE"),
+            (
+                "authentik_admin_token",
+                "SOVEREIGN_CONFIG_AUTHENTIK_ADMIN_TOKEN_FILE",
+            ),
+            (
+                "manager_api_token",
+                "SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE",
+            ),
+            (
+                "value_encryption_key",
+                "SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE",
+            ),
+        ],
+    ),
+    (
+        "sovereign-config",
+        &[
+            ("database_url", "SOVEREIGN_CONFIG_DATABASE_URL_FILE"),
+            (
+                "manager_api_token",
+                "SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE",
+            ),
+            (
+                "value_encryption_key",
+                "SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE",
+            ),
+        ],
+    ),
+];
 
-    // Same dual-mode shape as the database URL and the manager token: the
-    // direct variable wins, the file is the fallback, and the file-backed
-    // secret resolves to /dev/null so Compose still parses when the key is
-    // injected through the environment instead.
-    assert!(compose.contains(
-        "SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY: ${SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY:-}"
-    ));
-    assert!(compose.contains(
-        "SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE: ${SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE-/run/secrets/value_encryption_key}"
-    ));
-    assert!(
-        compose
-            .contains("  value_encryption_key:\n    file: ${VALUE_ENCRYPTION_KEY_FILE:-/dev/null}")
-    );
-    assert!(compose.contains("      - value_encryption_key"));
+/// Every credential reaches its container as a file, never as a variable
+/// (#615): an exited container — `migrate`, after every deploy — keeps its
+/// environment in `docker inspect`. Each file is a host file the deploy
+/// writes (`file:`), because Compose cannot write an `environment:`-sourced
+/// secret into a read-only container, and an unset one is an empty file the
+/// binary refuses.
+#[test]
+fn compose_delivers_every_credential_as_a_file() {
+    let compose: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../../../compose.yaml")).expect("compose parses");
+    for (service, credentials) in CREDENTIALS {
+        let definition = compose_service(service);
+        let environment = environment(&definition);
+        let mut expected: Vec<&str> = credentials.iter().map(|(secret, _)| *secret).collect();
+        let mut given = strings(&definition["secrets"]);
+        expected.sort_unstable();
+        given.sort_unstable();
+        assert_eq!(
+            given, expected,
+            "{service} is given exactly its credentials"
+        );
+        for (secret, variable) in credentials {
+            assert_eq!(
+                environment[*variable].as_str(),
+                Some(format!("/run/secrets/{secret}").as_str()),
+                "{service} reads {secret} from its file, at a path no deploy overrides"
+            );
+            let direct = variable.trim_end_matches("_FILE");
+            assert!(
+                environment.get(direct).is_none(),
+                "{service} must not take {direct} as a variable"
+            );
+        }
+    }
+    let secrets = compose["secrets"].as_mapping().expect("secrets");
+    for (secret, host_variable) in [
+        ("postgres_password", "POSTGRES_PASSWORD_SECRET_FILE"),
+        ("database_url", "DATABASE_URL_FILE"),
+        ("manager_api_token", "MANAGER_API_TOKEN_FILE"),
+        ("value_encryption_key", "VALUE_ENCRYPTION_KEY_FILE"),
+        ("authentik_admin_token", "AUTHENTIK_ADMIN_TOKEN_FILE"),
+    ] {
+        assert_eq!(
+            secrets[secret]["file"].as_str(),
+            Some(format!("${{{host_variable}:-/dev/null}}").as_str()),
+            "{secret} is a host file the deploy names"
+        );
+    }
+    assert_eq!(secrets.len(), 5, "a credential was added or removed");
 }
 
-/// Both containers must be discoverable as one service in two environments.
+/// Only `migrate` holds the Authentik admin token: the server that runs for
+/// weeks never could configure Authentik, whatever it was made to do.
+#[test]
+fn only_migrate_is_given_the_authentik_admin_token() {
+    let compose: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../../../compose.yaml")).expect("compose parses");
+    for (name, service) in compose["services"].as_mapping().expect("services") {
+        let name = name.as_str().unwrap();
+        let holds = strings(&service["secrets"]).contains(&"authentik_admin_token")
+            || serde_yaml::to_string(&service["environment"])
+                .unwrap()
+                .contains("AUTHENTIK_ADMIN_TOKEN");
+        assert_eq!(holds, name == "migrate", "{name}");
+    }
+}
+
+/// `migrate` is the same image as the server, run once per `up` and never
+/// restarted, and the server starts only once it has exited 0 (#615).
+#[test]
+fn migrate_runs_once_from_the_servers_image_before_the_server() {
+    let migrate = compose_service("migrate");
+    let server = compose_service("sovereign-config");
+    assert_eq!(migrate["image"], server["image"]);
+    assert_eq!(strings(&migrate["command"]), ["migrate"]);
+    assert_eq!(migrate["restart"].as_str(), Some("no"));
+    assert_eq!(migrate["healthcheck"]["disable"].as_bool(), Some(true));
+    assert_eq!(
+        migrate["depends_on"]["postgres"]["condition"].as_str(),
+        Some("service_healthy")
+    );
+    assert_eq!(
+        server["depends_on"]["migrate"]["condition"].as_str(),
+        Some("service_completed_successfully")
+    );
+    assert!(
+        environment(&migrate)["SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT"]
+            .as_str()
+            .is_some_and(|value| value.contains(":?")),
+        "a deploy must choose its blueprint; none set would skip Authentik silently"
+    );
+}
+
+/// Every container must be discoverable as one service in two environments.
 ///
 /// The database's labels are the whole reason this test exists: an unlabelled
 /// container still ships logs, so nothing fails — Loki just files them under
@@ -54,11 +167,14 @@ fn every_container_is_labelled_for_log_discovery() {
 
     for (service, expected) in [
         ("postgres", "sovereign-config-postgres"),
+        // Part of the server's service, as its telemetry is.
+        ("migrate", "sovereign-config"),
         ("sovereign-config", "sovereign-config"),
         ("otlp-ingest", "sovereign-config-otlp-ingest"),
     ] {
         assert!(
-            compose.contains(&format!("\"observability.service.name={expected}\"")),
+            strings(&compose_service(service)["labels"])
+                .contains(&format!("observability.service.name={expected}").as_str()),
             "{service} must name itself for Loki and Prometheus"
         );
     }
@@ -66,7 +182,7 @@ fn every_container_is_labelled_for_log_discovery() {
         compose
             .matches("\"observability.deployment.environment=${SOVEREIGN_CONFIG_ENV:-dev}\"")
             .count(),
-        3,
+        4,
         "every container must carry the environment, from the same variable"
     );
 }
@@ -233,6 +349,7 @@ fn environment(service: &serde_yaml::Mapping) -> serde_yaml::Mapping {
 fn compose_passes_the_otel_names_and_no_value() {
     let compose = include_str!("../../../compose.yaml");
     let server = environment(&compose_service("sovereign-config"));
+    let migrate = environment(&compose_service("migrate"));
     for name in [
         "OTEL_SERVICE_NAME",
         "OTEL_RESOURCE_ATTRIBUTES",
@@ -243,10 +360,14 @@ fn compose_passes_the_otel_names_and_no_value() {
         "OTEL_TRACES_EXPORTER",
         "OTEL_SDK_DISABLED",
     ] {
-        assert!(
-            server.get(name).is_some_and(serde_yaml::Value::is_null),
-            "compose must pass {name} through to the server without a value"
-        );
+        for (service, environment) in [("the server", &server), ("migrate", &migrate)] {
+            assert!(
+                environment
+                    .get(name)
+                    .is_some_and(serde_yaml::Value::is_null),
+                "compose must pass {name} through to {service} without a value"
+            );
+        }
     }
     let ingest = environment(&compose_service("otlp-ingest"));
     for name in [
@@ -263,7 +384,7 @@ fn compose_passes_the_otel_names_and_no_value() {
         ingest["OTEL_SERVICE_NAME"].as_str(),
         Some("sovereign-config-otlp-ingest")
     );
-    for (key, value) in server.iter().chain(ingest.iter()) {
+    for (key, value) in server.iter().chain(migrate.iter()).chain(ingest.iter()) {
         let key = key.as_str().unwrap_or_default();
         if key.starts_with("OTEL_") && key != "OTEL_SERVICE_NAME" {
             assert!(value.is_null(), "{key} must be passed by name only");
@@ -365,11 +486,15 @@ fn the_client_telemetry_ingest_is_hardened_and_never_a_dependency() {
 
 /// `service.instance.id` is derived from the hostname, which must therefore
 /// survive a redeploy: Docker's default is the container id, new each time.
+/// `migrate` is an instance of its own.
 #[test]
 fn the_server_hostname_is_its_stable_container_name() {
     let compose = include_str!("../../../compose.yaml");
     assert!(compose.contains(
         "    hostname: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}\n"
+    ));
+    assert!(compose.contains(
+        "    hostname: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}-migrate\n"
     ));
 }
 

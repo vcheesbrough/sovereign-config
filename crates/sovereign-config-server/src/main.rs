@@ -7,6 +7,7 @@ mod handshake;
 mod identity;
 mod managed;
 mod metrics;
+mod migrate;
 mod protocol;
 mod rpc;
 mod spans;
@@ -23,7 +24,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
 use tokio::{net::TcpListener, signal};
 use tonic::{
     Request,
@@ -39,7 +40,7 @@ use tracing::{Instrument, error, info};
 
 use audit::{AuditRecorder, AuditTrailService, v4::V4Audit, v5::V5Audit, v6::V6Audit};
 use auth::{Authenticator, grpc_service_layer};
-use config::{Config, ManagedConnectionConfig, required_env};
+use config::{Config, ManagedConnectionConfig, MigrateConfig, required_env};
 use handshake::HandshakeService;
 use managed::{
     ManagedConnectionsService, ManagedSettings, TRAIL_REPAIR_DELAY, V3ManagedConnections,
@@ -64,7 +65,7 @@ use spans::TraceLayer;
 use system::{SERVED_PROTOCOL_LABELS, SystemService, V4System, V5System};
 use values::{
     ConfigurationService, V3Configuration, V4Configuration, V5Configuration, V6Configuration,
-    encrypt_stored_secrets,
+    verify_stored_secrets,
 };
 use web::WebAssetsLayer;
 
@@ -104,17 +105,27 @@ async fn ready(State(database): State<PgPool>) -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if env::args().nth(1).as_deref() == Some("healthcheck") {
+    let command = env::args().nth(1);
+    if command.as_deref() == Some("healthcheck") {
         return healthcheck().await;
     }
     // First, before anything logs: it installs the subscriber, and it fails
     // startup on a half-configured OTEL_* set rather than exporting nowhere.
     let mut telemetry = sovereign_config_telemetry::init(APPLICATION_VERSION)?;
-    let served = serve(&telemetry.meter()).await;
-    // Inside the runtime and after serving has stopped, so the records of the
-    // shutdown itself are flushed. Bounded, and never able to fail the exit.
+    let outcome = if command.as_deref() == Some("migrate") {
+        // The one-shot step every deploy runs before the server (`migrate`).
+        match MigrateConfig::from_env() {
+            Ok(config) => migrate::run(config).await,
+            Err(error) => Err(error),
+        }
+    } else {
+        serve(&telemetry.meter()).await
+    };
+    // Inside the runtime and after the work has stopped, so the records of
+    // the shutdown itself are flushed. Bounded, and never able to fail the
+    // exit.
     telemetry.shutdown();
-    served
+    outcome
 }
 
 async fn serve(meter: &Meter) -> Result<()> {
@@ -128,11 +139,13 @@ async fn serve(meter: &Meter) -> Result<()> {
     let audit_metrics = Arc::new(AuditMetrics::default());
     let audit = AuditRecorder::new(Arc::clone(&audit_metrics), config.audit.coalesce_window);
     let (managed_provider, managed_settings) = managed_dependencies(config.managed);
-    let database = connect_database(&config.database_url).await?;
-    // Before anything acts on a stored account: they belong to one provider.
-    identity::claim_deployment(&database, config.identity_provider).await?;
     let value_cipher = Arc::new(config.value_cipher);
-    encrypt_stored_secrets(&database, &value_cipher).await?;
+    let database = verified_database(
+        &config.database_url,
+        config.identity_provider,
+        &value_cipher,
+    )
+    .await?;
 
     register_metrics(
         meter,
@@ -295,35 +308,35 @@ fn managed_dependencies(
     (managed.accounts, settings)
 }
 
-/// Connects to the required `PostgreSQL` dependency and applies the
-/// forward-only migrations before anything can serve — as one root span,
-/// since startup is part of no request.
-async fn connect_database(database_url: &str) -> Result<PgPool> {
-    async {
-        let database = PgPoolOptions::new()
-            .acquire_timeout(Duration::from_secs(5))
-            .connect(database_url)
-            .await
-            .map_err(|_| {
-                spans::record_error("unavailable");
-                anyhow::anyhow!("unable to connect to required PostgreSQL dependency")
-            })?;
-        sqlx::migrate!("./migrations")
-            .run(&database)
-            .await
-            .inspect_err(|_| spans::record_error("migration_failed"))
-            .context("database migration failed")?;
-        Ok(database)
-    }
-    .instrument(tracing::info_span!(
-        parent: None,
-        "migrate",
-        otel.kind = "client",
-        otel.status_code = tracing::field::Empty,
-        error.type = tracing::field::Empty,
-        db.system.name = "postgresql",
-        db.operation.name = "migrate",
-    ))
+/// Connects to the required `PostgreSQL` dependency and checks that
+/// `migrate` has brought it up to this release — the schema, the identity
+/// claim, the stored secrets — as one root span, since startup is part of no
+/// request. The server changes none of it (#615): a database `migrate` has
+/// not run on is refused, naming `migrate`, and so is the wrong key.
+async fn verified_database(
+    database_url: &str,
+    identity_provider: &'static str,
+    value_cipher: &encryption::ValueCipher,
+) -> Result<PgPool> {
+    spans::in_root_span(
+        tracing::info_span!(
+            parent: None,
+            "sovereign_config.startup.verify",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+        ),
+        "verify_failed",
+        async {
+            let database = migrate::connect(database_url).await?;
+            migrate::verify_schema(&database).await?;
+            // Before anything acts on a stored account: they belong to one
+            // provider.
+            identity::verify_deployment(&database, identity_provider).await?;
+            verify_stored_secrets(&database, value_cipher).await?;
+            Ok(database)
+        },
+    )
     .await
 }
 

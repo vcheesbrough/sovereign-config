@@ -539,6 +539,36 @@ pub(crate) const fn grpc_code_name(code: Code) -> &'static str {
 /// Marks the current store span failed, for a store function that returns
 /// `sqlx::Error` rather than going through [`crate::rpc::storage_unavailable`].
 /// Never records the error itself: its text can quote SQL or a value.
+/// Runs `work` inside `span`, a root span of its own — a `migrate` step or
+/// the server's startup checks, which are part of no request — and marks the
+/// span failed if it fails. Its `error.type` is recorded here and only here:
+/// the classification the failure carries
+/// ([`sovereign_config_telemetry::error::Classified`]), else `fallback`.
+pub(crate) async fn in_root_span<T>(
+    span: Span,
+    fallback: &'static str,
+    work: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    async {
+        let outcome = work.await;
+        if let Err(error) = &outcome {
+            record_error(
+                sovereign_config_telemetry::error::classification(error.as_ref())
+                    .unwrap_or(fallback),
+            );
+        }
+        outcome
+    }
+    .instrument(span)
+    .await
+}
+
+/// A failure that carries its own `error.type`, for code that runs inside a
+/// root span [`in_root_span`] records.
+pub(crate) fn classified(error_type: &'static str, message: impl Into<String>) -> anyhow::Error {
+    sovereign_config_telemetry::error::Classified::new(error_type, message).into()
+}
+
 pub(crate) fn record_storage_error(_: &sqlx::Error) {
     record_error(crate::rpc::STORAGE_UNAVAILABLE_TYPE);
 }

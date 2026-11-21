@@ -142,7 +142,7 @@ fn production_steps_deploy_to_prod_from_permitted_branches() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 7, "a deploy-prod step was added or removed");
+    assert_eq!(checked, 4, "a deploy-prod step was added or removed");
 }
 
 /// Every step of the dev deploy runs only on a deployment targeting dev, from
@@ -175,7 +175,7 @@ fn development_steps_deploy_to_dev_only_on_a_dev_deployment() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 6, "a deploy-dev step was added or removed");
+    assert_eq!(checked, 4, "a deploy-dev step was added or removed");
 }
 
 /// Besides the code-vitals recorder (`pipeline_code_vitals.rs`), the anchor is
@@ -252,7 +252,7 @@ fn a_push_never_deploys() {
 /// A deployment never builds, publishes or allocates: in both deploy
 /// workflows the plugin's `resolve` chooses the build — the commit's release
 /// tag, else its newest published build — and proves all three GHCR images
-/// carry its labels, before anything touches Authentik. Nothing else in
+/// carry its labels, before anything is deployed. Nothing else in
 /// Woodpecker names a version or runs the plugin's build-side modes.
 #[test]
 fn a_deployment_resolves_a_published_build_and_never_allocates() {
@@ -345,7 +345,7 @@ fn each_deploy_is_tagged_once_it_has_succeeded() {
 /// Woodpecker takes a GitHub deployment whose ref is a bare commit as a
 /// deployment of main, so `branch: main` alone would let one ship a commit
 /// main never had. Production refuses any commit main does not contain,
-/// before its blueprint is applied.
+/// before its deploy — and so its `migrate` — runs.
 #[test]
 fn production_deploys_only_commits_main_contains() {
     let pipeline = pipeline();
@@ -365,9 +365,9 @@ fn production_deploys_only_commits_main_contains() {
         "the token travels in a curl config file, never in a URL"
     );
     assert!(
-        depends_on(pipeline.step_in("deploy-prod", "apply-authentik-blueprint-prod"))
+        depends_on(pipeline.step_in("deploy-prod", "deploy-prod"))
             .contains(&"verify-commit-on-main"),
-        "the production blueprint must wait for the on-main check"
+        "the production deploy must wait for the on-main check"
     );
 }
 
@@ -403,38 +403,148 @@ fn deployments_pull_the_release_from_ghcr() {
     );
 }
 
+/// Each environment's `migrate` applies its own blueprint (#615): the deploy
+/// selects it, and the binary carries both (`sovereign-config-authentik`,
+/// `setup`). Nothing applies a blueprint from CI any more.
 #[test]
-fn production_blueprint_applies_the_production_environment() {
+fn each_deploy_selects_its_own_environments_blueprint() {
     let pipeline = pipeline();
-    let settings = step(&pipeline, "apply-authentik-blueprint-prod")
-        .get("settings")
-        .expect("blueprint step needs settings");
-    assert_eq!(
-        settings.get("file").and_then(Value::as_str),
-        Some("authentik/blueprint.yaml"),
-        "production must apply the production blueprint"
-    );
-    assert_eq!(
-        settings.get("instance_name").and_then(Value::as_str),
-        Some("sovereign-config"),
-        "production blueprint instance must be the production application"
-    );
+    for (deploy, blueprint, other) in [
+        ("deploy-dev", "development", "production"),
+        ("deploy-prod", "production", "development"),
+    ] {
+        let command = commands_text(step(&pipeline, deploy));
+        assert!(
+            command.contains(&format!("SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT={blueprint}")),
+            "{deploy} must select the {blueprint} blueprint"
+        );
+        assert!(
+            !command.contains(&format!("SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT={other}")),
+            "{deploy} must not select the {other} blueprint"
+        );
+    }
+    for (workflow, name, step) in pipeline.steps() {
+        let image = step
+            .get("image")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !image.contains("authentik-blueprint"),
+            "{workflow}/{name} applies a blueprint from CI; `migrate` does that"
+        );
+    }
 }
 
+/// A deploy runs `migrate` on its own and waits for it to exit before it
+/// replaces the server, so a failed `migrate` leaves the running server in
+/// place (#615). Compose alone would not: `up` recreates the server before
+/// its `depends_on` condition is met, and `up --wait migrate` reports a
+/// one-shot service ready before it has finished.
 #[test]
-fn development_blueprint_applies_the_development_environment() {
+fn each_deploy_runs_migrate_before_it_replaces_the_server() {
     let pipeline = pipeline();
-    let settings = step(&pipeline, "apply-authentik-blueprint-dev")
-        .get("settings")
-        .expect("blueprint step needs settings");
-    assert_eq!(
-        settings.get("file").and_then(Value::as_str),
-        Some("authentik/blueprint-dev.yaml")
-    );
-    assert_eq!(
-        settings.get("instance_name").and_then(Value::as_str),
-        Some("sovereign-config-dev")
-    );
+    for (deploy, project) in [
+        ("deploy-dev", "sovereign-config-dev"),
+        ("deploy-prod", "sovereign-config-prod"),
+    ] {
+        let command = commands_text(step(&pipeline, deploy));
+        let lines: Vec<&str> = command.lines().map(str::trim).collect();
+        let position = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{deploy} has no line with {needle}"))
+        };
+        let migrate = position(&format!(
+            "\"$$COMPOSE\" -p {project} up -d --pull always migrate ||"
+        ));
+        let wait = position("MIGRATE_EXIT=$$(docker wait ");
+        let refuse = position("if [ \"$$MIGRATE_EXIT\" != 0 ]; then");
+        let server = position(&format!(
+            "\"$$COMPOSE\" -p {project} up -d --no-deps --wait --wait-timeout 90 sovereign-config ||"
+        ));
+        assert!(
+            migrate < wait && wait < refuse && refuse < server,
+            "{deploy}: migrate, wait for it, refuse on failure, then the server"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains(" up ") && !line.contains("otlp-ingest"))
+                .count(),
+            2,
+            "{deploy}: no other Compose run may start the server"
+        );
+    }
+}
+
+/// Every credential reaches its container as a file (#615): the deploy writes
+/// each to the environment's secrets volume and hands Compose the paths. None
+/// is passed as a variable, which an exited container would keep in
+/// `docker inspect`.
+#[test]
+fn each_deploy_delivers_every_credential_as_a_file() {
+    let pipeline = pipeline();
+    for (deploy, volume) in [
+        ("deploy-dev", "sovereign-config-dev-secrets"),
+        ("deploy-prod", "sovereign-config-production-secrets"),
+    ] {
+        let deploy_step = step(&pipeline, deploy);
+        let command = commands_text(deploy_step);
+        let mounts = strings(deploy_step.get("volumes").expect("volumes"));
+        assert!(
+            mounts.contains(&format!("{volume}:/run/deploy-secrets")),
+            "{deploy} mounts {volume}: {mounts:?}"
+        );
+        assert!(command.contains(&format!(
+            "SECRETS=$$(docker volume inspect --format '{{{{ .Mountpoint }}}}' {volume})"
+        )));
+        for (secret, owner, file_variable) in [
+            ("postgres_password", "0:0", "POSTGRES_PASSWORD_SECRET_FILE"),
+            ("database_url", "10001:10001", "DATABASE_URL_FILE"),
+            ("manager_api_token", "10001:10001", "MANAGER_API_TOKEN_FILE"),
+            (
+                "value_encryption_key",
+                "10001:10001",
+                "VALUE_ENCRYPTION_KEY_FILE",
+            ),
+            (
+                "authentik_admin_token",
+                "10001:10001",
+                "AUTHENTIK_ADMIN_TOKEN_FILE",
+            ),
+        ] {
+            assert!(
+                command.contains(&format!("secret {secret} {owner} ")),
+                "{deploy} writes {secret} for {owner}"
+            );
+            assert!(
+                command.contains(&format!("{file_variable}=\"$$SECRETS/{secret}\"")),
+                "{deploy} hands Compose {secret}'s path"
+            );
+        }
+        for variable in [
+            "SOVEREIGN_CONFIG_DATABASE_URL=",
+            "SOVEREIGN_CONFIG_MANAGER_API_TOKEN=",
+            "SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY=",
+            "SOVEREIGN_CONFIG_AUTHENTIK_ADMIN_TOKEN=",
+            "POSTGRES_PASSWORD_FILE=",
+        ] {
+            assert!(
+                !command.contains(variable),
+                "{deploy} passes {variable} to Compose"
+            );
+        }
+        let environment = deploy_step.get("environment").expect("environment");
+        assert_eq!(
+            environment
+                .get("AUTHENTIK_ADMIN_TOKEN")
+                .and_then(|value| value.get("from_secret"))
+                .and_then(Value::as_str),
+            Some("authentik_api_token"),
+            "{deploy} gives `migrate` the Authentik admin token"
+        );
+    }
 }
 
 #[test]
@@ -510,20 +620,20 @@ fn no_deploy_gates_on_the_client_telemetry_ingest() {
     }
 }
 
+/// The live manager tests run against what the dev deploy's `migrate`
+/// applied, so after it (#615), against dev's own browsing group. They are
+/// the promote gate for prod too: prod's blueprint differs from dev's only
+/// in names, and a commit reaches prod only after its dev deploy.
 #[test]
-fn prod_live_manager_check_validates_the_production_group() {
-    // The live lifecycle test resolves the browsing group named by
-    // SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP; the prod gate must point it at the
-    // production group so it actually validates prod, not the dev group.
+fn the_live_manager_tests_run_after_the_dev_deploy() {
     let pipeline = pipeline();
-    let env = step(&pipeline, "validate-authentik-manager-live-prod")
-        .get("environment")
-        .expect("prod live-manager step needs environment");
+    let live = step(&pipeline, "validate-authentik-manager-live");
+    assert_eq!(depends_on(live), ["deploy-dev"]);
     assert_eq!(
-        env.get("SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP")
+        live.get("environment")
+            .and_then(|environment| environment.get("SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP"))
             .and_then(Value::as_str),
-        Some("sovereign-config-connections"),
-        "the prod live-manager gate must validate the production browsing group"
+        Some("sovereign-config-dev-connections")
     );
 }
 
@@ -545,25 +655,15 @@ fn every_step_sits_in_its_workflow() {
         (
             "deploy-dev",
             &[
-                "validate-authentik-version",
                 "resolve",
-                "apply-authentik-blueprint-dev",
-                "validate-authentik-manager-live",
                 "deploy-dev",
+                "validate-authentik-manager-live",
                 "tag",
             ],
         ),
         (
             "deploy-prod",
-            &[
-                "validate-authentik-version",
-                "verify-commit-on-main",
-                "resolve",
-                "apply-authentik-blueprint-prod",
-                "validate-authentik-manager-live-prod",
-                "deploy-prod",
-                "tag",
-            ],
+            &["verify-commit-on-main", "resolve", "deploy-prod", "tag"],
         ),
     ];
     let actual: Vec<(&str, String)> = pipeline
@@ -599,13 +699,13 @@ fn dev_workflow_is_gated_as_a_whole() {
     }
 }
 
-/// Both deploy workflows choose their build and check Authentik the same way.
-/// Workflows cannot share a step, so each is defined in both and identical
-/// but for its `when`.
+/// Both deploy workflows choose their build the same way. Workflows cannot
+/// share a step, so it is defined in both and identical but for its `when`.
 #[test]
 fn deploy_workflows_share_their_promotion_steps() {
     let pipeline = pipeline();
-    for name in ["validate-authentik-version", "resolve"] {
+    {
+        let name = "resolve";
         assert_eq!(pipeline.workflows_of(name), ["deploy-dev", "deploy-prod"]);
         let copies: Vec<_> = ["deploy-dev", "deploy-prod"]
             .iter()
@@ -636,66 +736,6 @@ fn prod_workflow_is_gated_as_a_whole() {
         "deploy-prod must not wait for a workflow that never runs on a deployment"
     );
     let conditions = when_conditions(pipeline.workflow("deploy-prod"));
-    assert!(!conditions.is_empty());
-    for condition in conditions {
-        assert_eq!(condition.events, deployment_event());
-        assert_eq!(
-            condition.branches,
-            PROD_BRANCHES
-                .iter()
-                .map(|&branch| branch.to_owned())
-                .collect()
-        );
-        assert_eq!(condition.evaluate.as_deref(), Some(PROD_TARGET));
-    }
-}
-
-/// Each deploy workflow checks Authentik compatibility, and that the commit has
-/// a published build, before applying its blueprint: workflows cannot share a step, so the check is defined in
-/// both and runs only with the deploy it guards (and
-/// `deploy_workflows_share_their_promotion_steps` holds the copies identical).
-#[test]
-fn each_blueprint_apply_waits_for_the_authentik_version_check() {
-    let pipeline = pipeline();
-    for (workflow, apply, target) in [
-        ("deploy-dev", "apply-authentik-blueprint-dev", DEV_TARGET),
-        ("deploy-prod", "apply-authentik-blueprint-prod", PROD_TARGET),
-    ] {
-        let dependencies: Vec<&str> = pipeline
-            .step_in(workflow, apply)
-            .get("depends_on")
-            .and_then(Value::as_sequence)
-            .expect("blueprint apply should list its dependencies")
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        assert!(
-            dependencies.contains(&"validate-authentik-version"),
-            "{apply} must wait for validate-authentik-version"
-        );
-        // resolve refuses a commit with no published build, so it fails
-        // before its blueprint or live tests touch Authentik.
-        assert!(
-            dependencies.contains(&"resolve"),
-            "{apply} must wait for the release check (resolve)"
-        );
-        let check = pipeline.step_in(workflow, "validate-authentik-version");
-        assert!(
-            when_conditions(check).iter().all(|condition| {
-                condition.events == deployment_event()
-                    && condition.evaluate.as_deref() == Some(target)
-            }),
-            "the {workflow} copy of validate-authentik-version must run only on its own deployment"
-        );
-    }
-}
-
-/// The prod copy of the Authentik check carries the same prod-only guard as
-/// every other production step.
-#[test]
-fn prod_authentik_check_is_gated_like_every_prod_step() {
-    let pipeline = pipeline();
-    let conditions = when_conditions(pipeline.step_in("deploy-prod", "validate-authentik-version"));
     assert!(!conditions.is_empty());
     for condition in conditions {
         assert_eq!(condition.events, deployment_event());

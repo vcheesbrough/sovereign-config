@@ -7,12 +7,20 @@ use std::{
 
 const SECRET: &str = "startup-redaction-sentinel-4d9a9fd8";
 const MANAGER_SECRET: &str = "manager-redaction-sentinel-e3b7c1f4";
+/// The Authentik admin token, which only `migrate` is given.
+const ADMIN_SECRET: &str = "admin-redaction-sentinel-9c2e4a71";
 // A real 32-byte key, base64-encoded, so the server gets past key validation
 // on the paths that are meant to fail somewhere else.
 const VALUE_ENCRYPTION_KEY: &str = "dmFsdWUtZW5jcnlwdGlvbi1zZW50aW5lbC1rZXktMDE=";
 
 fn run_server(environment: &[(&str, String)]) -> Output {
+    run_command(None, environment)
+}
+
+/// The binary, as the server with no `command`, or as `migrate`.
+fn run_command(command_name: Option<&str>, environment: &[(&str, String)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sovereign-config-server"));
+    command.args(command_name);
     command.env_clear();
     for (name, value) in environment {
         command.env(name, value);
@@ -39,6 +47,10 @@ fn assert_secret_is_redacted(output: &Output) {
     assert!(
         !output.contains(VALUE_ENCRYPTION_KEY),
         "startup output exposed the value encryption key: {output}"
+    );
+    assert!(
+        !output.contains(ADMIN_SECRET),
+        "startup output exposed the Authentik admin token: {output}"
     );
 }
 
@@ -355,8 +367,41 @@ fn fake_collector() -> (String, Received) {
 /// test then searches what the collector received.
 #[test]
 fn no_startup_secret_reaches_an_exported_span_or_log_record() {
+    assert_nothing_secret_is_exported(None, Vec::new(), "sovereign_config.startup.verify");
+}
+
+/// The same for `migrate`, which also holds the Authentik admin token: its
+/// first step fails on the unreachable database, before Authentik is called.
+#[test]
+fn no_migrate_secret_reaches_an_exported_span_or_log_record() {
+    assert_nothing_secret_is_exported(
+        Some("migrate"),
+        vec![
+            (
+                "SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT",
+                "production".to_owned(),
+            ),
+            (
+                "SOVEREIGN_CONFIG_AUTHENTIK_ADMIN_TOKEN",
+                ADMIN_SECRET.to_owned(),
+            ),
+        ],
+        "sovereign_config.migrate.schema",
+    );
+}
+
+/// Runs the binary with every secret configured and every signal exporting
+/// to a collector stand-in; it spans its start, fails on the unreachable
+/// database (whose URL carries one of the secrets), and flushes on the way
+/// out. Then searches what the collector received.
+fn assert_nothing_secret_is_exported(
+    command: Option<&str>,
+    extra: Vec<(&'static str, String)>,
+    span: &str,
+) {
     let (endpoint, received) = fake_collector();
     let mut environment = configured_environment("127.0.0.1:50051");
+    environment.extend(extra);
     environment.extend([
         ("OTEL_SERVICE_NAME", "sovereign-config".to_owned()),
         (
@@ -370,7 +415,7 @@ fn no_startup_secret_reaches_an_exported_span_or_log_record() {
         ("OTEL_METRICS_EXPORTER", "otlp".to_owned()),
         ("RUST_LOG", "debug".to_owned()),
     ]);
-    let output = run_server(&environment);
+    let output = run_command(command, &environment);
     assert_secret_is_redacted(&output);
 
     let received = received.lock().unwrap().clone();
@@ -389,15 +434,15 @@ fn no_startup_secret_reaches_an_exported_span_or_log_record() {
     let traces = bodies("/v1/traces");
     let logs = bodies("/v1/logs");
     assert!(
-        traces.iter().any(|body| contains(body, "migrate")),
-        "the startup span must have been exported: {:?}",
+        traces.iter().any(|body| contains(body, span)),
+        "the {span} span must have been exported: {:?}",
         received.iter().map(|(path, _)| path).collect::<Vec<_>>()
     );
     assert!(!logs.is_empty(), "log records must have been exported");
     // Whatever metrics left before the failed start are searched too.
     let metrics = bodies("/v1/metrics");
     for body in traces.iter().chain(&logs).chain(&metrics) {
-        for secret in [SECRET, MANAGER_SECRET, VALUE_ENCRYPTION_KEY] {
+        for secret in [SECRET, MANAGER_SECRET, VALUE_ENCRYPTION_KEY, ADMIN_SECRET] {
             assert!(
                 !contains(body, secret),
                 "an exported span or log record carries a startup secret"

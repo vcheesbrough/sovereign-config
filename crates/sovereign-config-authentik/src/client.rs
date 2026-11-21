@@ -29,6 +29,15 @@ const USERS_ROUTE: &str = "/api/v3/core/users/";
 const GROUPS_ROUTE: &str = "/api/v3/core/groups/";
 const TOKENS_ROUTE: &str = "/api/v3/core/tokens/";
 const SET_KEY_ROUTE: &str = "/api/v3/core/tokens/{identifier}/set_key/";
+const VERSION_ROUTE: &str = "/api/v3/admin/version/";
+const SCHEMA_ROUTE: &str = "/api/v3/schema/";
+const BLUEPRINTS_ROUTE: &str = "/api/v3/managed/blueprints/";
+const BLUEPRINT_ROUTE: &str = "/api/v3/managed/blueprints/{instance_uuid}/";
+const BLUEPRINT_APPLY_ROUTE: &str = "/api/v3/managed/blueprints/{instance_uuid}/apply/";
+
+/// The API schema runs to megabytes; it is read once per `migrate`, and only
+/// searched, never decoded.
+const MAX_SCHEMA_BYTES: usize = 32 * 1024 * 1024;
 
 /// The service account created for one managed connection.
 pub(crate) struct CreatedServiceAccount {
@@ -349,6 +358,138 @@ impl AuthentikAdminClient {
         .map(|_| ())
     }
 
+    /// The running Authentik's version, as it reports it.
+    pub(crate) async fn version(&self) -> Result<String, ProviderError> {
+        #[derive(Deserialize)]
+        struct VersionResponse {
+            version_current: String,
+        }
+        let body = self
+            .call(
+                Method::GET,
+                VERSION_ROUTE,
+                self.endpoint(VERSION_ROUTE)?,
+                None,
+            )
+            .await?;
+        let decoded: VersionResponse =
+            serde_json::from_slice(&body).map_err(|_| ProviderError::Invalid)?;
+        Ok(decoded.version_current)
+    }
+
+    /// The API schema's text, to search for the surfaces the server needs.
+    pub(crate) async fn schema(&self) -> Result<Vec<u8>, ProviderError> {
+        self.call_bounded(
+            Method::GET,
+            SCHEMA_ROUTE,
+            self.endpoint(SCHEMA_ROUTE)?,
+            None,
+            MAX_SCHEMA_BYTES,
+        )
+        .await
+    }
+
+    /// The managed blueprint instance named exactly `name`, if there is one.
+    pub(crate) async fn blueprint_instance(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, ProviderError> {
+        #[derive(Deserialize)]
+        struct Instances {
+            results: Vec<Instance>,
+        }
+        #[derive(Deserialize)]
+        struct Instance {
+            pk: String,
+            name: String,
+        }
+        let mut url = self.endpoint(BLUEPRINTS_ROUTE)?;
+        url.query_pairs_mut().append_pair("name", name);
+        let body = self.call(Method::GET, BLUEPRINTS_ROUTE, url, None).await?;
+        let decoded: Instances =
+            serde_json::from_slice(&body).map_err(|_| ProviderError::Invalid)?;
+        let mut matching = decoded
+            .results
+            .into_iter()
+            .filter(|instance| instance.name == name);
+        match (matching.next(), matching.next()) {
+            (None, _) => Ok(None),
+            (Some(instance), None) => Ok(Some(instance_uuid(instance.pk)?)),
+            // The plugin this replaces patched the first of several; with two,
+            // which one owns the objects is a question for a person.
+            (Some(_), Some(_)) => Err(ProviderError::Invalid),
+        }
+    }
+
+    /// Creates the managed blueprint instance `name` holding `content`.
+    pub(crate) async fn create_blueprint_instance(
+        &self,
+        name: &str,
+        content: &Secret,
+    ) -> Result<String, ProviderError> {
+        #[derive(Deserialize)]
+        struct Created {
+            pk: String,
+        }
+        let body = self
+            .call(
+                Method::POST,
+                BLUEPRINTS_ROUTE,
+                self.endpoint(BLUEPRINTS_ROUTE)?,
+                Some(blueprint_instance_body(name, content)),
+            )
+            .await?;
+        let decoded: Created = serde_json::from_slice(&body).map_err(|_| ProviderError::Invalid)?;
+        instance_uuid(decoded.pk)
+    }
+
+    /// Replaces the content of the managed blueprint instance `pk`.
+    pub(crate) async fn update_blueprint_instance(
+        &self,
+        pk: &str,
+        name: &str,
+        content: &Secret,
+    ) -> Result<(), ProviderError> {
+        self.call(
+            Method::PATCH,
+            BLUEPRINT_ROUTE,
+            self.endpoint(&format!("{BLUEPRINTS_ROUTE}{pk}/"))?,
+            Some(blueprint_instance_body(name, content)),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Asks Authentik to apply the instance `pk` now.
+    pub(crate) async fn apply_blueprint_instance(&self, pk: &str) -> Result<(), ProviderError> {
+        self.call(
+            Method::POST,
+            BLUEPRINT_APPLY_ROUTE,
+            self.endpoint(&format!("{BLUEPRINTS_ROUTE}{pk}/apply/"))?,
+            Some(json!({})),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// The instance's apply status, in Authentik's words.
+    pub(crate) async fn blueprint_status(&self, pk: &str) -> Result<String, ProviderError> {
+        #[derive(Deserialize)]
+        struct Status {
+            status: String,
+        }
+        let body = self
+            .call(
+                Method::GET,
+                BLUEPRINT_ROUTE,
+                self.endpoint(&format!("{BLUEPRINTS_ROUTE}{pk}/"))?,
+                None,
+            )
+            .await?;
+        let decoded: Status = serde_json::from_slice(&body).map_err(|_| ProviderError::Invalid)?;
+        Ok(decoded.status)
+    }
+
     /// One administration call, inside its client span: the request carries
     /// the span's `traceparent`, and the span records the response status and,
     /// on failure, the bounded classification — never a body, a token or the
@@ -360,6 +501,18 @@ impl AuthentikAdminClient {
         url: Url,
         body: Option<Value>,
     ) -> Result<Vec<u8>, ProviderError> {
+        self.call_bounded(method, route, url, body, MAX_ADMIN_RESPONSE_BYTES)
+            .await
+    }
+
+    async fn call_bounded(
+        &self,
+        method: Method,
+        route: &'static str,
+        url: Url,
+        body: Option<Value>,
+        limit: usize,
+    ) -> Result<Vec<u8>, ProviderError> {
         let span = client_span(&method, Some(route), &self.api_origin);
         async {
             let mut request = self
@@ -370,7 +523,7 @@ impl AuthentikAdminClient {
                 request = request.json(&body);
             }
             let result = match send(&self.http, request).await {
-                Ok(response) => expect_success(response).await,
+                Ok(response) => expect_success(response, limit).await,
                 Err(error) => Err(classify_transport(&error)),
             };
             if let Err(error) = &result {
@@ -387,6 +540,31 @@ impl AuthentikAdminClient {
             .join(path)
             .map_err(|_| ProviderError::Invalid)
     }
+}
+
+/// A managed blueprint instance's body: inline content, enabled, and no file
+/// path, as the CI plugin this replaces sent it.
+fn blueprint_instance_body(name: &str, content: &Secret) -> Value {
+    json!({
+        "name": name,
+        "content": content.expose(),
+        "path": "",
+        "enabled": true,
+    })
+}
+
+/// A blueprint instance's primary key, which goes into a URL path: Authentik
+/// uses UUIDs, so anything else is refused rather than sent.
+fn instance_uuid(pk: String) -> Result<String, ProviderError> {
+    if pk.is_empty()
+        || pk.len() > 64
+        || !pk
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        return Err(ProviderError::Invalid);
+    }
+    Ok(pk)
 }
 
 fn classify_transport(error: &reqwest::Error) -> ProviderError {
@@ -414,14 +592,17 @@ fn classify_status(status: StatusCode) -> ProviderError {
 }
 
 /// Reads a bounded successful response body, discarding any failure text.
-async fn expect_success(response: reqwest::Response) -> Result<Vec<u8>, ProviderError> {
+async fn expect_success(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, ProviderError> {
     let status = response.status();
     if !status.is_success() {
         return Err(classify_status(status));
     }
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_ADMIN_RESPONSE_BYTES as u64)
+        .is_some_and(|length| length > limit as u64)
     {
         return Err(ProviderError::Invalid);
     }
@@ -434,7 +615,7 @@ async fn expect_success(response: reqwest::Response) -> Result<Vec<u8>, Provider
             ProviderError::Invalid
         }
     })? {
-        if body.len() + chunk.len() > MAX_ADMIN_RESPONSE_BYTES {
+        if body.len() + chunk.len() > limit {
             return Err(ProviderError::Invalid);
         }
         body.extend_from_slice(&chunk);

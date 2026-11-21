@@ -30,6 +30,7 @@
 pub mod client;
 pub mod config;
 pub mod context;
+pub mod error;
 pub mod keys;
 pub mod resource;
 #[cfg(feature = "testing")]
