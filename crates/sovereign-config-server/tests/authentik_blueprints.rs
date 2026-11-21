@@ -20,7 +20,7 @@ fn blueprints_emit_isolated_granular_grants() {
         blueprint: "blueprint-dev.yaml",
         mapping: "sovereign-config development grants",
         provider: "sovereign-config-dev",
-        group: "sovereign-config-development-config-contributor",
+        group: "sovereign-config-dev-admins",
         source_attribute: "sovereign_config_dev_grants",
         other_attribute: "sovereign_config_prod_grants",
         manager: "sovereign-config-dev-connection-manager",
@@ -31,7 +31,7 @@ fn blueprints_emit_isolated_granular_grants() {
         blueprint: "blueprint.yaml",
         mapping: "sovereign-config production grants",
         provider: "sovereign-config",
-        group: "sovereign-config-production-config-contributor",
+        group: "sovereign-config-admins",
         source_attribute: "sovereign_config_prod_grants",
         other_attribute: "sovereign_config_dev_grants",
         manager: "sovereign-config-connection-manager",
@@ -83,22 +83,25 @@ fn the_web_ui_provider_carries_the_telemetry_scope() {
 }
 
 /// Sign-in to each application is gated on two groups, as the live
-/// Authentik already has it (#588): `admins` for operators and the
-/// connections group for managed accounts, either one sufficing. The
-/// bindings carry the values the hand-made ones hold, so applying a
-/// blueprint changes nothing live, and the connections group is the one the
+/// Authentik has it (#588): the environment's own admins group for
+/// operators and the connections group for managed accounts, either one
+/// sufficing. The blueprint creates both before binding them, so every
+/// reference resolves; the bindings carry the live values, so applying a
+/// blueprint changes nothing live; and the connections group is the one the
 /// server is told to add accounts to.
 #[test]
 fn the_applications_admit_only_operators_and_managed_accounts() {
-    for (blueprint, application, managed_group) in [
+    for (blueprint, application, admins_group, managed_group) in [
         (
             "blueprint-dev.yaml",
             "sovereign-config-dev",
+            "sovereign-config-dev-admins",
             "sovereign-config-dev-connections",
         ),
         (
             "blueprint.yaml",
             "sovereign-config",
+            "sovereign-config-admins",
             "sovereign-config-connections",
         ),
     ] {
@@ -118,10 +121,12 @@ fn the_applications_admit_only_operators_and_managed_accounts() {
             "{blueprint}: any one binding admits"
         );
         let app_position = position(entries, app);
-        let group_position = position(
-            entries,
-            present_entry(entries, "authentik_core.group", managed_group),
-        );
+        let group_positions = [admins_group, managed_group].map(|group| {
+            position(
+                entries,
+                present_entry(entries, "authentik_core.group", group),
+            )
+        });
 
         let bindings = entries
             .iter()
@@ -160,7 +165,13 @@ fn the_applications_admit_only_operators_and_managed_accounts() {
             // `!Find` resolves when its entry is applied, so a binding must
             // come after the application and the group it names.
             let binding_position = position(entries, binding);
-            assert!(binding_position > app_position && binding_position > group_position);
+            assert!(
+                binding_position > app_position
+                    && group_positions
+                        .iter()
+                        .all(|&group| binding_position > group),
+                "{blueprint}: every binding comes after the groups it names"
+            );
 
             let order = field(attrs, "order")
                 .as_u64()
@@ -169,7 +180,7 @@ fn the_applications_admit_only_operators_and_managed_accounts() {
         }
         assert_eq!(
             bound,
-            [(0, "admins"), (1, managed_group)],
+            [(0, admins_group), (1, managed_group)],
             "{blueprint}: operators at order 0, managed accounts at order 1, nothing else"
         );
     }
@@ -216,7 +227,7 @@ fn assert_environment(environment: &Environment<'_>) {
     assert!(expression.contains(
         "if request.user.attributes.get(\"sovereign_config_managed\"):\n    claims[\"preferred_username\"] = f\"{request.user.name} (access URL)\"\nelse:\n    claims[\"preferred_username\"] = request.user.username"
     ));
-    assert!(!expression.contains("config-contributor"));
+    assert!(!expression.contains(environment.group));
 
     let group = present_entry(entries, "authentik_core.group", environment.group);
     let attributes = mapping(field(mapping(field(group, "attrs")), "attributes"));

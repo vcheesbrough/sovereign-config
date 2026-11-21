@@ -152,7 +152,7 @@ Every component is released together from one source tag under one version.
 
 The server takes its identity provider from `SOVEREIGN_CONFIG_IDENTITY_PROVIDER`, which defaults to `authentik`, the one provider it is built with. Each provider has a chapter that says how to set it up and which variables it reads; Authentik's is [Authentik](docs/authentik.md).
 
-Apply the matching Authentik blueprint (`authentik/blueprint.yaml` for production, `authentik/blueprint-dev.yaml` for development) to your Authentik instance, substituting its `${VARIABLE}` placeholders first. It creates the OIDC provider, the grant scope mapping, the contributor group, and the restricted connection-manager service account and its API token, and binds the application to the `admins` group and the connections group, so only their members can sign in. The `admins` group must already exist. [Authentik](docs/authentik.md) lists every object it creates and the variables it needs.
+Apply the matching Authentik blueprint (`authentik/blueprint.yaml` for production, `authentik/blueprint-dev.yaml` for development) to your Authentik instance, substituting its `${VARIABLE}` placeholders first. It creates the OIDC provider, the grant scope mapping, the admins group (the operator group), the connections group, and the restricted connection-manager service account and its API token, and binds the application to the admins and connections groups, so only their members can sign in. [Authentik](docs/authentik.md) lists every object it creates and the variables it needs.
 
 > [!TIP]
 > Note the blueprint's **issuer URL**, its **client id** (the audience) and the **connection-manager API token**. The server needs all three.
@@ -210,7 +210,7 @@ The service starts only after PostgreSQL reports healthy. It applies its forward
 
 ### 5. Verify
 
-- [ ] `https://<host>/` serves the web UI. Sign in with an Authentik user in `admins` and in the environment's contributor group.
+- [ ] `https://<host>/` serves the web UI. Sign in with an Authentik user in the environment's admins group (`sovereign-config-admins` or `sovereign-config-dev-admins`).
 - [ ] `https://<host>/downloads` offers the CLI and MCP installers matched to this server.
 - [ ] `/readyz` on the internal listener (port `9090` inside the container) reports readiness, including the database.
 
@@ -232,7 +232,7 @@ The server is configured entirely through environment variables. `compose.yaml` 
 | `SOVEREIGN_CONFIG_PUBLIC_ORIGIN` | ✅ | The exact canonical HTTPS origin embedded in generated access URLs. No userinfo, no path other than `/`, no query and no fragment. |
 | `SOVEREIGN_CONFIG_MANAGER_API_TOKEN` / `_FILE` | ✅ | The Authentik connection-manager API token. |
 | `SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE` | ✅ | The Authentik user and group attribute that carries this environment's grants, matching the blueprint's scope mapping (`sovereign_config_prod_grants` or `sovereign_config_dev_grants`). |
-| `SOVEREIGN_CONFIG_MANAGER_GROUP` | ✅ | The Authentik group each access URL's service account is added to. It carries no grant, but it gates sign-in: the blueprint's application admits only this group and `admins`, so a create whose account cannot be added to it fails. It must match the blueprint (`sovereign-config-connections` or `sovereign-config-dev-connections`). |
+| `SOVEREIGN_CONFIG_MANAGER_GROUP` | ✅ | The Authentik group each access URL's service account is added to. It carries no grant, but it gates sign-in: the blueprint's application admits only this group and the environment's admins group, so a create whose account cannot be added to it fails. It must match the blueprint (`sovereign-config-connections` or `sovereign-config-dev-connections`). |
 | `SOVEREIGN_CONFIG_MANAGER_CLIENT_ID` | — | The OAuth client id every access URL names, which its service account authenticates through. Unset means `SOVEREIGN_CONFIG_OIDC_AUDIENCE`. With Authentik it must equal the audience, because a token minted through another client would carry that client's id as its `aud` and be refused; any other value fails startup. Only ASCII letters, digits, `-`, `.`, `_` and `~`. If unset, the audience must meet that rule. |
 | `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY` / `_FILE` | ✅ | The base64 32-byte key that seals secret values. |
 | `SOVEREIGN_CONFIG_GRPC_ADDR` | ✅ | The public listener, `0.0.0.0:50051` in `compose.yaml`. |
@@ -367,7 +367,7 @@ Other deploy tooling can use `sovereign-config render` with an access URL in `SO
 
 ## Access control
 
-Authorization lives in the identity provider. Each environment's blueprint creates a contributor group holding `read`, `write` and `manage` on `/`, and adding a person to it gives them the whole tree. Signing in at all needs membership of `admins`, the group the application is bound to for people ([Authentik](docs/authentik.md#who-may-sign-in)). For narrower access, set the environment's grant attribute on a user, a service account or a group:
+Authorization lives in the identity provider. Each environment's blueprint creates an admins group, the operator group, holding `read`, `write` and `manage` on `/`. Adding a person to it gives them the whole tree, and it is also the only group the application admits people from ([Authentik](docs/authentik.md#who-may-sign-in)): a person outside it cannot sign in to that environment, whatever grants they hold. For narrower access, set the environment's grant attribute on a user, a service account or a group (a person given only narrower access needs a binding of their own to sign in):
 
 ```yaml
 sovereign_config_prod_grants:

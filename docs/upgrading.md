@@ -40,10 +40,12 @@ docker compose up -d --wait
 
 Newest first. A release not listed needs nothing beyond the procedure.
 
-### 2.59: the connections group is required
+### 2.59: admins groups, and sign-in gated on them
 
-- **Blueprint.** Apply the 2.59 blueprint. It now declares the application's policy bindings: the `admins` group at order 0 and the connections group (`SOVEREIGN_CONFIG_MANAGER_GROUP`) at order 1 ([Who may sign in](authentik.md#who-may-sign-in)). Where those bindings already exist with those values, nothing changes. Where they do not, only members of `admins` and managed accounts can sign in from then on, and the `admins` group must exist. Without it Authentik refuses the binding and rolls back the whole import, so nothing in the blueprint is applied ([Who may sign in](authentik.md#who-may-sign-in)).
-- **Creating an access URL.** A create now fails with the same "dependency is unavailable" error as any other provisioning failure, and deletes the account, when the account cannot be added to the connections group. Before, the create succeeded and returned an access URL that could not obtain a token. Clients need no change, and no protocol version changed.
+- **Rename the contributor groups first.** In Authentik, rename `sovereign-config-production-config-contributor` to `sovereign-config-admins` and `sovereign-config-development-config-contributor` to `sovereign-config-dev-admins` **in place, before applying the 2.59 blueprint**. Renaming keeps each group's members and grant attribute. A blueprint finds its groups by name, so applying it before the rename creates a new, empty admins group, binds the application to it, and locks every operator out.
+- **Then apply the 2.59 blueprint.** It declares each application's policy bindings: the environment's admins group at order 0 and its connections group (`SOVEREIGN_CONFIG_MANAGER_GROUP`) at order 1 ([Who may sign in](authentik.md#who-may-sign-in)). From then on only operators in the admins group and managed accounts can sign in. A binding that already exists with those values is left unchanged.
+- **Remove any other binding by hand.** A blueprint never deletes a binding it does not declare. If an application was bound to a group such as `admins` by hand, delete that binding in Authentik, or its members keep signing in.
+- **Creating an access URL.** A create now fails with the same "dependency is unavailable" error as any other provisioning failure, and deletes the account, when the account cannot be added to the connections group. Before, the create succeeded and returned an access URL that could not obtain a token. Clients need no change, and no protocol version changed. This is a [recorded protocol exception](protocol-versioning.md#what-forces-a-new-version-and-what-does-not).
 
 ### 2.56: the identity provider is chosen by configuration
 

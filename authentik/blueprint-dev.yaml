@@ -54,10 +54,15 @@ entries:
       description: "Send Sovereign Config web UI telemetry"
       expression: return {}
 
+  # The operator group: its grant attribute gives its members every
+  # permission on the whole tree, and its binding below is the only way a
+  # person signs in to the application. Before 2.59 it was named
+  # `sovereign-config-development-config-contributor`; rename it in place before
+  # applying this blueprint, or a new, empty group is created instead.
   - model: authentik_core.group
     state: present
     identifiers:
-      name: sovereign-config-development-config-contributor
+      name: sovereign-config-dev-admins
     attrs:
       is_superuser: false
       attributes:
@@ -119,7 +124,8 @@ entries:
       slug: sovereign-config-dev
       provider: !Find [authentik_providers_oauth2.oauth2provider, [name, sovereign-config-dev]]
       # Sign-in is admitted when any binding below passes: an operator in
-      # `admins`, or a managed account in the connections group.
+      # `sovereign-config-dev-admins`, or a managed account in the connections
+      # group.
       policy_engine_mode: any
 
   # Isolated identity used only to provision managed application connections.
@@ -160,9 +166,9 @@ entries:
 
   # Every managed connection's service account is added here. The group
   # carries no roles and no grant attribute, but it gates sign-in: the
-  # application admits only this group and `admins` (bindings below), so an
-  # account outside it cannot obtain a token, and the server fails a create
-  # whose account it cannot add.
+  # application admits only this group and `sovereign-config-dev-admins`
+  # (bindings below), so an account outside it cannot obtain a token, and
+  # the server fails a create whose account it cannot add.
   - model: authentik_core.group
     state: present
     identifiers:
@@ -170,20 +176,17 @@ entries:
     attrs:
       is_superuser: false
 
-  # Who may sign in to the application. These record bindings first made by
-  # hand, with the values they already hold, so applying the blueprint
-  # changes nothing on an instance that has them. `admins` is an existing
-  # group this blueprint references but does not create. If it is absent,
-  # the `!Find` resolves to null, Authentik refuses the binding (it names no
-  # group, policy or user) and the whole import is rolled back; a policy or
-  # user binding on the application is never rewritten. A binding is
-  # identified by its application and group, so a binding at another order
-  # is updated, not duplicated.
+  # Who may sign in to the application: operators at order 0, managed
+  # accounts at order 1. Both groups are created above, so every `!Find`
+  # here resolves. These record the live bindings with the values they
+  # hold, so applying the blueprint changes nothing on an instance that has
+  # them. A binding is identified by its application and group, so a
+  # binding at another order is updated, not duplicated.
   - model: authentik_policies.policybinding
     state: present
     identifiers:
       target: !Find [authentik_core.application, [slug, sovereign-config-dev]]
-      group: !Find [authentik_core.group, [name, admins]]
+      group: !Find [authentik_core.group, [name, sovereign-config-dev-admins]]
     attrs:
       order: 0
       enabled: true
