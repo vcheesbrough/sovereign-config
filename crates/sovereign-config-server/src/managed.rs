@@ -11,7 +11,7 @@
 //!   authorization and the lifecycle flows.
 //! - `shim` — the one adapter every version's shim instantiates, and the
 //!   validation policies a version chooses between.
-//! - `v3`, `v4`, `v5` — each version's tonic impl: `shim` pointed at that version's
+//! - `v3`, `v4`, `v5`, `v6` — each version's tonic impl: `shim` pointed at that version's
 //!   generated types.
 //! - `provisioning` — identity-provider orchestration, compensation,
 //!   reconciliation.
@@ -28,6 +28,7 @@ mod store;
 mod v3;
 mod v4;
 mod v5;
+mod v6;
 mod wire;
 
 pub(crate) use repair::TRAIL_REPAIR_DELAY;
@@ -35,6 +36,7 @@ pub(crate) use service::{ManagedConnectionsService, ManagedSettings};
 pub(crate) use v3::V3ManagedConnections;
 pub(crate) use v4::V4ManagedConnections;
 pub(crate) use v5::V5ManagedConnections;
+pub(crate) use v6::V6ManagedConnections;
 
 #[cfg(test)]
 mod shim_tests;

@@ -3,14 +3,15 @@ const AxeBuilder = require('@axe-core/playwright').default;
 const {
   signedIn,
   openView,
-  grpcFrame,
   mockValues,
   mockApplication,
   mockConnections,
   openCallback,
   TREE_VALUES,
   treeNode,
-  openConfiguration
+  openConfiguration,
+  refuse,
+  SHARED_VERSIONS
 } = require('./helpers');
 
 test.describe('tree', () => {
@@ -407,11 +408,8 @@ test.describe('tree', () => {
     await mockValues(page, TREE_VALUES);
     // A principal scoped to a prefix is refused the root subtree; the namespace
     // list ListValues returns still carries the shape of the tree.
-    await page.route('**/sovereign.config.v3.Configuration/GetSubTree', route => route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'application/grpc-web+proto' },
-      body: grpcFrame(Buffer.alloc(0), 7)
-    }));
+    await page.route(`**/sovereign.config.${SHARED_VERSIONS}.Configuration/GetSubTree`,
+      route => refuse(route, 7));
     await openConfiguration(page);
 
     await expect(treeNode(page, '/apps/api')).toHaveCount(1);

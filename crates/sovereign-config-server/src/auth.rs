@@ -24,7 +24,6 @@ use tonic::{
     Status,
     body::{BoxBody, empty_body},
 };
-use tonic_web::GrpcWebLayer;
 use tower::{
     Layer, Service,
     layer::util::{Identity, Stack},
@@ -34,6 +33,7 @@ use tracing::{info, warn};
 use self::jwks::{KeyLookup, KeySets};
 use crate::{
     config::AuthenticationConfig,
+    connect::{ConnectShapeLayer, GrpcWebUnlessConnectLayer},
     metrics::{AuthenticationMetrics, AuthenticationResult, ProtocolMetrics},
     protocol::{NegotiatedProtocolVersion, UnservedVersionLayer},
     spans::{self, GrpcStatusLayer, RequestSpan},
@@ -540,7 +540,7 @@ fn is_unauthenticated_version_handshake(path: &str) -> bool {
         .is_some_and(served)
 }
 
-fn is_operational_rpc(path: &str) -> bool {
+pub(crate) fn is_operational_rpc(path: &str) -> bool {
     OPERATIONAL_RPCS.contains(&path) || is_unauthenticated_version_handshake(path)
 }
 
@@ -583,11 +583,23 @@ impl AuthenticationLayer {
 
 pub(crate) type GrpcServiceLayer = Stack<
     AuthenticationLayer,
-    Stack<UnservedVersionLayer, Stack<GrpcStatusLayer, Stack<GrpcWebLayer, Identity>>>,
+    Stack<
+        UnservedVersionLayer,
+        Stack<
+            ConnectShapeLayer,
+            Stack<GrpcStatusLayer, Stack<GrpcWebUnlessConnectLayer, Identity>>,
+        >,
+    >,
 >;
 
-/// The gRPC stack, outermost first: gRPC-Web, then the span's gRPC status
-/// recorder, then the version-not-served catch-all, then authentication.
+/// The gRPC stack, outermost first: gRPC-Web (which Connect calls and asset
+/// `GET`s go round), then the span's gRPC status recorder, then the Connect
+/// shape layer, then the version-not-served catch-all, then authentication.
+///
+/// The Connect shape layer is *outside* the catch-all and authentication so
+/// that their refusals of a Connect call reach the client in Connect's shape,
+/// and *inside* the status recorder so that the outcome it leaves on the
+/// response is what the span records (`crate::connect`).
 ///
 /// The status recorder is *inside* `GrpcWebLayer` because only there is a
 /// browser's status still in trailers rather than framed into the body, and
@@ -619,8 +631,11 @@ pub(crate) fn grpc_service_layer(
         Stack::new(
             UnservedVersionLayer::new(served_versions),
             Stack::new(
-                GrpcStatusLayer,
-                Stack::new(GrpcWebLayer::new(), Identity::new()),
+                ConnectShapeLayer,
+                Stack::new(
+                    GrpcStatusLayer,
+                    Stack::new(GrpcWebUnlessConnectLayer, Identity::new()),
+                ),
             ),
         ),
     )
@@ -724,7 +739,7 @@ where
     }
 }
 
-fn status_response(status: &Status) -> Response<BoxBody> {
+pub(crate) fn status_response(status: &Status) -> Response<BoxBody> {
     let mut trailers = HeaderMap::new();
     status
         .add_header(&mut trailers)

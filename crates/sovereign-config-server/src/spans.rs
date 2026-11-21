@@ -46,7 +46,7 @@ use crate::{auth::AuthenticatedPrincipal, metrics::RequestMetrics};
 /// `every_served_rpc_has_a_route_and_nothing_else_does` compares it with the
 /// `.proto` files of the served versions, so adding or retiring a version
 /// cannot leave it behind.
-pub(crate) const RPC_ROUTES: [&str; 45] = [
+pub(crate) const RPC_ROUTES: [&str; 60] = [
     "/sovereign.config.Handshake/Negotiate",
     "/sovereign.config.v3.System/GetVersion",
     "/sovereign.config.v3.System/GetIdentity",
@@ -92,6 +92,21 @@ pub(crate) const RPC_ROUTES: [&str; 45] = [
     "/sovereign.config.v5.ManagedConnections/RotateManagedConnection",
     "/sovereign.config.v5.ManagedConnections/RevokeManagedConnection",
     "/sovereign.config.v5.Audit/QueryAuditTrail",
+    "/sovereign.config.v6.System/GetVersion",
+    "/sovereign.config.v6.System/GetIdentity",
+    "/sovereign.config.v6.Configuration/ListValues",
+    "/sovereign.config.v6.Configuration/GetSubTree",
+    "/sovereign.config.v6.Configuration/PutValue",
+    "/sovereign.config.v6.Configuration/ReplaceSubTree",
+    "/sovereign.config.v6.Configuration/DeleteValues",
+    "/sovereign.config.v6.Configuration/RevealSecret",
+    "/sovereign.config.v6.Configuration/AddValuePath",
+    "/sovereign.config.v6.Configuration/ListValuePaths",
+    "/sovereign.config.v6.ManagedConnections/ListManagedConnections",
+    "/sovereign.config.v6.ManagedConnections/CreateManagedConnection",
+    "/sovereign.config.v6.ManagedConnections/RotateManagedConnection",
+    "/sovereign.config.v6.ManagedConnections/RevokeManagedConnection",
+    "/sovereign.config.v6.Audit/QueryAuditTrail",
 ];
 
 /// The gRPC health service's routes all start with this; see the module
@@ -435,7 +450,13 @@ where
             if span.is_none() && recorder.0.is_none() {
                 return Ok(response);
             }
-            if let Some(code) = grpc_status(response.headers()) {
+            // A Connect answer carries no `grpc-status`: the Connect layers
+            // leave its outcome on the response instead.
+            let connect = response
+                .extensions()
+                .get::<crate::connect::ConnectOutcome>()
+                .map(|outcome| outcome.0);
+            if let Some(code) = connect.or_else(|| grpc_status(response.headers())) {
                 if let Some(span) = &span {
                     record_grpc_status(span, code);
                 }

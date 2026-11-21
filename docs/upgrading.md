@@ -40,6 +40,16 @@ docker compose up -d --wait
 
 Newest first. A release not listed needs nothing beyond the procedure.
 
+### 3.60: protocol `v6` over Connect, and the end of `v3`–`v5` announced
+
+3.60 is a major release: the product's wire changes. Upgrading the server alone is still safe, and every client already deployed keeps working.
+
+- **Protocol `v6`, over Connect.** The server serves a new protocol version, `v6`, over the [Connect protocol](https://connectrpc.com/docs/protocol) only: unary calls, binary or JSON, over HTTP/1.1 or HTTP/2. It also serves the handshake over Connect. Clients from 3.60 on negotiate `v6`. `v6` is `v5` with a few changes to how values are written, so that its JSON form works with `curl` and needs no generated code ([Calling v6 with curl](connect-json.md)).
+- **Each version has one transport.** `v3`–`v5` are still served over native gRPC and gRPC-Web, exactly as before, and never over Connect. `v6` is never served over gRPC. A call on the wrong transport gets the version-not-served answer ([Protocol versioning](protocol-versioning.md#each-version-names-its-transport)).
+- **`v3`, `v4` and `v5` are deprecated.** Each carries a `deprecation_date` of `2027-01-01T00:00:00Z` in the handshake. A client on one of them warns its operator and keeps working. Retiring them, which also retires native gRPC, gRPC-Web and the need for h2c, comes in a later release (#594). That release can ship only after the date has passed and `sovereign_config_protocol_requests_total{outcome="authenticated"}` reads zero for each of the three versions.
+- **Keep h2c on the proxy for now.** A client older than 3.60 speaks native gRPC, which needs the proxy to forward HTTP/2 cleartext. Keep `loadbalancer.server.scheme=h2c`, as the reference `compose.yaml` does, until every client in use is on 3.60 or later. A 3.60 client needs no h2c: it works through a proxy that forwards HTTP/1.1 only.
+- **Order.** Upgrade the server first. A 3.60 client against an older server finds no Connect handshake, falls back to gRPC, and works on `v5` or earlier. An older client against a 3.60 server sees `v6` in the handshake and skips it, because it does not speak it.
+
 ### 2.59: admins groups, and sign-in gated on them
 
 - **Rename the contributor groups first.** In Authentik, rename `sovereign-config-production-config-contributor` to `sovereign-config-admins` and `sovereign-config-development-config-contributor` to `sovereign-config-dev-admins` **in place, before applying the 2.59 blueprint**. Renaming keeps each group's members and grant attribute. A blueprint finds its groups by name, so applying it before the rename creates a new, empty admins group, binds the application to it, and locks every operator out.
@@ -120,6 +130,11 @@ Migration `0003` deletes every stored value: recreate them at absolute paths aft
 
 These break code that builds against the client crates, not deployed clients. Nothing breaks until you rebuild against the release. Newest first. `sovereign-config-provider`'s own API has not changed.
 
+- **3.60:**
+  - **The crates are now version 3.** A dependency written `"2"` (or `"^2"`) does not pick up 3.x. Change it to `"3"`.
+  - `ProtocolVersion` gains `V6`, now `PREFERRED`. Add a `V6` arm to any exhaustive `match` on it.
+  - `TonicChannel::connect` no longer opens a connection. An unreachable service is reported by the first call, usually the handshake, with the same `Unavailable` error as before. The channel speaks Connect for `v6` and the handshake, and native gRPC for `v3`–`v5`. The type names are unchanged.
+  - The Connect transport trusts the platform's root certificates, as the gRPC transport already did.
 - **2.46.415:** `ProtocolVersion` gains `V5`, now `PREFERRED`. `AuditQuery` gains `actor_filter` and `AuditPage` gains `counts`: struct literals must set them or use `..Default::default()`. On a `v4` session, a query with an `actor_filter` fails as incompatible.
 - **2.31.0:** `ProtocolVersion` gains `V4`, then `PREFERRED`. `SessionTransport` also requires `AuditTransport`.
 - **2.28.0:**

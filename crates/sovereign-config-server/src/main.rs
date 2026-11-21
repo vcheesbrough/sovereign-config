@@ -1,6 +1,7 @@
 mod audit;
 mod auth;
 mod config;
+mod connect;
 mod encryption;
 mod handshake;
 mod identity;
@@ -36,13 +37,13 @@ use tonic_health::pb::{
 use tonic_health::server::HealthReporter;
 use tracing::{Instrument, error, info};
 
-use audit::{AuditRecorder, AuditTrailService, v4::V4Audit, v5::V5Audit};
+use audit::{AuditRecorder, AuditTrailService, v4::V4Audit, v5::V5Audit, v6::V6Audit};
 use auth::{Authenticator, grpc_service_layer};
 use config::{Config, ManagedConnectionConfig, required_env};
 use handshake::HandshakeService;
 use managed::{
     ManagedConnectionsService, ManagedSettings, TRAIL_REPAIR_DELAY, V3ManagedConnections,
-    V4ManagedConnections, V5ManagedConnections,
+    V4ManagedConnections, V5ManagedConnections, V6ManagedConnections,
 };
 use metrics::{
     AuditMetrics, AuthenticationMetrics, JobMetrics, ManagedConnectionMetrics, ProtocolMetrics,
@@ -62,7 +63,8 @@ use sovereign_config_proto::sovereign::config::{
 use spans::TraceLayer;
 use system::{SERVED_PROTOCOL_LABELS, SystemService, V4System, V5System};
 use values::{
-    ConfigurationService, V3Configuration, V4Configuration, V5Configuration, encrypt_stored_secrets,
+    ConfigurationService, V3Configuration, V4Configuration, V5Configuration, V6Configuration,
+    encrypt_stored_secrets,
 };
 use web::WebAssetsLayer;
 
@@ -199,6 +201,16 @@ async fn serve(meter: &Meter) -> Result<()> {
             SERVED_PROTOCOL_LABELS,
         ))
         .layer(web_assets)
+        // Innermost: a Connect unary call is answered here, by the handshake
+        // or `v6`, inside every layer above; anything else goes on to tonic.
+        .layer(connect::ConnectDispatchLayer::new(connect::service(
+            connect::ConnectServices {
+                handshake: HandshakeService::new(Arc::clone(&protocol_metrics)),
+                configuration: V6Configuration::new(Arc::clone(&configuration)),
+                managed_connections: V6ManagedConnections::new(Arc::clone(&managed_connections)),
+                audit: V6Audit::new(Arc::clone(&audit_trail)),
+            },
+        )))
         .add_service(health_service)
         // Unversioned, and registered first: it is the operation every
         // version's clients call before any of them. It has no shim, because

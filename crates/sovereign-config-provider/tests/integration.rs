@@ -499,8 +499,8 @@ async fn config_source_reports_no_protocol_version_when_nothing_was_negotiated()
 
     let mut state = MockState::happy();
     // Every version this build speaks is retired, so the connect fails.
-    state.protocol_version = "v7".to_owned();
-    state.supported_protocol_versions = vec!["v6".to_owned(), "v7".to_owned()];
+    state.protocol_version = "v8".to_owned();
+    state.supported_protocol_versions = vec!["v7".to_owned(), "v8".to_owned()];
     let harness = Harness::start(Arc::new(state)).await;
     let source = SovereignConfigSource::initialise_from_url(harness.url.clone());
 
@@ -700,8 +700,8 @@ async fn a_server_newer_than_this_build_still_connects() {
 async fn a_server_that_retired_this_version_is_incompatible() {
     let mut state = MockState::happy();
     // Every version this build speaks is gone.
-    state.protocol_version = "v7".to_owned();
-    state.supported_protocol_versions = vec!["v6".to_owned(), "v7".to_owned()];
+    state.protocol_version = "v8".to_owned();
+    state.supported_protocol_versions = vec!["v7".to_owned(), "v8".to_owned()];
     let harness = Harness::start(Arc::new(state)).await;
 
     match Provider::connect(&harness.url).await {

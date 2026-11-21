@@ -353,8 +353,8 @@ fn protocol_negotiation_accepts_a_server_newer_than_this_client() {
 
 #[test]
 fn protocol_negotiation_rejects_a_server_outside_the_range() {
-    // Both boundaries: a server too new (v3 to v5 retired) and one too old.
-    for offered in [advertised(&["v7", "v6"]), advertised(&["v2", "v1"]), vec![]] {
+    // Both boundaries: a server too new (v3 to v6 retired) and one too old.
+    for offered in [advertised(&["v8", "v7"]), advertised(&["v2", "v1"]), vec![]] {
         let error = ServiceStatus::select(&offered)
             .expect_err("a server with no version in common must be rejected");
         assert_eq!(error.kind, ErrorKind::IncompatibleProtocol);
@@ -531,7 +531,8 @@ fn protocol_version_parsing_ignores_versions_this_build_does_not_speak() {
     assert_eq!(ProtocolVersion::parse("v3"), Some(ProtocolVersion::V3));
     assert_eq!(ProtocolVersion::parse("v4"), Some(ProtocolVersion::V4));
     assert_eq!(ProtocolVersion::parse("v5"), Some(ProtocolVersion::V5));
-    for unknown in ["v1", "v6", "v10", "V3", "V5", "3", ""] {
+    assert_eq!(ProtocolVersion::parse("v6"), Some(ProtocolVersion::V6));
+    for unknown in ["v1", "v7", "v10", "V3", "V6", "3", ""] {
         assert_eq!(ProtocolVersion::parse(unknown), None, "{unknown:?}");
     }
 }

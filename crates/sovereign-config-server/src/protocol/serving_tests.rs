@@ -243,7 +243,7 @@ async fn both_protocol_packages_answer_on_their_own_routes() {
     assert_eq!(v3.protocol_version, "v3");
     // `v3` advertises the served set oldest first, whatever the preference
     // order of `SERVED_PROTOCOL_LABELS`.
-    assert_eq!(v3.supported_protocol_versions, ["v3", "v4", "v5"]);
+    assert_eq!(v3.supported_protocol_versions, ["v3", "v4", "v5", "v6"]);
     assert_eq!(test.application_version, "testversion-service");
     assert_eq!(test.protocol_version, TEST_VERSION);
     assert_ne!(v3.application_version, test.application_version);
@@ -839,11 +839,11 @@ async fn every_version_serves_beside_v3_with_each_contract_and_label_its_own() {
         .expect("the v5 route must answer")
         .into_inner();
     assert_eq!(on_v3.protocol_version, "v3");
-    assert_eq!(on_v3.supported_protocol_versions, ["v3", "v4", "v5"]);
+    assert_eq!(on_v3.supported_protocol_versions, ["v3", "v4", "v5", "v6"]);
     assert_eq!(on_v4.protocol_version, "v4");
-    assert_eq!(on_v4.supported_protocol_versions, ["v5", "v4", "v3"]);
+    assert_eq!(on_v4.supported_protocol_versions, ["v6", "v5", "v4", "v3"]);
     assert_eq!(on_v5.protocol_version, "v5");
-    assert_eq!(on_v5.supported_protocol_versions, ["v5", "v4", "v3"]);
+    assert_eq!(on_v5.supported_protocol_versions, ["v6", "v5", "v4", "v3"]);
 
     let audit = v4::audit_client::AuditClient::new(channel.clone())
         .query_audit_trail(v4::QueryAuditTrailRequest::default())

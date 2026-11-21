@@ -105,6 +105,74 @@ pub(crate) const fn to_proto_timestamp(value: Timestamp) -> prost_types::Timesta
     }
 }
 
+/// How a protocol version writes counts and times: the one place two
+/// versions with the same message shapes still differ in the values they put
+/// on the wire. A shim macro takes it as a type, so each version chooses its
+/// form rather than branching on its own name.
+pub(crate) trait WireForm {
+    /// The integer type a count travels as.
+    type Count;
+    /// The type an audit event's identifier travels as.
+    type Id;
+
+    fn timestamp(value: Timestamp) -> prost_types::Timestamp;
+
+    fn count(value: u64) -> Self::Count;
+
+    fn id(value: u64) -> Self::Id;
+}
+
+/// `v3`–`v5`: counts as `uint64`, timestamps at the precision they were
+/// taken with. Frozen, like those versions.
+pub(crate) struct Wide;
+
+impl WireForm for Wide {
+    type Count = u64;
+    type Id = u64;
+
+    fn timestamp(value: Timestamp) -> prost_types::Timestamp {
+        to_proto_timestamp(value)
+    }
+
+    fn count(value: u64) -> u64 {
+        value
+    }
+
+    fn id(value: u64) -> u64 {
+        value
+    }
+}
+
+/// `v6` on: counts as `uint32`, which protobuf's JSON mapping writes as a
+/// number where a 64-bit integer becomes a string; an audit event's
+/// identifier as an opaque decimal string; and every timestamp at
+/// microseconds, the precision Postgres stores.
+///
+/// A count past `u32::MAX` saturates rather than wrapping: the counts are of
+/// values and audit events one caller can see, and four billion of either is
+/// far outside what one deployment holds.
+pub(crate) struct JsonSafe;
+
+impl WireForm for JsonSafe {
+    type Count = u32;
+    type Id = String;
+
+    fn timestamp(value: Timestamp) -> prost_types::Timestamp {
+        prost_types::Timestamp {
+            seconds: value.seconds,
+            nanos: value.nanos - value.nanos % 1_000,
+        }
+    }
+
+    fn count(value: u64) -> u32 {
+        u32::try_from(value).unwrap_or(u32::MAX)
+    }
+
+    fn id(value: u64) -> String {
+        value.to_string()
+    }
+}
+
 /// Message of [`storage_unavailable`]; exported so metrics can classify the
 /// outcome by matching it, exactly as before the helper was shared.
 pub(crate) const STORAGE_UNAVAILABLE_MESSAGE: &str = "configuration storage is unavailable";

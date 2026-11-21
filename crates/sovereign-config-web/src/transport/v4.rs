@@ -31,7 +31,7 @@ impl AuditTransport for Dialer {
             return Err(audit_actor_filter_not_available(VERSION));
         }
         let response: proto::QueryAuditTrailResponse =
-            grpc_unary(QUERY_AUDIT_TRAIL, &audit_request(query), Some(bearer)).await?;
+            unary(QUERY_AUDIT_TRAIL, &audit_request(query), Some(bearer)).await?;
         Ok(AuditPage {
             events: response
                 .events

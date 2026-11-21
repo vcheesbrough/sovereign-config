@@ -4,10 +4,12 @@ const {
   signedIn,
   openView,
   mutationSequence,
-  grpcFrame,
   mockValues,
   mockApplication,
-  openCallback
+  openCallback,
+  refuse,
+  SHARED_VERSIONS,
+  negotiate
 } = require('./helpers');
 
 test.describe('values', () => {
@@ -132,16 +134,13 @@ test.describe('values', () => {
     const rejected = '{"value":"after"}';
     await editor.fill(rejected);
     const subtreeResponse = page.waitForResponse(
-      '**/sovereign.config.v3.Configuration/GetSubTree'
+      `**/sovereign.config.${SHARED_VERSIONS}.Configuration/GetSubTree`
     );
     releaseSubtree();
     await subtreeResponse;
     await expect(editor).toHaveValue(rejected);
-    await page.route('**/sovereign.config.v3.Configuration/ReplaceSubTree', route => route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'application/grpc-web+proto' },
-      body: grpcFrame(Buffer.alloc(0), 7)
-    }));
+    await page.route(`**/sovereign.config.${SHARED_VERSIONS}.Configuration/ReplaceSubTree`,
+      route => refuse(route, 7));
     await page.getByRole('button', { name: 'Save JSON' }).click();
     await expect(page.getByText('permission denied', { exact: true })).toBeVisible();
     await expect(editor).toHaveValue(rejected);
@@ -394,10 +393,12 @@ test.describe('values', () => {
     await expect(page.getByText('2 values')).toBeVisible();
   });
 
+  // A gRPC-Web shape, so a session on a gRPC-Web version (`v5`).
   test('trailers-only save errors retain their bounded gRPC status', async ({ page }) => {
+    await negotiate(page, 'v5');
     await openCallback(page);
     await mockValues(page);
-    await page.route('**/sovereign.config.v3.Configuration/PutValue', route => route.fulfill({
+    await page.route('**/sovereign.config.v5.Configuration/PutValue', route => route.fulfill({
       status: 200,
       headers: {
         'content-type': 'application/grpc-web+proto',

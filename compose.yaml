@@ -122,6 +122,9 @@ services:
       - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.middlewares=lan-vpn-only@docker,rate-limit@docker,crowdsec@docker,security-headers@docker"
       - "traefik.http.routers.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.service=${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}"
       - "traefik.http.services.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.loadbalancer.server.port=50051"
+      # h2c stays while any client older than 3.60 is in use: those speak
+      # native gRPC (protocol v3-v5). Clients from 3.60 on speak Connect,
+      # which needs no h2c (docs/upgrading.md, 3.60; retired by #594).
       - "traefik.http.services.${SOVEREIGN_CONFIG_CONTAINER_NAME:-sovereign-config}.loadbalancer.server.scheme=h2c"
       - "observability.service.name=sovereign-config"
       - "observability.deployment.environment=${SOVEREIGN_CONFIG_ENV:-dev}"

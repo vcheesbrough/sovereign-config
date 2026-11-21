@@ -25,6 +25,7 @@ mod shim;
 mod store;
 pub(crate) mod v4;
 pub(crate) mod v5;
+pub(crate) mod v6;
 
 use std::{sync::Arc, time::Duration};
 

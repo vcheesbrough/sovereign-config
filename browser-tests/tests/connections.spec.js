@@ -3,7 +3,6 @@ const AxeBuilder = require('@axe-core/playwright').default;
 const {
   signedIn,
   openView,
-  grpcFrame,
   requestPermissions,
   mockValues,
   mockApplication,
@@ -13,7 +12,9 @@ const {
   openCallback,
   TREE_VALUES,
   treeNode,
-  openConfiguration
+  openConfiguration,
+  refuse,
+  SHARED_VERSIONS
 } = require('./helpers');
 
 test.describe('connections', () => {
@@ -122,12 +123,8 @@ test.describe('connections', () => {
 
     // The listing now fails. An empty panel would read as authoritative and could
     // prompt a second, redundant credential for a root that already has one.
-    await page.route('**/sovereign.config.v3.ManagedConnections/ListManagedConnections', route =>
-      route.fulfill({
-        status: 200,
-        headers: { 'content-type': 'application/grpc-web+proto' },
-        body: grpcFrame(Buffer.alloc(0), 14)
-      }));
+    await page.route(`**/sovereign.config.${SHARED_VERSIONS}.ManagedConnections/ListManagedConnections`,
+      route => refuse(route, 14));
     await treeNode(page, '/apps/worker').click();
     await treeNode(page, '/apps/api').click();
 

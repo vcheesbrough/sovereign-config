@@ -3,10 +3,11 @@ const AxeBuilder = require('@axe-core/playwright').default;
 const {
   signedIn,
   openView,
-  grpcFrame,
   mockValues,
   mockApplication,
-  openCallback
+  openCallback,
+  refuse,
+  SHARED_VERSIONS
 } = require('./helpers');
 
 test.describe('secrets', () => {
@@ -105,12 +106,8 @@ test.describe('secrets', () => {
     await refreshedRow.getByRole('button', { name: 'Reveal secret for api-token' }).click();
     await expect(page.getByLabel('Secret value for api-token')).toHaveValue(rotatedSecret);
 
-    const failedPut = '**/sovereign.config.v3.Configuration/PutValue';
-    await page.route(failedPut, route => route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'application/grpc-web+proto' },
-      body: grpcFrame(Buffer.alloc(0), 7)
-    }));
+    const failedPut = `**/sovereign.config.${SHARED_VERSIONS}.Configuration/PutValue`;
+    await page.route(failedPut, route => refuse(route, 7));
     await page.getByRole('button', { name: 'Add value' }).click();
     await page.getByLabel('Name', { exact: true }).fill('failed-value');
     await page.getByLabel('Value', { exact: true }).fill('never-stored');
@@ -197,7 +194,7 @@ test.describe('secrets', () => {
     await expect(page.getByRole('row', { name: /api-token/ })).toBeVisible();
     const releaseReveal = values.delayNextReveal();
     const revealResponse = page.waitForResponse(
-      '**/sovereign.config.v3.Configuration/RevealSecret'
+      `**/sovereign.config.${SHARED_VERSIONS}.Configuration/RevealSecret`
     );
     await page.getByRole('row', { name: /api-token/ })
       .getByRole('button', { name: 'Reveal secret for api-token' }).click();

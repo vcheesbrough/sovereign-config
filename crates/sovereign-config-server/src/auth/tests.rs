@@ -1870,3 +1870,61 @@ async fn one_issuer_given_twice_with_one_key_location_shares_one_key_set() {
     authenticator.authenticate(&server.headers()).await.unwrap();
     assert_eq!(server.calls(), 1, "the token was verified from that set");
 }
+
+/// The production gRPC stack, in front of the Connect dispatch, with a real
+/// authenticator: a Connect call is refused `unauthenticated` in Connect's
+/// shape — the refusal's status read from its trailers — whether it carries
+/// no token or a forged one, and a valid token reaches the `v6` shim.
+#[tokio::test]
+async fn the_production_stack_answers_a_connect_call_in_connects_shape() {
+    use crate::connect::{ConnectDispatchLayer, service, tests::connect_services};
+
+    let server = issuer().await;
+    let stack = grpc_service_layer(
+        server.authenticator(Duration::from_secs(1)),
+        Arc::new(AuthenticationMetrics::default()),
+        Arc::new(ProtocolMetrics::new(crate::system::SERVED_PROTOCOL_LABELS)),
+        crate::system::SERVED_PROTOCOL_LABELS,
+    );
+    let fallback = service_fn(|_: Request<BoxBody>| async {
+        let mut response = Response::new(empty_body());
+        *response.status_mut() = StatusCode::NOT_FOUND;
+        Ok::<_, Infallible>(response)
+    });
+    let service = stack.layer(
+        ConnectDispatchLayer::new(service(connect_services(
+            "postgresql://unused@127.0.0.1:1/unused",
+        )))
+        .layer(fallback),
+    );
+    let call = |headers: HeaderMap| {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .version(http::Version::HTTP_11)
+            .uri("/sovereign.config.v6.System/GetIdentity")
+            .header(CONTENT_TYPE, "application/json")
+            .body(
+                http_body_util::Full::new(bytes::Bytes::from_static(b"{}"))
+                    .map_err(|never| match never {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+        request.headers_mut().extend(headers);
+        service.clone().oneshot(request)
+    };
+
+    for headers in [HeaderMap::new(), bearer("not.a.token")] {
+        let response = call(headers).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let answer: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["code"], "unauthenticated", "{answer}");
+    }
+
+    let response = call(server.headers()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let answer: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(answer, json!({ "authenticated": true }));
+}

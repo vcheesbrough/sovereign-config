@@ -47,9 +47,10 @@ function narratives(page) {
   return page.locator('#audit-body .audit-narrative');
 }
 
-// A v5 session unless a test asks for another: the audit trail is not served
-// on v3, and `v4` has neither the actor filter nor the counts.
-async function signIn(page, events, { version = 'v5', ...options } = {}) {
+// A v6 session, the service's preferred version, unless a test asks for
+// another: the audit trail is not served on v3, and `v4` has neither the actor
+// filter nor the counts.
+async function signIn(page, events, { version = 'v6', ...options } = {}) {
   await negotiate(page, version);
   const audit = await mockAudit(page, { events, ...options });
   await openCallback(page);
@@ -139,6 +140,33 @@ test.describe('audit trail', () => {
     await page.getByRole('button', { name: 'Filter' }).click();
     await expect(page.locator('#empty-audit')).toBeVisible();
     await expect(page.locator('#audit-state')).toHaveText('0 of 7 events match');
+  });
+
+  // `v5` carries the same trail over gRPC-Web, its event ids as numbers where
+  // `v6`'s are strings.
+  test('a v5 service reads the trail and its counts over gRPC-Web', async ({ page }) => {
+    const trail = [];
+    page.on('request', request => {
+      if (request.url().endsWith('.Audit/QueryAuditTrail')) trail.push(request);
+    });
+    const audit = await signIn(page, EVENTS, { pageSize: 25, version: 'v5' });
+    await page.goto('/audit/');
+    await expect(narratives(page)).toHaveText([
+      'A Vincent changed /apps/api/token',
+      'provider-subject revealed /apps/api/password 14 times between 21:13 and 22:11',
+      'A Vincent created /apps/worker/concurrency',
+      'A Vincent created the access URL Pipeline reader for /apps/api'
+    ]);
+    await expect(page.locator('#audit-state')).toHaveText('4 of 7 events match');
+
+    await page.getByLabel('Actor contains').fill('PROVIDER');
+    await page.getByRole('button', { name: 'Filter' }).click();
+    await expect(narratives(page)).toHaveText([/revealed \/apps\/api\/password/]);
+    expect(audit.requests.at(-1)).toMatchObject({ actorFilter: 'PROVIDER', cursor: '' });
+    for (const request of trail) {
+      expect(new URL(request.url()).pathname).toBe('/sovereign.config.v5.Audit/QueryAuditTrail');
+      expect(request.headers()['content-type']).toBe('application/grpc-web+proto');
+    }
   });
 
   test('a v4 service shows what has loaded and cannot filter by actor', async ({ page }) => {

@@ -15,6 +15,9 @@
 /// module may use too. Paths resolve where the macro is invoked.
 macro_rules! version_dialer {
     ($version:expr) => {
+        version_dialer!($version, tonic::transport::Channel);
+    };
+    ($version:expr, $channel:ty) => {
         use async_trait::async_trait;
         use sovereign_config_client::{
             AuditTransport, ManagedConnectionTransport, RpcCode, SessionTransport, Transport,
@@ -29,7 +32,7 @@ macro_rules! version_dialer {
             SubTreeMutationContent, SubTreeMutationValue, SubTreeValue, ValueContent, ValueListing,
             ValuePaths, ValueSubTree,
         };
-        use tonic::transport::Channel;
+        type Channel = $channel;
 
         use super::{authenticated_request, map_status};
 
@@ -237,7 +240,7 @@ macro_rules! version_dialer {
                 let updated_at = response.updated_at.ok_or_else(invalid_response)?;
                 Ok(ReplaceMetadata {
                     updated_at: timestamp(updated_at.seconds, updated_at.nanos)?,
-                    value_count: response.value_count,
+                    value_count: u64::from(response.value_count),
                 })
             }
 
@@ -262,7 +265,7 @@ macro_rules! version_dialer {
                 let deleted_at = response.deleted_at.ok_or_else(invalid_response)?;
                 Ok(DeleteMetadata {
                     deleted_at: timestamp(deleted_at.seconds, deleted_at.nanos)?,
-                    deleted_count: response.deleted_count,
+                    deleted_count: u64::from(response.deleted_count),
                 })
             }
 

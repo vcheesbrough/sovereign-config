@@ -7,6 +7,9 @@
 /// The kind and event translations, over whichever `proto` is in scope.
 macro_rules! audit_wire {
     () => {
+        audit_wire!(crate::rpc::Wide);
+    };
+    ($wire:ty) => {
         const fn kind(kind: proto::AuditEventKind) -> Option<AuditEventKind> {
             use proto::AuditEventKind as Wire;
             Some(match kind {
@@ -59,11 +62,15 @@ macro_rules! audit_wire {
 
         fn event(entry: AuditEntry) -> proto::AuditEvent {
             proto::AuditEvent {
-                id: entry.id,
+                id: <$wire as crate::rpc::WireForm>::id(entry.id),
                 kind: wire_kind(entry.kind) as i32,
                 path: entry.path.as_str().to_owned(),
-                occurred_at: Some(to_proto_timestamp(entry.occurred_at)),
-                first_occurred_at: Some(to_proto_timestamp(entry.first_occurred_at)),
+                occurred_at: Some(<$wire as crate::rpc::WireForm>::timestamp(
+                    entry.occurred_at,
+                )),
+                first_occurred_at: Some(<$wire as crate::rpc::WireForm>::timestamp(
+                    entry.first_occurred_at,
+                )),
                 event_count: entry.event_count,
                 actor_subject: entry.actor_subject,
                 actor_name: entry.actor_name,

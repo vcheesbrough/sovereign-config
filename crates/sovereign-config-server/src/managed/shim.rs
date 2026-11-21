@@ -47,6 +47,9 @@ impl Validation for Upfront {
 /// implementation made.
 macro_rules! managed_connections_shim {
     ($shim:ident, $validation:ty) => {
+        managed_connections_shim!($shim, $validation, crate::rpc::Wide);
+    };
+    ($shim:ident, $validation:ty, $wire:ty) => {
         pub(crate) struct $shim {
             pub(super) shared: std::sync::Arc<super::ManagedConnectionsService>,
         }
@@ -79,8 +82,12 @@ macro_rules! managed_connections_shim {
                 root: metadata.root,
                 state: state(metadata.state) as i32,
                 permissions: metadata.permissions.to_proto(),
-                created_at: Some(crate::rpc::to_proto_timestamp(metadata.created_at)),
-                updated_at: Some(crate::rpc::to_proto_timestamp(metadata.updated_at)),
+                created_at: Some(<$wire as crate::rpc::WireForm>::timestamp(
+                    metadata.created_at,
+                )),
+                updated_at: Some(<$wire as crate::rpc::WireForm>::timestamp(
+                    metadata.updated_at,
+                )),
             }
         }
 

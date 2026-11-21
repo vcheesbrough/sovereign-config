@@ -13,7 +13,7 @@ use tonic::{Request, Response, Status};
 
 use super::service::{AuditTrailService, TrailQuery};
 use super::shim::audit_wire;
-use crate::rpc::{CallContext, to_proto_timestamp};
+use crate::rpc::CallContext;
 
 pub(crate) struct V5Audit {
     shared: Arc<AuditTrailService>,
