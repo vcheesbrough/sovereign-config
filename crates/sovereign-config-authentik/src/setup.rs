@@ -37,7 +37,7 @@ use sovereign_config_identity::{ProviderError, Variables};
 use sovereign_config_telemetry::error::Classified;
 use tracing::info;
 
-use crate::client::AuthentikAdminClient;
+use crate::client::{AuthentikAdminClient, BlueprintState};
 use crate::settings::validate_issuer_url;
 
 const BLUEPRINT: &str = "SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT";
@@ -62,7 +62,11 @@ const REQUIRED_SURFACES: [&str; 4] = [
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long Authentik may take to report the apply finished.
 const APPLY_DEADLINE: Duration = Duration::from_secs(300);
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_secs(2)
+};
 
 /// The blueprint each environment applies, compiled into the binary so the
 /// one an image applies is the one it was built with.
@@ -279,23 +283,31 @@ impl Setup {
             info!(blueprint = name, "created the blueprint instance");
             pk
         };
+        // What the instance said before this apply: Authentik may apply in
+        // the background, so a status read straight after asking can still
+        // be the last apply's.
+        let before = self.state(&pk).await?;
         self.client
             .apply_blueprint_instance(&pk)
             .await
             .map_err(|error| failure("unable to apply the blueprint", error))?;
-        self.wait_for_verdict(&pk).await
+        self.wait_for_verdict(&pk, &before).await
     }
 
-    async fn wait_for_verdict(&self, pk: &str) -> Result<()> {
+    async fn state(&self, pk: &str) -> Result<BlueprintState> {
+        self.client
+            .blueprint_status(pk)
+            .await
+            .map_err(|error| failure("unable to read the blueprint's status", error))
+    }
+
+    async fn wait_for_verdict(&self, pk: &str, before: &BlueprintState) -> Result<()> {
         let name = self.blueprint.instance_name();
         let deadline = tokio::time::Instant::now() + APPLY_DEADLINE;
         loop {
-            let status = self
-                .client
-                .blueprint_status(pk)
-                .await
-                .map_err(|error| failure("unable to read the blueprint's status", error))?;
-            match Verdict::of(&status) {
+            let now = self.state(pk).await?;
+            let status = now.status.clone();
+            match Verdict::after(before, &now) {
                 Verdict::Applied => {
                     info!(blueprint = name, status = %displayable(&status), "applied the blueprint");
                     return Ok(());
@@ -336,6 +348,26 @@ enum Verdict {
 }
 
 impl Verdict {
+    /// The verdict on this apply, from the state before it and now.
+    ///
+    /// It applied only once `last_applied` has moved, which Authentik does on
+    /// every successful apply; an unchanged one is the previous apply still
+    /// showing. It failed when a failure status shows that was not already
+    /// there. A failure that repeats the previous one cannot be told from an
+    /// apply not yet run, so it is waited out to the deadline, and fails
+    /// then.
+    fn after(before: &BlueprintState, now: &BlueprintState) -> Self {
+        match Self::of(&now.status) {
+            Self::Applied
+                if now.last_applied.is_some() && now.last_applied != before.last_applied =>
+            {
+                Self::Applied
+            }
+            Self::Failed if now.status != before.status => Self::Failed,
+            _ => Self::Pending,
+        }
+    }
+
     /// `warning` is a non-fatal issue Authentik applied past, as the CI plugin
     /// treated it; an unrecognised status is waited out.
     fn of(status: &str) -> Self {

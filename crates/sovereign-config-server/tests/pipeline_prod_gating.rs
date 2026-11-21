@@ -459,13 +459,15 @@ fn each_deploy_runs_migrate_before_it_replaces_the_server() {
             "\"$$COMPOSE\" -p {project} up -d --pull always migrate ||"
         ));
         let wait = position("MIGRATE_EXIT=$$(docker wait ");
+        let emptied = position(": > /run/deploy-secrets/authentik_admin_token");
         let refuse = position("if [ \"$$MIGRATE_EXIT\" != 0 ]; then");
         let server = position(&format!(
-            "\"$$COMPOSE\" -p {project} up -d --no-deps --wait --wait-timeout 90 sovereign-config ||"
+            "\"$$COMPOSE\" -p {project} up -d --no-deps --force-recreate --wait --wait-timeout 90 sovereign-config ||"
         ));
         assert!(
-            migrate < wait && wait < refuse && refuse < server,
-            "{deploy}: migrate, wait for it, refuse on failure, then the server"
+            migrate < wait && wait < emptied && emptied < refuse && refuse < server,
+            "{deploy}: migrate, wait for it, empty its admin token, refuse on failure, \
+             then the server"
         );
         assert_eq!(
             lines

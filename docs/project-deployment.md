@@ -56,7 +56,7 @@ Production also refuses a commit `main` does not contain (`verify-commit-on-main
 
 Dev runs whichever branch was deployed last. A migration deployed from a branch stays applied to the dev database. Each deployment is verified after Woodpecker completes by calling `System.GetVersion` through the public endpoint twice: over native gRPC, and on `v6` over Connect JSON.
 
-After the dev deploy, **`validate-authentik-manager-live`** exercises the connection manager against live Authentik, with the permissions the blueprint `migrate` just applied. It is the promote gate for production too: the production blueprint differs from the development one only in names, so a red run keeps the commit from production, and production runs no live check of its own.
+After the dev deploy, **`validate-authentik-manager-live`** exercises the connection manager against live Authentik, with the permissions the blueprint `migrate` just applied. Production runs no live check of its own: the production blueprint differs from the development one only in names, so this run is the promote gate. It is an operator gate, like deploying to dev first: the pipeline does not stop a promotion whose dev run was red, so do not promote one.
 
 The pipeline does not require a dev deployment before a promotion, but **deploy the main commit to dev before promoting it to prod**. That is an operator rule, not a gate. A published build means the checks passed. CI's migration checks run against a fresh PostgreSQL. Only a dev deployment proves the release against a long-lived database and against live Authentik, and runs the live connection-manager check. Skipping it is an accepted risk, not an oversight.
 
@@ -75,7 +75,7 @@ Everything a release changes outside its image runs in **`sovereign-config-serve
 
 **A deploy runs `migrate` on its own and waits for it** (`docker wait`), and replaces the server only once it has exited 0. If `migrate` fails part-way, the deploy fails and the previous release goes on serving, against whatever `migrate` changed. A plain `docker compose up` would not keep that promise: Compose replaces the server before the `depends_on` condition on `migrate` is met, and `up --wait migrate` reports a one-shot service ready before it has finished.
 
-**Every migration must therefore work with the release before it.** The previous release serves against the new state during every deploy, and after a failed one. Expand in one release; contract (drop, rename, tighten) in a later one, once no running release reads the old shape. A rollback is a deploy of the older image, whose `migrate` runs against the newer state; an image from before `migrate` existed still migrates in-process, which is safe because the schema only moves forward.
+**Every migration must therefore work with the release before it.** The previous release serves against the new state during every deploy, and after a failed one. Expand in one release; contract (drop, rename, tighten) in a later one, once no running release reads the old shape. A rollback to 3.62 or later is a deploy of the older image, whose `migrate` tolerates migrations it does not know. An image from before 3.62 migrates in-process and refuses a database carrying a migration it does not know, so rolling back that far needs the backup restore in [Upgrading](upgrading.md#procedure) once a newer migration has been applied.
 
 **Credentials reach every container as files**, never as variables, because an exited `migrate` keeps its environment in `docker inspect`. The deploy writes each to a Docker volume of its own, `sovereign-config-dev-secrets` or `sovereign-config-production-secrets`, each file mode `0400` and owned by the user that reads it, and Compose bind-mounts one file per container at `/run/secrets/<name>`. Compose cannot write an `environment:`-sourced secret into a read-only container, so the files come from the host.
 
@@ -87,7 +87,7 @@ Everything a release changes outside its image runs in **`sovereign-config-serve
 | Authentik admin token (`authentik_admin_token`) | ✅ | — | — |
 | PostgreSQL password (`postgres_password`) | — | — | ✅ |
 
-**Checking a deploy:** `docker inspect -f '{{.State.ExitCode}}' sovereign-config-dev-migrate` (or `sovereign-config-production-migrate`) is `0`, and its log says what each step changed. An exited `migrate` is expected: it is not a container that is down. Compose does not recreate a container when only a secret file changes, so after rotating one, redeploy with `--force-recreate`.
+**Checking a deploy:** `docker inspect -f '{{.State.ExitCode}}' sovereign-config-dev-migrate` (or `sovereign-config-production-migrate`) is `0`, and its log says what each step changed. An exited `migrate` is expected: it is not a container that is down. Compose does not recreate a container when only a secret file changes, so the deploy always recreates the server, and a redeploy is how a rotated credential reaches it. The Authentik admin token's file is emptied once `migrate` has exited.
 
 ### Production prerequisites
 

@@ -257,6 +257,13 @@ struct Authentik {
     /// The status an apply leaves behind.
     applies_to: String,
     status: String,
+    last_applied: Option<String>,
+    /// How many status reads an apply takes to land: Authentik may apply in
+    /// the background, after answering the request to.
+    apply_after_reads: usize,
+    /// Reads left before an apply asked for lands.
+    landing_in: Option<usize>,
+    applies: usize,
     /// `METHOD path` of every call, with whether it carried the admin token.
     calls: Vec<(String, bool)>,
 }
@@ -337,7 +344,30 @@ async fn status(
     headers: HeaderMap,
 ) -> Json<Value> {
     record(&state, format!("GET {pk}"), &headers);
-    Json(json!({ "pk": pk, "status": state.lock().unwrap().status }))
+    let mut authentik = state.lock().unwrap();
+    match authentik.landing_in {
+        Some(0) => {
+            authentik.landing_in = None;
+            land(&mut authentik);
+        }
+        Some(left) => authentik.landing_in = Some(left - 1),
+        None => {}
+    }
+    Json(json!({
+        "pk": pk,
+        "status": authentik.status,
+        "last_applied": authentik.last_applied,
+    }))
+}
+
+/// Authentik's own bookkeeping: a successful apply moves `last_applied`, a
+/// failed one does not.
+fn land(authentik: &mut Authentik) {
+    authentik.status = authentik.applies_to.clone();
+    if matches!(authentik.status.as_str(), "successful" | "warning") {
+        authentik.applies += 1;
+        authentik.last_applied = Some(format!("2026-11-21T00:00:{:02}Z", authentik.applies));
+    }
 }
 
 async fn apply(
@@ -347,7 +377,11 @@ async fn apply(
 ) -> Json<Value> {
     record(&state, format!("POST {pk} apply"), &headers);
     let mut authentik = state.lock().unwrap();
-    authentik.status = authentik.applies_to.clone();
+    if authentik.apply_after_reads == 0 {
+        land(&mut authentik);
+    } else {
+        authentik.landing_in = Some(authentik.apply_after_reads);
+    }
     Json(json!({}))
 }
 
@@ -439,12 +473,14 @@ async fn the_blueprint_is_created_once_then_updated_in_place() {
             "GET schema",
             "GET instances",
             "POST instances",
+            &format!("GET {INSTANCE_PK}"),
             &format!("POST {INSTANCE_PK} apply"),
             &format!("GET {INSTANCE_PK}"),
             "GET version",
             "GET schema",
             "GET instances",
             &format!("PATCH {INSTANCE_PK}"),
+            &format!("GET {INSTANCE_PK}"),
             &format!("POST {INSTANCE_PK} apply"),
             &format!("GET {INSTANCE_PK}"),
         ]
@@ -534,4 +570,75 @@ async fn two_instances_under_one_name_are_left_alone() {
         "unable to look up the blueprint instance (invalid)"
     );
     assert_eq!(calls(&fake), ["GET version", "GET schema", "GET instances"]);
+}
+
+/// An instance applied before, successfully, whose new apply Authentik runs
+/// in the background: the old `successful` is not this apply's.
+async fn previously_applied(applies_to: &str) -> Fake {
+    let fake = fake("2026.5.2", applies_to).await;
+    {
+        let mut authentik = fake.state.lock().unwrap();
+        authentik.instances.push((
+            INSTANCE_PK.to_owned(),
+            "sovereign-config-dev".to_owned(),
+            "old".to_owned(),
+        ));
+        authentik.status = "successful".to_owned();
+        authentik.last_applied = Some("2026-11-20T00:00:00Z".to_owned());
+        authentik.apply_after_reads = 3;
+    }
+    fake
+}
+
+#[tokio::test]
+async fn a_stale_success_is_not_taken_for_this_apply() {
+    let fake = previously_applied("error").await;
+    let error = setup_against(&fake, "new").apply().await.unwrap_err();
+    assert_eq!(classified(&error), Some("blueprint_failed"));
+}
+
+#[tokio::test]
+async fn an_apply_run_in_the_background_is_waited_for() {
+    let fake = previously_applied("successful").await;
+    setup_against(&fake, "new").apply().await.unwrap();
+    let reads_after_apply = calls(&fake)
+        .iter()
+        .skip_while(|call| !call.ends_with(" apply"))
+        .filter(|call| call.starts_with("GET "))
+        .count();
+    assert!(
+        reads_after_apply > 1,
+        "the verdict waited for the apply to land: {reads_after_apply}"
+    );
+    assert_eq!(fake.state.lock().unwrap().applies, 1);
+}
+
+#[test]
+fn a_verdict_needs_this_apply_to_have_landed() {
+    let state = |status: &str, last_applied: Option<&str>| super::BlueprintState {
+        status: status.to_owned(),
+        last_applied: last_applied.map(str::to_owned),
+    };
+    let before = state("successful", Some("t1"));
+    assert_eq!(Verdict::after(&before, &before), Verdict::Pending);
+    assert_eq!(
+        Verdict::after(&before, &state("successful", Some("t2"))),
+        Verdict::Applied
+    );
+    assert_eq!(
+        Verdict::after(&before, &state("error", Some("t1"))),
+        Verdict::Failed
+    );
+    // The same failure as before cannot be told from an apply not yet run.
+    let failed = state("error", Some("t1"));
+    assert_eq!(Verdict::after(&failed, &failed), Verdict::Pending);
+    assert_eq!(
+        Verdict::after(&failed, &state("successful", Some("t2"))),
+        Verdict::Applied
+    );
+    // A first apply of a new instance.
+    assert_eq!(
+        Verdict::after(&state("unknown", None), &state("warning", Some("t1"))),
+        Verdict::Applied
+    );
 }

@@ -121,12 +121,18 @@ steps:
         }
         MIGRATE_EXIT=$$(docker wait "$$("$$COMPOSE" -p sovereign-config-dev ps -aq migrate)")
         "$$COMPOSE" -p sovereign-config-dev logs --no-log-prefix migrate
+        # Only `migrate` reads the Authentik admin token, and it has exited:
+        # the file is emptied rather than left on the host until the next
+        # deploy writes it again.
+        : > /run/deploy-secrets/authentik_admin_token
         if [ "$$MIGRATE_EXIT" != 0 ]; then
           echo "ERROR: migrate exited $$MIGRATE_EXIT; the running server was left in place" >&2
           exit 1
         fi
-        # Phase 2: the server, which verifies what `migrate` applied.
-        "$$COMPOSE" -p sovereign-config-dev up -d --no-deps --wait --wait-timeout 90 sovereign-config || {
+        # Phase 2: the server, which verifies what `migrate` applied. Always
+        # recreated: Compose does not notice a credential file that changed,
+        # and `migrate` has already given Authentik any new manager key.
+        "$$COMPOSE" -p sovereign-config-dev up -d --no-deps --force-recreate --wait --wait-timeout 90 sovereign-config || {
           "$$COMPOSE" -p sovereign-config-dev logs --tail 200
           exit 1
         }
@@ -138,8 +144,10 @@ steps:
   # Exercises the connection manager against the real Authentik RBAC surface,
   # which no mock can reproduce. Runs after the deploy, whose `migrate`
   # applied the blueprint that creates the manager identity (#615). It is the
-  # promote gate: a red run here keeps the commit from production, for prod
-  # as much as dev, since dev's blueprint differs from prod's only in names.
+  # promote gate for prod too, by the operator rule that a main commit is
+  # deployed to dev before prod (AGENTS.md), not by anything the pipeline
+  # enforces: a red run here means the commit is not promoted. Dev's
+  # blueprint differs from prod's only in names.
   validate-authentik-manager-live:
     depends_on:
       - deploy-dev

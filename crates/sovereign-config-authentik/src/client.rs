@@ -56,6 +56,16 @@ impl core::fmt::Debug for CreatedServiceAccount {
     }
 }
 
+/// A blueprint instance's apply state. Authentik moves `last_applied` on
+/// every successful apply, unchanged content included, and leaves it alone
+/// when an apply fails.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub(crate) struct BlueprintState {
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) last_applied: Option<String>,
+}
+
 /// An existing Authentik user located by exact generated username.
 pub(crate) struct FoundUser {
     pub(crate) user_id: i64,
@@ -472,12 +482,9 @@ impl AuthentikAdminClient {
         .map(|_| ())
     }
 
-    /// The instance's apply status, in Authentik's words.
-    pub(crate) async fn blueprint_status(&self, pk: &str) -> Result<String, ProviderError> {
-        #[derive(Deserialize)]
-        struct Status {
-            status: String,
-        }
+    /// The instance's apply status, in Authentik's words, and when it was
+    /// last applied successfully.
+    pub(crate) async fn blueprint_status(&self, pk: &str) -> Result<BlueprintState, ProviderError> {
         let body = self
             .call(
                 Method::GET,
@@ -486,8 +493,7 @@ impl AuthentikAdminClient {
                 None,
             )
             .await?;
-        let decoded: Status = serde_json::from_slice(&body).map_err(|_| ProviderError::Invalid)?;
-        Ok(decoded.status)
+        serde_json::from_slice(&body).map_err(|_| ProviderError::Invalid)
     }
 
     /// One administration call, inside its client span: the request carries

@@ -154,12 +154,18 @@ steps:
         }
         MIGRATE_EXIT=$$(docker wait "$$("$$COMPOSE" -p sovereign-config-prod ps -aq migrate)")
         "$$COMPOSE" -p sovereign-config-prod logs --no-log-prefix migrate
+        # Only `migrate` reads the Authentik admin token, and it has exited:
+        # the file is emptied rather than left on the host until the next
+        # deploy writes it again.
+        : > /run/deploy-secrets/authentik_admin_token
         if [ "$$MIGRATE_EXIT" != 0 ]; then
           echo "ERROR: migrate exited $$MIGRATE_EXIT; the running server was left in place" >&2
           exit 1
         fi
-        # Phase 2: the server, which verifies what `migrate` applied.
-        "$$COMPOSE" -p sovereign-config-prod up -d --no-deps --wait --wait-timeout 90 sovereign-config || {
+        # Phase 2: the server, which verifies what `migrate` applied. Always
+        # recreated: Compose does not notice a credential file that changed,
+        # and `migrate` has already given Authentik any new manager key.
+        "$$COMPOSE" -p sovereign-config-prod up -d --no-deps --force-recreate --wait --wait-timeout 90 sovereign-config || {
           "$$COMPOSE" -p sovereign-config-prod logs --tail 200
           exit 1
         }
