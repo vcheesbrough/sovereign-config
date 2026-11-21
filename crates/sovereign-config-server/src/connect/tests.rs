@@ -63,7 +63,8 @@ fn principal(permissions: &[Permission]) -> AuthenticatedPrincipal {
 
 /// Authentication's shape without its tokens: the operational routes pass,
 /// [`WRITER`] and [`READER`] become principals, and anything else is refused
-/// `UNAUTHENTICATED` in gRPC's trailers-only shape, as the real layer does.
+/// `UNAUTHENTICATED` with its status in trailers after an empty body, as the
+/// real layer does (`auth::status_response`).
 #[derive(Clone, Copy)]
 struct StandInAuthentication;
 
