@@ -8,7 +8,8 @@
 //! version as idle and the idle one as live. Nothing about the client's own
 //! view of itself can catch that; only the path on the wire can.
 //!
-//! The server here implements no version. It records the route and answers
+//! The server here implements no version. It records the route — and the
+//! transport, because a version names its transport (#582) — and answers
 //! `UNIMPLEMENTED`, which is exactly what a server that does not serve the
 //! dialled version says, so the assertions hold for a version that exists and
 //! for one that does not.
@@ -51,16 +52,51 @@ impl Recorder {
     }
 }
 
+/// The transport a recorded call arrived on.
+fn transport_of(request: &Request) -> &'static str {
+    match request
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("application/proto") => "connect",
+        Some(value) if value.starts_with("application/grpc") => "grpc",
+        _ => "other",
+    }
+}
+
 /// A server that serves no protocol version at all: it records the route it
 /// was asked for and answers `UNIMPLEMENTED`, as a real server does for a
-/// route it has no service registered on.
+/// route it has no service registered on. Every answer is gRPC's, as a
+/// server older than `v6` answers whatever it is sent.
 async fn serve(recorder: Recorder) -> String {
+    serve_speaking(recorder, false).await
+}
+
+/// The same, answering a Connect call in Connect's shape, as a server that
+/// serves `v6` does.
+async fn serve_connect(recorder: Recorder) -> String {
+    serve_speaking(recorder, true).await
+}
+
+async fn serve_speaking(recorder: Recorder, connect: bool) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let app = axum::Router::new().fallback(move |request: Request| {
         let recorder = recorder.clone();
         async move {
-            recorder.record(request.uri().path());
+            let transport = transport_of(&request);
+            recorder.record(&format!("{transport} {}", request.uri().path()));
+            if connect && transport == "connect" {
+                return Response::builder()
+                    .status(404)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"code":"unimplemented","message":"no such route"}"#,
+                    ))
+                    .unwrap()
+                    .into_response();
+            }
             Response::builder()
                 .status(200)
                 .header("content-type", "application/grpc")
@@ -123,7 +159,8 @@ async fn issue_every_rpc(transport: &TonicTransport) {
 }
 
 /// Every RPC a session issues travels on the routes of the version it
-/// negotiated — for every version this build speaks.
+/// negotiated, over that version's transport — for every version this build
+/// speaks: Connect for `v6`, gRPC before it.
 ///
 /// Table-driven over `ProtocolVersion::ALL` on purpose: a version added to that
 /// list is covered here the moment it is declared, without anyone remembering
@@ -138,7 +175,12 @@ async fn every_rpc_travels_on_the_routes_of_the_version_the_session_speaks() {
         issue_every_rpc(&channel.speaking(version)).await;
 
         let routes = recorder.take();
-        let expected_package = format!("/sovereign.config.{version}.");
+        let transport = if version == ProtocolVersion::V6 {
+            "connect"
+        } else {
+            "grpc"
+        };
+        let expected_package = format!("{transport} /sovereign.config.{version}.");
         assert_eq!(
             routes.len(),
             RPC_COUNT,
@@ -147,7 +189,7 @@ async fn every_rpc_travels_on_the_routes_of_the_version_the_session_speaks() {
         for route in &routes {
             assert!(
                 route.starts_with(&expected_package),
-                "{version}: dialled {route}, which does not name the negotiated version"
+                "{version}: dialled {route}, which does not name the negotiated version and its transport"
             );
         }
     }
@@ -162,12 +204,34 @@ async fn every_rpc_travels_on_the_routes_of_the_version_the_session_speaks() {
 #[tokio::test(flavor = "multi_thread")]
 async fn negotiation_dials_the_unversioned_handshake_first() {
     let recorder = Recorder::default();
+    let endpoint = serve_connect(recorder.clone()).await;
+    let channel = TonicChannel::connect(endpoint).await.unwrap();
+
+    let _ = channel.served_versions(ProtocolVersion::ALL).await;
+
+    assert_eq!(
+        recorder.take(),
+        ["connect /sovereign.config.Handshake/Negotiate"]
+    );
+}
+
+/// A service older than `v6` answers the Connect handshake in gRPC's shape,
+/// and is asked again over gRPC — the handshake every earlier client used.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_older_than_v6_is_asked_again_over_grpc() {
+    let recorder = Recorder::default();
     let endpoint = serve(recorder.clone()).await;
     let channel = TonicChannel::connect(endpoint).await.unwrap();
 
     let _ = channel.served_versions(ProtocolVersion::ALL).await;
 
-    assert_eq!(recorder.take(), ["/sovereign.config.Handshake/Negotiate"]);
+    assert_eq!(
+        recorder.take(),
+        [
+            "connect /sovereign.config.Handshake/Negotiate",
+            "grpc /sovereign.config.Handshake/Negotiate",
+        ]
+    );
 }
 
 /// A service with no handshake is reached on the legacy version's own route.
@@ -191,9 +255,10 @@ async fn a_service_without_a_handshake_is_asked_on_the_legacy_route() {
     assert_eq!(
         recorder.take(),
         [
-            "/sovereign.config.Handshake/Negotiate".to_owned(),
+            "connect /sovereign.config.Handshake/Negotiate".to_owned(),
+            "grpc /sovereign.config.Handshake/Negotiate".to_owned(),
             format!(
-                "/sovereign.config.{}.System/GetVersion",
+                "grpc /sovereign.config.{}.System/GetVersion",
                 ProtocolVersion::LEGACY
             ),
         ]
@@ -217,10 +282,15 @@ async fn a_transport_reports_the_version_its_routes_name() {
         let _ = transport
             .get_identity(&Secret::new("dispatch-token-sentinel"))
             .await;
+        let wire = if version == ProtocolVersion::V6 {
+            "connect"
+        } else {
+            "grpc"
+        };
         assert_eq!(
             recorder.take(),
             [format!(
-                "/sovereign.config.{}.System/GetIdentity",
+                "{wire} /sovereign.config.{}.System/GetIdentity",
                 transport.protocol_version()
             )]
         );

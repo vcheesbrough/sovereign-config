@@ -40,8 +40,11 @@ const PROTO_CRATE: &str = "sovereign_config_proto::";
 /// - `handshake.rs` names the **unversioned** `sovereign.config` package. It is
 ///   the one service that belongs to no version, which is exactly why it needs
 ///   naming here: the scan sees the proto crate, not which package of it, so
-///   the module that is furthest from a version still has to be listed.
-const VERSION_AWARE: [&str; 3] = ["main.rs", "system.rs", "handshake.rs"];
+///   the module that is furthest from a version still has to be listed;
+/// - `connect.rs` registers `v6`'s services and the handshake on the Connect
+///   router, as `main.rs` registers gRPC versions' servers, bridging each
+///   Connect message onto that version's own shim (#582).
+const VERSION_AWARE: [&str; 4] = ["main.rs", "system.rs", "handshake.rs", "connect.rs"];
 
 /// The one implementation of the identity-provider trait, as a path segment.
 const AUTHENTIK_CRATE: &str = "sovereign_config_authentik";

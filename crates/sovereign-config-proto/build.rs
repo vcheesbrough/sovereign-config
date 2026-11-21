@@ -16,6 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../../proto/sovereign/config/v3/service.proto",
                 "../../proto/sovereign/config/v4/service.proto",
                 "../../proto/sovereign/config/v5/service.proto",
+                "../../proto/sovereign/config/v6/service.proto",
             ],
             &["../../proto"],
         )?;

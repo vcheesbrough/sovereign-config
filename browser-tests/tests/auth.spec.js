@@ -10,7 +10,10 @@ const {
   mockValues,
   mockApplication,
   mockDiscovery,
-  openCallback
+  negotiate,
+  openCallback,
+  CONNECT,
+  GRPC_WEB
 } = require('./helpers');
 
 test.describe('auth', () => {
@@ -199,25 +202,47 @@ test.describe('auth', () => {
     });
   });
 
-  for (const contract of transportContract) {
-    test(`browser transport maps gRPC status ${contract.grpc_status}`, async ({ page }) => {
-      const requests = await openCallback(page, 'success', 'expected-state', contract.grpc_status);
-      if (contract.grpc_status === 0) {
-        await expect(signedIn(page)).toBeVisible();
-        return;
-      }
-      await expect(page.getByText(contract.message, { exact: true })).toBeVisible();
-      // Only an Unauthenticated answer ends the session; every other failure is
-      // the service's, so Log out stays on offer.
-      const session = contract.grpc_status === 16 ? signedOut(page) : signedIn(page);
-      await expect(session).toBeVisible();
-      if (contract.grpc_status === 16) {
-        await expect.poll(() => storedRefreshState(page))
-          .toEqual({ token: null, endpoint: null, expiry: null });
-        await page.reload();
-        await expect(signedOut(page)).toBeVisible();
-        expect(requests).toHaveLength(2);
-      }
-    });
+  // The shared transport contract, on both wires the browser speaks: Connect,
+  // which `v6` (the service's preferred version) travels, with each refusal
+  // given the contract's own Connect code and HTTP status; and gRPC-Web, which
+  // a `v5` session still travels.
+  const wires = [
+    { name: 'Connect', version: 'v6', contentType: CONNECT },
+    { name: 'gRPC-Web', version: 'v5', contentType: GRPC_WEB }
+  ];
+  for (const wire of wires) {
+    for (const contract of transportContract) {
+      test(`browser transport maps gRPC status ${contract.grpc_status} over ${wire.name}`, async ({ page }) => {
+        await negotiate(page, wire.version);
+        const identities = [];
+        page.on('request', request => {
+          if (request.url().endsWith('.System/GetIdentity')) identities.push(request);
+        });
+        const requests = await openCallback(page, 'success', 'expected-state', contract);
+        if (contract.grpc_status === 0) {
+          await expect(signedIn(page)).toBeVisible();
+        } else {
+          await expect(page.getByText(contract.message, { exact: true })).toBeVisible();
+          // Only an Unauthenticated answer ends the session; every other
+          // failure is the service's, so Log out stays on offer.
+          const session = contract.grpc_status === 16 ? signedOut(page) : signedIn(page);
+          await expect(session).toBeVisible();
+        }
+        // The answer was read on the wire under test, not on some other one.
+        expect(identities.length).toBeGreaterThan(0);
+        for (const request of identities) {
+          expect(new URL(request.url()).pathname)
+            .toBe(`/sovereign.config.${wire.version}.System/GetIdentity`);
+          expect(request.headers()['content-type']).toBe(wire.contentType);
+        }
+        if (contract.grpc_status === 16) {
+          await expect.poll(() => storedRefreshState(page))
+            .toEqual({ token: null, endpoint: null, expiry: null });
+          await page.reload();
+          await expect(signedOut(page)).toBeVisible();
+          expect(requests).toHaveLength(2);
+        }
+      });
+    }
   }
 });

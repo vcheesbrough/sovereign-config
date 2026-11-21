@@ -47,7 +47,7 @@ macro_rules! audit_wire {
 
         fn audit_entry(event: proto::AuditEvent) -> Result<AuditEntry, ClientError> {
             Ok(AuditEntry {
-                id: event.id,
+                id: super::audit_wire::WireId::into_id(event.id).ok_or_else(browser_error)?,
                 kind: audit_kind(event.kind)?,
                 path: ConfigPath::parse_selection(event.path).map_err(|_| browser_error())?,
                 occurred_at: proto_timestamp(event.occurred_at)?,
@@ -65,3 +65,23 @@ macro_rules! audit_wire {
 }
 
 pub(super) use audit_wire;
+
+/// An audit event's identifier as a version carries it: a `uint64` up to
+/// `v5`, an opaque string from `v6`. This workspace's server writes the
+/// string as the decimal of the same number, which is what this client reads
+/// it back as; a string that is not one is a broken response.
+pub(super) trait WireId {
+    fn into_id(self) -> Option<u64>;
+}
+
+impl WireId for u64 {
+    fn into_id(self) -> Option<u64> {
+        Some(self)
+    }
+}
+
+impl WireId for String {
+    fn into_id(self) -> Option<u64> {
+        self.parse().ok()
+    }
+}

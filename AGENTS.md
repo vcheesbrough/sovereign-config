@@ -78,8 +78,11 @@ Run the **`ci-watch`** skill (baseline §4) with `OWNER=vcheesbrough`,
   call its public native gRPC `System.GetVersion` endpoint **after** the
   pipeline completes — do **not** embed this check in the pipeline. Verify
   `grpc-status: 0` and report the returned application and protocol versions.
-  Treat any other response as a deployment failure and fix it before reporting
-  completion.
+  Then make the same call on `v6` over Connect JSON —
+  `POST /sovereign.config.v6.System/GetVersion` with
+  `Content-Type: application/json` and `{"protocolVersion":"v6"}` — and verify
+  HTTP `200` with `"protocolVersion":"v6"`. Treat any other response to either
+  as a deployment failure and fix it before reporting completion.
 
 ---
 
@@ -127,6 +130,17 @@ supported — a server upgrade alone must never break them.
   member. Anything else is a new package served alongside the old one, never an
   edit in place. Exceptions are approved before implementation and recorded in
   `docs/protocol-versioning.md` with their reason; there are four (2.25.0, 2.29.0, 2.42.372 and 2.59.0).
+- **A version names its transport** (#582). `v3`–`v5` are served over native
+  gRPC and gRPC-Web only; `v6` and every later version over Connect unary
+  (binary and JSON) only; the handshake over every transport the server
+  speaks. Changing a version's transport is a new version, and a call on the
+  wrong one is answered version-not-served, with the marker placed as that
+  transport places it (a header for Connect, trailers for gRPC), never both.
+  From `v6` on, JSON field and enum value names are wire contract
+  (`test-contracts/v6-json-names.txt`); behaviour must not depend on the
+  encoding; nothing travels in a URL (Connect `GET` is never enabled); error
+  text is not contract. `docs/protocol-versioning.md`, *Each version names its
+  transport*, is the full statement.
 - **The handshake's shape is fixed, forever**, because it can never itself be
   versioned. Do not add to it, and do not give it a version-shaped package name
   — `/sovereign.config.Handshake/…` has one dotted segment fewer than a
@@ -230,6 +244,7 @@ in the change that closes it.
 | Spans carry `code.module.name`, the span bridge's own key, which is not a semantic-convention name. | It is the quickest way from a span to the code that opened it; it is the one allowed exception in `sovereign-config-telemetry`'s key check. | Dropping it, if the conventions gain nothing `tracing` can fill |
 | Metric label keys other than the RED and pool ones (`version`, `outcome`, `reason`, `kind`, `operation`, `result`, `call`) are neither semantic-convention names nor `sovereign_config.`-prefixed. | They predate the contract, and the retirement gate (`sovereign_config_protocol_requests_total{outcome="authenticated"}`) and the audit alert series are written against them; renaming would move every stored series. The forbidden-key test covers them; only span keys are checked against `keys::is_known`. | A protocol-gate rewrite that can afford a rename |
 | Instruments are held by what records them (`Arc` families, `RequestMetrics`, `JobMetrics`), not in statics as `references/rust.md` suggests. | Every test assembles its own capture; statics would make parallel tests share series. They are still created once, at startup. | — (deliberate) |
+| A Connect call's span and RED data point carry `rpc.system.name="grpc"`, not the conventions' `connect_rpc`. | **Decided in #582:** `v6` is counted in the same series as every gRPC version, under its own `rpc.method` and version label, so the protocol panels and the retirement gate read it with no edit and no new label value. The web UI's client spans do the same. | #594, when gRPC is retired and every call is Connect |
 | The CLI, MCP server, provider and broker emit no telemetry. | The first three are operator tools, not user devices sending to a public endpoint; the broker is a server-side process not yet instrumented. | #423 (broker); the rest — deliberate |
 | The web UI's OTLP is hand-built OTLP/JSON over `fetch`, not an SDK. | No OpenTelemetry SDK builds for `wasm32`; binding the JavaScript SDK is larger than the few hundred lines needed. | An SDK for `wasm32` |
 | `telemetry:write` cannot be withdrawn from one user. | Authentik grants a provider's scopes to every user who signs in to it; the skill's per-user opt-out needs a provider that withholds scopes per user or group. It does keep the CLI and MCP (same client id, never requesting it) out of the ingest. | A per-user scope policy in the provider |

@@ -333,12 +333,24 @@ where
         // could disagree — on the one route in the system where disagreeing
         // means either answering a served version as retired, or letting a
         // retired one reach a router that no longer has it.
+        //
+        // A version names its transport: one served only over the other
+        // transport is not served to this call, and is refused exactly as a
+        // retired one is, in the shape of the transport the call arrived on.
         if *request.method() == Method::POST
             && let Some(Route::Versioned(version)) = classify(request.uri().path())
-            && !self.recognised.contains(&version)
         {
-            let refusal = version_not_served(version, self.recognised).into_http();
-            return Box::pin(async move { Ok(refusal) });
+            let transport = crate::connect::request_transport(request.method(), request.headers());
+            let carried: Vec<&'static str> = self
+                .recognised
+                .iter()
+                .copied()
+                .filter(|served| crate::system::transport_of(served) == Some(transport))
+                .collect();
+            if !carried.contains(&version) {
+                let refusal = version_not_served(version, &carried).into_http();
+                return Box::pin(async move { Ok(refusal) });
+            }
         }
 
         Box::pin(async move { inner.call(request).await })

@@ -11,12 +11,17 @@ publish = false
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
+# The Connect protocol for the handshake and `v6` (#582): buffa messages
+# bridged onto the prost shims.
+buffa.workspace = true
+connectrpc.workspace = true
 bytes.workspace = true
 chacha20poly1305.workspace = true
 getrandom.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 mime_guess.workspace = true
+prost.workspace = true
 prost-types.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 ring.workspace = true
@@ -36,6 +41,7 @@ tracing.workspace = true
 opentelemetry.workspace = true
 zeroize.workspace = true
 sovereign-config-proto = { path = "../sovereign-config-proto" }
+sovereign-config-connect = { path = "../sovereign-config-connect" }
 sovereign-config-core = { path = "../sovereign-config-core" }
 # The identity-provider contract managed connections depend on, and its one
 # implementation, which only `main.rs` names (`tests/lint_ratchet.rs`).
@@ -44,7 +50,11 @@ sovereign-config-authentik = { path = "../sovereign-config-authentik" }
 sovereign-config-telemetry = { path = "../sovereign-config-telemetry" }
 
 [dev-dependencies]
-prost.workspace = true
+# The native client, driven through an HTTP/1.1-only proxy against the
+# Connect stack (`connect/proxy_tests.rs`): the transport the CLI, the MCP
+# server, the provider and the broker share.
+sovereign-config-client = { path = "../sovereign-config-client" }
+sovereign-config-native = { path = "../sovereign-config-native" }
 # The in-memory provider, for driving the managed service without HTTP.
 sovereign-config-identity = { path = "../sovereign-config-identity", features = ["conformance"] }
 # Exported spans and log records in plain types, for asserting on what left.

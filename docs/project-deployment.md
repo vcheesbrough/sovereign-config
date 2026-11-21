@@ -57,7 +57,7 @@ A deployment never builds, publishes or claims a version.
 
 Production also refuses a commit `main` does not contain (`verify-commit-on-main`). Woodpecker takes a GitHub deployment whose ref is a bare commit as a deployment of `main`, so the `branch: main` condition alone would not stop such a deployment from shipping some other commit. The check guards against an accident, not an attacker: the deployed commit supplies the workflow file.
 
-Dev runs whichever branch was deployed last. A migration deployed from a branch stays applied to the dev database. Each deployment is verified by calling `System.GetVersion` through the public gRPC endpoint after Woodpecker completes.
+Dev runs whichever branch was deployed last. A migration deployed from a branch stays applied to the dev database. Each deployment is verified after Woodpecker completes by calling `System.GetVersion` through the public endpoint twice: over native gRPC, and on `v6` over Connect JSON.
 
 The pipeline does not require a dev deployment before a promotion, but **deploy the main commit to dev before promoting it to prod**. That is an operator rule, not a gate. A published build means the checks passed. CI's migration checks run against a fresh PostgreSQL, and `deploy-prod` runs its own live connection-manager check. Only a dev deployment proves the release against a long-lived database and against live Authentik with the development blueprint. Skipping it is an accepted risk, not an oversight.
 

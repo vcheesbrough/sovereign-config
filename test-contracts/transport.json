@@ -1,12 +1,12 @@
 [
-  { "grpc_status": 0, "error_kind": null, "message": null },
-  { "grpc_status": 3, "error_kind": "InvalidRequest", "message": "request is invalid" },
-  { "grpc_status": 5, "error_kind": "NotFound", "message": "configuration value not found" },
-  { "grpc_status": 6, "error_kind": "Conflict", "message": "configuration path already exists" },
-  { "grpc_status": 7, "error_kind": "PermissionDenied", "message": "permission denied" },
-  { "grpc_status": 9, "error_kind": "IncompatibleProtocol", "message": "service protocol is incompatible" },
-  { "grpc_status": 10, "error_kind": "Unavailable", "message": "service is unavailable" },
-  { "grpc_status": 14, "error_kind": "Unavailable", "message": "service is unavailable" },
-  { "grpc_status": 16, "error_kind": "Unauthenticated", "message": "authentication required" },
-  { "grpc_status": 2, "error_kind": "Internal", "message": "request failed" }
+  { "grpc_status": 0, "connect_code": null, "http_status": 200, "error_kind": null, "message": null },
+  { "grpc_status": 3, "connect_code": "invalid_argument", "http_status": 400, "error_kind": "InvalidRequest", "message": "request is invalid" },
+  { "grpc_status": 5, "connect_code": "not_found", "http_status": 404, "error_kind": "NotFound", "message": "configuration value not found" },
+  { "grpc_status": 6, "connect_code": "already_exists", "http_status": 409, "error_kind": "Conflict", "message": "configuration path already exists" },
+  { "grpc_status": 7, "connect_code": "permission_denied", "http_status": 403, "error_kind": "PermissionDenied", "message": "permission denied" },
+  { "grpc_status": 9, "connect_code": "failed_precondition", "http_status": 400, "error_kind": "IncompatibleProtocol", "message": "service protocol is incompatible" },
+  { "grpc_status": 10, "connect_code": "aborted", "http_status": 409, "error_kind": "Unavailable", "message": "service is unavailable" },
+  { "grpc_status": 14, "connect_code": "unavailable", "http_status": 503, "error_kind": "Unavailable", "message": "service is unavailable" },
+  { "grpc_status": 16, "connect_code": "unauthenticated", "http_status": 401, "error_kind": "Unauthenticated", "message": "authentication required" },
+  { "grpc_status": 2, "connect_code": "unknown", "http_status": 500, "error_kind": "Internal", "message": "request failed" }
 ]

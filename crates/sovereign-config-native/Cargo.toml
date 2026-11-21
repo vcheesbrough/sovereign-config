@@ -9,8 +9,11 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 http.workspace = true
+prost.workspace = true
 prost-types.workspace = true
-reqwest = { workspace = true, features = ["json"] }
+# Also the Connect transport for `v6` and the handshake (#582), trusting the
+# platform's roots as the gRPC transport does.
+reqwest = { workspace = true, features = ["json", "rustls-tls-native-roots"] }
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

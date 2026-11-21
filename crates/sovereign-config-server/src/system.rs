@@ -1,6 +1,6 @@
 //! The `System` service: protocol negotiation and authenticated identity, once
 //! per protocol version — [`SystemService`] for `v3`, [`V4System`] for `v4` and
-//! [`V5System`] for `v5`.
+//! [`V5System`] for `v5`, and [`V6System`] for `v6`.
 //! It stays per-version, unlike every other service, because `GetVersion` is
 //! version-specific by nature: each version answers on its own route, in its
 //! own message, with its own promised ordering.
@@ -22,15 +22,34 @@ use sovereign_config_proto::sovereign::config::{
         GetIdentityRequest, GetIdentityResponse, GetVersionRequest, GetVersionResponse,
         system_server::System,
     },
-    v4, v5,
+    v4, v5, v6,
 };
 use tonic::{Extensions, Request, Response, Status};
 
 use crate::{APPLICATION_VERSION, auth::AuthenticatedPrincipal};
 
+/// The wire a protocol version is served over. **A version names its
+/// transport**: changing it is a new version, and a call on any other
+/// transport is answered version-not-served (`docs/protocol-versioning.md`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WireTransport {
+    /// Native gRPC and gRPC-Web: `v3`–`v5`.
+    Grpc,
+    /// Connect unary, binary and JSON: `v6` on.
+    Connect,
+}
+
+/// The `deprecation_date` announced for `v3`–`v5` in 3.60.0 (#582): the
+/// retirement of native gRPC, gRPC-Web and the h2c requirement with them
+/// (#594), which may start once it has passed and each version's
+/// `outcome="authenticated"` series reads zero.
+const GRPC_VERSIONS_DEPRECATED: &str = "2027-01-01T00:00:00Z";
+
 /// One protocol version this binary routes, and when it is expected to go.
 pub(crate) struct ServedProtocol {
     pub(crate) version: ProtocolVersion,
+    /// The one transport this version is served over.
+    pub(crate) transport: WireTransport,
     /// Where this version falls in **age** order: lower is older.
     ///
     /// Deliberately its own field rather than inferred from this list's order,
@@ -74,19 +93,28 @@ pub(crate) struct ServedProtocol {
 /// see `docs/protocol-versioning.md`.
 pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ServedProtocol] = &[
     ServedProtocol {
-        version: ProtocolVersion::V5,
-        age: 5,
+        version: ProtocolVersion::V6,
+        transport: WireTransport::Connect,
+        age: 6,
         deprecation_date: None,
+    },
+    ServedProtocol {
+        version: ProtocolVersion::V5,
+        transport: WireTransport::Grpc,
+        age: 5,
+        deprecation_date: Some(GRPC_VERSIONS_DEPRECATED),
     },
     ServedProtocol {
         version: ProtocolVersion::V4,
+        transport: WireTransport::Grpc,
         age: 4,
-        deprecation_date: None,
+        deprecation_date: Some(GRPC_VERSIONS_DEPRECATED),
     },
     ServedProtocol {
         version: ProtocolVersion::V3,
+        transport: WireTransport::Grpc,
         age: 3,
-        deprecation_date: None,
+        deprecation_date: Some(GRPC_VERSIONS_DEPRECATED),
     },
 ];
 
@@ -97,6 +125,7 @@ pub(crate) const SERVED_PROTOCOL_VERSIONS: &[ServedProtocol] = &[
 /// test below is what keeps the two in step. Compiled-in labels are what keep
 /// `sovereign_config_protocol_requests_total` bounded.
 pub(crate) const SERVED_PROTOCOL_LABELS: &[&str] = &[
+    ProtocolVersion::V6.as_str(),
     ProtocolVersion::V5.as_str(),
     ProtocolVersion::V4.as_str(),
     ProtocolVersion::V3.as_str(),
@@ -110,6 +139,15 @@ fn preferred_served() -> &'static str {
         .expect("the server must serve at least one protocol version")
         .version
         .as_str()
+}
+
+/// The transport the served version labelled `label` is served over, or
+/// `None` when this server does not serve it.
+pub(crate) fn transport_of(label: &str) -> Option<WireTransport> {
+    SERVED_PROTOCOL_VERSIONS
+        .iter()
+        .find(|served| served.version.as_str() == label)
+        .map(|served| served.transport)
 }
 
 pub(crate) fn served(requested: &str) -> bool {
@@ -277,6 +315,34 @@ impl v5::system_server::System for V5System {
     }
 }
 
+/// `v6`'s `System`: unchanged from `v5`'s, served over Connect.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct V6System;
+
+#[tonic::async_trait]
+impl v6::system_server::System for V6System {
+    async fn get_version(
+        &self,
+        request: Request<v6::GetVersionRequest>,
+    ) -> Result<Response<v6::GetVersionResponse>, Status> {
+        Ok(Response::new(v6::GetVersionResponse {
+            application_version: APPLICATION_VERSION.to_owned(),
+            protocol_version: echoed(request.into_inner().protocol_version),
+            supported_protocol_versions: preferred_first_supported_protocol_versions(),
+        }))
+    }
+
+    async fn get_identity(
+        &self,
+        request: Request<v6::GetIdentityRequest>,
+    ) -> Result<Response<v6::GetIdentityResponse>, Status> {
+        require_principal(request.extensions())?;
+        Ok(Response::new(v6::GetIdentityResponse {
+            authenticated: true,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -306,7 +372,10 @@ mod tests {
 
         assert_eq!(response.protocol_version, ProtocolVersion::V3.as_str());
         assert_eq!(response.application_version, APPLICATION_VERSION);
-        assert_eq!(response.supported_protocol_versions, ["v3", "v4", "v5"]);
+        assert_eq!(
+            response.supported_protocol_versions,
+            ["v3", "v4", "v5", "v6"]
+        );
     }
 
     #[tokio::test]
@@ -348,16 +417,19 @@ mod tests {
         let preference_is_not_reverse_age = [
             ServedProtocol {
                 version: ProtocolVersion::V3,
+                transport: super::WireTransport::Grpc,
                 age: 9,
                 deprecation_date: None,
             },
             ServedProtocol {
                 version: ProtocolVersion::V3,
+                transport: super::WireTransport::Grpc,
                 age: 3,
                 deprecation_date: None,
             },
             ServedProtocol {
                 version: ProtocolVersion::V3,
+                transport: super::WireTransport::Grpc,
                 age: 5,
                 deprecation_date: Some("2027-01-01T00:00:00Z"),
             },
@@ -436,7 +508,10 @@ mod tests {
                 ProtocolVersion::PREFERRED.as_str(),
                 "an unserved request falls back to the preferred served version"
             );
-            assert_eq!(response.supported_protocol_versions, ["v3", "v4", "v5"]);
+            assert_eq!(
+                response.supported_protocol_versions,
+                ["v3", "v4", "v5", "v6"]
+            );
         }
     }
 
@@ -462,7 +537,10 @@ mod tests {
 
             assert_eq!(response.protocol_version, requested);
             assert_eq!(response.application_version, APPLICATION_VERSION);
-            assert_eq!(response.supported_protocol_versions, ["v5", "v4", "v3"]);
+            assert_eq!(
+                response.supported_protocol_versions,
+                ["v6", "v5", "v4", "v3"]
+            );
         }
         let unserved = get_version_on_v4("v1").await;
         assert_eq!(
@@ -487,7 +565,10 @@ mod tests {
 
             assert_eq!(response.protocol_version, requested);
             assert_eq!(response.application_version, APPLICATION_VERSION);
-            assert_eq!(response.supported_protocol_versions, ["v5", "v4", "v3"]);
+            assert_eq!(
+                response.supported_protocol_versions,
+                ["v6", "v5", "v4", "v3"]
+            );
         }
         let refused = v5::system_server::System::get_identity(
             &V5System,

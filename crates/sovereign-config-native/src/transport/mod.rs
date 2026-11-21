@@ -1,7 +1,10 @@
-//! The native gRPC transport.
+//! The native transport: Connect unary for `v6` and the handshake, native gRPC
+//! for `v3`–`v5` (#582).
 //!
 //! A connection is opened as a [`TonicChannel`], which can do exactly one
-//! thing: ask a service which protocol versions it serves. Only
+//! thing: ask a service which protocol versions it serves. It asks over
+//! Connect first; a service that does not answer in Connect's shape predates
+//! `v6`, and is asked again over gRPC, as every client before 3.60 asked it. Only
 //! [`TonicChannel::speaking`] — handed the version negotiation settled on —
 //! produces a [`TonicTransport`] that can carry configuration traffic. The
 //! version an operator is shown and the version on the wire are therefore the
@@ -13,9 +16,11 @@
 
 mod adapter;
 mod audit_wire;
+mod connect;
 mod v3;
 mod v4;
 mod v5;
+mod v6;
 
 use std::{net::IpAddr, time::Duration};
 
@@ -33,8 +38,10 @@ use sovereign_config_core::{
     VERSION_NOT_SERVED_KIND, ValueListing, ValuePaths, ValueSubTree,
 };
 use sovereign_config_proto::sovereign::config::{
-    NegotiateRequest, handshake_client::HandshakeClient,
+    NegotiateRequest, NegotiateResponse, handshake_client::HandshakeClient,
 };
+
+use self::connect::{ConnectChannel, ConnectFailure};
 use tonic::{
     Code, Request,
     metadata::MetadataValue,
@@ -54,12 +61,28 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// The dialer reports its own version, so what a session says it speaks is read
 /// from the same module that owns the routes it dials.
-fn dialer(version: ProtocolVersion, channel: Channel) -> Box<dyn SessionTransport> {
+///
+/// It is also where a version becomes a transport: `v6` dials Connect, and
+/// every earlier version native gRPC.
+fn dialer(version: ProtocolVersion, channels: &Channels) -> Box<dyn SessionTransport> {
     match version {
-        ProtocolVersion::V5 => Box::new(v5::Dialer::new(channel)),
-        ProtocolVersion::V4 => Box::new(v4::Dialer::new(channel)),
-        ProtocolVersion::V3 => Box::new(v3::Dialer::new(channel)),
+        ProtocolVersion::V6 => Box::new(v6::Dialer::new(channels.connect.clone())),
+        ProtocolVersion::V5 => Box::new(v5::Dialer::new(channels.grpc.clone())),
+        ProtocolVersion::V4 => Box::new(v4::Dialer::new(channels.grpc.clone())),
+        ProtocolVersion::V3 => Box::new(v3::Dialer::new(channels.grpc.clone())),
     }
+}
+
+/// The handshake's one route, which every transport serves.
+const NEGOTIATE: &str = "/sovereign.config.Handshake/Negotiate";
+
+/// Both ways of reaching one service. The gRPC channel connects lazily, on
+/// its first call, so a session on `v6` never opens one — which is what lets
+/// it work through a proxy that forwards HTTP/1.1 only.
+#[derive(Clone)]
+struct Channels {
+    grpc: Channel,
+    connect: ConnectChannel,
 }
 
 /// A connected channel that has not yet agreed a protocol version.
@@ -68,17 +91,27 @@ fn dialer(version: ProtocolVersion, channel: Channel) -> Box<dyn SessionTranspor
 /// until [`Handshake::get_version`] has said which version the service serves.
 #[derive(Clone)]
 pub struct TonicChannel {
-    channel: Channel,
+    channels: Channels,
 }
 
 impl TonicChannel {
-    /// Connects to a native gRPC endpoint without configuring retries.
+    /// Opens a connection to a service endpoint without configuring retries.
+    ///
+    /// Nothing is dialled until the first call: an unreachable service is
+    /// reported, bounded, by the handshake.
     ///
     /// # Errors
     ///
     /// Returns a bounded invalid-request or unavailable error.
-    pub async fn connect(endpoint: String) -> Result<Self, ClientError> {
-        Self::connect_with_timeouts(endpoint, CONNECT_TIMEOUT, REQUEST_TIMEOUT).await
+    ///
+    /// Still a future, as it was when it dialled: callers await it, and a
+    /// transport that dials eagerly again needs no change to them.
+    pub fn connect(endpoint: String) -> impl Future<Output = Result<Self, ClientError>> {
+        std::future::ready(Self::connect_with_timeouts(
+            endpoint,
+            CONNECT_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ))
     }
 
     /// The transport for a session that negotiated `version`.
@@ -88,26 +121,27 @@ impl TonicChannel {
     #[must_use]
     pub fn speaking(&self, version: ProtocolVersion) -> TonicTransport {
         TonicTransport {
-            channel: self.channel.clone(),
+            channels: self.channels.clone(),
             version,
         }
     }
 
-    async fn connect_with_timeouts(
+    fn connect_with_timeouts(
         endpoint: String,
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, ClientError> {
         validate_service_endpoint(&endpoint)?;
-        let endpoint = Endpoint::new(endpoint)
+        let connect = ConnectChannel::new(&endpoint, connect_timeout, request_timeout)
+            .map_err(|_| map_rpc_status(RpcCode::Unavailable))?;
+        let grpc = Endpoint::new(endpoint)
             .map_err(|_| map_rpc_status(RpcCode::InvalidArgument))?
             .connect_timeout(connect_timeout)
-            .timeout(request_timeout);
-        let channel = tokio::time::timeout(connect_timeout, endpoint.connect())
-            .await
-            .map_err(|_| map_rpc_status(RpcCode::Unavailable))?
-            .map_err(|_| map_rpc_status(RpcCode::Unavailable))?;
-        Ok(Self { channel })
+            .timeout(request_timeout)
+            .connect_lazy();
+        Ok(Self {
+            channels: Channels { grpc, connect },
+        })
     }
 }
 
@@ -117,16 +151,29 @@ impl Handshake for TonicChannel {
         &self,
         client_versions: &[ProtocolVersion],
     ) -> Result<Vec<ServedVersion>, ClientError> {
-        let served = HandshakeClient::new(self.channel.clone())
-            .negotiate(Request::new(NegotiateRequest {
-                client_protocol_versions: client_versions
-                    .iter()
-                    .map(|version| version.as_str().to_owned())
-                    .collect(),
-            }))
+        let request = NegotiateRequest {
+            client_protocol_versions: client_versions
+                .iter()
+                .map(|version| version.as_str().to_owned())
+                .collect(),
+        };
+        let served = match self
+            .channels
+            .connect
+            .unary::<NegotiateRequest, NegotiateResponse>(NEGOTIATE, Request::new(request.clone()))
             .await
-            .map_err(|status| map_status(&status))?
-            .into_inner();
+        {
+            Ok(response) => response.into_inner(),
+            Err(ConnectFailure::Status(status)) => return Err(map_status(&status)),
+            // A service that predates `v6` answers a Connect call in some
+            // other shape. Asked over gRPC, it answers as it always has, and
+            // the session selects `v5` or earlier (#594 removes this).
+            Err(ConnectFailure::NotConnect) => HandshakeClient::new(self.channels.grpc.clone())
+                .negotiate(Request::new(request))
+                .await
+                .map_err(|status| map_status(&status))?
+                .into_inner(),
+        };
 
         Ok(served
             .served_protocol_versions
@@ -139,7 +186,7 @@ impl Handshake for TonicChannel {
     }
 
     async fn legacy_version(&self) -> Result<VersionReply, ClientError> {
-        dialer(ProtocolVersion::LEGACY, self.channel.clone())
+        dialer(ProtocolVersion::LEGACY, &self.channels)
             .get_version()
             .await
     }
@@ -153,10 +200,11 @@ impl Connection for TonicChannel {
     }
 }
 
-/// A native gRPC transport bound to one negotiated protocol version.
+/// A native transport bound to one negotiated protocol version: Connect for
+/// `v6`, native gRPC for every earlier version.
 #[derive(Clone)]
 pub struct TonicTransport {
-    channel: Channel,
+    channels: Channels,
     version: ProtocolVersion,
 }
 
@@ -186,7 +234,7 @@ impl TonicTransport {
     }
 
     fn dialer(&self) -> Box<dyn SessionTransport> {
-        dialer(self.version, self.channel.clone())
+        dialer(self.version, &self.channels)
     }
 }
 
@@ -474,7 +522,6 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_millis(25),
         )
-        .await
         .unwrap();
 
         for version in ProtocolVersion::ALL.iter().copied() {
@@ -483,6 +530,8 @@ mod tests {
         server.abort();
     }
 
+    /// Opening a channel dials nothing; a peer that accepts and then stalls is
+    /// found, bounded and `Unavailable`, by the handshake that follows.
     #[tokio::test]
     async fn stalled_connection_is_bounded_and_unavailable() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -492,19 +541,19 @@ mod tests {
             pending::<()>().await;
         });
 
-        let result = tokio::time::timeout(
+        let channel = TonicChannel::connect_with_timeouts(
+            format!("https://{address}"),
+            Duration::from_millis(25),
             Duration::from_secs(1),
-            TonicChannel::connect_with_timeouts(
-                format!("https://{address}"),
-                Duration::from_millis(25),
-                Duration::from_secs(1),
-            ),
+        )
+        .expect("opening a channel dials nothing");
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            channel.served_versions(ProtocolVersion::ALL),
         )
         .await
-        .expect("connection timeout was not enforced");
-        let error = result
-            .err()
-            .expect("stalled connection unexpectedly succeeded");
+        .expect("connection timeout was not enforced")
+        .expect_err("stalled connection unexpectedly succeeded");
 
         assert_eq!(error.kind, ErrorKind::Unavailable);
         peer.abort();
@@ -525,7 +574,6 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_millis(25),
         )
-        .await
         .unwrap();
 
         let version = tokio::time::timeout(

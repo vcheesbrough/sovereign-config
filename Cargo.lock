@@ -282,6 +282,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "buffa"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a92f2f5df67a9d5ccfc65237bfc954c56328aee40a04a9b92381ecba370be246"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "foldhash",
+ "hashbrown 0.15.5",
+ "once_cell",
+ "rustversion",
+ "serde",
+ "serde_json",
+ "smoothutf8",
+ "thiserror",
+]
+
+[[package]]
+name = "buffa-codegen"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb4bea10ef85ea3d06a20412c67cb612527feb25f33367eab850139441fb5dd9"
+dependencies = [
+ "buffa",
+ "buffa-descriptor",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn",
+ "thiserror",
+]
+
+[[package]]
+name = "buffa-descriptor"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b7dd79a6898e70dac8adae959c8ad2cae51ed96397935c91c996280cedcb55e"
+dependencies = [
+ "buffa",
+ "rustversion",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "buffa-types"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b15b05c8418f1e200e406e5b19df97400dffa833e2450e4392c506896cbc97ac"
+dependencies = [
+ "buffa",
+ "bytes",
+ "jiff",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -298,6 +357,9 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "cc"
@@ -428,6 +490,62 @@ dependencies = [
  "pathdiff",
  "serde_core",
  "winnow",
+]
+
+[[package]]
+name = "connectrpc"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "457cfa540c62e1b0b05db676cc9a9129162ad94d3a3eec6f2d19706c53acae7d"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "buffa",
+ "bytes",
+ "futures",
+ "http",
+ "http-body",
+ "http-body-util",
+ "percent-encoding",
+ "pin-project",
+ "serde",
+ "serde_json",
+ "sync_wrapper",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tower 0.5.3",
+ "tracing",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
+name = "connectrpc-build"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "603619f92fc55725d971ed9292855cd75f7a2c52ed66c181e0ec531dd7f8dd9b"
+dependencies = [
+ "anyhow",
+ "buffa",
+ "buffa-codegen",
+ "connectrpc-codegen",
+ "tempfile",
+]
+
+[[package]]
+name = "connectrpc-codegen"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "514a7a6fbe705d532ddf490c221db7bd52c5b94fd691cb257a7c18e5646355bb"
+dependencies = [
+ "anyhow",
+ "buffa",
+ "buffa-codegen",
+ "heck",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -746,6 +864,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -818,6 +951,7 @@ version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
+ "futures-channel",
  "futures-core",
  "futures-io",
  "futures-macro",
@@ -911,6 +1045,7 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
+ "serde",
 ]
 
 [[package]]
@@ -1053,6 +1188,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
+ "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -1253,6 +1389,41 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jiff"
+version = "0.2.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175dc66334db3b9ab9985bf8b61cfed50dc16d20964bb47f9e479adcae984a7f"
+dependencies = [
+ "jiff-core",
+ "jiff-static",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff-core"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e599b80292e597019b8b3e392de3f4bea2959ddfb8c7dff60e035e9e311a2c1b"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "jiff-static"
+version = "0.2.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7b1af7547d47354bc438d797e3854601bde8f8d185780c5ba4ab27afa54f1ba"
+dependencies = [
+ "jiff-core",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "js-sys"
@@ -1715,6 +1886,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
+name = "portable-atomic-util"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
+dependencies = [
+ "portable-atomic",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2126,6 +2306,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -2577,6 +2758,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "simdutf8"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2589,6 +2776,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "smoothutf8"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b4ec95892483d6d94284caccfddb9b77111a4dcac33ed25d624248def0fa5f1"
+dependencies = [
+ "simdutf8",
 ]
 
 [[package]]
@@ -2613,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-authentik"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2632,7 +2828,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-cli"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2656,7 +2852,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-client"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "async-trait",
  "sovereign-config-core",
@@ -2665,8 +2861,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovereign-config-connect"
+version = "3.60.0"
+dependencies = [
+ "buffa",
+ "buffa-types",
+ "connectrpc",
+ "connectrpc-build",
+ "http-body",
+ "protoc-bin-vendored",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sovereign-config-core"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -2677,7 +2887,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-identity"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2689,7 +2899,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-layers"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "async-trait",
  "sovereign-config-client",
@@ -2701,7 +2911,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-mcp"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2716,11 +2926,12 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-native"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
  "http",
+ "prost 0.13.5",
  "prost-types",
  "reqwest 0.12.28",
  "rustix",
@@ -2738,7 +2949,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-proto"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "prost 0.13.5",
  "prost-types",
@@ -2749,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-proto-testversion"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "prost 0.13.5",
  "protoc-bin-vendored",
@@ -2759,7 +2970,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-provider"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -2778,14 +2989,14 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-render-consumer"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "sovereign-config-rust-consumer"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "async-trait",
  "sovereign-config-client",
@@ -2795,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-rust-provider-consumer"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "serde",
  "sovereign-config-provider",
@@ -2804,13 +3015,15 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-server"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
  "base64 0.22.1",
+ "buffa",
  "bytes",
  "chacha20poly1305",
+ "connectrpc",
  "getrandom 0.3.4",
  "http",
  "http-body-util",
@@ -2827,8 +3040,11 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "sovereign-config-authentik",
+ "sovereign-config-client",
+ "sovereign-config-connect",
  "sovereign-config-core",
  "sovereign-config-identity",
+ "sovereign-config-native",
  "sovereign-config-proto",
  "sovereign-config-proto-testversion",
  "sovereign-config-telemetry",
@@ -2847,7 +3063,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-telemetry"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "http",
  "opentelemetry",
@@ -2869,7 +3085,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-web"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2889,7 +3105,7 @@ dependencies = [
 
 [[package]]
 name = "sovereign-config-woodpecker-broker"
-version = "2.59.0"
+version = "3.60.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -3495,6 +3711,7 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",

@@ -16,6 +16,7 @@ mod audit_wire;
 mod v3;
 mod v4;
 mod v5;
+mod v6;
 
 use std::{future::Future, rc::Rc};
 
@@ -53,6 +54,7 @@ use crate::telemetry;
 /// until that version has a dialer.
 fn dialer(version: ProtocolVersion) -> Box<dyn SessionTransport> {
     match version {
+        ProtocolVersion::V6 => Box::new(v6::Dialer),
         ProtocolVersion::V5 => Box::new(v5::Dialer),
         ProtocolVersion::V4 => Box::new(v4::Dialer),
         ProtocolVersion::V3 => Box::new(v3::Dialer),
@@ -63,6 +65,7 @@ fn dialer(version: ProtocolVersion) -> Box<dyn SessionTransport> {
 #[cfg(test)]
 fn routes(version: ProtocolVersion) -> &'static [&'static str] {
     match version {
+        ProtocolVersion::V6 => v6::ROUTES,
         ProtocolVersion::V5 => v5::ROUTES,
         ProtocolVersion::V4 => v4::ROUTES,
         ProtocolVersion::V3 => v3::ROUTES,
@@ -91,7 +94,10 @@ impl Handshake for BrowserHandshake {
                 .map(|version| version.as_str().to_owned())
                 .collect(),
         };
-        let response: NegotiateResponse = grpc_unary(NEGOTIATE, &request, None).await?;
+        // Over Connect only: the page is served by the service it calls, and
+        // every service that serves this page serves the handshake over
+        // Connect (#582).
+        let response: NegotiateResponse = connect_unary(NEGOTIATE, &request, None).await?;
         Ok(response
             .served_protocol_versions
             .into_iter()
@@ -474,6 +480,136 @@ where
     outcome
 }
 
+/// One Connect unary call: a client span in its action's trace, whose
+/// `traceparent` it carries, and one telemetry record (by route, status and
+/// error kind; never its content). The handshake and `v6` travel on it.
+async fn connect_unary<M, R>(
+    path: &'static str,
+    message: &M,
+    bearer: Option<&Secret>,
+) -> Result<R, ClientError>
+where
+    M: Message,
+    R: Message + Default,
+{
+    let call = telemetry::begin_call(path);
+    let mut status = None;
+    let outcome = connect_unary_call(
+        path,
+        message,
+        bearer,
+        call.traceparent().as_deref(),
+        &mut status,
+    )
+    .await;
+    telemetry::end_call(call, status, outcome.as_ref().err());
+    outcome
+}
+
+/// The call itself: the encoded message, `POST`ed as `application/proto`.
+/// `status` receives the gRPC code the answer stands for, when it was a
+/// Connect answer.
+async fn connect_unary_call<M, R>(
+    path: &'static str,
+    message: &M,
+    bearer: Option<&Secret>,
+    traceparent: Option<&str>,
+    status: &mut Option<u16>,
+) -> Result<R, ClientError>
+where
+    M: Message,
+    R: Message + Default,
+{
+    let body = Uint8Array::from(message.encode_to_vec().as_slice());
+    let mut headers = vec![
+        ("content-type", "application/proto"),
+        ("connect-protocol-version", "1"),
+    ];
+    if let Some(traceparent) = traceparent {
+        headers.push(("traceparent", traceparent));
+    }
+    let authorization;
+    if let Some(bearer) = bearer {
+        authorization = format!("Bearer {}", bearer.expose());
+        headers.push(("authorization", authorization.as_str()));
+    }
+    let response = fetch(path, "POST", Some(body.into()), &headers).await?;
+    let content_type = response.headers().get("content-type").ok().flatten();
+    let kind = response.headers().get(ERROR_KIND_METADATA).ok().flatten();
+    let ok = response.ok();
+    let buffer = JsFuture::from(response.array_buffer().map_err(|_| browser_error())?)
+        .await
+        .map_err(|_| browser_error())?;
+    let (outcome, answered) = decode_connect_answer(
+        ok,
+        content_type.as_deref(),
+        kind.as_deref(),
+        &Uint8Array::new(&buffer).to_vec(),
+    );
+    *status = answered;
+    outcome
+}
+
+/// A Connect unary answer, and the gRPC code it stands for when it was one.
+///
+/// Success is `200` with `application/proto`; a refusal is any other status
+/// with a JSON body naming its code, and the version-not-served marker in a
+/// header. Anything else did not come from a Connect service.
+pub(crate) fn decode_connect_answer<R: Message + Default>(
+    ok: bool,
+    content_type: Option<&str>,
+    kind: Option<&str>,
+    body: &[u8],
+) -> (Result<R, ClientError>, Option<u16>) {
+    let media = content_type.map(|value| value.split(';').next().unwrap_or(value).trim());
+    if ok {
+        if media != Some("application/proto") {
+            return (Err(map_rpc_status(RpcCode::Other)), None);
+        }
+        return (
+            R::decode(body).map_err(|_| map_rpc_status(RpcCode::Other)),
+            Some(0),
+        );
+    }
+    let code = (media == Some("application/json"))
+        .then(|| serde_json::from_slice::<serde_json::Value>(body).ok())
+        .flatten()
+        .and_then(|error| error.get("code")?.as_str().and_then(connect_code));
+    let Some(code) = code else {
+        return (Err(map_rpc_status(RpcCode::Unavailable)), None);
+    };
+    // The marker, never the code, as for gRPC-Web.
+    let outcome = if kind == Some(VERSION_NOT_SERVED_KIND) {
+        Err(map_rpc_status(RpcCode::VersionNotServed))
+    } else {
+        Err(map_rpc_status(grpc_status_code(code)))
+    };
+    (outcome, Some(code))
+}
+
+/// A Connect error code, as the gRPC status number it stands for.
+fn connect_code(code: &str) -> Option<u16> {
+    Some(match code {
+        "canceled" => 1,
+        "unknown" => 2,
+        "invalid_argument" => 3,
+        "deadline_exceeded" => 4,
+        "not_found" => 5,
+        "already_exists" => 6,
+        "permission_denied" => 7,
+        "resource_exhausted" => 8,
+        "failed_precondition" => 9,
+        "aborted" => 10,
+        "out_of_range" => 11,
+        "unimplemented" => 12,
+        "internal" => 13,
+        "unavailable" => 14,
+        "data_loss" => 15,
+        "unauthenticated" => 16,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn decode_grpc_web<R: Message + Default>(bytes: &[u8]) -> Result<R, ClientError> {
     decode_grpc_web_response(bytes, None, None)
@@ -592,7 +728,7 @@ mod tests {
 
     use sovereign_config_core::{ClientError, ErrorKind, ProtocolVersion};
 
-    use super::{BrowserTransport, routes, v4, v5};
+    use super::{BrowserTransport, routes, v4, v5, v6};
 
     /// The RPCs a version's routes have to cover: `System` (2),
     /// `Configuration` (8) and `ManagedConnections` (4). Written as the sum so
@@ -662,6 +798,83 @@ mod tests {
         assert_eq!(
             v5::AUDIT_ROUTES,
             ["/sovereign.config.v5.Audit/QueryAuditTrail"]
+        );
+    }
+
+    #[test]
+    fn v6_audit_routes_name_v6() {
+        assert_eq!(
+            v6::AUDIT_ROUTES,
+            ["/sovereign.config.v6.Audit/QueryAuditTrail"]
+        );
+    }
+
+    /// A Connect answer: the reply on success, the code and marker on a
+    /// refusal, and anything that is not Connect's shape read as the service
+    /// being unreachable rather than decoded.
+    #[test]
+    fn a_connect_answer_is_read_by_its_status_type_and_marker() {
+        use prost::Message as _;
+        use sovereign_config_core::ErrorKind;
+        use sovereign_config_proto::sovereign::config::v6;
+
+        use super::decode_connect_answer;
+
+        let reply = v6::RevealSecretResponse {
+            value: "connect-sentinel".into(),
+        };
+        let (decoded, status) = decode_connect_answer::<v6::RevealSecretResponse>(
+            true,
+            Some("application/proto"),
+            None,
+            &reply.encode_to_vec(),
+        );
+        assert_eq!(decoded.unwrap().value, "connect-sentinel");
+        assert_eq!(status, Some(0));
+
+        let refusal = br#"{"code":"permission_denied","message":"no"}"#;
+        let (decoded, status) = decode_connect_answer::<v6::RevealSecretResponse>(
+            false,
+            Some("application/json"),
+            None,
+            refusal,
+        );
+        assert_eq!(decoded.unwrap_err().kind, ErrorKind::PermissionDenied);
+        assert_eq!(status, Some(7));
+
+        let retired = br#"{"code":"failed_precondition","message":"gone"}"#;
+        let (decoded, status) = decode_connect_answer::<v6::RevealSecretResponse>(
+            false,
+            Some("application/json; charset=utf-8"),
+            Some("version-not-served"),
+            retired,
+        );
+        assert_eq!(
+            decoded.unwrap_err(),
+            sovereign_config_client::map_rpc_status(
+                sovereign_config_client::RpcCode::VersionNotServed
+            )
+        );
+        assert_eq!(status, Some(9));
+
+        let (decoded, status) = decode_connect_answer::<v6::RevealSecretResponse>(
+            false,
+            Some("text/html"),
+            None,
+            b"<html>bad gateway</html>",
+        );
+        assert_eq!(decoded.unwrap_err().kind, ErrorKind::Unavailable);
+        assert_eq!(status, None);
+
+        let (decoded, _) = decode_connect_answer::<v6::RevealSecretResponse>(
+            true,
+            Some("application/grpc-web+proto"),
+            None,
+            &[0, 0, 0, 0, 0],
+        );
+        assert!(
+            decoded.is_err(),
+            "a success not in Connect's shape is not decoded"
         );
     }
 

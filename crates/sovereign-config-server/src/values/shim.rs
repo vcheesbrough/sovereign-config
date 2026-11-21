@@ -88,6 +88,9 @@ impl Validation for Upfront {
 /// shim — which is what lets `proto` name a different package in each.
 macro_rules! configuration_shim {
     ($shim:ident, $validation:ty) => {
+        configuration_shim!($shim, $validation, crate::rpc::Wide);
+    };
+    ($shim:ident, $validation:ty, $wire:ty) => {
         #[derive(Clone)]
         pub(crate) struct $shim {
             shared: std::sync::Arc<super::ConfigurationService>,
@@ -171,8 +174,12 @@ macro_rules! configuration_shim {
                         .into_iter()
                         .map(|value| proto::ListedValue {
                             path: value.path.as_str().to_owned(),
-                            created_at: Some(crate::rpc::to_proto_timestamp(value.created_at)),
-                            updated_at: Some(crate::rpc::to_proto_timestamp(value.updated_at)),
+                            created_at: Some(<$wire as crate::rpc::WireForm>::timestamp(
+                                value.created_at,
+                            )),
+                            updated_at: Some(<$wire as crate::rpc::WireForm>::timestamp(
+                                value.updated_at,
+                            )),
                             classification: classification(&value.value),
                             alias_paths: path_strings(&value.alias_paths),
                             content: Some(listed_content(value.value)),
@@ -224,8 +231,12 @@ macro_rules! configuration_shim {
                     .put_value(&context, &message.path, written)
                     .await?;
                 Ok(tonic::Response::new(proto::PutValueResponse {
-                    created_at: Some(crate::rpc::to_proto_timestamp(metadata.created_at)),
-                    updated_at: Some(crate::rpc::to_proto_timestamp(metadata.updated_at)),
+                    created_at: Some(<$wire as crate::rpc::WireForm>::timestamp(
+                        metadata.created_at,
+                    )),
+                    updated_at: Some(<$wire as crate::rpc::WireForm>::timestamp(
+                        metadata.updated_at,
+                    )),
                 }))
             }
 
@@ -244,8 +255,10 @@ macro_rules! configuration_shim {
                     .replace_sub_tree(&context, &message.path, values)
                     .await?;
                 Ok(tonic::Response::new(proto::ReplaceSubTreeResponse {
-                    updated_at: Some(crate::rpc::to_proto_timestamp(metadata.updated_at)),
-                    value_count: metadata.value_count,
+                    updated_at: Some(<$wire as crate::rpc::WireForm>::timestamp(
+                        metadata.updated_at,
+                    )),
+                    value_count: <$wire as crate::rpc::WireForm>::count(metadata.value_count),
                 }))
             }
 
@@ -260,8 +273,10 @@ macro_rules! configuration_shim {
                     .delete_values(&context, &message.path, message.recurse)
                     .await?;
                 Ok(tonic::Response::new(proto::DeleteValuesResponse {
-                    deleted_at: Some(crate::rpc::to_proto_timestamp(metadata.deleted_at)),
-                    deleted_count: metadata.deleted_count,
+                    deleted_at: Some(<$wire as crate::rpc::WireForm>::timestamp(
+                        metadata.deleted_at,
+                    )),
+                    deleted_count: <$wire as crate::rpc::WireForm>::count(metadata.deleted_count),
                 }))
             }
 
@@ -296,7 +311,9 @@ macro_rules! configuration_shim {
                     )
                     .await?;
                 Ok(tonic::Response::new(proto::AddValuePathResponse {
-                    created_at: Some(crate::rpc::to_proto_timestamp(metadata.created_at)),
+                    created_at: Some(<$wire as crate::rpc::WireForm>::timestamp(
+                        metadata.created_at,
+                    )),
                 }))
             }
 

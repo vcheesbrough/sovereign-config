@@ -22,5 +22,14 @@ pub mod sovereign {
         pub mod v5 {
             tonic::include_proto!("sovereign.config.v5");
         }
+
+        /// Served over the Connect protocol only (#582). The tonic stubs are
+        /// generated like every other version's, but no gRPC router ever
+        /// registers them: the server reaches its `v6` shims through the
+        /// Connect bridge, and the clients dial `v6` with hand-written
+        /// Connect unary calls over these messages.
+        pub mod v6 {
+            tonic::include_proto!("sovereign.config.v6");
+        }
     }
 }

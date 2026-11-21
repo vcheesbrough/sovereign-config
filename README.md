@@ -9,7 +9,7 @@
 [![Latest release](https://img.shields.io/github/v/tag/vcheesbrough/sovereign-config?sort=semver&label=release&color=2ea44f)](https://github.com/vcheesbrough/sovereign-config/releases)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust&logoColor=white)](docs/development.md)
-[![gRPC and gRPC-Web](https://img.shields.io/badge/API-gRPC%20%2B%20gRPC--Web-244c5a)](docs/protocol-versioning.md)
+[![Connect, gRPC and gRPC-Web](https://img.shields.io/badge/API-Connect%20%2B%20gRPC%20%2B%20gRPC--Web-244c5a)](docs/protocol-versioning.md)
 [![OpenTelemetry](https://img.shields.io/badge/telemetry-OpenTelemetry-7b5ea7?logo=opentelemetry&logoColor=white)](docs/observability.md)
 
 [Features](#features) · [Deployment](#deployment) · [Using it](#using-sovereign-config) · [Configuration](#configuration-reference) · [Roadmap](#roadmap) · [Docs](#documentation)
@@ -102,9 +102,9 @@ flowchart LR
     IDP["Authentik<br/>OIDC provider"]
     OTEL["OTLP collector<br/>(optional)"]
 
-    UI -- "gRPC-Web + user token" --> SRV
-    CLI -- "gRPC + user token" --> SRV
-    MCP -- "gRPC + user token" --> SRV
+    UI -- "Connect + user token" --> SRV
+    CLI -- "Connect + user token" --> SRV
+    MCP -- "Connect + user token" --> SRV
     APP -- "access URL" --> SRV
     RENDER -- "access URL" --> SRV
     WP -- "access URL" --> SRV
@@ -117,7 +117,7 @@ flowchart LR
 
 | Component | What it is | How it is distributed |
 | --- | --- | --- |
-| **Server** | The gRPC and gRPC-Web service, with the web UI embedded. | Container image `sovereign-config` |
+| **Server** | The Connect, gRPC and gRPC-Web service, with the web UI embedded. | Container image `sovereign-config` |
 | **[CLI](docs/cli.md)** | `sovereign-config`: profiles, login, reads and writes, `render`. | Installer served by every server under `/downloads`; `cargo install` from a release tag |
 | **[MCP server](#mcp-server)** | `sovereign-config-mcp`: the administration surface as Model Context Protocol tools for a local MCP host. | Installer served by every server; `cargo install` from a release tag |
 | **[Application provider](crates/sovereign-config-provider/README.md)** | `sovereign-config-provider`: a Rust library that loads one subtree into a `serde` type. | Tagged workspace source |
@@ -133,7 +133,7 @@ Every component is released together from one source tag under one version.
 | 🐳 | **Docker with Compose**, linux/amd64 | The reference stack is [`compose.yaml`](compose.yaml). |
 | 🐘 | **PostgreSQL** | The reference stack runs its own, pinned by digest. A deployment needs `CREATE` on its database, which the bundled role has. |
 | 🪪 | **Authentik 2026.5.2 or newer** | The repository ships Authentik blueprints that create everything the service needs (see [Authentik](docs/authentik.md)). Authentik is the only identity provider the server is built with today. What any other would have to provide is written down as [the realm contract](docs/authentication.md#the-realm-contract), and support for more is planned (see [Roadmap](#roadmap)). |
-| 🔀 | **A TLS-terminating reverse proxy** | It must forward HTTP/2 cleartext (h2c) to the service. The reference stack is currently labelled for the author's own Traefik setup (see [step 4](#4-configure-and-start)). |
+| 🔀 | **A TLS-terminating reverse proxy** | Clients from 3.60 on speak [Connect](docs/connect-json.md) over HTTP/1.1 or HTTP/2, which any proxy forwards. Clients older than 3.60 need the proxy to forward HTTP/2 cleartext (h2c) to the service. Keep h2c until none are left ([3.60](docs/upgrading.md#360-protocol-v6-over-connect-and-the-end-of-v3v5-announced)). The reference stack is currently labelled for the author's own Traefik setup (see [step 4](#4-configure-and-start)). |
 | 💾 | **Encrypted storage** | For the database volume and for every backup. |
 
 ## Concepts
@@ -274,7 +274,7 @@ The server never seeds users, groups or authorization state, and PostgreSQL hold
 
 ### Web UI
 
-The server embeds a WebAssembly administration UI and serves it from the same origin as its gRPC-Web API. Signing in uses OIDC authorization code with PKCE. Access tokens stay in WASM memory only, and the rotating refresh token stays in tab-scoped session storage, so a reload restores the session but closing the tab ends it.
+The server embeds a WebAssembly administration UI and serves it from the same origin as its API. Signing in uses OIDC authorization code with PKCE. Access tokens stay in WASM memory only, and the rotating refresh token stays in tab-scoped session storage, so a reload restores the session but closing the tab ends it.
 
 | View | What it does |
 | --- | --- |
@@ -412,9 +412,9 @@ Stop the server, back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the n
 
 ## Compatibility
 
-The API is served as versioned protobuf packages, currently `sovereign.config.v5` (preferred), `sovereign.config.v4` and `sovereign.config.v3`, over native gRPC and gRPC-Web on one port. A client sends the versions it speaks to an unversioned handshake, and the server answers with every version it serves. The client then uses the best one both sides support. A client older than the server therefore keeps working, and upgrading the server alone is safe. A version is retired only after it is announced with a deprecation date and its authenticated traffic has dropped to zero.
+The API is served as versioned protobuf packages on one port. Each version has one transport. `sovereign.config.v6` (preferred) is served over [Connect](docs/connect-json.md), binary or JSON, over HTTP/1.1 or HTTP/2. `sovereign.config.v5`, `v4` and `v3` are served over native gRPC and gRPC-Web, and are deprecated from 2027-01-01. A client sends the versions it speaks to an unversioned handshake, and the server answers with every version it serves. The client then uses the best one both sides support. A client older than the server therefore keeps working, and upgrading the server alone is safe. A version is retired only after it is announced with a deprecation date and its authenticated traffic has dropped to zero.
 
-`v4` adds the audit-trail query to `v3`'s surface and validates a request's shape before authorizing it; `v5` adds an actor filter and counts to that query. Negotiation does not cover every change: some releases changed what older clients see without a protocol change, and [Upgrading](docs/upgrading.md) says how to sequence them. [Protocol versioning](docs/protocol-versioning.md) describes negotiation, the compatibility rules, and how versions are introduced and retired.
+`v4` adds the audit-trail query to `v3`'s surface and validates a request's shape before authorizing it; `v5` adds an actor filter and counts to that query; `v6` is `v5` over Connect, with JSON-friendly counts, identifiers and timestamps, so it can be called with `curl` ([Calling v6 with curl](docs/connect-json.md)). Negotiation does not cover every change: some releases changed what older clients see without a protocol change, and [Upgrading](docs/upgrading.md) says how to sequence them. [Protocol versioning](docs/protocol-versioning.md) describes negotiation, the compatibility rules, and how versions are introduced and retired.
 
 ## Roadmap
 
@@ -439,6 +439,7 @@ The project intends to extend Sovereign Config in these directions. They are sta
 | 📡 | [Observability](docs/observability.md) | Spans, metrics, logs, configuration, web UI telemetry. |
 | ⬆️ | [Upgrading](docs/upgrading.md) | The upgrade procedure and the releases that need action. |
 | 🤝 | [Protocol versioning](docs/protocol-versioning.md) | Version negotiation and the procedure for adding or retiring a version. |
+| 🌐 | [Calling v6 with curl](docs/connect-json.md) | The JSON form of protocol `v6`, for clients written by hand. |
 | 🛠️ | [Development](docs/development.md) | Workspace layout, building, testing and the release gate. |
 | 🏠 | [Project deployment](docs/project-deployment.md) | How the project's own instance is built and deployed. |
 | 🦀 | [Application provider](crates/sovereign-config-provider/README.md) | The Rust library API. |

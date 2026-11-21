@@ -54,10 +54,103 @@ async function storedRefreshState(page) {
   }));
 }
 
-function grpcFrame(payload, status = 0) {
+// The two wires the browser speaks. `v3`–`v5` travel gRPC-Web: a 5-byte
+// frame around the message, the status in a trailer frame, always HTTP 200.
+// The handshake and `v6` travel Connect unary: the bare message as
+// `application/proto`, success as HTTP 200 with the bare reply, a refusal as
+// another status with a JSON `{code, message}` body and the version-not-served
+// marker in a header. Every mock answers in the shape of the request it
+// received, through `requestMessage` and `reply`, so one mock serves both.
+const GRPC_WEB = 'application/grpc-web+proto';
+const CONNECT = 'application/proto';
+const ERROR_KIND_HEADER = 'sovereign-config-error-kind';
+
+// gRPC status number → [Connect code, the HTTP status Connect gives it].
+const CONNECT_CODES = {
+  1: ['canceled', 499],
+  2: ['unknown', 500],
+  3: ['invalid_argument', 400],
+  4: ['deadline_exceeded', 504],
+  5: ['not_found', 404],
+  6: ['already_exists', 409],
+  7: ['permission_denied', 403],
+  8: ['resource_exhausted', 429],
+  9: ['failed_precondition', 400],
+  10: ['aborted', 409],
+  11: ['out_of_range', 400],
+  12: ['unimplemented', 501],
+  13: ['internal', 500],
+  14: ['unavailable', 503],
+  15: ['data_loss', 500],
+  16: ['unauthenticated', 401]
+};
+
+function mediaType(headers) {
+  return (headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+}
+
+// Whether a request (Playwright's `Request`) was sent over Connect.
+function isConnect(request) {
+  return mediaType(request.headers()) === CONNECT;
+}
+
+// The request's protobuf message, whichever wire carried it: the bare body
+// over Connect, the first frame's payload over gRPC-Web.
+function requestMessage(route) {
+  const request = route.request();
+  const body = request.postDataBuffer() || Buffer.alloc(0);
+  if (isConnect(request)) return body;
+  if (body.length < 5) return Buffer.alloc(0);
+  return body.subarray(5, 5 + body.readUInt32BE(1));
+}
+
+// Answers `route` with `payload` (an encoded reply message) or, when `status`
+// is a non-zero gRPC status, with that refusal, in the shape of the request:
+// Connect for a Connect request, gRPC-Web otherwise. `kind` is the error-kind
+// marker (e.g. `version-not-served`), a header over Connect and a trailer over
+// gRPC-Web, as the service sends it. `connectCode` and `httpStatus` replace the
+// Connect code and HTTP status `CONNECT_CODES` would give `status`, for a test
+// that states them itself (the shared transport contract).
+function reply(route, payload = Buffer.alloc(0), {
+  status = 0, kind, message, headers = {}, connectCode, httpStatus
+} = {}) {
+  if (!isConnect(route.request())) {
+    return route.fulfill({
+      status: 200,
+      headers: { 'content-type': GRPC_WEB, ...headers },
+      body: grpcFrame(payload, status, kind)
+    });
+  }
+  if (status === 0) {
+    return route.fulfill({
+      status: 200,
+      headers: { 'content-type': CONNECT, ...headers },
+      body: payload
+    });
+  }
+  const [defaultCode, defaultHttpStatus] = CONNECT_CODES[status] || CONNECT_CODES[2];
+  const code = connectCode || defaultCode;
+  return route.fulfill({
+    status: httpStatus || defaultHttpStatus,
+    headers: {
+      'content-type': 'application/json',
+      ...(kind ? { [ERROR_KIND_HEADER]: kind } : {}),
+      ...headers
+    },
+    body: JSON.stringify({ code, message: message || code.replace(/_/g, ' ') })
+  });
+}
+
+// A refusal with `status` and no reply message.
+function refuse(route, status, options = {}) {
+  return reply(route, Buffer.alloc(0), { ...options, status });
+}
+
+function grpcFrame(payload, status = 0, kind = undefined) {
   const dataHeader = Buffer.alloc(5);
   dataHeader.writeUInt32BE(payload.length, 1);
-  const trailer = Buffer.from(`grpc-status: ${status}\r\n`);
+  const trailer = Buffer.from(`grpc-status: ${status}\r\n`
+    + (kind ? `${ERROR_KIND_HEADER}: ${kind}\r\n` : ''));
   const trailerHeader = Buffer.alloc(5);
   trailerHeader[0] = 0x80;
   trailerHeader.writeUInt32BE(trailer.length, 1);
@@ -92,11 +185,16 @@ function scalarField(number, value) {
   return Buffer.concat([varint(number << 3), varint(value)]);
 }
 
-// `v4` is `v3` plus the Audit service, and `v5` is `v4` with an actor filter
-// and counts on the audit query, with every shared message identical on the
-// wire, so the shared mocks answer on all three and a test picks the version
-// its session negotiates (see `negotiate`).
-const SHARED_VERSIONS = '{v3,v4,v5}';
+// `v4` is `v3` plus the Audit service, `v5` is `v4` with an actor filter and
+// counts on the audit query, and `v6` is `v5` over Connect with 32-bit counts
+// and a string audit-event id. Every shared message is identical on the wire
+// (a uint32 and a uint64 varint encode alike), so the shared mocks answer on
+// all four and a test picks the version its session negotiates (see
+// `negotiate`); the mocked handshake offers `v6` first, as the service does.
+const SHARED_VERSIONS = '{v3,v4,v5,v6}';
+const VERSIONS = ['v6', 'v5', 'v4', 'v3'];
+// What the service announces: every version but the newest is deprecated.
+const DEPRECATION_DATE = '2027-01-01T00:00:00Z';
 
 function storedValue(value) {
   return typeof value === 'string' ? { value, secret: false } : value;
@@ -174,8 +272,8 @@ function messageFields(buffer, start = 0) {
   return fields;
 }
 
-function stringFields(frame) {
-  const decoded = messageFields(frame, 5);
+function stringFields(message) {
+  const decoded = messageFields(message);
   const fields = new Map();
   for (const [number, values] of decoded) {
     const value = values[0];
@@ -194,8 +292,8 @@ function nestedStringFields(message) {
   return fields;
 }
 
-function repeatedMessages(frame, number) {
-  return (messageFields(frame, 5).get(number) || []).map(nestedStringFields);
+function repeatedMessages(message, number) {
+  return (messageFields(message).get(number) || []).map(nestedStringFields);
 }
 
 // Decodes a repeated varint field, accepting both packed (wire type 2, a
@@ -221,7 +319,7 @@ function decodeRepeatedVarints(values) {
 // The permission enums selected for field 3 of a captured
 // CreateManagedConnection request, in the order they were sent.
 function requestPermissions(request) {
-  return decodeRepeatedVarints(messageFields(request.body, 5).get(3) || []);
+  return decodeRepeatedVarints(messageFields(request.body).get(3) || []);
 }
 
 function parentPath(path) {
@@ -269,25 +367,17 @@ async function mockValues(page, initial = {}) {
   let delayedAddPath;
   await page.route(`**/sovereign.config.${SHARED_VERSIONS}.Configuration/*`, async route => {
     const method = route.request().url().split('/').pop();
-    const body = route.request().postDataBuffer();
+    const body = requestMessage(route);
     const fields = stringFields(body);
     requests.push({ method, body, fields });
     const authorized = route.request().headers().authorization === 'Bearer access-token-two';
     if (!authorized) {
-      return route.fulfill({
-        status: 200,
-        headers: { 'content-type': 'application/grpc-web+proto' },
-        body: grpcFrame(Buffer.alloc(0), 16)
-      });
+      return refuse(route, 16);
     }
     if (method === 'ListValues') {
       const selected = fields.get(1) || '/';
       const values = [...stored].filter(([path]) => foldEquals(parentPath(path), selected));
-      return route.fulfill({
-        status: 200,
-        headers: { 'content-type': 'application/grpc-web+proto' },
-        body: grpcFrame(listReply(values, existingPaths(stored)))
-      });
+      return reply(route, listReply(values, existingPaths(stored)));
     }
     if (method === 'GetSubTree') {
       if (delayedSubtree) {
@@ -297,20 +387,12 @@ async function mockValues(page, initial = {}) {
       }
       const selected = fields.get(1) || '/';
       const values = [...stored].filter(([path]) => isAtOrBelowFold(path, selected));
-      return route.fulfill({
-        status: 200,
-        headers: { 'content-type': 'application/grpc-web+proto' },
-        body: grpcFrame(subtreeReply(values))
-      });
+      return reply(route, subtreeReply(values));
     }
     if (method === 'PutValue') {
       const secret = fields.has(3);
       stored.set(fields.get(1), { value: fields.get(secret ? 3 : 2), secret });
-      return route.fulfill({
-        status: 200,
-        headers: { 'content-type': 'application/grpc-web+proto' },
-        body: grpcFrame(mutationReply())
-      });
+      return reply(route, mutationReply());
     }
     if (method === 'ReplaceSubTree') {
       const selected = fields.get(1) || '/';
@@ -323,13 +405,9 @@ async function mockValues(page, initial = {}) {
       for (const value of replacements) {
         if (value.has(2)) stored.set(value.get(1), { value: value.get(2), secret: false });
       }
-      return route.fulfill({
-        status: 200,
-        headers: { 'content-type': 'application/grpc-web+proto' },
-        body: grpcFrame(Buffer.concat([
+      return reply(route, Buffer.concat([
           field(1, timestamp(1700000001)), scalarField(2, replacements.length)
-        ]))
-      });
+        ]));
     }
     if (method === 'RevealSecret') {
       if (delayedReveal) {
@@ -340,11 +418,7 @@ async function mockValues(page, initial = {}) {
       const selected = fields.get(1);
       const value = stored.get(selected);
       const status = value?.secret ? 0 : (value ? 3 : 5);
-      return route.fulfill({
-        status: 200,
-        headers: { 'content-type': 'application/grpc-web+proto' },
-        body: grpcFrame(status === 0 ? field(1, Buffer.from(value.value)) : Buffer.alloc(0), status)
-      });
+      return reply(route, status === 0 ? field(1, Buffer.from(value.value)) : Buffer.alloc(0), { status });
     }
     if (method === 'AddValuePath') {
       if (delayedAddPath) {
@@ -356,20 +430,12 @@ async function mockValues(page, initial = {}) {
       const added = fields.get(2);
       const value = stored.get(source);
       if (!value) {
-        return route.fulfill({
-          status: 200,
-          headers: { 'content-type': 'application/grpc-web+proto' },
-          body: grpcFrame(Buffer.alloc(0), 5)
-        });
+        return refuse(route, 5);
       }
       // One value, many paths: record the new path as another alias of the
       // same stored value rather than copying its content.
       value.aliases = [...(value.aliases || []), added].sort();
-      return route.fulfill({
-        status: 200,
-        headers: { 'content-type': 'application/grpc-web+proto' },
-        body: grpcFrame(field(1, timestamp(1700000002)))
-      });
+      return reply(route, field(1, timestamp(1700000002)));
     }
     if (method !== 'DeleteValues') {
       throw new Error(`unexpected Configuration RPC ${method}`);
@@ -393,13 +459,9 @@ async function mockValues(page, initial = {}) {
         }
       }
     }
-    return route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'application/grpc-web+proto' },
-      body: grpcFrame(Buffer.concat([
+    return reply(route, Buffer.concat([
         field(1, timestamp(1700000001)), scalarField(2, deleted)
-      ]))
-    });
+      ]));
   });
   return {
     requests,
@@ -436,11 +498,7 @@ async function mockApplication(page) {
   // empty replies keep those reads off the network; Playwright matches routes in
   // reverse registration order, so mockValues/mockConnections still win.
   for (const service of ['Configuration', 'ManagedConnections']) {
-    await page.route(`**/sovereign.config.${SHARED_VERSIONS}.${service}/*`, route => route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'application/grpc-web+proto' },
-      body: grpcFrame(Buffer.alloc(0))
-    }));
+    await page.route(`**/sovereign.config.${SHARED_VERSIONS}.${service}/*`, route => reply(route, Buffer.alloc(0)));
   }
   await page.route('**/app-config.js', route => route.fulfill({
     contentType: 'text/javascript',
@@ -450,31 +508,19 @@ async function mockApplication(page) {
   // versioned route. Without it the client finds no handshake, falls back to
   // the legacy `v3` GetVersion route, and — since Playwright would answer that
   // too — the suite would pass while never exercising the path the real client
-  // takes. Mocking both is what keeps the fallback a fallback.
-  await page.route('**/sovereign.config.Handshake/Negotiate', route => {
-    const protocol = Buffer.from('v3');
-    // NegotiateResponse { served_protocol_versions: [ { protocol_version } ] }
-    const served = Buffer.concat([Buffer.from([0x0a, protocol.length]), protocol]);
-    const message = Buffer.concat([Buffer.from([0x0a, served.length]), served]);
-    return route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'application/grpc-web+proto' },
-      body: grpcFrame(message)
-    });
-  });
+  // takes. Mocking both is what keeps the fallback a fallback. It answers as
+  // the service does: every version, newest first, the older ones deprecated.
+  await page.route('**/sovereign.config.Handshake/Negotiate', route =>
+    reply(route, negotiateReply(VERSIONS)));
   await page.route(`**/sovereign.config.${SHARED_VERSIONS}.System/GetVersion`, route => {
     const application = Buffer.from('1.5.0');
     const url = route.request().url();
-    const protocol = Buffer.from(url.includes('.v5.') ? 'v5' : url.includes('.v4.') ? 'v4' : 'v3');
+    const protocol = Buffer.from(VERSIONS.find(version => url.includes(`.${version}.`)) || 'v3');
     const message = Buffer.concat([
       Buffer.from([0x0a, application.length]), application,
       Buffer.from([0x12, protocol.length]), protocol
     ]);
-    return route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'application/grpc-web+proto' },
-      body: grpcFrame(message)
-    });
+    return reply(route, message);
   });
   await page.route('**/configuration/**', route => {
     if (route.request().resourceType() !== 'document') return route.continue();
@@ -541,22 +587,18 @@ async function mockConnections(page, options = {}) {
   let delayedList;
   await page.route(`**/sovereign.config.${SHARED_VERSIONS}.ManagedConnections/*`, async route => {
     const method = route.request().url().split('/').pop();
-    const body = route.request().postDataBuffer();
+    const body = requestMessage(route);
     const fields = stringFields(body);
     state.requests.push({ method, fields, body });
     const authorized = route.request().headers().authorization === 'Bearer access-token-two';
-    const reply = (body, status = 0) => route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'application/grpc-web+proto' },
-      body: grpcFrame(body, status)
-    });
-    if (!authorized) return reply(Buffer.alloc(0), 16);
+    const answer = (body, status = 0) => reply(route, body, { status });
+    if (!authorized) return answer(Buffer.alloc(0), 16);
     const scripted = state.script[method];
-    if (typeof scripted === 'number') return reply(Buffer.alloc(0), scripted);
+    if (typeof scripted === 'number') return answer(Buffer.alloc(0), scripted);
     if (typeof scripted === 'function') {
       const outcome = scripted(state);
-      if (typeof outcome === 'number') return reply(Buffer.alloc(0), outcome);
-      if (outcome) return reply(outcome);
+      if (typeof outcome === 'number') return answer(Buffer.alloc(0), outcome);
+      if (outcome) return answer(outcome);
     }
     if (method === 'ListManagedConnections') {
       if (delayedList) {
@@ -564,7 +606,7 @@ async function mockConnections(page, options = {}) {
         delayedList = undefined;
         await delay.promise;
       }
-      return reply(listConnectionsReply(state.connections));
+      return answer(listConnectionsReply(state.connections));
     }
     if (method === 'CreateManagedConnection') {
       const permissions = requestPermissions({ body });
@@ -574,17 +616,17 @@ async function mockConnections(page, options = {}) {
         ...(permissions.length ? { permissions } : {})
       };
       state.connections = [...state.connections, created];
-      return reply(provisionedReply(connectionUrl(APP_PASSWORD_SENTINEL, created.root), created));
+      return answer(provisionedReply(connectionUrl(APP_PASSWORD_SENTINEL, created.root), created));
     }
     if (method === 'RotateManagedConnection') {
       state.rotations += 1;
-      return reply(provisionedReply(connectionUrl(`rotated-password-${state.rotations}`)));
+      return answer(provisionedReply(connectionUrl(`rotated-password-${state.rotations}`)));
     }
     if (method === 'RevokeManagedConnection') {
       state.connections = [];
-      return reply(Buffer.alloc(0));
+      return answer(Buffer.alloc(0));
     }
-    return reply(Buffer.alloc(0), 2);
+    return answer(Buffer.alloc(0), 2);
   });
   state.delayNextList = () => {
     let release;
@@ -595,22 +637,25 @@ async function mockConnections(page, options = {}) {
   return state;
 }
 
-// Makes the handshake serve `version` instead of mockApplication's `v3`.
-// Playwright matches the newest route first, so this must follow
-// mockApplication.
-async function negotiate(page, version) {
-  await page.route('**/sovereign.config.Handshake/Negotiate', route => {
-    const protocol = Buffer.from(version);
-    const served = field(1, protocol);
-    return route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'application/grpc-web+proto' },
-      body: grpcFrame(field(1, served))
-    });
-  });
+// A NegotiateResponse serving `versions` in that order, each but `v6`
+// carrying the deprecation date the service announces.
+function negotiateReply(versions) {
+  return Buffer.concat(versions.map(version => field(1, Buffer.concat([
+    field(1, Buffer.from(version)),
+    ...(version === 'v6' ? [] : [field(2, Buffer.from(DEPRECATION_DATE))])
+  ]))));
 }
 
-// `v4.AuditEventKind` and `v5.AuditEventKind` numbers, by the trail's labels.
+// Makes the handshake serve only `version` (or the versions listed, in order)
+// instead of mockApplication's full set. Playwright matches the newest route
+// first, so this must follow mockApplication.
+async function negotiate(page, version) {
+  const versions = Array.isArray(version) ? version : [version];
+  await page.route('**/sovereign.config.Handshake/Negotiate', route =>
+    reply(route, negotiateReply(versions)));
+}
+
+// `v4`–`v6` `AuditEventKind` numbers, by the trail's labels.
 const AUDIT_KINDS = {
   'value.created': 1,
   'value.updated': 2,
@@ -626,9 +671,11 @@ const AUDIT_KINDS = {
   'connection.revoked': 12
 };
 
-function auditEvent({ id, kind, path: eventPath, at, firstAt = at, count = 1, subject = 'operator-subject', name, protocol = 'v4', narrative }) {
+// One AuditEvent. `v6` carries its id as a decimal string, `v4` and `v5` as a
+// uint64.
+function auditEvent({ id, kind, path: eventPath, at, firstAt = at, count = 1, subject = 'operator-subject', name, protocol = 'v4', narrative }, version = 'v5') {
   return Buffer.concat([
-    scalarField(1, id),
+    version === 'v6' ? field(1, Buffer.from(String(id))) : scalarField(1, id),
     scalarField(2, AUDIT_KINDS[kind]),
     field(3, Buffer.from(eventPath)),
     field(4, timestamp(at)),
@@ -647,7 +694,7 @@ function timestampSeconds(message) {
 
 // A QueryAuditTrailRequest, decoded into the filters it carries.
 function auditRequest(body) {
-  const fields = messageFields(body, 5);
+  const fields = messageFields(body);
   const text = number => (fields.get(number) || []).map(value => value.toString())[0] || '';
   const kindNumbers = decodeRepeatedVarints(fields.get(7) || []);
   const labels = Object.fromEntries(Object.entries(AUDIT_KINDS).map(([label, number]) => [number, label]));
@@ -701,25 +748,21 @@ function auditMatches(event, query) {
 }
 
 /**
- * Mocks `v4.Audit/QueryAuditTrail` and `v5.Audit/QueryAuditTrail` over
- * `events`, which are given newest first. Pages hold `pageSize` events and the
- * cursor is the offset of the next one — opaque to the client, which is all the
- * contract promises. `v5`'s first page also carries the query's counts.
+ * Mocks `Audit/QueryAuditTrail` on `v4`, `v5` and `v6` over `events`, which
+ * are given newest first. Pages hold `pageSize` events and the cursor is the
+ * offset of the next one — opaque to the client, which is all the contract
+ * promises. From `v5` on, the first page also carries the query's counts.
  */
 async function mockAudit(page, { events = [], pageSize = 3 } = {}) {
   const state = { requests: [], failures: 0 };
   let delayed;
-  await page.route('**/sovereign.config.{v4,v5}.Audit/QueryAuditTrail', async route => {
-    const v5 = route.request().url().includes('.v5.');
-    const query = auditRequest(route.request().postDataBuffer());
+  await page.route('**/sovereign.config.{v4,v5,v6}.Audit/QueryAuditTrail', async route => {
+    const version = VERSIONS.find(label => route.request().url().includes(`.${label}.`));
+    const query = auditRequest(requestMessage(route));
     state.requests.push(query);
-    const reply = (body, status = 0) => route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'application/grpc-web+proto' },
-      body: grpcFrame(body, status)
-    });
+    const answer = (body, status = 0) => reply(route, body, { status });
     if (route.request().headers().authorization !== 'Bearer access-token-two') {
-      return reply(Buffer.alloc(0), 16);
+      return answer(Buffer.alloc(0), 16);
     }
     if (delayed) {
       const delay = delayed;
@@ -728,15 +771,15 @@ async function mockAudit(page, { events = [], pageSize = 3 } = {}) {
     }
     if (state.failures > 0) {
       state.failures -= 1;
-      return reply(Buffer.alloc(0), 14);
+      return answer(Buffer.alloc(0), 14);
     }
     const matching = events.filter(event => auditMatches(event, query));
     const start = query.cursor ? Number(query.cursor) : 0;
     const slice = matching.slice(start, start + pageSize);
     const next = start + pageSize < matching.length ? String(start + pageSize) : '';
-    const counted = v5 && !query.cursor;
-    return reply(Buffer.concat([
-      ...slice.map(event => field(1, auditEvent(event))),
+    const counted = version !== 'v4' && !query.cursor;
+    return answer(Buffer.concat([
+      ...slice.map(event => field(1, auditEvent(event, version))),
       ...(next ? [field(2, Buffer.from(next))] : []),
       ...(counted
         ? [
@@ -855,14 +898,19 @@ async function openCallback(
       })
     });
   });
+  // `identityStatus` is a gRPC status, or a `test-contracts/transport.json`
+  // case, whose Connect code and HTTP status the refusal then carries.
+  const identity = typeof identityStatus === 'number'
+    ? { status: identityStatus }
+    : {
+      status: identityStatus.grpc_status,
+      connectCode: identityStatus.connect_code || undefined,
+      httpStatus: identityStatus.http_status
+    };
   await page.route(`**/sovereign.config.${SHARED_VERSIONS}.System/GetIdentity`, route => {
     const authorized = route.request().headers().authorization === 'Bearer access-token-two';
-    const status = authorized ? identityStatus : 16;
-    return route.fulfill({
-      status: 200,
-      headers: { 'content-type': 'application/grpc-web+proto' },
-      body: grpcFrame(status === 0 ? Buffer.from([0x08, 0x01]) : Buffer.alloc(0), status)
-    });
+    const answer = authorized ? identity : { status: 16 };
+    return reply(route, answer.status === 0 ? Buffer.from([0x08, 0x01]) : Buffer.alloc(0), answer);
   });
   await page.goto(`/auth/callback?code=test-code&state=${state}`);
   return tokenRequests;
@@ -893,6 +941,13 @@ module.exports = {
   openView,
   mutationSequence,
   storedRefreshState,
+  GRPC_WEB,
+  CONNECT,
+  CONNECT_CODES,
+  isConnect,
+  requestMessage,
+  reply,
+  refuse,
   grpcFrame,
   varint,
   field,
@@ -924,7 +979,11 @@ module.exports = {
   listConnectionsReply,
   provisionedReply,
   mockConnections,
+  SHARED_VERSIONS,
+  VERSIONS,
+  negotiateReply,
   negotiate,
+  auditEvent,
   mockAudit,
   mockDiscovery,
   idToken,

@@ -49,7 +49,7 @@ macro_rules! audit_wire {
             let occurred_at = event.occurred_at.ok_or_else(invalid_response)?;
             let first_occurred_at = event.first_occurred_at.ok_or_else(invalid_response)?;
             Ok(AuditEntry {
-                id: event.id,
+                id: super::audit_wire::WireId::into_id(event.id).ok_or_else(invalid_response)?,
                 kind: audit_kind(event.kind)?,
                 path: ConfigPath::parse_selection(event.path).map_err(|_| invalid_response())?,
                 occurred_at: timestamp(occurred_at.seconds, occurred_at.nanos)?,
@@ -67,3 +67,23 @@ macro_rules! audit_wire {
 }
 
 pub(super) use audit_wire;
+
+/// An audit event's identifier as a version carries it: a `uint64` up to
+/// `v5`, an opaque string from `v6`. This workspace's server writes the
+/// string as the decimal of the same number, which is what this client reads
+/// it back as; a string that is not one is a broken response.
+pub(super) trait WireId {
+    fn into_id(self) -> Option<u64>;
+}
+
+impl WireId for u64 {
+    fn into_id(self) -> Option<u64> {
+        Some(self)
+    }
+}
+
+impl WireId for String {
+    fn into_id(self) -> Option<u64> {
+        self.parse().ok()
+    }
+}

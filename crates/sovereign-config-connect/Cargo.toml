@@ -1,0 +1,30 @@
+[package]
+name = "sovereign-config-connect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Connect-protocol messages and service stubs for the handshake and protocol v6, served by sovereign-config-server."
+
+# Generated from the same `.proto` files `sovereign-config-proto` compiles with
+# tonic-build: buffa messages and `connectrpc` service traits for the
+# handshake and `v6`, the only operations served over Connect. Server side
+# only: the clients speak Connect unary by hand over prost.
+
+[dependencies]
+buffa.workspace = true
+buffa-types.workspace = true
+connectrpc.workspace = true
+http-body = "1.0.1"
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+connectrpc-build = "0.9.0"
+protoc-bin-vendored = "3.2.0"
+
+# No `[lints] workspace = true`, as for `sovereign-config-proto`: the crate is
+# generated code, and its build script sets `PROTOC` in an `unsafe` block the
+# workspace forbids.

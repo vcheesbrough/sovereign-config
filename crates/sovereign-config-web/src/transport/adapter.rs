@@ -11,8 +11,14 @@
 /// Defines `Dialer` and its routes for `$version`, whose package label is
 /// `$label`, over the messages the invoking module imports as `proto`, with
 /// the imports its body needs — which the invoking module may use too.
+///
+/// `$unary` is the call every route travels on: `grpc_unary` (gRPC-Web) for
+/// `v3`–`v5`, `connect_unary` for `v6` on — a version names its transport.
 macro_rules! version_dialer {
     ($version:expr, $label:literal) => {
+        version_dialer!($version, $label, grpc_unary);
+    };
+    ($version:expr, $label:literal, $unary:ident) => {
         use async_trait::async_trait;
         use sovereign_config_client::{
             AuditTransport, ManagedConnectionTransport, SessionTransport, Transport,
@@ -30,7 +36,7 @@ macro_rules! version_dialer {
 
         use crate::browser::browser_error;
 
-        use super::grpc_unary;
+        use super::$unary as unary;
 
         /// The version this module speaks. Reported as the session's version,
         /// so it is read from the same place the routes come from.
@@ -100,7 +106,7 @@ macro_rules! version_dialer {
             REVOKE_MANAGED_CONNECTION,
         ];
 
-        /// This version's gRPC-Web routes and mapping.
+        /// This version's routes and mapping.
         #[derive(Clone, Copy)]
         pub(super) struct Dialer;
 
@@ -111,7 +117,7 @@ macro_rules! version_dialer {
             }
 
             async fn get_version(&self) -> Result<VersionReply, ClientError> {
-                let response: proto::GetVersionResponse = grpc_unary(
+                let response: proto::GetVersionResponse = unary(
                     GET_VERSION,
                     &proto::GetVersionRequest {
                         protocol_version: VERSION.as_str().to_owned(),
@@ -134,7 +140,7 @@ macro_rules! version_dialer {
                 bearer: &Secret,
             ) -> Result<AuthenticationStatus, ClientError> {
                 let response: proto::GetIdentityResponse =
-                    grpc_unary(GET_IDENTITY, &proto::GetIdentityRequest {}, Some(bearer)).await?;
+                    unary(GET_IDENTITY, &proto::GetIdentityRequest {}, Some(bearer)).await?;
                 Ok(AuthenticationStatus {
                     authenticated: response.authenticated,
                 })
@@ -148,7 +154,7 @@ macro_rules! version_dialer {
                 path: &ConfigPath,
                 bearer: &Secret,
             ) -> Result<ValueListing, ClientError> {
-                let response: proto::ListValuesResponse = grpc_unary(
+                let response: proto::ListValuesResponse = unary(
                     LIST_VALUES,
                     &proto::ListValuesRequest {
                         path: path.as_str().to_owned(),
@@ -190,7 +196,7 @@ macro_rules! version_dialer {
                 path: &ConfigPath,
                 bearer: &Secret,
             ) -> Result<ValueSubTree, ClientError> {
-                let response: proto::GetSubTreeResponse = grpc_unary(
+                let response: proto::GetSubTreeResponse = unary(
                     GET_SUB_TREE,
                     &proto::GetSubTreeRequest {
                         path: path.as_str().to_owned(),
@@ -250,7 +256,7 @@ macro_rules! version_dialer {
                 values: &[SubTreeMutationValue],
                 bearer: &Secret,
             ) -> Result<ReplaceMetadata, ClientError> {
-                let response: proto::ReplaceSubTreeResponse = grpc_unary(
+                let response: proto::ReplaceSubTreeResponse = unary(
                     REPLACE_SUB_TREE,
                     &proto::ReplaceSubTreeRequest {
                         path: path.as_str().to_owned(),
@@ -261,7 +267,7 @@ macro_rules! version_dialer {
                 .await?;
                 Ok(ReplaceMetadata {
                     updated_at: proto_timestamp(response.updated_at)?,
-                    value_count: response.value_count,
+                    value_count: u64::from(response.value_count),
                 })
             }
 
@@ -271,7 +277,7 @@ macro_rules! version_dialer {
                 recurse: bool,
                 bearer: &Secret,
             ) -> Result<DeleteMetadata, ClientError> {
-                let response: proto::DeleteValuesResponse = grpc_unary(
+                let response: proto::DeleteValuesResponse = unary(
                     DELETE_VALUES,
                     &proto::DeleteValuesRequest {
                         path: path.as_str().to_owned(),
@@ -282,7 +288,7 @@ macro_rules! version_dialer {
                 .await?;
                 Ok(DeleteMetadata {
                     deleted_at: proto_timestamp(response.deleted_at)?,
-                    deleted_count: response.deleted_count,
+                    deleted_count: u64::from(response.deleted_count),
                 })
             }
 
@@ -291,7 +297,7 @@ macro_rules! version_dialer {
                 path: &ConfigPath,
                 bearer: &Secret,
             ) -> Result<RevealedSecret, ClientError> {
-                let response: proto::RevealSecretResponse = grpc_unary(
+                let response: proto::RevealSecretResponse = unary(
                     REVEAL_SECRET,
                     &proto::RevealSecretRequest {
                         path: path.as_str().to_owned(),
@@ -311,7 +317,7 @@ macro_rules! version_dialer {
                 new_path: &ConfigPath,
                 bearer: &Secret,
             ) -> Result<AddPathMetadata, ClientError> {
-                let response: proto::AddValuePathResponse = grpc_unary(
+                let response: proto::AddValuePathResponse = unary(
                     ADD_VALUE_PATH,
                     &proto::AddValuePathRequest {
                         source_path: source.as_str().to_owned(),
@@ -330,7 +336,7 @@ macro_rules! version_dialer {
                 path: &ConfigPath,
                 bearer: &Secret,
             ) -> Result<ValuePaths, ClientError> {
-                let response: proto::ListValuePathsResponse = grpc_unary(
+                let response: proto::ListValuePathsResponse = unary(
                     LIST_VALUE_PATHS,
                     &proto::ListValuePathsRequest {
                         path: path.as_str().to_owned(),
@@ -353,7 +359,7 @@ macro_rules! version_dialer {
                 &self,
                 bearer: &Secret,
             ) -> Result<Vec<ManagedConnectionMetadata>, ClientError> {
-                let response: proto::ListManagedConnectionsResponse = grpc_unary(
+                let response: proto::ListManagedConnectionsResponse = unary(
                     LIST_MANAGED_CONNECTIONS,
                     &proto::ListManagedConnectionsRequest {},
                     Some(bearer),
@@ -373,7 +379,7 @@ macro_rules! version_dialer {
                 permissions: &ManagedPermissions,
                 bearer: &Secret,
             ) -> Result<ProvisionedManagedConnection, ClientError> {
-                let response: proto::CreateManagedConnectionResponse = grpc_unary(
+                let response: proto::CreateManagedConnectionResponse = unary(
                     CREATE_MANAGED_CONNECTION,
                     &proto::CreateManagedConnectionRequest {
                         display_name: display_name.as_str().to_owned(),
@@ -391,7 +397,7 @@ macro_rules! version_dialer {
                 connection_id: &ConnectionId,
                 bearer: &Secret,
             ) -> Result<ProvisionedManagedConnection, ClientError> {
-                let response: proto::RotateManagedConnectionResponse = grpc_unary(
+                let response: proto::RotateManagedConnectionResponse = unary(
                     ROTATE_MANAGED_CONNECTION,
                     &proto::RotateManagedConnectionRequest {
                         connection_id: connection_id.as_str().to_owned(),
@@ -407,7 +413,7 @@ macro_rules! version_dialer {
                 connection_id: &ConnectionId,
                 bearer: &Secret,
             ) -> Result<(), ClientError> {
-                let _: proto::RevokeManagedConnectionResponse = grpc_unary(
+                let _: proto::RevokeManagedConnectionResponse = unary(
                     REVOKE_MANAGED_CONNECTION,
                     &proto::RevokeManagedConnectionRequest {
                         connection_id: connection_id.as_str().to_owned(),
@@ -426,7 +432,7 @@ macro_rules! version_dialer {
             content: proto::put_value_request::Content,
             bearer: &Secret,
         ) -> Result<PutMetadata, ClientError> {
-            let response: proto::PutValueResponse = grpc_unary(
+            let response: proto::PutValueResponse = unary(
                 PUT_VALUE,
                 &proto::PutValueRequest {
                     path: path.as_str().to_owned(),

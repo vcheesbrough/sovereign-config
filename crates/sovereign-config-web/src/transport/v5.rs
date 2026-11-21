@@ -28,7 +28,7 @@ impl AuditTransport for Dialer {
         bearer: &Secret,
     ) -> Result<AuditPage, ClientError> {
         let response: proto::QueryAuditTrailResponse =
-            grpc_unary(QUERY_AUDIT_TRAIL, &audit_request(query), Some(bearer)).await?;
+            unary(QUERY_AUDIT_TRAIL, &audit_request(query), Some(bearer)).await?;
         Ok(AuditPage {
             events: response
                 .events

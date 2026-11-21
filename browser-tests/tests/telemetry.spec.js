@@ -123,7 +123,7 @@ test.describe('client telemetry', () => {
       { key: 'service.version', value: { stringValue: '2.38.0-test' } }
     ]);
 
-    // The gRPC-Web call carried a sampled W3C traceparent, and the record of
+    // The call carried a sampled W3C traceparent, and the record of
     // that call carries the same trace and the call's span.
     const listing = grpc.find(call => call.url.endsWith('/ListValues'));
     expect(listing.traceparent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
