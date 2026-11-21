@@ -552,9 +552,9 @@ mod tests {
             .await
             .unwrap();
 
-        let served = channel.served_versions(ProtocolVersion::ALL).await.unwrap();
+        let offered = channel.served_versions(ProtocolVersion::ALL).await.unwrap();
         assert_eq!(
-            served
+            offered
                 .iter()
                 .map(|entry| entry.version.as_str())
                 .collect::<Vec<_>>(),
