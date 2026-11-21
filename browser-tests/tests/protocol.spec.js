@@ -6,6 +6,7 @@ const {
   negotiate,
   openCallback,
   openConfiguration,
+  treeNode,
   messageFields,
   refuse,
   CONNECT,
@@ -33,6 +34,30 @@ function recordCalls(page) {
     });
   });
   return calls;
+}
+
+// Whether the page's calls to the service have gone quiet: none in flight,
+// and none started or finished for a short stretch. A view opens with a
+// chain of calls, each started when the one before it answers, so "none in
+// flight" alone can be read in the gap between two links.
+function serviceTraffic(page) {
+  let pending = 0;
+  let lastActivity = Date.now();
+  const service = request => new URL(request.url()).pathname.startsWith('/sovereign.config.');
+  const started = request => {
+    if (!service(request)) return;
+    pending += 1;
+    lastActivity = Date.now();
+  };
+  const ended = request => {
+    if (!service(request)) return;
+    pending -= 1;
+    lastActivity = Date.now();
+  };
+  page.on('request', started);
+  page.on('requestfinished', ended);
+  page.on('requestfailed', ended);
+  return { quiet: () => pending === 0 && Date.now() - lastActivity >= 250 };
 }
 
 async function openPath(page, selected) {
@@ -98,10 +123,17 @@ test.describe('protocol', () => {
 
   test('a v6 call refused as version-not-served over Connect re-negotiates and retries', async ({ page }) => {
     const calls = recordCalls(page);
+    const traffic = serviceTraffic(page);
     await openCallback(page);
     await expect(signedIn(page)).toBeVisible();
     await mockValues(page, VALUES);
     await openConfiguration(page);
+    // Opening the view starts its own calls (the listing, then what follows
+    // from it). Let them all answer on v6 first: one still in flight when the
+    // routes change below would be refused, and the page would re-negotiate
+    // to v5 before the call this test is about is made.
+    await expect(treeNode(page, '/apps/api')).toBeVisible();
+    await expect.poll(traffic.quiet).toBe(true);
 
     // The service stops serving v6: its routes answer with the marker in a
     // header, and the handshake now offers v5 alone.
@@ -113,10 +145,14 @@ test.describe('protocol', () => {
     await expect(page.getByLabel('Value for enabled')).toHaveValue('true');
     await expect(page.locator('#error')).toBeHidden();
 
+    // The listing was tried on v6, refused, re-negotiated, and retried on v5
+    // over gRPC-Web: in that order.
     const listings = calls.filter(call => call.method === 'ListValues');
     expect(listings[0].path).toBe('/sovereign.config.v6.Configuration/ListValues');
     expect(listings.at(-1).path).toBe('/sovereign.config.v5.Configuration/ListValues');
     expect(listings.at(-1).contentType).toBe(GRPC_WEB);
-    expect(calls.some(call => call.path === '/sovereign.config.Handshake/Negotiate')).toBe(true);
+    const handshake = calls.findIndex(call => call.path === '/sovereign.config.Handshake/Negotiate');
+    expect(handshake).toBeGreaterThan(calls.indexOf(listings[0]));
+    expect(handshake).toBeLessThan(calls.indexOf(listings.at(-1)));
   });
 });
