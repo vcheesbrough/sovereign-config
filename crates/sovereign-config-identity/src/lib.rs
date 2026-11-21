@@ -305,9 +305,13 @@ pub trait ManagedIdentityProvider: Send + Sync {
         grant: &AccountGrant<'_>,
     ) -> Result<(), ProviderError>;
 
-    /// Adds the account to the group operators browse managed accounts by.
-    /// Best-effort, and it never grants anything; [`ProviderError::NotFound`]
-    /// when the group does not exist. Idempotent.
+    /// Adds the account to the group that holds every managed account.
+    ///
+    /// The group carries no grant, but a provider may admit accounts to the
+    /// application only through it (Authentik's blueprints do), so the
+    /// server treats a failure as failing the create and deletes the
+    /// account. [`ProviderError::NotFound`] when the group does not exist.
+    /// Idempotent.
     async fn assign_browse_group(&self, account: &AccountId) -> Result<(), ProviderError>;
 
     /// Names an existing account after its connection, as [`Self::grant`]

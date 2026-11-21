@@ -143,8 +143,9 @@ impl ManagedConnectionsService {
     }
 
     /// Discovers the single app-password credential, records its identifier,
-    /// and patches the exact selected grant plus managed marker, naming the
-    /// account after the connection's display name.
+    /// patches the exact selected grant plus managed marker, naming the
+    /// account after the connection's display name, and adds the account to
+    /// the connections group.
     pub(super) async fn configure_account(
         &self,
         connection_id: &ConnectionId,
@@ -203,31 +204,27 @@ impl ManagedConnectionsService {
             }
         }
 
-        // Group membership is an operator convenience for browsing accounts in
-        // the identity provider; it grants nothing and its failure must never
-        // fail or roll back a connection that is otherwise fully functional.
-        self.assign_managed_group(connection_id, account).await;
-        Ok(())
-    }
-
-    pub(super) async fn assign_managed_group(
-        &self,
-        connection_id: &ConnectionId,
-        account: &AccountId,
-    ) {
-        let outcome = match self.provider.assign_browse_group(account).await {
-            Ok(()) => ManagedDependencyOutcome::Ok,
-            Err(error) => dependency_outcome(error),
-        };
-        if !matches!(outcome, ManagedDependencyOutcome::Ok) {
-            warn!(
-                connection_id = connection_id.as_str(),
-                outcome = outcome.as_str(),
-                "the service account was not added to the browsing group; the connection works regardless"
-            );
+        // The group carries no grant, but the identity provider may admit an
+        // account to the application only through it (#588). An account left
+        // out of it would hold a credential that obtains no token, so a
+        // failure here fails the create like any other step, and the caller
+        // deletes the account rather than hand out a dead access URL.
+        match self.provider.assign_browse_group(account).await {
+            Ok(()) => {
+                self.metrics.record_dependency(
+                    ManagedDependencyCall::AssignGroup,
+                    ManagedDependencyOutcome::Ok,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.metrics.record_dependency(
+                    ManagedDependencyCall::AssignGroup,
+                    dependency_outcome(error),
+                );
+                Err(dependency_error())
+            }
         }
-        self.metrics
-            .record_dependency(ManagedDependencyCall::AssignGroup, outcome);
     }
 
     /// Deletes the created service account and metadata row after a failed

@@ -40,6 +40,13 @@ docker compose up -d --wait
 
 Newest first. A release not listed needs nothing beyond the procedure.
 
+### 2.59: admins groups, and sign-in gated on them
+
+- **Rename the contributor groups first.** In Authentik, rename `sovereign-config-production-config-contributor` to `sovereign-config-admins` and `sovereign-config-development-config-contributor` to `sovereign-config-dev-admins` **in place, before applying the 2.59 blueprint**. Renaming keeps each group's members and grant attribute. A blueprint finds its groups by name, so applying it before the rename creates a new, empty admins group, binds the application to it, and locks every operator out.
+- **Then apply the 2.59 blueprint.** It declares each application's policy bindings: the environment's admins group at order 0 and its connections group (`SOVEREIGN_CONFIG_MANAGER_GROUP`) at order 1 ([Who may sign in](authentik.md#who-may-sign-in)). From then on only operators in the admins group and managed accounts can sign in. A binding that already exists with those values is left unchanged.
+- **Remove any other binding by hand.** A blueprint never deletes a binding it does not declare. If an application was bound to a group such as `admins` by hand, delete that binding in Authentik, or its members keep signing in. Before you delete it, check who signs in only through it. Add an operator to the environment's admins group. Give a person who holds only narrower grants a binding of their own. Anyone else in it can no longer sign in once it is gone.
+- **Creating an access URL.** A create now fails with the same "dependency is unavailable" error as any other provisioning failure, and deletes the account, when the account cannot be added to the connections group. Before, the create succeeded and returned an access URL that could not obtain a token. Clients need no change, and no protocol version changed. This is a [recorded protocol exception](protocol-versioning.md#what-forces-a-new-version-and-what-does-not).
+
 ### 2.56: the identity provider is chosen by configuration
 
 No action. `SOVEREIGN_CONFIG_IDENTITY_PROVIDER` selects the identity provider and defaults to `authentik`, so a deployment that does not set it starts exactly as before, with the same variables, the same access URLs and the same tokens. Migration `0016` adds one small table, in which the first start records `authentik` as the deployment's provider; from then on the server refuses to start under a different provider name ([Authentication](authentication.md#choosing-the-identity-provider)). Clients need no change, and no protocol version changed.

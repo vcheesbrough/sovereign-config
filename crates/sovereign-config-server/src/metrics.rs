@@ -686,7 +686,8 @@ pub(crate) enum ManagedDependencyCall {
     FindCredentials,
     SetCredential,
     DeleteUser,
-    /// Best-effort: never fails or rolls back connection creation.
+    /// Adding a new account to the connections group. Required (#588): a
+    /// failure fails the create, which deletes the account.
     AssignGroup,
     /// The startup repair naming an existing account after its connection
     /// (#440). Best-effort: never fails startup.

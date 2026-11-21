@@ -107,9 +107,9 @@ async fn live_manager_completes_the_managed_connection_lifecycle() {
             .set_credential_secret(&identifiers[0], &Secret::new("live-test-replacement-key"))
             .await
             .map_err(|error| format!("rotating the app password failed: {error:?}"))?;
-        // Group membership is best-effort in production, but the manager
-        // must actually be able to resolve and use it against real
-        // Authentik, not only against the mock.
+        // Group membership gates sign-in, so the manager must actually be
+        // able to resolve and use it against real Authentik, not only
+        // against the mock.
         let managed_group = live_managed_group();
         let group_id = client
             .find_group_by_name(&managed_group)

@@ -144,22 +144,38 @@ async fn create_grants_names_and_groups_the_account_and_returns_its_secret() {
     );
 }
 
-/// The browsing group is a convenience: its absence never fails a create.
+/// The connections group gates sign-in (#588): a create whose account
+/// cannot join it fails, whatever the provider's error, and the account is
+/// deleted rather than left holding a credential that obtains no token.
 #[tokio::test]
 #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
-async fn create_succeeds_without_the_browsing_group() {
+async fn create_fails_and_deletes_the_account_when_it_cannot_join_the_group() {
     let fake = Arc::new(FakeIdentityProvider::new());
     let service = service_over_or_skip!(&fake);
-    fake.remove_browse_group();
 
-    let (connection_id, _) = create(&service, "Ungrouped", "/", &operator("/"))
+    for error in ProviderError::ALL {
+        fake.fail_next(Operation::AssignBrowseGroup, error);
+        let status = create(&service, "Ungrouped", "/", &operator("/"))
+            .await
+            .expect_err("a create whose account cannot join the group fails");
+        assert_bounded(&status);
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{error:?}");
+        assert!(
+            fake.accounts().is_empty(),
+            "{error:?}: the account is deleted"
+        );
+        assert!(
+            rows(&service).await.is_empty(),
+            "{error:?}: the row is discarded"
+        );
+    }
+
+    fake.remove_browse_group();
+    create(&service, "Ungrouped", "/", &operator("/"))
         .await
-        .expect("create must succeed without the group");
-    assert_eq!(
-        row(&service, &connection_id).await.map(|row| row.state),
-        Some("active".to_owned())
-    );
-    assert!(!fake.accounts()[0].in_browse_group);
+        .expect_err("a create fails when the group does not exist");
+    assert!(fake.accounts().is_empty());
+    assert!(rows(&service).await.is_empty());
 }
 
 /// An ambiguous create that did land is found by its exact username and
