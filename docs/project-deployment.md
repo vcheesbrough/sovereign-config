@@ -58,6 +58,8 @@ This repository only **promotes** a release (`.woodpecker/promote-prod.yml`): a 
 2. run the promotion (normally its `tag` finds the dev deploy's tag already there);
 3. in mini-config, bump the image line in `sovereign-config-stack/docker-compose.yml` to that tag and its digest, carry over anything this release changed in `compose.yaml`, merge, and deploy it there.
 
+Woodpecker runs the workflow files of the commit it deploys, so a prod Deploy of a commit from before the promotion still carries the old `deploy-prod.yml`. Production's Woodpecker secrets (`sovereign_config_prod_*`) are therefore deleted from the broker: without them that pipeline fails at its first step that needs one, and nothing but mini-config can deploy production.
+
 This deviates from release-flow, where the first deploy writes the tag: the tag is written before production runs the build, so read production's version from production (AGENTS.md §1).
 
 The tag push runs `.github/workflows/release.yml`, which gives the version a **GitHub Release**. The Release lists the three images at that version, each with its pinned `docker pull …@sha256:` and its package page, so a reader of the tag can find what was deployed. A tag whose commit `main` does not contain (a branch deployed to dev) becomes a pre-release, never "latest", so the Releases page leads with what `main` ships. A manual run of the workflow for an existing tag rewrites that tag's Release, which is how tags from before #550 get one.
@@ -103,7 +105,7 @@ Everything a release changes outside its image runs in **`sovereign-config-serve
 
 ### Production prerequisites
 
-Production's credentials (the PostgreSQL password, the connection-manager token, the value encryption key, and the Authentik admin token only `migrate` gets) live in mini-config's `secrets.env.enc`, with its `sovereign-config-stack`, along with the pre-created `sovereign-config-production-db` volume and DNS/Traefik for the production host. No pipeline here holds them. The promotion uses only the shared secret `github_token` (resolving the build, writing the tag, and the on-main check). The dev deploy also uses `authentik_api_token` (the Authentik admin token `migrate` applies the blueprint with). It holds no registry credential: the images are public. Every CI secret is served by the Sovereign Config Woodpecker secrets broker, which offers it to every event except pull requests, so moving a step between `push` and `deployment` needs no secret change.
+Production's credentials (the PostgreSQL password, the connection-manager token, the value encryption key, and the Authentik admin token only `migrate` gets) live in mini-config's `secrets.env.enc`, with its `sovereign-config-stack`, along with the pre-created encrypted `sovereign-config-production-db` volume and DNS/Traefik for the production host. No pipeline here holds them. The promotion uses only the shared secret `github_token` (resolving the build, writing the tag, and the on-main check). The dev deploy also uses `authentik_api_token` (the Authentik admin token `migrate` applies the blueprint with). It holds no registry credential: the images are public. Every CI secret is served by the Sovereign Config Woodpecker secrets broker, which offers it to every event except pull requests, so moving a step between `push` and `deployment` needs no secret change.
 
 ### Self-hosting exception
 

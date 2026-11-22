@@ -411,7 +411,8 @@ fn deployments_pull_the_release_from_ghcr() {
 #[test]
 fn each_deploy_selects_its_own_environments_blueprint() {
     let pipeline = pipeline();
-    for (deploy, blueprint, other) in [("deploy-dev", "development", "production")] {
+    {
+        let (deploy, blueprint, other) = ("deploy-dev", "development", "production");
         let command = commands_text(step(&pipeline, deploy));
         assert!(
             command.contains(&format!("SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT={blueprint}")),
@@ -442,7 +443,8 @@ fn each_deploy_selects_its_own_environments_blueprint() {
 #[test]
 fn each_deploy_runs_migrate_before_it_replaces_the_server() {
     let pipeline = pipeline();
-    for (deploy, project) in [("deploy-dev", "sovereign-config-dev")] {
+    {
+        let (deploy, project) = ("deploy-dev", "sovereign-config-dev");
         let command = commands_text(step(&pipeline, deploy));
         let lines: Vec<&str> = command.lines().map(str::trim).collect();
         let position = |needle: &str| {
@@ -482,7 +484,8 @@ fn each_deploy_runs_migrate_before_it_replaces_the_server() {
 #[test]
 fn each_deploy_hands_compose_every_credential_as_a_variable() {
     let pipeline = pipeline();
-    for (deploy, environment_name) in [("deploy-dev", "dev")] {
+    {
+        let (deploy, environment_name) = ("deploy-dev", "dev");
         let deploy_step = step(&pipeline, deploy);
         let command = commands_text(deploy_step);
         let environment = deploy_step.get("environment").expect("environment");
@@ -585,6 +588,31 @@ fn production_is_promoted_never_deployed_from_here() {
         checked += 1;
     }
     assert_eq!(checked, 3, "a promote-prod step was added or removed");
+    // Every test here reads only the workflows it knows, and Woodpecker runs
+    // every file in `.woodpecker/`: a `deploy-prod.yml` brought back by a
+    // revert or a bad merge would deploy production beside the promotion.
+    let mut files: Vec<String> = std::fs::read_dir(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.woodpecker"),
+    )
+    .expect(".woodpecker/ is readable")
+    .map(|entry| {
+        entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .into_owned()
+    })
+    .collect();
+    files.sort();
+    let mut expected: Vec<String> = support::WORKFLOWS
+        .iter()
+        .map(|workflow| format!("{workflow}.yml"))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        files, expected,
+        "every .woodpecker/ file is a known workflow, so no unseen one deploys production"
+    );
 }
 
 /// Nothing gates on the client-telemetry ingest. The health-gated `up
@@ -594,7 +622,8 @@ fn production_is_promoted_never_deployed_from_here() {
 #[test]
 fn no_deploy_gates_on_the_client_telemetry_ingest() {
     let pipeline = pipeline();
-    for deploy in ["deploy-dev"] {
+    {
+        let deploy = "deploy-dev";
         let command = commands_text(step(&pipeline, deploy));
         let lines: Vec<&str> = command.lines().map(str::trim).collect();
         let gated: Vec<&&str> = lines

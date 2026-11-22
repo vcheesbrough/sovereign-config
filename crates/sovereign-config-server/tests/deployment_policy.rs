@@ -313,6 +313,27 @@ fn production_credentials_live_with_its_deployer_not_here() {
     );
 }
 
+/// Production runs mini-config's mirror of `compose.yaml`
+/// (`sovereign-config-stack/docker-compose.yml`, its card #614), not this
+/// file, so a change here reaches production only if it is carried there. This
+/// pins the file: when it fails, put the change into the mirror in the
+/// release's pin-bump PR (AGENTS.md §1), then set the new hash here. A server
+/// started on a stale mirror fails its checks after `migrate` has run.
+#[test]
+fn a_compose_change_is_carried_to_productions_mirror() {
+    use sha2::{Digest, Sha256};
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(include_bytes!("../../../compose.yaml"))
+    );
+    assert_eq!(
+        digest, "0d0b916193865d8f8d95ee827c2f5b9f0e79b713cdb88624a33194e08d7937be",
+        "compose.yaml changed: carry the change into mini-config's \
+         sovereign-config-stack/docker-compose.yml in the release's pin-bump PR, \
+         then update this hash"
+    );
+}
+
 /// Access tokens are verified against the issuer's JWKS (#450), so nothing
 /// deploys an introspection endpoint, client or secret any more. A leftover
 /// would be a credential provisioned for nothing — or a sign that something
@@ -547,7 +568,8 @@ fn the_server_hostname_is_its_stable_container_name() {
 /// Production's are set by its deployer, mini-config.
 #[test]
 fn deploys_set_the_telemetry_values_for_their_environment() {
-    for (workflow, environment) in [("deploy-dev", "dev")] {
+    {
+        let (workflow, environment) = ("deploy-dev", "dev");
         let path = format!(
             "{}/../../.woodpecker/{workflow}.yml",
             env!("CARGO_MANIFEST_DIR")
@@ -581,7 +603,8 @@ fn deploys_set_the_telemetry_values_for_their_environment() {
 /// starts that ingest. Production's is set by its deployer, mini-config.
 #[test]
 fn deploys_turn_client_telemetry_on_for_their_own_origin() {
-    for (workflow, host) in [("deploy-dev", "sovereign-config-dev.desync.link")] {
+    {
+        let (workflow, host) = ("deploy-dev", "sovereign-config-dev.desync.link");
         let path = format!(
             "{}/../../.woodpecker/{workflow}.yml",
             env!("CARGO_MANIFEST_DIR")
