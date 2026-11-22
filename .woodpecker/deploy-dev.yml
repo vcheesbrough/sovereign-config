@@ -108,6 +108,8 @@ steps:
         secret manager_api_token 10001:10001 "$$MANAGER_API_TOKEN"
         secret value_encryption_key 10001:10001 "$$VALUE_ENCRYPTION_KEY"
         secret authentik_admin_token 10001:10001 "$$AUTHENTIK_ADMIN_TOKEN"
+        # Emptied however this step ends, as well as straight after `migrate`.
+        trap ': > /run/deploy-secrets/authentik_admin_token' EXIT
         unset POSTGRES_PASSWORD ENCODED_PASSWORD MANAGER_API_TOKEN VALUE_ENCRYPTION_KEY AUTHENTIK_ADMIN_TOKEN
         # Compose mounts them from the host, so it is given the volume's host path.
         SECRETS=$$(docker volume inspect --format '{{ .Mountpoint }}' sovereign-config-dev-secrets)

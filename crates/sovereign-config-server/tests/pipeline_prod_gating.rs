@@ -459,7 +459,16 @@ fn each_deploy_runs_migrate_before_it_replaces_the_server() {
             "\"$$COMPOSE\" -p {project} up -d --pull always migrate ||"
         ));
         let wait = position("MIGRATE_EXIT=$$(docker wait ");
-        let emptied = position(": > /run/deploy-secrets/authentik_admin_token");
+        let emptied = lines
+            .iter()
+            .position(|line| *line == ": > /run/deploy-secrets/authentik_admin_token")
+            .unwrap_or_else(|| panic!("{deploy} never empties the admin token's file"));
+        // And however the step ends: set before anything can fail.
+        let trap = position("trap ': > /run/deploy-secrets/authentik_admin_token' EXIT");
+        assert!(
+            trap < migrate,
+            "{deploy}: the trap is set before migrate runs"
+        );
         let refuse = position("if [ \"$$MIGRATE_EXIT\" != 0 ]; then");
         let server = position(&format!(
             "\"$$COMPOSE\" -p {project} up -d --no-deps --force-recreate --wait --wait-timeout 90 sovereign-config ||"

@@ -56,9 +56,9 @@ impl core::fmt::Debug for CreatedServiceAccount {
     }
 }
 
-/// A blueprint instance's apply state. Authentik moves `last_applied` on
-/// every successful apply, unchanged content included, and leaves it alone
-/// when an apply fails.
+/// A blueprint instance's apply state. Authentik moves `last_applied`
+/// whenever it saves the instance (`auto_now`), so on every apply, failed or
+/// not, unchanged content included.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub(crate) struct BlueprintState {
     pub(crate) status: String,

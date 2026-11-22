@@ -360,14 +360,12 @@ async fn status(
     }))
 }
 
-/// Authentik's own bookkeeping: a successful apply moves `last_applied`, a
-/// failed one does not.
+/// Authentik's own bookkeeping: every apply saves the instance, which moves
+/// `last_applied` (`auto_now`), whether it failed or not.
 fn land(authentik: &mut Authentik) {
     authentik.status = authentik.applies_to.clone();
-    if matches!(authentik.status.as_str(), "successful" | "warning") {
-        authentik.applies += 1;
-        authentik.last_applied = Some(format!("2026-11-21T00:00:{:02}Z", authentik.applies));
-    }
+    authentik.applies += 1;
+    authentik.last_applied = Some(format!("2026-11-21T00:00:{:02}Z", authentik.applies));
 }
 
 async fn apply(
@@ -590,6 +588,18 @@ async fn previously_applied(applies_to: &str) -> Fake {
     fake
 }
 
+/// A deploy after a failed one, failing again: the repeat is recognised when
+/// it lands, not waited out to the deadline.
+#[tokio::test]
+async fn a_repeated_failure_fails_when_it_lands() {
+    let fake = previously_applied("error").await;
+    fake.state.lock().unwrap().status = "error".to_owned();
+    let started = std::time::Instant::now();
+    let error = setup_against(&fake, "new").apply().await.unwrap_err();
+    assert_eq!(classified(&error), Some("blueprint_failed"));
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
 #[tokio::test]
 async fn a_stale_success_is_not_taken_for_this_apply() {
     let fake = previously_applied("error").await;
@@ -629,9 +639,13 @@ fn a_verdict_needs_this_apply_to_have_landed() {
         Verdict::after(&before, &state("error", Some("t1"))),
         Verdict::Failed
     );
-    // The same failure as before cannot be told from an apply not yet run.
+    // The same failure again is this apply's once `last_applied` moves.
     let failed = state("error", Some("t1"));
     assert_eq!(Verdict::after(&failed, &failed), Verdict::Pending);
+    assert_eq!(
+        Verdict::after(&failed, &state("error", Some("t2"))),
+        Verdict::Failed
+    );
     assert_eq!(
         Verdict::after(&failed, &state("successful", Some("t2"))),
         Verdict::Applied

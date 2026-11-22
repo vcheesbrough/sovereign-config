@@ -350,20 +350,16 @@ enum Verdict {
 impl Verdict {
     /// The verdict on this apply, from the state before it and now.
     ///
-    /// It applied only once `last_applied` has moved, which Authentik does on
-    /// every successful apply; an unchanged one is the previous apply still
-    /// showing. It failed when a failure status shows that was not already
-    /// there. A failure that repeats the previous one cannot be told from an
-    /// apply not yet run, so it is waited out to the deadline, and fails
-    /// then.
+    /// A verdict is this apply's only once something has moved since the
+    /// state read before it: Authentik moves `last_applied` on every save of
+    /// the instance, so on every apply, and an unchanged state is the
+    /// previous apply still showing. A success needs `last_applied` to have
+    /// moved; a failure, either its status or `last_applied`.
     fn after(before: &BlueprintState, now: &BlueprintState) -> Self {
+        let moved = now.last_applied.is_some() && now.last_applied != before.last_applied;
         match Self::of(&now.status) {
-            Self::Applied
-                if now.last_applied.is_some() && now.last_applied != before.last_applied =>
-            {
-                Self::Applied
-            }
-            Self::Failed if now.status != before.status => Self::Failed,
+            Self::Applied if moved => Self::Applied,
+            Self::Failed if moved || now.status != before.status => Self::Failed,
             _ => Self::Pending,
         }
     }
