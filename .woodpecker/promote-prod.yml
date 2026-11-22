@@ -1,0 +1,97 @@
+# Promote-prod workflow: promoting a build to production records it as the
+# release, and deploys nothing. Production is deployed by mini-config
+# (sovereign-config-stack, its card #614): its compose file pins this
+# release's server image by tag and digest, and `run-stack.sh` runs `migrate`
+# and then the server, with the credentials in mini-config's SOPS file. So
+# production comes back from cold without Woodpecker, the broker, or
+# Sovereign Config itself. Triggered by Woodpecker's Deploy feature, a
+# `deployment` event targeting prod, only from main.
+#
+# The order of a release: deploy the main commit to dev (its live manager
+# tests are the promote gate, AGENTS.md), run this promotion, then bump the
+# pin in mini-config to the tag it wrote and deploy it there.
+#
+# The tag is written by the first deploy to dev or promotion to prod,
+# whichever comes first (normally the dev deploy), and always before
+# production runs the build: it does not mean "running in production" as
+# release-flow has it (AGENTS.md, Deviations). Production's version is read
+# from production itself.
+# See anchor.yml for why a push still runs a Woodpecker pipeline.
+
+when:
+  - event: deployment
+    branch: main
+    evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
+
+steps:
+  # Woodpecker takes a GitHub deployment whose ref is a bare commit as a
+  # deployment of main (its GitHub forge sets the branch to the default
+  # branch), so `branch: main` alone would let one promote a commit main never
+  # had. This refuses any commit main does not contain. It guards against an
+  # accident, not an attacker: the promoted commit supplies this file.
+  verify-commit-on-main:
+    depends_on: []
+    when:
+      - event: deployment
+        branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
+    image: docker.io/curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
+    environment:
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      - |
+        umask 077
+        printf 'header = "Authorization: Bearer %s"\n' "$$GITHUB_TOKEN" > /tmp/github-curl.conf
+        curl --fail --silent --show-error --config /tmp/github-curl.conf --header 'Accept: application/vnd.github+json' "https://api.github.com/repos/$$CI_REPO/compare/$$CI_COMMIT_SHA...main?per_page=1" > /tmp/compare.json
+        if ! grep -q '"behind_by": *0,' /tmp/compare.json; then
+          echo "ERROR: main does not contain $$CI_COMMIT_SHA; production promotes only commits on main." >&2
+          exit 1
+        fi
+        echo "main contains $$CI_COMMIT_SHA"
+
+  # Chooses what this promotion records, and never builds or allocates: the
+  # commit's release tag if it was promoted or deployed before, else its newest build that
+  # .github/workflows/build.yml published (release-flow). It refuses a target
+  # or branch outside the plugin's policy — dev from any branch, prod from
+  # main — and checks each image's version and revision labels in GHCR, so a
+  # commit with no green build fails here, before anything is tagged.
+  # All three images must be published: a server without its matching broker
+  # would leave CI resolving secrets against a stale extension, and a version
+  # without its CLI image is not a whole release for the pipelines that pin it.
+  # The images are public, so it needs no registry credentials.
+  resolve:
+    depends_on: []
+    when:
+      - event: deployment
+        branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
+    pull: true
+    image: ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.2.0@sha256:9d5b3541aa143727f8c68c8c8f1d36557d999d3c857c4581be43363c8ff78c94
+    settings:
+      mode: resolve
+      images:
+        - ghcr.io/vcheesbrough/sovereign-config
+        - ghcr.io/vcheesbrough/sovereign-config-woodpecker-broker
+        - ghcr.io/vcheesbrough/sovereign-config-cli
+      github_token:
+        from_secret: github_token
+
+  # Records the promotion: the annotated git tag named by .release-tag, once
+  # the build is resolved and main contains the commit. A no-op when the
+  # commit already carries it (a re-promotion, or dev then prod), and the
+  # plugin refuses a second tag on a commit or a tag that would move.
+  tag:
+    depends_on:
+      - resolve
+      - verify-commit-on-main
+    when:
+      - event: deployment
+        branch: main
+        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
+    pull: true
+    image: ghcr.io/vcheesbrough/woodpecker-plugin-release-versions:0.2.0@sha256:9d5b3541aa143727f8c68c8c8f1d36557d999d3c857c4581be43363c8ff78c94
+    settings:
+      mode: tag
+      github_token:
+        from_secret: github_token

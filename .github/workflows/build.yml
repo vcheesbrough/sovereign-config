@@ -1,8 +1,9 @@
 # Build workflow: every push to a branch (or a manual run) checks the commit,
 # builds the three images, and — only once every check has passed — publishes
-# them to GHCR under one version. Nothing here deploys: dev and prod are
-# Woodpecker deployments on mini (.woodpecker/deploy-dev.yml, deploy-prod.yml),
-# which resolve the build this workflow published (card #539).
+# them to GHCR under one version. Nothing here deploys: dev is a Woodpecker
+# deployment on mini (.woodpecker/deploy-dev.yml), prod a promotion
+# (.woodpecker/promote-prod.yml) that mini-config then deploys; both resolve
+# the build this workflow published (card #539).
 #
 #   version ─┬─ script-validation
 #            ├─ web-bundle ─┬─ unit-test
@@ -19,7 +20,7 @@
 # (Cargo.toml) plus the next patch by creating refs/builds/<version>, and
 # scripts/ci-publish-images.sh refuses to push an image that lacks this
 # version's labels or is already published. A git tag is written by the first
-# deploy, never here; .github/workflows/release.yml then gives it a Release.
+# dev deploy or prod promotion, never here; .github/workflows/release.yml then gives it a Release.
 #
 # Every tool runs in the same digest-pinned image the Woodpecker steps used,
 # through `docker run` on the runner, so the pins stay checkable

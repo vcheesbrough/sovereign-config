@@ -40,19 +40,31 @@ On `main`, a push also runs `.woodpecker/code-vitals.yml`, which records the com
 
 ## Deploying
 
-**A push never deploys.** Development is deployed with Woodpecker's **Deploy feature: a `deployment` event targeting the `dev` environment, from any branch**, started from that branch's anchor pipeline. Pushes from several branches therefore never queue behind each other's deploys or fight over the one dev environment. Production is deployed the same way, **targeting `prod`, from `main`**.
+**A push never deploys.** Development is deployed with Woodpecker's **Deploy feature: a `deployment` event targeting the `dev` environment, from any branch**, started from that branch's anchor pipeline. Pushes from several branches therefore never queue behind each other's deploys or fight over the one dev environment.
 
-Both deploy workflows run the same sequence:
+The dev deploy (`.woodpecker/deploy-dev.yml`) runs:
 
 1. **`resolve`** (the release plugin) chooses what to ship: the commit's release tag if it was deployed before, otherwise its newest published build. It refuses a target or branch outside the plugin's policy (dev from any branch, prod from main) and checks all three images' labels in GHCR. A commit with no published build fails here, before anything is deployed.
-2. They deploy onto the environment's stack: **`migrate`** first, then the server ([Migrations](#migrations)). `migrate` applies the environment's Authentik blueprint (`authentik/blueprint-dev.yaml` or `authentik/blueprint.yaml`), after checking that live Authentik is new enough.
-3. **`tag`** pushes the annotated git tag. A git tag therefore means **"this build was deployed"**, not "this build passed its checks". The first deploy of a commit, to either environment, writes the tag, and every later deploy of that commit reuses the build the tag names.
+2. It deploys onto the dev stack: **`migrate`** first, then the server ([Migrations](#migrations)). `migrate` applies the environment's Authentik blueprint (`authentik/blueprint-dev.yaml`), after checking that live Authentik is new enough.
+3. **`tag`** pushes the annotated git tag. A git tag therefore means **"this build was deployed to dev or promoted to prod"**, not "this build passed its checks", and not "production runs it". The first deploy or promotion of a commit writes the tag, and every later one reuses the build the tag names.
+
+### Production
+
+**Production is deployed by mini-config, not from here** (mini-config #614). Its `sovereign-config-stack/docker-compose.yml` mirrors `compose.yaml` with production's values, pins the server image by tag and digest, and keeps production's credentials in mini-config's `secrets.env.enc` (SOPS). `./run-stack.sh sovereign-config-stack up -d` runs the same two phases as the dev deploy: `migrate` alone, then the server once it has exited 0, applying `authentik/blueprint.yaml`. So production comes back from cold with nothing but its host: no Woodpecker, no broker, and no Sovereign Config to read its own secrets from.
+
+This repository only **promotes** a release (`.woodpecker/promote-prod.yml`): a Woodpecker Deploy **targeting `prod`, from `main`**, runs `verify-commit-on-main`, `resolve` and `tag`, and deploys nothing. A release then goes:
+
+1. deploy the main commit to dev, where the live manager tests below are the promote gate;
+2. run the promotion (normally its `tag` finds the dev deploy's tag already there);
+3. in mini-config, bump the image line in `sovereign-config-stack/docker-compose.yml` to that tag and its digest, carry over anything this release changed in `compose.yaml`, merge, and deploy it there.
+
+This deviates from release-flow, where the first deploy writes the tag: the tag is written before production runs the build, so read production's version from production (AGENTS.md §1).
 
 The tag push runs `.github/workflows/release.yml`, which gives the version a **GitHub Release**. The Release lists the three images at that version, each with its pinned `docker pull …@sha256:` and its package page, so a reader of the tag can find what was deployed. A tag whose commit `main` does not contain (a branch deployed to dev) becomes a pre-release, never "latest", so the Releases page leads with what `main` ships. A manual run of the workflow for an existing tag rewrites that tag's Release, which is how tags from before #550 get one.
 
 A deployment never builds, publishes or claims a version.
 
-Production also refuses a commit `main` does not contain (`verify-commit-on-main`). Woodpecker takes a GitHub deployment whose ref is a bare commit as a deployment of `main`, so the `branch: main` condition alone would not stop such a deployment from shipping some other commit. The check guards against an accident, not an attacker: the deployed commit supplies the workflow file.
+The promotion also refuses a commit `main` does not contain (`verify-commit-on-main`). Woodpecker takes a GitHub deployment whose ref is a bare commit as a deployment of `main`, so the `branch: main` condition alone would not stop such a deployment from promoting some other commit. The check guards against an accident, not an attacker: the deployed commit supplies the workflow file.
 
 Dev runs whichever branch was deployed last. A migration deployed from a branch stays applied to the dev database. Each deployment is verified after Woodpecker completes by calling `System.GetVersion` through the public endpoint twice: over native gRPC, and on `v6` over Connect JSON.
 
@@ -91,13 +103,13 @@ Everything a release changes outside its image runs in **`sovereign-config-serve
 
 ### Production prerequisites
 
-Before the first promotion the operator provides the production Woodpecker secrets `sovereign_config_prod_postgres_password`, `sovereign_config_prod_manager_api_token`, and `sovereign_config_prod_value_encryption_key` (the server refuses to start without it), the pre-created encrypted `sovereign-config-production-db` volume, and DNS/Traefik for the production host. The deployment path also reuses the shared secrets `github_token` (resolving the build, writing the tag, and the on-main check) and `authentik_api_token` (the Authentik admin token `migrate` applies the blueprint with). It holds no registry credential: the images are public. Every CI secret is served by the Sovereign Config Woodpecker secrets broker, which offers it to every event except pull requests, so moving a step between `push` and `deployment` needs no secret change.
+Production's credentials (the PostgreSQL password, the connection-manager token, the value encryption key, and the Authentik admin token only `migrate` gets) live in mini-config's `secrets.env.enc`, with its `sovereign-config-stack`, along with the pre-created `sovereign-config-production-db` volume and DNS/Traefik for the production host. No pipeline here holds them. The promotion uses only the shared secret `github_token` (resolving the build, writing the tag, and the on-main check). The dev deploy also uses `authentik_api_token` (the Authentik admin token `migrate` applies the blueprint with). It holds no registry credential: the images are public. Every CI secret is served by the Sovereign Config Woodpecker secrets broker, which offers it to every event except pull requests, so moving a step between `push` and `deployment` needs no secret change.
 
 ### Self-hosting exception
 
 Sovereign Config's own deploy steps deliberately do **not** consume their configuration through `render`, and keep their Woodpecker secrets. Reading `/sovereign-config/prod/...` in order to deploy Sovereign Config would create a circular availability dependency: a broken production deployment could not be redeployed through a path that requires production to be readable. Other repositories and the homelab stacks are the intended consumers.
 
-The build sits outside the estate for the same reason. If its images lived in the estate's registry, restoring Sovereign Config would need the devops stack, so that stack could never render its own secrets from Sovereign Config. With the images in GHCR, the stacks Sovereign Config needs at run time are Traefik and Authentik alone. The deploys' Woodpecker secrets still come through the broker from Sovereign Config itself. A rebuilt host is therefore brought up by hand once, from `compose.yaml`, and Woodpecker takes over after that (mini-config `RECOVERY.md`, step 11a).
+The build sits outside the estate for the same reason. If its images lived in the estate's registry, restoring Sovereign Config would need the devops stack, so that stack could never render its own secrets from Sovereign Config. With the images in GHCR, the stacks Sovereign Config needs at run time are Traefik and Authentik alone. Production's own deploy holds no Woodpecker secret: mini-config deploys it from SOPS, so a rebuilt host brings it up with `run-stack.sh` alone (mini-config `RECOVERY.md`, step 11a). The dev deploy's secrets still come through the broker from production.
 
 ## Container users
 
@@ -147,7 +159,7 @@ Both environments export to the estate's shared collector, `http://monitor-alloy
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` |
 | `OTEL_LOGS_EXPORTER`, `OTEL_METRICS_EXPORTER`, `OTEL_TRACES_EXPORTER` | `otlp` |
 
-These values live in the deploy steps of `.woodpecker/deploy-dev.yml` and `deploy-prod.yml`, not in a Sovereign Config layer as other products on the estate keep them: this service is the store `render` reads, and rendering its own deploy from itself would make redeploying a broken store depend on the store. None of the values is secret. The deploy steps also start the client-telemetry ingest after the health gate, with `--profile client-telemetry up -d --no-deps otlp-ingest`, and treat its failure as a warning.
+These values live in the deploy step of `.woodpecker/deploy-dev.yml` and, for production, in mini-config's `sovereign-config-stack/docker-compose.yml`, not in a Sovereign Config layer as other products on the estate keep them: this service is the store `render` reads, and rendering its own deploy from itself would make redeploying a broken store depend on the store. None of the values is secret. The deploy steps also start the client-telemetry ingest after the health gate, with `--profile client-telemetry up -d --no-deps otlp-ingest`, and treat its failure as a warning.
 
 The collector copies the resource attributes `telemetry_source` to `log_source` and `deployment.environment.name` to `deployment.environment` at ingest when absent; Loki stores them as the labels `log_source` and `deployment_environment`, and keeps `telemetry_source` as structured metadata. The same server lines also arrive once more from the container's stdout under `log_source="docker"` while both paths run. Each container's `observability.*` Docker labels are what the platform's stdout shipping and scraping read.
 

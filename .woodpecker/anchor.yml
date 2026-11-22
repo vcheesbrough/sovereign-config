@@ -6,7 +6,8 @@
 #   push/manual: anchor                      (GitHub Actions builds and publishes)
 #                code-vitals   (main only: records the commit; never blocks)
 #   deployment:  deploy-dev    (dev target, from any branch)
-#                deploy-prod   (prod target, from main only)
+#                promote-prod  (prod target, from main only: tags, never deploys;
+#                               mini-config deploys production)
 #
 # Woodpecker starts a deployment from an existing pipeline (its Deploy button),
 # and it drops a push that no workflow matches without recording a pipeline.

@@ -288,26 +288,29 @@ fn readme_documents_the_value_encryption_boundary() {
     assert!(readme.contains("sealed as an `enc:v1:` AEAD envelope"));
 }
 
+/// Production's credentials live with its deployer, mini-config (its card
+/// #614), and nowhere in this repository's pipelines: a promotion holding them
+/// would be a second deployer, and production could not come back without
+/// Woodpecker and the broker. The doc says where they are.
 #[test]
-fn deployment_doc_lists_every_production_secret_the_deployment_consumes() {
+fn production_credentials_live_with_its_deployer_not_here() {
     let doc = include_str!("../../../docs/project-deployment.md");
-    let pipeline = include_str!("../../../.woodpecker/deploy-prod.yml");
-
-    // A missing entry here is not cosmetic: the deploy step recreates the
-    // running container before the server validates its configuration, so an
-    // unprovisioned secret takes production down rather than failing the
-    // pipeline.
+    let promotion = include_str!("../../../.woodpecker/promote-prod.yml");
     for secret in [
         "sovereign_config_prod_postgres_password",
         "sovereign_config_prod_manager_api_token",
         "sovereign_config_prod_value_encryption_key",
+        "authentik_api_token",
     ] {
-        assert!(pipeline.contains(secret), "{secret} missing from pipeline");
         assert!(
-            doc.contains(secret),
-            "{secret} missing from docs/project-deployment.md"
+            !promotion.contains(secret),
+            "the prod promotion must not hold {secret}"
         );
     }
+    assert!(
+        doc.contains("`sovereign-config-stack`") && doc.contains("`secrets.env.enc`"),
+        "docs/project-deployment.md must say where production's credentials live"
+    );
 }
 
 /// Access tokens are verified against the issuer's JWKS (#450), so nothing
@@ -323,8 +326,8 @@ fn nothing_deploys_introspection_configuration() {
             include_str!("../../../.woodpecker/deploy-dev.yml"),
         ),
         (
-            ".woodpecker/deploy-prod.yml",
-            include_str!("../../../.woodpecker/deploy-prod.yml"),
+            ".woodpecker/promote-prod.yml",
+            include_str!("../../../.woodpecker/promote-prod.yml"),
         ),
     ] {
         assert!(
@@ -541,9 +544,10 @@ fn the_server_hostname_is_its_stable_container_name() {
 
 /// Every deployment that sets telemetry sets the whole working set, with its
 /// own environment's name, and never names a backend behind the collector.
+/// Production's are set by its deployer, mini-config.
 #[test]
 fn deploys_set_the_telemetry_values_for_their_environment() {
-    for (workflow, environment) in [("deploy-dev", "dev"), ("deploy-prod", "prod")] {
+    for (workflow, environment) in [("deploy-dev", "dev")] {
         let path = format!(
             "{}/../../.woodpecker/{workflow}.yml",
             env!("CARGO_MANIFEST_DIR")
@@ -574,13 +578,10 @@ fn deploys_set_the_telemetry_values_for_their_environment() {
 }
 
 /// Each deployment hands its page exactly its own origin as the ingest, and
-/// starts that ingest.
+/// starts that ingest. Production's is set by its deployer, mini-config.
 #[test]
 fn deploys_turn_client_telemetry_on_for_their_own_origin() {
-    for (workflow, host) in [
-        ("deploy-dev", "sovereign-config-dev.desync.link"),
-        ("deploy-prod", "sovereign-config.desync.link"),
-    ] {
+    for (workflow, host) in [("deploy-dev", "sovereign-config-dev.desync.link")] {
         let path = format!(
             "{}/../../.woodpecker/{workflow}.yml",
             env!("CARGO_MANIFEST_DIR")
