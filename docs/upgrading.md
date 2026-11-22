@@ -47,6 +47,7 @@ Newest first. A release not listed needs nothing beyond the procedure.
 - **`compose.yaml` reads every credential from the environment** of whatever runs `docker compose`: `POSTGRES_PASSWORD`, `DATABASE_URL`, `MANAGER_API_TOKEN`, `VALUE_ENCRYPTION_KEY` and `AUTHENTIK_ADMIN_TOKEN` ([README](../README.md#3-set-the-secrets)). It no longer reads the `*_FILE` host paths 3.62 used. Set the variables instead, and delete the files. Containers still receive each as a file, never as a variable.
 - **The server and `migrate` no longer have a read-only root filesystem**, because Compose writes those files into the container. They keep their user, no capabilities and `no-new-privileges`.
 - **Run `migrate` and the server with `--force-recreate`**, as the [procedure](#procedure) does. Compose writes a secret into a container when it creates it, so a restarted container keeps the old value of a rotated one.
+- **The first 3.63 deploy recreates PostgreSQL once.** Its secret's definition changed, so Compose replaces the container while `migrate` starts, and the server still running from the previous release loses its database for a few seconds and reconnects. Later deploys leave PostgreSQL alone.
 
 ### 3.62: migrations run in `migrate`, and every credential is a file
 
