@@ -17,9 +17,9 @@ Run these where you run `docker compose` for the deployment, with its environmen
 
    ```sh
    export SOVEREIGN_CONFIG_IMAGE_TAG=<version>
-   docker compose up -d --pull always migrate
+   docker compose up -d --pull always --force-recreate migrate
    docker wait "$(docker compose ps -aq migrate)"   # 0 once migrate has finished
-   docker compose up -d --no-deps --wait sovereign-config
+   docker compose up -d --no-deps --force-recreate --wait sovereign-config
    ```
 
    From 3.62, `migrate` brings the database and Authentik up to the release, and the server only checks that it has ([Project deployment](project-deployment.md#migrations)). Start the server only once `docker wait` has printed `0`: a plain `up` replaces the server before `migrate` finishes. Before 3.62, `docker compose up -d --pull always --wait` did both, because the server migrated at startup. With `OTEL_RESOURCE_ATTRIBUTES` set, run the Compose plugin binary instead of `docker compose` (see [Observability](../README.md#observability)).
@@ -42,11 +42,17 @@ docker compose up -d --wait
 
 Newest first. A release not listed needs nothing beyond the procedure.
 
+### 3.63: credentials come from the environment
+
+- **`compose.yaml` reads every credential from the environment** of whatever runs `docker compose`: `POSTGRES_PASSWORD`, `DATABASE_URL`, `MANAGER_API_TOKEN`, `VALUE_ENCRYPTION_KEY` and `AUTHENTIK_ADMIN_TOKEN` ([README](../README.md#3-set-the-secrets)). It no longer reads the `*_FILE` host paths 3.62 used. Set the variables instead, and delete the files. Containers still receive each as a file, never as a variable.
+- **The server and `migrate` no longer have a read-only root filesystem**, because Compose writes those files into the container. They keep their user, no capabilities and `no-new-privileges`.
+- **Run `migrate` and the server with `--force-recreate`**, as the [procedure](#procedure) does. Compose writes a secret into a container when it creates it, so a restarted container keeps the old value of a rotated one.
+
 ### 3.62: migrations run in `migrate`, and every credential is a file
 
 - **A `migrate` service runs before the server.** It is the same image, run as `sovereign-config-server migrate`: it applies the database migrations, records the identity provider, encrypts any secret still in plaintext, and applies the Authentik blueprint, then exits. The server no longer does any of this. It refuses to start, naming `migrate`, on a database `migrate` has not brought up to its release. Upgrade with the new [procedure](#procedure).
-- **`migrate` applies the blueprint.** Set `SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT` to `production` or `development`, and give it an Authentik API token allowed to manage blueprints as `AUTHENTIK_ADMIN_TOKEN_FILE` ([Applying a blueprint](authentik.md#applying-a-blueprint)). It checks Authentik is 2026.5.2 or newer first. Stop applying the blueprint by other means: the instance it applies is `sovereign-config` (or `sovereign-config-dev`), so a blueprint you imported under another name would be a second instance managing the same objects. Delete that one. To keep applying it yourself, remove the variable from `compose.yaml`.
-- **Credentials reach containers only as files.** `compose.yaml` no longer passes `SOVEREIGN_CONFIG_DATABASE_URL`, `SOVEREIGN_CONFIG_MANAGER_API_TOKEN`, `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY` or `POSTGRES_PASSWORD` through, and no longer lets a `_FILE` path be overridden. Put each in the file its `*_FILE` host variable names ([README](../README.md#3-create-the-secrets)). An exited `migrate` would otherwise keep them in `docker inspect`.
+- **`migrate` applies the blueprint.** Set `SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT` to `production` or `development`, and give it an Authentik API token allowed to manage blueprints (from 3.63, the `AUTHENTIK_ADMIN_TOKEN` variable) ([Applying a blueprint](authentik.md#applying-a-blueprint)). It checks Authentik is 2026.5.2 or newer first. Stop applying the blueprint by other means: the instance it applies is `sovereign-config` (or `sovereign-config-dev`), so a blueprint you imported under another name would be a second instance managing the same objects. Delete that one. To keep applying it yourself, remove the variable from `compose.yaml`.
+- **Credentials reach containers only as files.** `compose.yaml` no longer passes `SOVEREIGN_CONFIG_DATABASE_URL`, `SOVEREIGN_CONFIG_MANAGER_API_TOKEN`, `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY` or `POSTGRES_PASSWORD` through, and no longer lets a `_FILE` path be overridden. In 3.62 each came from the file its `*_FILE` host variable named; from 3.63, from a variable (above). An exited `migrate` would otherwise keep them in `docker inspect`.
 - **Rolling back to 3.62 or later is a deploy of the older image.** Its `migrate` tolerates migrations it does not know. Rolling back to a release before 3.62 still needs the restore above if a newer migration was applied.
 
 ### 3.0: protocol `v6` over Connect, and the end of `v3`–`v5` announced
@@ -74,7 +80,7 @@ No action. `SOVEREIGN_CONFIG_IDENTITY_PROVIDER` selects the identity provider an
 
 Take `compose.yaml` from 2.55 or later. The server now runs with a read-only root filesystem, no capabilities and `no-new-privileges`. PostgreSQL keeps five capabilities and loses the rest. Nothing in the database volume changes owner.
 
-- **Secret files.** The server still runs as uid `10001`, so a secret file it owns stays readable. Its group id changed from `999` to `10001`. A secret file the server could read only through group `999` must be re-owned: `chown 10001:10001 <file>`. Files owned and moded as the [README](../README.md#3-create-the-secrets) says need nothing.
+- **Secret files.** The server still runs as uid `10001`, so a secret file it owns stays readable. Its group id changed from `999` to `10001`. A secret file the server could read only through group `999` must be re-owned: `chown 10001:10001 <file>`. Files owned and moded as the [README](../README.md#3-set-the-secrets) says need nothing.
 - **Your own `compose.yaml`.** Nothing is required: the image runs as `10001:10001` by itself. To harden the server, copy `user:`, `cap_drop:`, `read_only:`, `tmpfs:` and `security_opt:` from the reference file.
 - **Extra mounts.** A volume you added to the server must be writable by `10001:10001`, because nothing else in the container is writable.
 

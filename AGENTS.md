@@ -273,11 +273,12 @@ The `migrations` skill (baseline §10) is the contract (#615);
   previous release serves, and leaves it serving if it fails. Expand first;
   contract (drop, rename, tighten) in a later release. Never edit a migration
   that has been deployed to dev; add a new one.
-- **Credentials are files, never variables**, for every container:
-  `compose.yaml` mounts `/run/secrets/<name>` from host files the deploy
-  writes to `sovereign-config-<env>-secrets`, because Compose cannot write an
-  `environment:`-sourced secret into a read-only container.
-  `deployment_policy.rs` pins it. Only `migrate` gets the Authentik admin
+- **Credentials reach containers as files, never as their variables**, and
+  Compose reads them from its own environment (`secrets: … environment:`,
+  #617), so the stack starts from variables alone, without Woodpecker.
+  Compose writes them into each container at `/run/secrets/<name>`, which is
+  why the server and `migrate` have no `read_only` (a recorded exception)
+  and are always `--force-recreate`d. `deployment_policy.rs` pins it. Only `migrate` gets the Authentik admin
   token (`authentik_api_token`); it also gets the database URL, the value
   encryption key and the manager token. The server keeps the database URL,
   the key and the manager token.

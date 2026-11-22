@@ -60,26 +60,58 @@ const CREDENTIALS: [(&str, &[(&str, &str)]); 3] = [
     ),
 ];
 
-/// Every credential reaches its container as a file, never as a variable
-/// (#615): an exited container — `migrate`, after every deploy — keeps its
-/// environment in `docker inspect`. Each file is a host file the deploy
-/// writes (`file:`), because Compose cannot write an `environment:`-sourced
-/// secret into a read-only container, and an unset one is an empty file the
-/// binary refuses.
+/// A service's secrets, each as `(source, uid)`: long syntax, `uid` unset
+/// for one Postgres reads as root.
+fn secret_grants(service: &serde_yaml::Mapping) -> Vec<(String, Option<String>)> {
+    service["secrets"]
+        .as_sequence()
+        .expect("secrets is a list")
+        .iter()
+        .map(|grant| {
+            let source = grant["source"]
+                .as_str()
+                .expect("every secret is long syntax, naming its source")
+                .to_owned();
+            assert_eq!(
+                grant.get("uid").map(|uid| uid.as_str()),
+                grant.get("gid").map(|gid| gid.as_str()),
+                "{source}: uid and gid go together"
+            );
+            (
+                source,
+                grant
+                    .get("uid")
+                    .and_then(serde_yaml::Value::as_str)
+                    .map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+/// Every credential reaches its container as a file, never as one of its
+/// variables (#615): an exited container — `migrate`, after every deploy —
+/// keeps its environment in `docker inspect`. Compose reads each from the
+/// environment of whatever runs it and writes it into the containers given
+/// it (#617), so a stack can be started from variables alone, with no deploy
+/// step writing files. An unset variable fails `up`.
 #[test]
-fn compose_delivers_every_credential_as_a_file() {
-    let compose: serde_yaml::Value =
-        serde_yaml::from_str(include_str!("../../../compose.yaml")).expect("compose parses");
+fn compose_delivers_every_credential_from_the_environment_as_a_file() {
+    let text = include_str!("../../../compose.yaml");
+    let compose: serde_yaml::Value = serde_yaml::from_str(text).expect("compose parses");
     for (service, credentials) in CREDENTIALS {
         let definition = compose_service(service);
         let environment = environment(&definition);
-        let mut expected: Vec<&str> = credentials.iter().map(|(secret, _)| *secret).collect();
-        let mut given = strings(&definition["secrets"]);
+        let owner = (service != "postgres").then(|| "10001".to_owned());
+        let mut expected: Vec<(String, Option<String>)> = credentials
+            .iter()
+            .map(|(secret, _)| ((*secret).to_owned(), owner.clone()))
+            .collect();
+        let mut given = secret_grants(&definition);
         expected.sort_unstable();
         given.sort_unstable();
         assert_eq!(
             given, expected,
-            "{service} is given exactly its credentials"
+            "{service} is given exactly its credentials, owned by the user that reads them"
         );
         for (secret, variable) in credentials {
             assert_eq!(
@@ -94,18 +126,24 @@ fn compose_delivers_every_credential_as_a_file() {
             );
         }
     }
+    // Every grant is readable by its owner alone.
+    let grants: usize = CREDENTIALS
+        .iter()
+        .map(|(_, credentials)| credentials.len())
+        .sum();
+    assert_eq!(text.matches("        mode: 0400\n").count(), grants);
     let secrets = compose["secrets"].as_mapping().expect("secrets");
-    for (secret, host_variable) in [
-        ("postgres_password", "POSTGRES_PASSWORD_SECRET_FILE"),
-        ("database_url", "DATABASE_URL_FILE"),
-        ("manager_api_token", "MANAGER_API_TOKEN_FILE"),
-        ("value_encryption_key", "VALUE_ENCRYPTION_KEY_FILE"),
-        ("authentik_admin_token", "AUTHENTIK_ADMIN_TOKEN_FILE"),
+    for (secret, variable) in [
+        ("postgres_password", "POSTGRES_PASSWORD"),
+        ("database_url", "DATABASE_URL"),
+        ("manager_api_token", "MANAGER_API_TOKEN"),
+        ("value_encryption_key", "VALUE_ENCRYPTION_KEY"),
+        ("authentik_admin_token", "AUTHENTIK_ADMIN_TOKEN"),
     ] {
         assert_eq!(
-            secrets[secret]["file"].as_str(),
-            Some(format!("${{{host_variable}:-/dev/null}}").as_str()),
-            "{secret} is a host file the deploy names"
+            secrets[secret],
+            serde_yaml::from_str::<serde_yaml::Value>(&format!("environment: {variable}")).unwrap(),
+            "{secret} is read from {variable}, and from nowhere else"
         );
     }
     assert_eq!(secrets.len(), 5, "a credential was added or removed");
@@ -119,10 +157,13 @@ fn only_migrate_is_given_the_authentik_admin_token() {
         serde_yaml::from_str(include_str!("../../../compose.yaml")).expect("compose parses");
     for (name, service) in compose["services"].as_mapping().expect("services") {
         let name = name.as_str().unwrap();
-        let holds = strings(&service["secrets"]).contains(&"authentik_admin_token")
-            || serde_yaml::to_string(&service["environment"])
-                .unwrap()
-                .contains("AUTHENTIK_ADMIN_TOKEN");
+        let holds = service.get("secrets").is_some_and(|_| {
+            secret_grants(service.as_mapping().unwrap())
+                .iter()
+                .any(|(source, _)| source == "authentik_admin_token")
+        }) || serde_yaml::to_string(&service["environment"])
+            .unwrap()
+            .contains("AUTHENTIK_ADMIN_TOKEN");
         assert_eq!(holds, name == "migrate", "{name}");
     }
 }
@@ -229,7 +270,7 @@ fn readme_documents_the_value_encryption_boundary() {
     // now encrypts secrets itself, and the key is unrecoverable if lost, so
     // both facts have to stay documented.
     assert!(readme.contains("applies application-level encryption"));
-    assert!(readme.contains("VALUE_ENCRYPTION_KEY_FILE"));
+    assert!(readme.contains("| `VALUE_ENCRYPTION_KEY` |"));
     assert!(readme.contains("SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY"));
     assert!(readme.contains("Back up the value encryption key"));
     assert!(!readme.contains("does not add application-level encryption"));
@@ -567,6 +608,17 @@ const SERVICES_WITHOUT_A_USER: [(&str, &str); 1] = [(
     "the upstream entrypoint starts as root to own the data directory, then drops to postgres",
 )];
 
+/// The services that run as [`CONTAINER_USER`] on a writable root
+/// filesystem, each with its reason. Compose writes an `environment:`-sourced
+/// secret into the container and refuses to for a read-only one (#617).
+const SERVICES_WITH_A_WRITABLE_ROOT: [(&str, &str); 2] = [
+    ("migrate", "Compose writes its secrets into the container"),
+    (
+        "sovereign-config",
+        "Compose writes its secrets into the container",
+    ),
+];
+
 /// What the root part of the Postgres entrypoint uses: taking ownership of
 /// the data directory (`CHOWN`, `FOWNER`), reading a password file and
 /// writing a directory it does not own (`DAC_OVERRIDE`), and dropping to
@@ -632,10 +684,14 @@ fn every_service_runs_unprivileged_with_no_capabilities() {
                     user, CONTAINER_USER,
                     "{name} must run as the documented {CONTAINER_USER}"
                 );
+                let writable = SERVICES_WITH_A_WRITABLE_ROOT
+                    .iter()
+                    .any(|(service, _)| *service == name);
                 assert_eq!(
                     service["read_only"].as_bool(),
-                    Some(true),
-                    "{name} runs as {CONTAINER_USER} and must have a read-only root filesystem"
+                    (!writable).then_some(true),
+                    "{name} runs as {CONTAINER_USER} and must have a read-only root \
+                     filesystem, or be a decided exception that sets no `read_only`"
                 );
                 assert_eq!(
                     strings(&service["tmpfs"]),
@@ -674,13 +730,14 @@ fn only_numeric_non_root_ids_count_as_unprivileged() {
     }
 }
 
-/// The server restates the image's user and has a read-only root filesystem:
-/// it writes no file, so anything that tries to is a fault or an intruder.
+/// The server restates the image's user. Its root filesystem is writable only
+/// because Compose writes its secrets into it (#617); the user, the dropped
+/// capabilities and `no-new-privileges` stay.
 #[test]
-fn the_server_runs_as_the_documented_user_on_a_read_only_filesystem() {
+fn the_server_runs_as_the_documented_user() {
     let server = compose_service("sovereign-config");
     assert_eq!(server["user"].as_str(), Some(CONTAINER_USER));
-    assert_eq!(server["read_only"].as_bool(), Some(true));
+    assert!(server.get("read_only").is_none());
     assert_eq!(strings(&server["tmpfs"]), ["/tmp"]);
     let doc = include_str!("../../../docs/project-deployment.md");
     assert!(

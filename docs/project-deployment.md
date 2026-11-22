@@ -77,7 +77,7 @@ Everything a release changes outside its image runs in **`sovereign-config-serve
 
 **Every migration must therefore work with the release before it.** The previous release serves against the new state during every deploy, and after a failed one. Expand in one release; contract (drop, rename, tighten) in a later one, once no running release reads the old shape. A rollback to 3.62 or later is a deploy of the older image, whose `migrate` tolerates migrations it does not know. An image from before 3.62 migrates in-process and refuses a database carrying a migration it does not know, so rolling back that far needs the backup restore in [Upgrading](upgrading.md#procedure) once a newer migration has been applied.
 
-**Credentials reach every container as files**, never as variables, because an exited `migrate` keeps its environment in `docker inspect`. The deploy writes each to a Docker volume of its own, `sovereign-config-dev-secrets` or `sovereign-config-production-secrets`, each file mode `0400` and owned by the user that reads it, and Compose bind-mounts one file per container at `/run/secrets/<name>`. Compose cannot write an `environment:`-sourced secret into a read-only container, so the files come from the host.
+**Credentials reach every container as files**, never as its own variables, because an exited `migrate` keeps its environment in `docker inspect`. Compose reads each from the environment it runs in — the deploy step exports the Woodpecker secrets under the names `compose.yaml` reads — and writes it into each container given it, at `/run/secrets/<name>`, mode `0400`, owned by the user that reads it (#617). Nothing but those variables is needed to start the stack, so it can be started without Woodpecker. The file lives in the container's own layer until the container is recreated: an exited `migrate` holds the Authentik admin token until the next deploy, out of `docker inspect` but within reach of `docker cp`.
 
 | Credential | `migrate` | Server | PostgreSQL |
 | --- | :---: | :---: | :---: |
@@ -87,7 +87,7 @@ Everything a release changes outside its image runs in **`sovereign-config-serve
 | Authentik admin token (`authentik_admin_token`) | ✅ | — | — |
 | PostgreSQL password (`postgres_password`) | — | — | ✅ |
 
-**Checking a deploy:** `docker inspect -f '{{.State.ExitCode}}' sovereign-config-dev-migrate` (or `sovereign-config-production-migrate`) is `0`, and its log says what each step changed. An exited `migrate` is expected: it is not a container that is down. Compose does not recreate a container when only a secret file changes, so the deploy always recreates the server, and a redeploy is how a rotated credential reaches it. The Authentik admin token's file is emptied once `migrate` has exited.
+**Checking a deploy:** `docker inspect -f '{{.State.ExitCode}}' sovereign-config-dev-migrate` (or `sovereign-config-production-migrate`) is `0`, and its log says what each step changed. An exited `migrate` is expected: it is not a container that is down. Compose writes a secret into a container only when it creates it, so the deploy recreates `migrate` and the server every time (`--force-recreate`), and a redeploy is how a rotated credential reaches them.
 
 ### Production prerequisites
 
@@ -105,9 +105,9 @@ Every container runs as a stated, unprivileged user (card #579). `tests/deployme
 
 | Container | Runs as | Hardening | Where it is set |
 | --- | --- | --- | --- |
-| Server (`sovereign-config`) | `10001:10001` | `cap_drop: ALL`, `no-new-privileges`, read-only root filesystem, `tmpfs` on `/tmp` | `docker/server.Dockerfile` and `user:` in `compose.yaml` |
+| Server (`sovereign-config`) | `10001:10001` | `cap_drop: ALL`, `no-new-privileges`, `tmpfs` on `/tmp`; a writable root filesystem (below) | `docker/server.Dockerfile` and `user:` in `compose.yaml` |
 | `migrate` | `10001:10001` | The same | The server's image, and `user:` in `compose.yaml` |
-| Client-telemetry ingest (`otlp-ingest`) | `10001:10001` | The same | `user:` in `compose.yaml` (a published image) |
+| Client-telemetry ingest (`otlp-ingest`) | `10001:10001` | `cap_drop: ALL`, `no-new-privileges`, read-only root filesystem, `tmpfs` on `/tmp` | `user:` in `compose.yaml` (a published image) |
 | Woodpecker broker | `10001:10001` | See below | `docker/broker.Dockerfile` |
 | PostgreSQL (`postgres`) | Starts as root, runs as `postgres`, `999:999` | `cap_drop: ALL` with five capabilities added back, `no-new-privileges` | The upstream image's entrypoint |
 | CLI image | Root | None | `docker/cli.Dockerfile` sets no `USER` |
@@ -116,7 +116,7 @@ Every container runs as a stated, unprivileged user (card #579). `tests/deployme
 
 **A volume shared between containers is owned by group `10001`**, with its directory group-writable and setgid (`chown 10001:10001`, `chmod 2770`). A container from another image that must share it either runs as `10001:10001` or adds the group with `group_add: ["10001"]`. The identity-provider socket (card #578) is the first such volume.
 
-**The server's root filesystem is read-only.** The server writes no file: its state is the database, and its logs go to stdout and OTLP. `/tmp` is a `tmpfs` only so that a library expecting one finds it. Secret files are mounted read-only and are read as uid 10001, as before.
+**The server's and `migrate`'s root filesystems are writable, as a decided exception (#617).** Neither writes a file: the server's state is the database, and both log to stdout and OTLP. But Compose delivers their credentials by writing them into the container, from the environment it runs in, and refuses to do that for a read-only container. Credentials from the environment were chosen over host files so the stack can be started without the deploy pipeline (#617). Everything else stays: uid 10001, no capabilities, `no-new-privileges`, and `/tmp` as a `tmpfs`. `tests/deployment_policy.rs` lists both as the only writable-root services.
 
 **PostgreSQL keeps the upstream image's own user handling**, and sets no `user:`. Its entrypoint starts as root to take ownership of the data directory and to read the password file, then drops to `postgres` for good. With `user: "999:999"` it could do neither. A pre-created volume owned by root would then fail its first start, and the documented `root:root`, `0400` password file would be unreadable. That is too much risk to a long-lived database for the gain. What the entrypoint needs as root is five capabilities: `CHOWN` and `FOWNER` for the data directory, `DAC_OVERRIDE` to read and write what root does not own, and `SETGID` and `SETUID` to drop to `postgres`. `compose.yaml` drops every other capability. The database process itself runs as `999:999` and holds none. `docker exec` into that container still starts as root, so read the database process's user from `/proc/1/status`, not from `id`.
 

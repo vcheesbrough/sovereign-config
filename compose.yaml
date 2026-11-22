@@ -9,7 +9,9 @@ services:
       # (#615): an exited container keeps its environment in `docker inspect`.
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     secrets:
-      - postgres_password
+      # Read by the entrypoint as root, before it drops to `postgres`.
+      - source: postgres_password
+        mode: 0400
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
@@ -78,10 +80,22 @@ services:
       OTEL_SDK_DISABLED:
     hostname: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}-migrate
     secrets:
-      - database_url
-      - authentik_admin_token
-      - manager_api_token
-      - value_encryption_key
+      - source: database_url
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: authentik_admin_token
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: manager_api_token
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: value_encryption_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
     depends_on:
       postgres:
         condition: service_healthy
@@ -89,10 +103,11 @@ services:
     networks:
       - sovereign_config_private
       - traefik
+    # No `read_only`, as for the server below: Compose writes its secrets
+    # into the container (#617).
     user: "10001:10001"
     cap_drop:
       - ALL
-    read_only: true
     tmpfs:
       - /tmp
     security_opt:
@@ -152,9 +167,18 @@ services:
     # redeploy and the instance keeps one identity.
     hostname: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}
     secrets:
-      - database_url
-      - manager_api_token
-      - value_encryption_key
+      - source: database_url
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: manager_api_token
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: value_encryption_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
     depends_on:
       postgres:
         condition: service_healthy
@@ -168,11 +192,12 @@ services:
     # The image's own user, restated so the deployment does not depend on the
     # image for it (docs/project-deployment.md, *Container users*). The server
     # writes no file: its state is the database, and its logs go to stdout and
-    # OTLP. `/tmp` is there for a library that expects one.
+    # OTLP. `/tmp` is there for a library that expects one. Its root
+    # filesystem is not read-only, because Compose writes its secrets into the
+    # container, which it refuses to do for a read-only one (#617).
     user: "10001:10001"
     cap_drop:
       - ALL
-    read_only: true
     tmpfs:
       - /tmp
     security_opt:
@@ -266,21 +291,22 @@ services:
       - "observability.deployment.environment=${SOVEREIGN_CONFIG_ENV:-dev}"
     restart: unless-stopped
 
-# Files on the Docker host, bind-mounted read-only at /run/secrets/<name>.
-# Not `environment:`-sourced secrets: Compose cannot write those into a
-# read-only container. An unset path is an empty secret, which the binary
-# refuses at startup.
+# Read from the environment of whatever runs Compose — a deploy step, a
+# decrypted env file, a shell — and written into each container that is given
+# it, at /run/secrets/<name> (#617). The value never becomes one of the
+# container's own variables. Compose refuses to start a service whose secret's
+# variable is unset.
 secrets:
   postgres_password:
-    file: ${POSTGRES_PASSWORD_SECRET_FILE:-/dev/null}
+    environment: POSTGRES_PASSWORD
   database_url:
-    file: ${DATABASE_URL_FILE:-/dev/null}
+    environment: DATABASE_URL
   manager_api_token:
-    file: ${MANAGER_API_TOKEN_FILE:-/dev/null}
+    environment: MANAGER_API_TOKEN
   value_encryption_key:
-    file: ${VALUE_ENCRYPTION_KEY_FILE:-/dev/null}
+    environment: VALUE_ENCRYPTION_KEY
   authentik_admin_token:
-    file: ${AUTHENTIK_ADMIN_TOKEN_FILE:-/dev/null}
+    environment: AUTHENTIK_ADMIN_TOKEN
 
 volumes:
   postgres_data:

@@ -456,27 +456,16 @@ fn each_deploy_runs_migrate_before_it_replaces_the_server() {
                 .unwrap_or_else(|| panic!("{deploy} has no line with {needle}"))
         };
         let migrate = position(&format!(
-            "\"$$COMPOSE\" -p {project} up -d --pull always migrate ||"
+            "\"$$COMPOSE\" -p {project} up -d --pull always --force-recreate migrate ||"
         ));
         let wait = position("MIGRATE_EXIT=$$(docker wait ");
-        let emptied = lines
-            .iter()
-            .position(|line| *line == ": > /run/deploy-secrets/authentik_admin_token")
-            .unwrap_or_else(|| panic!("{deploy} never empties the admin token's file"));
-        // And however the step ends: set before anything can fail.
-        let trap = position("trap ': > /run/deploy-secrets/authentik_admin_token' EXIT");
-        assert!(
-            trap < migrate,
-            "{deploy}: the trap is set before migrate runs"
-        );
         let refuse = position("if [ \"$$MIGRATE_EXIT\" != 0 ]; then");
         let server = position(&format!(
             "\"$$COMPOSE\" -p {project} up -d --no-deps --force-recreate --wait --wait-timeout 90 sovereign-config ||"
         ));
         assert!(
-            migrate < wait && wait < emptied && emptied < refuse && refuse < server,
-            "{deploy}: migrate, wait for it, empty its admin token, refuse on failure, \
-             then the server"
+            migrate < wait && wait < refuse && refuse < server,
+            "{deploy}: migrate, wait for it, refuse on failure, then the server"
         );
         assert_eq!(
             lines
@@ -489,72 +478,66 @@ fn each_deploy_runs_migrate_before_it_replaces_the_server() {
     }
 }
 
-/// Every credential reaches its container as a file (#615): the deploy writes
-/// each to the environment's secrets volume and hands Compose the paths. None
-/// is passed as a variable, which an exited container would keep in
-/// `docker inspect`.
+/// Every credential reaches Compose as a variable of the deploy step's own
+/// environment, under the name `compose.yaml` reads it by (#617): the stack
+/// needs nothing from Woodpecker but those variables. Nothing is written to
+/// a file or a volume, and no `*_FILE` path or direct server variable is
+/// handed over.
 #[test]
-fn each_deploy_delivers_every_credential_as_a_file() {
+fn each_deploy_hands_compose_every_credential_as_a_variable() {
     let pipeline = pipeline();
-    for (deploy, volume) in [
-        ("deploy-dev", "sovereign-config-dev-secrets"),
-        ("deploy-prod", "sovereign-config-production-secrets"),
-    ] {
+    for (deploy, environment_name) in [("deploy-dev", "dev"), ("deploy-prod", "prod")] {
         let deploy_step = step(&pipeline, deploy);
         let command = commands_text(deploy_step);
-        let mounts = strings(deploy_step.get("volumes").expect("volumes"));
-        assert!(
-            mounts.contains(&format!("{volume}:/run/deploy-secrets")),
-            "{deploy} mounts {volume}: {mounts:?}"
-        );
-        assert!(command.contains(&format!(
-            "SECRETS=$$(docker volume inspect --format '{{{{ .Mountpoint }}}}' {volume})"
-        )));
-        for (secret, owner, file_variable) in [
-            ("postgres_password", "0:0", "POSTGRES_PASSWORD_SECRET_FILE"),
-            ("database_url", "10001:10001", "DATABASE_URL_FILE"),
-            ("manager_api_token", "10001:10001", "MANAGER_API_TOKEN_FILE"),
+        let environment = deploy_step.get("environment").expect("environment");
+        for (variable, secret) in [
             (
-                "value_encryption_key",
-                "10001:10001",
-                "VALUE_ENCRYPTION_KEY_FILE",
+                "POSTGRES_PASSWORD",
+                format!("sovereign_config_{environment_name}_postgres_password"),
             ),
             (
-                "authentik_admin_token",
-                "10001:10001",
-                "AUTHENTIK_ADMIN_TOKEN_FILE",
+                "MANAGER_API_TOKEN",
+                format!("sovereign_config_{environment_name}_manager_api_token"),
             ),
+            (
+                "VALUE_ENCRYPTION_KEY",
+                format!("sovereign_config_{environment_name}_value_encryption_key"),
+            ),
+            ("AUTHENTIK_ADMIN_TOKEN", "authentik_api_token".to_owned()),
         ] {
-            assert!(
-                command.contains(&format!("secret {secret} {owner} ")),
-                "{deploy} writes {secret} for {owner}"
-            );
-            assert!(
-                command.contains(&format!("{file_variable}=\"$$SECRETS/{secret}\"")),
-                "{deploy} hands Compose {secret}'s path"
+            assert_eq!(
+                environment
+                    .get(variable)
+                    .and_then(|value| value.get("from_secret"))
+                    .and_then(Value::as_str),
+                Some(secret.as_str()),
+                "{deploy} takes {variable} from {secret}"
             );
         }
-        for variable in [
+        assert!(command.contains(
+            "export POSTGRES_PASSWORD MANAGER_API_TOKEN VALUE_ENCRYPTION_KEY AUTHENTIK_ADMIN_TOKEN \
+             DATABASE_URL=\"postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config\""
+        ));
+        let mounts = strings(deploy_step.get("volumes").expect("volumes"));
+        assert_eq!(
+            mounts,
+            BTreeSet::from(["/var/run/docker.sock:/var/run/docker.sock".to_owned()]),
+            "{deploy} mounts no secrets volume"
+        );
+        for leftover in [
+            "/run/deploy-secrets",
+            "docker volume inspect",
+            "_FILE=",
             "SOVEREIGN_CONFIG_DATABASE_URL=",
             "SOVEREIGN_CONFIG_MANAGER_API_TOKEN=",
             "SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY=",
             "SOVEREIGN_CONFIG_AUTHENTIK_ADMIN_TOKEN=",
-            "POSTGRES_PASSWORD_FILE=",
         ] {
             assert!(
-                !command.contains(variable),
-                "{deploy} passes {variable} to Compose"
+                !command.contains(leftover),
+                "{deploy} still carries {leftover}"
             );
         }
-        let environment = deploy_step.get("environment").expect("environment");
-        assert_eq!(
-            environment
-                .get("AUTHENTIK_ADMIN_TOKEN")
-                .and_then(|value| value.get("from_secret"))
-                .and_then(Value::as_str),
-            Some("authentik_api_token"),
-            "{deploy} gives `migrate` the Authentik admin token"
-        );
     }
 }
 
