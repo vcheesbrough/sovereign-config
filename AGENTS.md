@@ -59,11 +59,24 @@ Run the **`ci-watch`** skill (baseline §4) with `OWNER=vcheesbrough`,
   read it with `woodpecker-plugin-release-versions` (`resolve`, `tag`). The
   GitHub build keeps it with `scripts/ci-claim-build.sh` and
   `scripts/ci-publish-images.sh`, and **no GitHub workflow runs a Woodpecker
-  plugin** (#550). `Cargo.toml` supplies `major.minor` (bump the minor at
-  iteration start, keep patch `0`), and each build claims the next patch. The
+  plugin** (#550). `Cargo.toml` supplies `major.minor`, and each build claims the next patch
+  (keep patch `0`). The
   first deploy of a build writes its git tag, so a tag means "deployed".
   `release.yml` then gives the tag a GitHub Release that lists its images. A
   card's **Version** records the `major.minor`.
+- **Versions follow in sequence, and never track the iteration number.**
+  This overrides baseline §2, where minor = `N`; the iteration number names
+  the card and branch only.
+  - The next minor is the one **after the version production runs**. Read
+    prod's version first, every time: `curl -s --http1.1 -X POST -H
+    'content-type: application/json' -d '{"protocolVersion":"v6"}'
+    https://sovereign-config.desync.link/sovereign.config.v6.System/GetVersion`.
+    After 3.0.x comes 3.1.0, then 3.2.0. A new major starts at `X.0.0`.
+  - **While trunk's `major.minor` is newer than prod's, it is unreleased.**
+    Every card then stays on that line and changes no version. A tag or a
+    GitHub Release proves only a dev deploy, never a release.
+  - A version out of sequence is removed everywhere it reached: GHCR images,
+    `refs/builds/*`, git tags and GitHub Releases. It is never left behind.
 - **A push never deploys** (#466). A push is green once the GitHub Actions
   build has published its images. Dev is deployed only by a Woodpecker Deploy
   targeting `dev` (any branch), started from that push's anchor pipeline. The
@@ -273,11 +286,12 @@ The `migrations` skill (baseline §10) is the contract (#615);
   previous release serves, and leaves it serving if it fails. Expand first;
   contract (drop, rename, tighten) in a later release. Never edit a migration
   that has been deployed to dev; add a new one.
-- **Credentials are files, never variables**, for every container:
-  `compose.yaml` mounts `/run/secrets/<name>` from host files the deploy
-  writes to `sovereign-config-<env>-secrets`, because Compose cannot write an
-  `environment:`-sourced secret into a read-only container.
-  `deployment_policy.rs` pins it. Only `migrate` gets the Authentik admin
+- **Credentials reach containers as files, never as their variables**, and
+  Compose reads them from its own environment (`secrets: … environment:`,
+  #617), so the stack starts from variables alone, without Woodpecker.
+  Compose writes them into each container at `/run/secrets/<name>`, which is
+  why the server and `migrate` have no `read_only` (a recorded exception)
+  and are always `--force-recreate`d. `deployment_policy.rs` pins it. Only `migrate` gets the Authentik admin
   token (`authentik_api_token`); it also gets the database URL, the value
   encryption key and the manager token. The server keeps the database URL,
   the key and the manager token.

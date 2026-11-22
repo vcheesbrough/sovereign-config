@@ -163,19 +163,19 @@ The operator must pre-create the external volume named by `POSTGRES_DATA_VOLUME`
 
 The stack publishes no application, PostgreSQL, metrics, logging or tracing port. PostgreSQL sits on an internal network, and the service is reachable only through the reverse proxy on an external network. The reference stack names that network `proxy-backend`, after the author's own Traefik network.
 
-### 3. Create the secrets
+### 3. Set the secrets
 
-Create the secret files in an operator-controlled directory, and never commit them:
+`compose.yaml` reads every credential from the environment of the shell (or tool) that runs `docker compose`, and refuses to start without one. Set them from your secret store, for example a decrypted env file, and never commit them:
 
-| Host variable | File contents | Owner and mode |
-| --- | --- | --- |
-| `POSTGRES_PASSWORD_SECRET_FILE` | Only the PostgreSQL password. | `root:root`, `0400` (read by the PostgreSQL entrypoint) |
-| `DATABASE_URL_FILE` | The complete private-network URL, for example `postgresql://sovereign_config:<password>@postgres:5432/sovereign_config`. | `10001:10001`, `0400` |
-| `MANAGER_API_TOKEN_FILE` | Only the Authentik connection-manager API token from the blueprint. | `10001:10001`, `0400` |
-| `VALUE_ENCRYPTION_KEY_FILE` | Only the value encryption key: 32 random bytes in standard base64, from `openssl rand -base64 32`. | `10001:10001`, `0400` |
-| `AUTHENTIK_ADMIN_TOKEN_FILE` | Only an Authentik API token allowed to manage blueprints and read the version and schema. Only `migrate` is given it. | `10001:10001`, `0400` |
+| Variable | Contents |
+| --- | --- |
+| `POSTGRES_PASSWORD` | The PostgreSQL password. |
+| `DATABASE_URL` | The complete private-network URL, for example `postgresql://sovereign_config:<password>@postgres:5432/sovereign_config`, with the password percent-encoded. |
+| `MANAGER_API_TOKEN` | The Authentik connection-manager API token from the blueprint. |
+| `VALUE_ENCRYPTION_KEY` | The value encryption key: 32 random bytes in standard base64, from `openssl rand -base64 32`. |
+| `AUTHENTIK_ADMIN_TOKEN` | An Authentik API token allowed to manage blueprints and read the version and schema. Only `migrate` is given it. |
 
-The server and `migrate` run as the fixed user `10001:10001`, with no capabilities and a read-only root filesystem, and Compose preserves host ownership for these file-backed secrets. `compose.yaml` delivers every credential as a file and never as an environment variable, because an exited container — `migrate`, after every deploy — keeps its environment in `docker inspect`. Outside Compose, the binary also takes each secret directly through its variable (`SOVEREIGN_CONFIG_DATABASE_URL`, `SOVEREIGN_CONFIG_MANAGER_API_TOKEN`, `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY`, `SOVEREIGN_CONFIG_AUTHENTIK_ADMIN_TOKEN`), which takes precedence over the matching `_FILE`. Startup fails with a redacted error when a required secret is absent through both routes.
+Compose writes each into the containers given it as a file at `/run/secrets/<name>`, mode `0400`, owned by the user that reads it. It never becomes one of a container's own variables, because an exited container — `migrate`, after every deploy — keeps those in `docker inspect`. The server and `migrate` run as the fixed user `10001:10001`, with no capabilities and `no-new-privileges`. Their root filesystem is writable, because Compose writes these files into the container, which it refuses to do for a read-only one. The files live in each container's own layer until it is recreated: an exited `migrate` holds the Authentik admin token until the next deploy. Outside Compose, the binary also takes each secret directly through its variable (`SOVEREIGN_CONFIG_DATABASE_URL`, `SOVEREIGN_CONFIG_MANAGER_API_TOKEN`, `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY`, `SOVEREIGN_CONFIG_AUTHENTIK_ADMIN_TOKEN`), which takes precedence over the matching `_FILE`. Startup fails with a redacted error when a required secret is absent through both routes.
 
 > [!WARNING]
 > **Back up the value encryption key, and keep that backup somewhere you would still have after losing the deployment.** It is the only thing that can decrypt the stored secrets; without it they are unrecoverable, no matter how good the database backups are. Neither `migrate` nor the server runs with a key that opens none of the stored secrets, rather than serving errors or sealing a second layer over intact data.
@@ -188,20 +188,16 @@ export SOVEREIGN_CONFIG_ENV='prod'
 export SOVEREIGN_CONFIG_HOST='config.example.com'
 export SOVEREIGN_CONFIG_CONTAINER_NAME='sovereign-config-production'
 export POSTGRES_DATA_VOLUME='sovereign-config-production-db'
-export POSTGRES_PASSWORD_SECRET_FILE="$HOME/.config/sovereign-config/postgres-password"
-export DATABASE_URL_FILE="$HOME/.config/sovereign-config/database-url"
-export MANAGER_API_TOKEN_FILE="$HOME/.config/sovereign-config/manager-api-token"
-export VALUE_ENCRYPTION_KEY_FILE="$HOME/.config/sovereign-config/value-encryption-key"
-export AUTHENTIK_ADMIN_TOKEN_FILE="$HOME/.config/sovereign-config/authentik-admin-token"
+# and the five secrets from step 3
 export SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT='production'
 export SOVEREIGN_CONFIG_OIDC_ISSUER='https://auth.example.com/application/o/sovereign-config/'
 export SOVEREIGN_CONFIG_OIDC_AUDIENCE='sovereign-config'
 export SOVEREIGN_CONFIG_PUBLIC_ORIGIN='https://config.example.com'
 export SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE='sovereign_config_prod_grants'
 export SOVEREIGN_CONFIG_MANAGER_GROUP='sovereign-config-connections'
-docker compose up -d migrate
+docker compose up -d --force-recreate migrate
 docker wait "$(docker compose ps -aq migrate)"   # prints 0 once migrate has finished
-docker compose up -d --no-deps --wait sovereign-config
+docker compose up -d --no-deps --force-recreate --wait sovereign-config
 ```
 
 `migrate` is the same image run once, before the server: it applies the forward-only database migrations, records the identity provider, encrypts any secret still stored in plaintext, and applies the Authentik blueprint, then exits. The server never changes any of that. It checks it at startup, and refuses to start on a database `migrate` has not brought up to its release. Run `migrate` on its own first, as above, on every upgrade too: a plain `docker compose up` replaces the server before `migrate` has finished, so a failed `migrate` would leave no server running. Run that way, a failed `migrate` leaves the previous release serving, which every migration is written to allow.
@@ -429,7 +425,7 @@ Metrics are pushed rather than scraped, and there is no `/metrics` endpoint. A c
 
 ## Upgrading
 
-Stop the server, back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new release, run `migrate` and wait for it to exit 0, then start the server ([Upgrading](docs/upgrading.md#procedure)). Migrations are forward-only, so a downgrade to a release before 3.62 means restoring the backup.
+Stop the server, back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new release, run `migrate` and wait for it to exit 0, then start the server ([Upgrading](docs/upgrading.md#procedure)). Migrations are forward-only, so a downgrade to a release before 3.1 means restoring the backup.
 
 > [!IMPORTANT]
 > Some releases need clients upgraded in a particular order. Read [Upgrading](docs/upgrading.md) for the procedure and the releases that need action.

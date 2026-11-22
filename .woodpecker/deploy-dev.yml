@@ -50,9 +50,10 @@ steps:
   #
   # Every credential reaches its container as a file (compose.yaml,
   # `secrets:`), never as a variable an exited container keeps in `docker
-  # inspect`. They are written to a Docker volume of their own, which Compose
-  # mounts from the host one file per container; only `migrate` is given the
-  # Authentik admin token.
+  # inspect`. Compose reads each from this step's environment and writes it
+  # into the containers given it (#617), so the stack needs nothing from
+  # Woodpecker but these variables; only `migrate` is given the Authentik
+  # admin token.
   deploy-dev:
     depends_on:
       - resolve
@@ -62,7 +63,6 @@ steps:
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - sovereign-config-dev-secrets:/run/deploy-secrets
     environment:
       POSTGRES_PASSWORD:
         from_secret: sovereign_config_dev_postgres_password
@@ -91,48 +91,30 @@ steps:
         export OTEL_TRACES_EXPORTER=otlp
         export OTEL_METRICS_EXPORTER=otlp
         printf 'telemetry: %s\n' "$$OTEL_RESOURCE_ATTRIBUTES"
-        # The credentials, as files: written beside and renamed into place,
-        # so a running container keeps the file it started with. The server
-        # and `migrate` run as 10001; the Postgres entrypoint reads its file
-        # as root, before it drops to `postgres`.
-        umask 077
-        secret() {
-          printf '%s' "$$3" > "/run/deploy-secrets/.$$1"
-          chown "$$2" "/run/deploy-secrets/.$$1"
-          chmod 0400 "/run/deploy-secrets/.$$1"
-          mv -f "/run/deploy-secrets/.$$1" "/run/deploy-secrets/$$1"
-        }
+        # The credentials Compose reads from this environment (compose.yaml,
+        # `secrets:`): the four Woodpecker secrets under their own names, and
+        # the database URL built from the password. Exported rather than
+        # prefixed, because several Compose runs read them.
         ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
-        secret postgres_password 0:0 "$$POSTGRES_PASSWORD"
-        secret database_url 10001:10001 "postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config"
-        secret manager_api_token 10001:10001 "$$MANAGER_API_TOKEN"
-        secret value_encryption_key 10001:10001 "$$VALUE_ENCRYPTION_KEY"
-        secret authentik_admin_token 10001:10001 "$$AUTHENTIK_ADMIN_TOKEN"
-        # Emptied however this step ends, as well as straight after `migrate`.
-        trap ': > /run/deploy-secrets/authentik_admin_token' EXIT
-        unset POSTGRES_PASSWORD ENCODED_PASSWORD MANAGER_API_TOKEN VALUE_ENCRYPTION_KEY AUTHENTIK_ADMIN_TOKEN
-        # Compose mounts them from the host, so it is given the volume's host path.
-        SECRETS=$$(docker volume inspect --format '{{ .Mountpoint }}' sovereign-config-dev-secrets)
-        # Exported rather than prefixed, because several Compose runs read them.
-        export POSTGRES_PASSWORD_SECRET_FILE="$$SECRETS/postgres_password" DATABASE_URL_FILE="$$SECRETS/database_url" MANAGER_API_TOKEN_FILE="$$SECRETS/manager_api_token" VALUE_ENCRYPTION_KEY_FILE="$$SECRETS/value_encryption_key" AUTHENTIK_ADMIN_TOKEN_FILE="$$SECRETS/authentik_admin_token"
+        export POSTGRES_PASSWORD MANAGER_API_TOKEN VALUE_ENCRYPTION_KEY AUTHENTIK_ADMIN_TOKEN DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config"
+        unset ENCODED_PASSWORD
         export SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config-dev/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-dev SOVEREIGN_CONFIG_PUBLIC_ORIGIN=https://sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT=https://sovereign-config-dev.desync.link SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE=sovereign_config_dev_grants SOVEREIGN_CONFIG_MANAGER_GROUP=sovereign-config-dev-connections SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT=development
         # Phase 1: `migrate`, while the running server goes on serving.
-        "$$COMPOSE" -p sovereign-config-dev up -d --pull always migrate || {
+        # Recreated every time: Compose writes a secret into a container when
+        # it creates it, so a restarted one would keep a rotated value's old
+        # copy.
+        "$$COMPOSE" -p sovereign-config-dev up -d --pull always --force-recreate migrate || {
           "$$COMPOSE" -p sovereign-config-dev logs --tail 200
           exit 1
         }
         MIGRATE_EXIT=$$(docker wait "$$("$$COMPOSE" -p sovereign-config-dev ps -aq migrate)")
         "$$COMPOSE" -p sovereign-config-dev logs --no-log-prefix migrate
-        # Only `migrate` reads the Authentik admin token, and it has exited:
-        # the file is emptied rather than left on the host until the next
-        # deploy writes it again.
-        : > /run/deploy-secrets/authentik_admin_token
         if [ "$$MIGRATE_EXIT" != 0 ]; then
           echo "ERROR: migrate exited $$MIGRATE_EXIT; the running server was left in place" >&2
           exit 1
         fi
         # Phase 2: the server, which verifies what `migrate` applied. Always
-        # recreated: Compose does not notice a credential file that changed,
+        # recreated: Compose does not notice a credential whose value changed,
         # and `migrate` has already given Authentik any new manager key.
         "$$COMPOSE" -p sovereign-config-dev up -d --no-deps --force-recreate --wait --wait-timeout 90 sovereign-config || {
           "$$COMPOSE" -p sovereign-config-dev logs --tail 200
