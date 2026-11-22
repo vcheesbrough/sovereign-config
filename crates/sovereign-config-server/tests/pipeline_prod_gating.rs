@@ -1,9 +1,10 @@
 //! Guards the deployment-trigger policy encoded in the `.woodpecker/` workflows:
 //! a push (or manual run) only anchors a pipeline to deploy from, and never
-//! builds or deploys — GitHub Actions builds (card #539); each environment
-//! deploys only on a `deployment` event (Woodpecker's Deploy) targeting it —
-//! production from main only (card #262), development from any branch (card
-//! #466) — and ships only what the release-versions plugin resolves. The
+//! builds or deploys — GitHub Actions builds (card #539); development deploys
+//! only on a `deployment` event (Woodpecker's Deploy) targeting it, from any
+//! branch (card #466); production is only promoted, on a deployment targeting
+//! prod from main (card #262), and deployed by mini-config (its card #614).
+//! Each ships or records only what the release-versions plugin resolves. The
 //! pipeline files are not otherwise exercised by any test.
 
 mod support;
@@ -108,7 +109,7 @@ fn setting<'a>(step: &'a Value, name: &str) -> Option<&'a Value> {
     step.get("settings").and_then(|settings| settings.get(name))
 }
 
-/// Every step of the prod deploy runs only on a deployment targeting prod,
+/// Every step of the prod promotion runs only on a deployment targeting prod,
 /// from main.
 #[test]
 fn production_steps_deploy_to_prod_from_permitted_branches() {
@@ -116,7 +117,7 @@ fn production_steps_deploy_to_prod_from_permitted_branches() {
     let pipeline = pipeline();
     let mut checked = 0;
     for (workflow, name, step) in pipeline.steps() {
-        if workflow != "deploy-prod" {
+        if workflow != "promote-prod" {
             continue;
         }
         let conditions = when_conditions(step);
@@ -142,7 +143,7 @@ fn production_steps_deploy_to_prod_from_permitted_branches() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 4, "a deploy-prod step was added or removed");
+    assert_eq!(checked, 3, "a promote-prod step was added or removed");
 }
 
 /// Every step of the dev deploy runs only on a deployment targeting dev, from
@@ -213,7 +214,7 @@ fn a_push_only_anchors_a_pipeline_to_deploy_from() {
         image.contains("@sha256:") && !image.starts_with(RELEASE_VERSIONS),
         "the anchor runs a digest-pinned image that is not the release plugin"
     );
-    for workflow in ["deploy-dev", "deploy-prod"] {
+    for workflow in ["deploy-dev", "promote-prod"] {
         assert_eq!(workflow_events(&pipeline, workflow), deployment_event());
     }
 }
@@ -249,19 +250,19 @@ fn a_push_never_deploys() {
     assert!(checked > 0, "no push step was found to check");
 }
 
-/// A deployment never builds, publishes or allocates: in both deploy
-/// workflows the plugin's `resolve` chooses the build — the commit's release
+/// A deployment never builds, publishes or allocates: in the dev deploy and
+/// the prod promotion the plugin's `resolve` chooses the build — the commit's release
 /// tag, else its newest published build — and proves all three GHCR images
-/// carry its labels, before anything is deployed. Nothing else in
+/// carry its labels, before anything is deployed or tagged. Nothing else in
 /// Woodpecker names a version or runs the plugin's build-side modes.
 #[test]
 fn a_deployment_resolves_a_published_build_and_never_allocates() {
     let pipeline = pipeline();
     assert_eq!(
         pipeline.workflows_of("resolve"),
-        ["deploy-dev", "deploy-prod"]
+        ["deploy-dev", "promote-prod"]
     );
-    let resolve = pipeline.step_in("deploy-prod", "resolve");
+    let resolve = pipeline.step_in("promote-prod", "resolve");
     assert!(
         resolve
             .get("image")
@@ -313,25 +314,27 @@ fn a_deployment_resolves_a_published_build_and_never_allocates() {
             );
         }
     }
-    for deploy in ["deploy-dev", "deploy-prod"] {
-        let step = step(&pipeline, deploy);
-        assert!(
-            depends_on(step).contains(&"resolve"),
-            "{deploy} must ship what resolve chose"
-        );
-    }
+    assert!(
+        depends_on(step(&pipeline, "deploy-dev")).contains(&"resolve"),
+        "deploy-dev must ship what resolve chose"
+    );
 }
 
-/// Each deploy records itself only once it has succeeded: `tag` waits for the
-/// deploy step alone, so a smoke check (run after the pipeline, AGENTS.md)
-/// never holds a tag back and a failed deploy is never tagged.
+/// The dev deploy records itself only once it has succeeded: its `tag` waits
+/// for the deploy step alone, so a smoke check (run after the pipeline,
+/// AGENTS.md) never holds a tag back and a failed deploy is never tagged. The
+/// prod promotion deploys nothing, so its `tag` waits for the build it
+/// resolved and for the on-main check.
 #[test]
-fn each_deploy_is_tagged_once_it_has_succeeded() {
+fn each_deploy_or_promotion_is_tagged_once_it_has_succeeded() {
     let pipeline = pipeline();
-    assert_eq!(pipeline.workflows_of("tag"), ["deploy-dev", "deploy-prod"]);
-    for (workflow, deploy) in [("deploy-dev", "deploy-dev"), ("deploy-prod", "deploy-prod")] {
+    assert_eq!(pipeline.workflows_of("tag"), ["deploy-dev", "promote-prod"]);
+    for (workflow, waits_for) in [
+        ("deploy-dev", &["deploy-dev"][..]),
+        ("promote-prod", &["resolve", "verify-commit-on-main"][..]),
+    ] {
         let tag = pipeline.step_in(workflow, "tag");
-        assert_eq!(depends_on(tag), [deploy]);
+        assert_eq!(depends_on(tag), waits_for);
         assert_eq!(setting(tag, "mode").and_then(Value::as_str), Some("tag"));
         assert!(
             tag.get("image")
@@ -344,16 +347,16 @@ fn each_deploy_is_tagged_once_it_has_succeeded() {
 
 /// Woodpecker takes a GitHub deployment whose ref is a bare commit as a
 /// deployment of main, so `branch: main` alone would let one ship a commit
-/// main never had. Production refuses any commit main does not contain,
-/// before its deploy — and so its `migrate` — runs.
+/// main never had. Production refuses to promote any commit main does not
+/// contain, before it is tagged.
 #[test]
-fn production_deploys_only_commits_main_contains() {
+fn production_promotes_only_commits_main_contains() {
     let pipeline = pipeline();
     assert_eq!(
         pipeline.workflows_of("verify-commit-on-main"),
-        ["deploy-prod"]
+        ["promote-prod"]
     );
-    let check = commands_text(pipeline.step_in("deploy-prod", "verify-commit-on-main"));
+    let check = commands_text(pipeline.step_in("promote-prod", "verify-commit-on-main"));
     assert!(
         check.contains("/compare/$$CI_COMMIT_SHA...main")
             && check.contains(r#"grep -q '"behind_by": *0,'"#)
@@ -365,9 +368,8 @@ fn production_deploys_only_commits_main_contains() {
         "the token travels in a curl config file, never in a URL"
     );
     assert!(
-        depends_on(pipeline.step_in("deploy-prod", "deploy-prod"))
-            .contains(&"verify-commit-on-main"),
-        "the production deploy must wait for the on-main check"
+        depends_on(pipeline.step_in("promote-prod", "tag")).contains(&"verify-commit-on-main"),
+        "the production promotion must wait for the on-main check"
     );
 }
 
@@ -380,7 +382,7 @@ fn production_deploys_only_commits_main_contains() {
 fn deployments_pull_the_release_from_ghcr() {
     let pipeline = pipeline();
     for (workflow, name, step) in pipeline.steps() {
-        if !workflow.starts_with("deploy-") {
+        if !workflow.starts_with("deploy-") && !workflow.starts_with("promote-") {
             continue;
         }
         let text = serde_yaml::to_string(step).expect("step serialises");
@@ -409,10 +411,8 @@ fn deployments_pull_the_release_from_ghcr() {
 #[test]
 fn each_deploy_selects_its_own_environments_blueprint() {
     let pipeline = pipeline();
-    for (deploy, blueprint, other) in [
-        ("deploy-dev", "development", "production"),
-        ("deploy-prod", "production", "development"),
-    ] {
+    {
+        let (deploy, blueprint, other) = ("deploy-dev", "development", "production");
         let command = commands_text(step(&pipeline, deploy));
         assert!(
             command.contains(&format!("SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT={blueprint}")),
@@ -443,10 +443,8 @@ fn each_deploy_selects_its_own_environments_blueprint() {
 #[test]
 fn each_deploy_runs_migrate_before_it_replaces_the_server() {
     let pipeline = pipeline();
-    for (deploy, project) in [
-        ("deploy-dev", "sovereign-config-dev"),
-        ("deploy-prod", "sovereign-config-prod"),
-    ] {
+    {
+        let (deploy, project) = ("deploy-dev", "sovereign-config-dev");
         let command = commands_text(step(&pipeline, deploy));
         let lines: Vec<&str> = command.lines().map(str::trim).collect();
         let position = |needle: &str| {
@@ -486,7 +484,8 @@ fn each_deploy_runs_migrate_before_it_replaces_the_server() {
 #[test]
 fn each_deploy_hands_compose_every_credential_as_a_variable() {
     let pipeline = pipeline();
-    for (deploy, environment_name) in [("deploy-dev", "dev"), ("deploy-prod", "prod")] {
+    {
+        let (deploy, environment_name) = ("deploy-dev", "dev");
         let deploy_step = step(&pipeline, deploy);
         let command = commands_text(deploy_step);
         let environment = deploy_step.get("environment").expect("environment");
@@ -555,19 +554,65 @@ fn development_deploy_targets_the_development_environment() {
     assert!(!command.contains("sovereign-config-production"));
 }
 
+/// Production is deployed by mini-config (its card #614), never from here: the
+/// promotion holds no Docker socket, runs no Compose, names no stack, and holds
+/// none of production's credentials, so there is never a second deployer and
+/// production never depends on Woodpecker or the broker to come back.
 #[test]
-fn production_deploy_targets_the_production_environment() {
+fn production_is_promoted_never_deployed_from_here() {
     let pipeline = pipeline();
-    let command = commands_text(step(&pipeline, "deploy-prod"));
-    assert!(command.contains("SOVEREIGN_CONFIG_ENV=prod"));
-    assert!(command.contains("SOVEREIGN_CONFIG_HOST=sovereign-config.desync.link"));
-    assert!(command.contains("\"$$COMPOSE\" -p sovereign-config-prod"));
-    // It deploys the resolved, already-built tag and pulls it rather than
-    // relying on a locally built image (there is no build on the deploy path).
-    assert!(command.contains("SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag)"));
-    assert!(command.contains("--pull always"));
-    // A production deploy must never touch the development stack.
-    assert!(!command.contains("sovereign-config-dev"));
+    let mut checked = 0;
+    for (workflow, name, step) in pipeline.steps() {
+        if workflow != "promote-prod" {
+            continue;
+        }
+        assert!(
+            step.get("volumes").is_none(),
+            "{name} in promote-prod mounts nothing"
+        );
+        // The parsed step, so comments describing the deployment do not count.
+        let text = serde_yaml::to_string(step).expect("step serialises");
+        for forbidden in [
+            "compose",
+            "docker.sock",
+            "sovereign-config-prod",
+            "sovereign-config-production",
+            "sovereign_config_prod_",
+            "authentik_api_token",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{name} in promote-prod must not deploy ({forbidden})"
+            );
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 3, "a promote-prod step was added or removed");
+    // Every test here reads only the workflows it knows, and Woodpecker runs
+    // every file in `.woodpecker/`: a `deploy-prod.yml` brought back by a
+    // revert or a bad merge would deploy production beside the promotion.
+    let mut files: Vec<String> = std::fs::read_dir(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.woodpecker"),
+    )
+    .expect(".woodpecker/ is readable")
+    .map(|entry| {
+        entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .into_owned()
+    })
+    .collect();
+    files.sort();
+    let mut expected: Vec<String> = support::WORKFLOWS
+        .iter()
+        .map(|workflow| format!("{workflow}.yml"))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        files, expected,
+        "every .woodpecker/ file is a known workflow, so no unseen one deploys production"
+    );
 }
 
 /// Nothing gates on the client-telemetry ingest. The health-gated `up
@@ -577,7 +622,8 @@ fn production_deploy_targets_the_production_environment() {
 #[test]
 fn no_deploy_gates_on_the_client_telemetry_ingest() {
     let pipeline = pipeline();
-    for deploy in ["deploy-dev", "deploy-prod"] {
+    {
+        let deploy = "deploy-dev";
         let command = commands_text(step(&pipeline, deploy));
         let lines: Vec<&str> = command.lines().map(str::trim).collect();
         let gated: Vec<&&str> = lines
@@ -655,10 +701,7 @@ fn every_step_sits_in_its_workflow() {
                 "tag",
             ],
         ),
-        (
-            "deploy-prod",
-            &["verify-commit-on-main", "resolve", "deploy-prod", "tag"],
-        ),
+        ("promote-prod", &["verify-commit-on-main", "resolve", "tag"]),
     ];
     let actual: Vec<(&str, String)> = pipeline
         .steps()
@@ -693,15 +736,16 @@ fn dev_workflow_is_gated_as_a_whole() {
     }
 }
 
-/// Both deploy workflows choose their build the same way. Workflows cannot
-/// share a step, so it is defined in both and identical but for its `when`.
+/// The dev deploy and the prod promotion choose their build the same way.
+/// Workflows cannot share a step, so it is defined in both and identical but
+/// for its `when`.
 #[test]
 fn deploy_workflows_share_their_promotion_steps() {
     let pipeline = pipeline();
     {
         let name = "resolve";
-        assert_eq!(pipeline.workflows_of(name), ["deploy-dev", "deploy-prod"]);
-        let copies: Vec<_> = ["deploy-dev", "deploy-prod"]
+        assert_eq!(pipeline.workflows_of(name), ["deploy-dev", "promote-prod"]);
+        let copies: Vec<_> = ["deploy-dev", "promote-prod"]
             .iter()
             .map(|workflow| {
                 let mut copy = pipeline
@@ -720,16 +764,19 @@ fn deploy_workflows_share_their_promotion_steps() {
     }
 }
 
-/// The prod workflow is itself restricted to a prod deployment from main. It
+/// The prod promotion is itself restricted to a prod deployment from main. It
 /// depends on no other workflow, because nothing else runs on a deployment.
 #[test]
 fn prod_workflow_is_gated_as_a_whole() {
     let pipeline = pipeline();
     assert!(
-        pipeline.workflow("deploy-prod").get("depends_on").is_none(),
-        "deploy-prod must not wait for a workflow that never runs on a deployment"
+        pipeline
+            .workflow("promote-prod")
+            .get("depends_on")
+            .is_none(),
+        "promote-prod must not wait for a workflow that never runs on a deployment"
     );
-    let conditions = when_conditions(pipeline.workflow("deploy-prod"));
+    let conditions = when_conditions(pipeline.workflow("promote-prod"));
     assert!(!conditions.is_empty());
     for condition in conditions {
         assert_eq!(condition.events, deployment_event());

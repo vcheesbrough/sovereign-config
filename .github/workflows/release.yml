@@ -1,6 +1,6 @@
 # Release workflow: gives each deployed version a GitHub Release that links its
-# images (card #550). A version's git tag is written by its first deploy — the
-# Woodpecker deploys' `tag` step — and that tag push runs this workflow, which
+# images (card #550). A version's git tag is written by its first dev deploy or
+# prod promotion — the Woodpecker `tag` step — and that tag push runs this workflow, which
 # creates the Release: the three GHCR images at that version, each with its
 # digest and package page. A tag whose commit main does not contain (a branch
 # deployed to dev) becomes a pre-release, never "latest".

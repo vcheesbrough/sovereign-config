@@ -62,7 +62,17 @@ Run the **`ci-watch`** skill (baseline §4) with `OWNER=vcheesbrough`,
   `scripts/ci-publish-images.sh`, and **no GitHub workflow runs a Woodpecker
   plugin** (#550). `Cargo.toml` supplies `major.minor`, and each build claims the next patch
   (keep patch `0`). The
-  first deploy of a build writes its git tag, so a tag means "deployed".
+  first deploy of a build to dev, or its promotion to prod, writes its git
+  tag, so a tag means "deployed to dev or promoted to prod".
+  **Deviation from release-flow (mini-config #614):** production is deployed
+  by mini-config, not from here. Its `sovereign-config-stack` pins the
+  release's server image by tag and digest, keeps production's credentials in
+  its SOPS file, and runs `migrate` then the server, so production comes back
+  from cold without Woodpecker, the broker or Sovereign Config itself.
+  `promote-prod` (Woodpecker Deploy → `prod`, from main) resolves the build
+  and tags it, and deploys nothing. A release reaches production when
+  mini-config's pin is bumped to that tag and deployed there, so a tag never
+  proves production runs it: read production's version from production.
   `release.yml` then gives the tag a GitHub Release that lists its images. A
   card's **Version** records the `major.minor`.
 - **An iteration is the release line it ships in** (baseline §2): *Iteration
@@ -81,7 +91,10 @@ Run the **`ci-watch`** skill (baseline §4) with `OWNER=vcheesbrough`,
   one dev environment runs whichever branch was deployed last, so trigger a
   dev deployment only when the user asks for one.
 - **Deploy a main commit to dev before promoting it to prod.** This is an
-  operator rule; the pipeline does not enforce it. A published build means
+  operator rule; the pipeline does not enforce it. A release then goes: dev
+  deploy, `promote-prod`, then a pin bump in mini-config's
+  `sovereign-config-stack/docker-compose.yml` (tag and digest, with that
+  file kept in step with this release's `compose.yaml`), deployed there. A published build means
   only that checks passed, so only a dev deploy proves a release against the
   long-lived database and live Authentik (`docs/project-deployment.md`).
 - **Deployment smoke check** (post-pipeline, not part of `ci-watch`): for a
