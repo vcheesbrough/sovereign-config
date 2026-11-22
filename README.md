@@ -425,7 +425,7 @@ Metrics are pushed rather than scraped, and there is no `/metrics` endpoint. A c
 
 ## Upgrading
 
-Stop the server, back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new release, run `migrate` and wait for it to exit 0, then start the server ([Upgrading](docs/upgrading.md#procedure)). Migrations are forward-only, so a downgrade to a release before 3.62 means restoring the backup.
+Stop the server, back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new release, run `migrate` and wait for it to exit 0, then start the server ([Upgrading](docs/upgrading.md#procedure)). Migrations are forward-only, so a downgrade to a release before 3.1 means restoring the backup.
 
 > [!IMPORTANT]
 > Some releases need clients upgraded in a particular order. Read [Upgrading](docs/upgrading.md) for the procedure and the releases that need action.
