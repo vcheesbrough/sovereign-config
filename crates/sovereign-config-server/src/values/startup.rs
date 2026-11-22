@@ -1,15 +1,16 @@
 use anyhow::Context as _;
 use sqlx::PgPool;
-use tracing::{error, info, instrument};
+use tracing::{error, info};
 
 use super::SECRET;
-use super::store::{lock_encryption_pass, reseal_secret, stored_secrets};
+use super::store::{StoredSecretRow, lock_encryption_pass, reseal_secret, stored_secrets};
 use crate::encryption::{ValueCipher, is_envelope};
 
-/// Brings every stored secret up to the current encrypted representation.
+/// Brings every stored secret up to the current encrypted representation:
+/// `migrate`'s stored-data step (`crate::migrate`).
 ///
-/// Runs at startup, after migrations, because encrypting is something only the
-/// server can do — a SQL migration has no access to the key. Rows already
+/// Runs after the schema step, because encrypting is something only this
+/// binary can do — a SQL migration has no access to the key. Rows already
 /// sealed are verified and left alone, so a second run changes nothing; rows
 /// still in plaintext, written before this server encrypted anything, are
 /// sealed in place. Running on every start rather than once behind a marker
@@ -26,16 +27,12 @@ use crate::encryption::{ValueCipher, is_envelope};
 /// every `plain` value too, none of which needs a key at all. Those rows are
 /// logged and left exactly as found, and [`ConfigurationService::reveal_secret`]
 /// still fails closed for their paths.
-#[instrument(
-    name = "sovereign_config.startup.encrypt_stored_secrets",
-    parent = None,
-    skip_all,
-    fields(otel.kind = "internal")
-)]
+///
+/// Returns how many rows it sealed. The step's span is `migrate`'s.
 pub(crate) async fn encrypt_stored_secrets(
     database: &PgPool,
     cipher: &ValueCipher,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let mut transaction = database
         .begin()
         .await
@@ -43,12 +40,14 @@ pub(crate) async fn encrypt_stored_secrets(
     // Replicas start concurrently, and two of them rewriting the same row would
     // race. The lock is held for the transaction, so it is released either way.
     //
-    // It excludes other encryption passes, not live traffic: this assumes no
-    // other instance is already serving. The deployment runs one container, so
-    // the pass completes before anything can write. Anyone adding a replica or
-    // a rolling deploy must revisit this — a `put_value` landing between the
-    // SELECT below and its UPDATE would be overwritten by the sealed older
-    // value. Locking the rows (`FOR UPDATE`) is the fix at that point.
+    // It excludes other encryption passes, not live traffic, and from #615
+    // the pass runs while the previous release still serves. That is safe
+    // only because a serving release never writes plaintext: every release
+    // since encryption seals on write, so the rows this pass rewrites are
+    // ones no live writer produces. A `put_value` landing between the SELECT
+    // below and its UPDATE on such a row would be overwritten by the sealed
+    // older value; were plaintext writers ever to serve again, locking the
+    // rows (`FOR UPDATE`) is the fix.
     lock_encryption_pass(&mut transaction)
         .await
         .context("unable to lock configuration secrets for encryption")?;
@@ -58,21 +57,8 @@ pub(crate) async fn encrypt_stored_secrets(
         .context("unable to read configuration secrets for encryption")?;
 
     let mut encrypted = 0usize;
-    let mut sealed_on_entry = 0usize;
-    let mut unreadable = Vec::new();
-    for row in stored {
-        if is_envelope(&row.value) {
-            sealed_on_entry += 1;
-            if let Err(error) = cipher.decrypt(row.id, SECRET, &row.value) {
-                error!(
-                    content_id = row.id,
-                    reason = %error,
-                    "stored configuration secret is unreadable"
-                );
-                unreadable.push(row.id);
-            }
-            continue;
-        }
+    let survey = survey(&stored, cipher);
+    for row in stored.iter().filter(|row| !is_envelope(&row.value)) {
         let sealed = cipher
             .encrypt(row.id, SECRET, &row.value)
             .map_err(|error| anyhow::anyhow!("configuration secret {}: {error}", row.id))?;
@@ -85,14 +71,10 @@ pub(crate) async fn encrypt_stored_secrets(
         encrypted += 1;
     }
 
-    if wrong_key(unreadable.len(), sealed_on_entry) {
-        // Nothing is committed: the rows encrypted above roll back with the
-        // transaction, so a mistaken key cannot half-convert the database.
-        anyhow::bail!(
-            "every stored configuration secret is unreadable ({sealed_on_entry} rows); \
-             the configured value encryption key does not match this database"
-        );
-    }
+    // Nothing is committed on failure: the rows encrypted above roll back
+    // with the transaction, so a mistaken key cannot half-convert the
+    // database.
+    survey.refuse_wrong_key()?;
 
     transaction
         .commit()
@@ -101,15 +83,107 @@ pub(crate) async fn encrypt_stored_secrets(
     if encrypted > 0 {
         info!(count = encrypted, "encrypted stored configuration secrets");
     }
-    if !unreadable.is_empty() {
-        error!(
-            count = unreadable.len(),
-            content_ids = ?unreadable,
-            "some stored configuration secrets are unreadable and will fail when revealed; \
-             every other value is unaffected"
-        );
+    survey.report_unreadable();
+    Ok(encrypted)
+}
+
+/// The server's half of the stored-data step: it checks, and changes nothing.
+///
+/// The server never serves under the wrong key (#615 keeps the rule the pass
+/// above applies), and never with a secret still in plaintext, which would
+/// mean `migrate` has not run for this release. Damaged rows among healthy
+/// ones are reported and tolerated, exactly as the pass tolerates them.
+///
+/// # Errors
+///
+/// The rows cannot be read, a secret is still in plaintext, or the key opens
+/// none of them.
+pub(crate) async fn verify_stored_secrets(
+    database: &PgPool,
+    cipher: &ValueCipher,
+) -> anyhow::Result<()> {
+    // A transaction only because the store's reads take one; nothing is
+    // written, and it is rolled back on drop.
+    let mut transaction = database
+        .begin()
+        .await
+        .context("unable to read configuration secrets")?;
+    let stored = stored_secrets(&mut transaction)
+        .await
+        .context("unable to read configuration secrets")?;
+    drop(transaction);
+    let survey = survey(&stored, cipher);
+    if survey.plaintext > 0 {
+        return Err(crate::spans::classified(
+            "unsealed_secrets",
+            format!(
+                "{} stored configuration secrets are not encrypted yet; \
+                 run `sovereign-config-server migrate` before starting the server",
+                survey.plaintext
+            ),
+        ));
     }
+    survey.refuse_wrong_key()?;
+    survey.report_unreadable();
     Ok(())
+}
+
+/// What the stored secrets look like under `cipher`.
+struct Survey {
+    plaintext: usize,
+    sealed: usize,
+    unreadable: Vec<i64>,
+}
+
+fn survey(stored: &[StoredSecretRow], cipher: &ValueCipher) -> Survey {
+    let mut survey = Survey {
+        plaintext: 0,
+        sealed: 0,
+        unreadable: Vec::new(),
+    };
+    for row in stored {
+        if !is_envelope(&row.value) {
+            survey.plaintext += 1;
+            continue;
+        }
+        survey.sealed += 1;
+        if let Err(error) = cipher.decrypt(row.id, SECRET, &row.value) {
+            error!(
+                content_id = row.id,
+                reason = %error,
+                "stored configuration secret is unreadable"
+            );
+            survey.unreadable.push(row.id);
+        }
+    }
+    survey
+}
+
+impl Survey {
+    fn refuse_wrong_key(&self) -> anyhow::Result<()> {
+        if wrong_key(self.unreadable.len(), self.sealed) {
+            return Err(crate::spans::classified(
+                "wrong_key",
+                format!(
+                    "every stored configuration secret is unreadable ({} rows); \
+                     the configured value encryption key does not match this database",
+                    self.sealed
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn report_unreadable(&self) {
+        if !self.unreadable.is_empty() {
+            error!(
+                count = self.unreadable.len(),
+                content_ids = ?self.unreadable,
+                "some stored configuration secrets are unreadable and will fail when revealed; \
+                 every other value is unaffected"
+            );
+        }
+    }
 }
 
 /// Decides whether unreadable secrets mean the key is wrong or the rows are.

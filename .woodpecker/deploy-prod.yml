@@ -3,8 +3,12 @@
 # to GHCR — triggered by Woodpecker's Deploy feature, a `deployment` event
 # targeting prod, only from main. Nothing here builds, publishes or allocates
 # a version: resolve chooses the build and proves its images are published,
-# deploy-prod deploys it, and tag records it. Deploy a main commit to dev
-# before promoting it here (AGENTS.md; the pipeline does not enforce it).
+# deploy-prod deploys it (its `migrate` step changes everything outside the
+# image, the Authentik blueprint included), and tag records it. The live
+# manager tests that gate a promotion ran on the dev deploy of the same
+# commit (#615), whose blueprint differs from prod's only in names. Deploy a
+# main commit to dev before promoting it here (AGENTS.md; the pipeline does
+# not enforce it).
 # See anchor.yml for why a push still runs a Woodpecker pipeline.
 
 when:
@@ -13,34 +17,6 @@ when:
     evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
 
 steps:
-  # A cheap, dependency-free curl gate: live Authentik must be new enough and
-  # expose every API surface managed connections need, before this workflow
-  # applies its blueprint. It needs no build artifact, so it depends on nothing.
-  validate-authentik-version:
-    depends_on: []
-    when:
-      - event: deployment
-        branch: main
-        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
-    image: docker.io/curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
-    environment:
-      AUTHENTIK_API_TOKEN:
-        from_secret: authentik_api_token
-    commands:
-      - |
-        umask 077
-        printf 'header = "Authorization: Bearer %s"\n' "$$AUTHENTIK_API_TOKEN" > /tmp/authentik-curl.conf
-        VERSION=$$(curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/admin/version/ | sed -n 's/.*"version_current":"\([^"]*\)".*/\1/p')
-        test -n "$$VERSION"
-        awk -v version="$$VERSION" 'BEGIN { split(version, part, "."); if (part[1] > 2026 || (part[1] == 2026 && part[2] > 5) || (part[1] == 2026 && part[2] == 5 && part[3] >= 2)) exit 0; exit 1 }'
-        curl --fail --silent --show-error --config /tmp/authentik-curl.conf https://auth.desync.link/api/v3/schema/ > /tmp/authentik-schema.json
-        grep -q 'grant_types' /tmp/authentik-schema.json
-        # Surfaces required by managed application connections.
-        grep -q '/core/users/service_account/' /tmp/authentik-schema.json
-        grep -q '/core/tokens/{identifier}/set_key/' /tmp/authentik-schema.json
-        grep -q 'initial_permissions' /tmp/authentik-schema.json
-        echo "Validated compatible Authentik $$VERSION"
-
   # Woodpecker takes a GitHub deployment whose ref is a bare commit as a
   # deployment of main (its GitHub forge sets the branch to the default
   # branch), so `branch: main` alone would let one ship a commit main never
@@ -72,7 +48,7 @@ steps:
   # .github/workflows/build.yml published (release-flow). It refuses a target
   # or branch outside the plugin's policy — dev from any branch, prod from
   # main — and checks each image's version and revision labels in GHCR, so a
-  # commit with no green build fails here, before anything touches Authentik.
+  # commit with no green build fails here, before anything is deployed.
   # All three images must be published: a server without its matching broker
   # would leave CI resolving secrets against a stale extension, and a version
   # without its CLI image is not a whole release for the pipelines that pin it.
@@ -94,80 +70,24 @@ steps:
       github_token:
         from_secret: github_token
 
-  # Waits for resolve as well, so a commit with no published build — its
-  # checks failed or have not finished — fails before anything touches
-  # Authentik, and its blueprint and live tests never run.
-  apply-authentik-blueprint-prod:
-    depends_on:
-      - validate-authentik-version
-      - resolve
-      - verify-commit-on-main
-    # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
-    # the `prod` environment, only from main.
-    when:
-      - event: deployment
-        branch: main
-        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
-    pull: true
-    image: ghcr.io/vcheesbrough/woodpecker-plugin-authentik-blueprint:v0.2.0@sha256:9f262c4390205b5629e9af7560f4e492f0155395a429153703ba351206d9d975
-    settings:
-      api_url: https://auth.desync.link
-      api_token:
-        from_secret: authentik_api_token
-      file: authentik/blueprint.yaml
-      instance_name: sovereign-config
-      timeout_seconds: 900
-      vars:
-        AUTHENTIK_SOVEREIGN_CONFIG_MANAGER_API_TOKEN:
-          from_secret: sovereign_config_prod_manager_api_token
-        SOVEREIGN_CONFIG_BROWSER_REDIRECT_URI: https://sovereign-config.desync.link/auth/callback
-        AUTHENTIK_BRAND_DOMAIN: auth.desync.link
-
-  # Mirrors validate-authentik-manager-live for production: exercises the
-  # connection manager against the real Authentik RBAC surface after the
-  # production blueprint applies, gating the deployment so a broken permission
-  # model cannot reach the running production service.
-  validate-authentik-manager-live-prod:
-    depends_on:
-      - apply-authentik-blueprint-prod
-    # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
-    # the `prod` environment, only from main.
-    when:
-      - event: deployment
-        branch: main
-        evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "prod"'
-    image: docker.io/library/rust@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
-    environment:
-      CARGO_TARGET_DIR: /woodpecker/cache/sovereign-config-target
-      # Every CI run is a fresh checkout, so incremental state is written and
-      # never usefully read — it was 43 GB of the shared target volume
-      # (bored card #326). Off, it is also marginally faster for clean builds.
-      CARGO_INCREMENTAL: "0"
-      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_URL: https://auth.desync.link/
-      SOVEREIGN_CONFIG_LIVE_MANAGED_GROUP: sovereign-config-connections
-      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_TOKEN:
-        from_secret: sovereign_config_prod_manager_api_token
-      # Elevated credential used only to create and clean up a disposable canary
-      # object for the "manager cannot touch objects it didn't create" test;
-      # never used to act as the manager under test.
-      SOVEREIGN_CONFIG_LIVE_AUTHENTIK_ADMIN_TOKEN:
-        from_secret: authentik_api_token
-    volumes:
-      - sovereign-config-cargo-registry:/usr/local/cargo/registry
-      - sovereign-config-cargo-git:/usr/local/cargo/git
-      - sovereign-config-contract-target:/woodpecker/cache/sovereign-config-target
-    commands:
-      # Cargo never reaps artifacts from commits it no longer builds; this
-      # enforces the 20 GiB ceiling on the shared volume (bored card #326).
-      - scripts/ci-prune-cargo-target.sh
-      - cargo test --package sovereign-config-authentik live_ -- --ignored --test-threads=1
-
+  # Deploys the build in two phases, so the running server keeps serving
+  # unless the new release's state is in place (#615; docs/project-deployment.md,
+  # *Migrations*). First `migrate` runs alone: the schema, the identity claim,
+  # the stored secrets and the Authentik blueprint, from the image being
+  # deployed. Only once it has exited 0 is the server replaced. A plain
+  # `up` would replace the server first and leave none running if `migrate`
+  # failed, and `up --wait migrate` does not wait for a one-shot service to
+  # finish, hence `docker wait`.
+  #
+  # Every credential reaches its container as a file (compose.yaml,
+  # `secrets:`), never as a variable an exited container keeps in `docker
+  # inspect`. They are written to a Docker volume of their own, which Compose
+  # mounts from the host one file per container; only `migrate` is given the
+  # Authentik admin token.
   deploy-prod:
     depends_on:
-      - validate-authentik-manager-live-prod
       - resolve
-    # Promote with Woodpecker's Deploy feature: a `deployment` event targeting
-    # the `prod` environment, only from main.
+      - verify-commit-on-main
     when:
       - event: deployment
         branch: main
@@ -175,14 +95,16 @@ steps:
     image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - sovereign-config-production-secrets:/run/deploy-secrets
     environment:
       POSTGRES_PASSWORD:
         from_secret: sovereign_config_prod_postgres_password
-      OIDC_ISSUER: https://auth.desync.link/application/o/sovereign-config/
       MANAGER_API_TOKEN:
         from_secret: sovereign_config_prod_manager_api_token
       VALUE_ENCRYPTION_KEY:
         from_secret: sovereign_config_prod_value_encryption_key
+      AUTHENTIK_ADMIN_TOKEN:
+        from_secret: authentik_api_token
     commands:
       - |
         # Telemetry (docs/project-deployment.md): non-secret, so kept here with the
@@ -202,10 +124,50 @@ steps:
         export OTEL_TRACES_EXPORTER=otlp
         export OTEL_METRICS_EXPORTER=otlp
         printf 'telemetry: %s\n' "$$OTEL_RESOURCE_ATTRIBUTES"
+        # The credentials, as files: written beside and renamed into place,
+        # so a running container keeps the file it started with. The server
+        # and `migrate` run as 10001; the Postgres entrypoint reads its file
+        # as root, before it drops to `postgres`.
+        umask 077
+        secret() {
+          printf '%s' "$$3" > "/run/deploy-secrets/.$$1"
+          chown "$$2" "/run/deploy-secrets/.$$1"
+          chmod 0400 "/run/deploy-secrets/.$$1"
+          mv -f "/run/deploy-secrets/.$$1" "/run/deploy-secrets/$$1"
+        }
         ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
-        # Exported rather than prefixed, because two Compose runs read them.
-        export SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=prod SOVEREIGN_CONFIG_HOST=sovereign-config.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-production POSTGRES_DATA_VOLUME=sovereign-config-production-db POSTGRES_PASSWORD_FILE= SOVEREIGN_CONFIG_DATABASE_URL_FILE= SOVEREIGN_CONFIG_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config SOVEREIGN_CONFIG_PUBLIC_ORIGIN=https://sovereign-config.desync.link SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT=https://sovereign-config.desync.link SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE=sovereign_config_prod_grants SOVEREIGN_CONFIG_MANAGER_GROUP=sovereign-config-connections SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE= SOVEREIGN_CONFIG_MANAGER_API_TOKEN="$$MANAGER_API_TOKEN" SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY_FILE= SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY="$$VALUE_ENCRYPTION_KEY"
-        "$$COMPOSE" -p sovereign-config-prod up -d --pull always --wait --wait-timeout 90 || {
+        secret postgres_password 0:0 "$$POSTGRES_PASSWORD"
+        secret database_url 10001:10001 "postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config"
+        secret manager_api_token 10001:10001 "$$MANAGER_API_TOKEN"
+        secret value_encryption_key 10001:10001 "$$VALUE_ENCRYPTION_KEY"
+        secret authentik_admin_token 10001:10001 "$$AUTHENTIK_ADMIN_TOKEN"
+        # Emptied however this step ends, as well as straight after `migrate`.
+        trap ': > /run/deploy-secrets/authentik_admin_token' EXIT
+        unset POSTGRES_PASSWORD ENCODED_PASSWORD MANAGER_API_TOKEN VALUE_ENCRYPTION_KEY AUTHENTIK_ADMIN_TOKEN
+        # Compose mounts them from the host, so it is given the volume's host path.
+        SECRETS=$$(docker volume inspect --format '{{ .Mountpoint }}' sovereign-config-production-secrets)
+        # Exported rather than prefixed, because several Compose runs read them.
+        export POSTGRES_PASSWORD_SECRET_FILE="$$SECRETS/postgres_password" DATABASE_URL_FILE="$$SECRETS/database_url" MANAGER_API_TOKEN_FILE="$$SECRETS/manager_api_token" VALUE_ENCRYPTION_KEY_FILE="$$SECRETS/value_encryption_key" AUTHENTIK_ADMIN_TOKEN_FILE="$$SECRETS/authentik_admin_token"
+        export SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=prod SOVEREIGN_CONFIG_HOST=sovereign-config.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-production POSTGRES_DATA_VOLUME=sovereign-config-production-db SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config SOVEREIGN_CONFIG_PUBLIC_ORIGIN=https://sovereign-config.desync.link SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT=https://sovereign-config.desync.link SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE=sovereign_config_prod_grants SOVEREIGN_CONFIG_MANAGER_GROUP=sovereign-config-connections SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT=production
+        # Phase 1: `migrate`, while the running server goes on serving.
+        "$$COMPOSE" -p sovereign-config-prod up -d --pull always migrate || {
+          "$$COMPOSE" -p sovereign-config-prod logs --tail 200
+          exit 1
+        }
+        MIGRATE_EXIT=$$(docker wait "$$("$$COMPOSE" -p sovereign-config-prod ps -aq migrate)")
+        "$$COMPOSE" -p sovereign-config-prod logs --no-log-prefix migrate
+        # Only `migrate` reads the Authentik admin token, and it has exited:
+        # the file is emptied rather than left on the host until the next
+        # deploy writes it again.
+        : > /run/deploy-secrets/authentik_admin_token
+        if [ "$$MIGRATE_EXIT" != 0 ]; then
+          echo "ERROR: migrate exited $$MIGRATE_EXIT; the running server was left in place" >&2
+          exit 1
+        fi
+        # Phase 2: the server, which verifies what `migrate` applied. Always
+        # recreated: Compose does not notice a credential file that changed,
+        # and `migrate` has already given Authentik any new manager key.
+        "$$COMPOSE" -p sovereign-config-prod up -d --no-deps --force-recreate --wait --wait-timeout 90 sovereign-config || {
           "$$COMPOSE" -p sovereign-config-prod logs --tail 200
           exit 1
         }

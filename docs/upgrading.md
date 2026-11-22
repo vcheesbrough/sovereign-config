@@ -17,10 +17,12 @@ Run these where you run `docker compose` for the deployment, with its environmen
 
    ```sh
    export SOVEREIGN_CONFIG_IMAGE_TAG=<version>
-   docker compose up -d --pull always --wait
+   docker compose up -d --pull always migrate
+   docker wait "$(docker compose ps -aq migrate)"   # 0 once migrate has finished
+   docker compose up -d --no-deps --wait sovereign-config
    ```
 
-   The server migrates the database before it reports healthy. `--wait` returns once it does, or fails. With `OTEL_RESOURCE_ATTRIBUTES` set, run the Compose plugin binary instead of `docker compose` (see [Observability](../README.md#observability)).
+   From 3.62, `migrate` brings the database and Authentik up to the release, and the server only checks that it has ([Project deployment](project-deployment.md#migrations)). Start the server only once `docker wait` has printed `0`: a plain `up` replaces the server before `migrate` finishes. Before 3.62, `docker compose up -d --pull always --wait` did both, because the server migrated at startup. With `OTEL_RESOURCE_ATTRIBUTES` set, run the Compose plugin binary instead of `docker compose` (see [Observability](../README.md#observability)).
 4. Check the running version: `curl -s https://<host>/dist/manifest.json` lists installers named for it.
 
 **Rolling back.** Migrations are forward-only, so an older image cannot run against a migrated database. Restore the backup into a new volume and start the older version there:
@@ -39,6 +41,13 @@ docker compose up -d --wait
 ## Releases that need action
 
 Newest first. A release not listed needs nothing beyond the procedure.
+
+### 3.62: migrations run in `migrate`, and every credential is a file
+
+- **A `migrate` service runs before the server.** It is the same image, run as `sovereign-config-server migrate`: it applies the database migrations, records the identity provider, encrypts any secret still in plaintext, and applies the Authentik blueprint, then exits. The server no longer does any of this. It refuses to start, naming `migrate`, on a database `migrate` has not brought up to its release. Upgrade with the new [procedure](#procedure).
+- **`migrate` applies the blueprint.** Set `SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT` to `production` or `development`, and give it an Authentik API token allowed to manage blueprints as `AUTHENTIK_ADMIN_TOKEN_FILE` ([Applying a blueprint](authentik.md#applying-a-blueprint)). It checks Authentik is 2026.5.2 or newer first. Stop applying the blueprint by other means: the instance it applies is `sovereign-config` (or `sovereign-config-dev`), so a blueprint you imported under another name would be a second instance managing the same objects. Delete that one. To keep applying it yourself, remove the variable from `compose.yaml`.
+- **Credentials reach containers only as files.** `compose.yaml` no longer passes `SOVEREIGN_CONFIG_DATABASE_URL`, `SOVEREIGN_CONFIG_MANAGER_API_TOKEN`, `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY` or `POSTGRES_PASSWORD` through, and no longer lets a `_FILE` path be overridden. Put each in the file its `*_FILE` host variable names ([README](../README.md#3-create-the-secrets)). An exited `migrate` would otherwise keep them in `docker inspect`.
+- **Rolling back to 3.62 or later is a deploy of the older image.** Its `migrate` tolerates migrations it does not know. Rolling back to a release before 3.62 still needs the restore above if a newer migration was applied.
 
 ### 3.0: protocol `v6` over Connect, and the end of `v3`–`v5` announced
 

@@ -12,7 +12,7 @@ This document is what holds whichever identity provider a deployment uses: choos
 
 `SOVEREIGN_CONFIG_IDENTITY_PROVIDER` names the provider the server starts with. Unset or blank means `authentik`, so a deployment that predates the variable needs no change. A name the server does not have fails startup, listing the names it has. The chosen provider then reads and validates its own variables — its chapter lists them — and a missing or invalid one fails startup by name, quoting no value.
 
-**A deployment has one identity provider for life.** The accounts behind access URLs and the subjects in the audit trail are the provider's own identifiers, and mean nothing to another. The first start records the provider's name in the database, and a later start under a different name fails rather than orphan them. Moving a deployment to another provider is a migration of those values, not a setting, and is not supported in place.
+**A deployment has one identity provider for life.** The accounts behind access URLs and the subjects in the audit trail are the provider's own identifiers, and mean nothing to another. The first `migrate` records the provider's name in the database, and a later `migrate` or server start under a different name fails rather than orphan them. Moving a deployment to another provider is a migration of those values, not a setting, and is not supported in place.
 
 What the server takes from the provider, once, at startup:
 

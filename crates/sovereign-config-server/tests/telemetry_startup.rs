@@ -266,11 +266,11 @@ fn ready(metrics_port: u16) -> bool {
     internal_get(metrics_port, "/readyz").is_some_and(|status| status.starts_with("HTTP/1.1 200"))
 }
 
-/// A schema of the test database's own, so this server's migrations and its
-/// startup secret-encryption pass cannot meet another test's rows. `public`
-/// stays on the path after it, where an extension another test already
-/// installed (`pg_trgm`) lives; if none has, the migration installs it into
-/// this schema and the next setup's `CASCADE` removes it again.
+/// A schema of the test database's own, so this server's migrations and
+/// `migrate`'s secret-encryption pass cannot meet another test's rows.
+/// `public` stays on the path after it, holding the extension (`pg_trgm`)
+/// every schema shares; it is installed there first, so no migration puts it
+/// in this schema.
 async fn isolated_database_url() -> String {
     const SCHEMA: &str = "telemetry_startup";
 
@@ -282,6 +282,7 @@ async fn isolated_database_url() -> String {
         .await
         .expect("the test database must accept connections");
     for statement in [
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA public".to_owned(),
         format!("DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"),
         format!("CREATE SCHEMA {SCHEMA}"),
     ] {
@@ -294,12 +295,26 @@ async fn isolated_database_url() -> String {
     format!("{database_url}{separator}options=-c%20search_path%3D{SCHEMA}%2Cpublic")
 }
 
+/// Runs the real binary's `migrate` on `database_url`, as a deploy runs it
+/// before the server, and returns its output.
+fn migrate(database_url: &str) -> Output {
+    let environment = server_environment(database_url, "unused", "unused");
+    Command::new(env!("CARGO_BIN_EXE_sovereign-config-server"))
+        .arg("migrate")
+        .env_clear()
+        .envs(environment.iter().map(|(name, value)| (name, value)))
+        .output()
+        .expect("migrate must start")
+}
+
 /// Starts the real server, waits until it serves, stops it with SIGTERM and
 /// returns its stdout and how long it took to exit.
 fn serve_then_stop(
     database_url: &str,
     telemetry: Vec<(&'static str, String)>,
 ) -> (String, Duration) {
+    let migrated = migrate(database_url);
+    assert!(migrated.status.success(), "migrate: {:?}", text(&migrated));
     let metrics_port = unused_port();
     let mut environment = server_environment(
         database_url,
@@ -347,6 +362,51 @@ fn serve_then_stop(
         text(&output)
     );
     (text(&output).0, elapsed)
+}
+
+/// The server never migrates (#615): on a database `migrate` has not run
+/// on it exits at once, naming `migrate`. `migrate` itself exits 0 once
+/// every step has run, and the server then serves.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn the_server_refuses_an_unmigrated_database_until_migrate_has_run() {
+    let database_url = isolated_database_url().await;
+    let environment = server_environment(
+        &database_url,
+        &format!("127.0.0.1:{}", unused_port()),
+        &format!("127.0.0.1:{}", unused_port()),
+    );
+    let (refused, _) = tokio::task::spawn_blocking(move || run(&environment))
+        .await
+        .unwrap();
+    let (stdout, stderr) = text(&refused);
+    assert!(!refused.status.success(), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("run `sovereign-config-server migrate` before starting the server"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("sovereign-config started"), "{stdout}");
+
+    let migrated = {
+        let database_url = database_url.clone();
+        tokio::task::spawn_blocking(move || migrate(&database_url))
+            .await
+            .unwrap()
+    };
+    let (stdout, stderr) = text(&migrated);
+    assert!(migrated.status.success(), "{stdout}{stderr}");
+    assert_eq!(count(&stdout, "migrations complete"), 1, "{stdout}");
+    // No blueprint is selected here, so the provider is left alone.
+    assert!(
+        stdout.contains("no identity provider setup selected"),
+        "{stdout}"
+    );
+
+    let (stdout, _) =
+        tokio::task::spawn_blocking(move || serve_then_stop(&database_url, Vec::new()))
+            .await
+            .unwrap();
+    assert!(stdout.contains("sovereign-config started"), "{stdout}");
 }
 
 #[tokio::test]

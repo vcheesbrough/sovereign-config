@@ -251,6 +251,40 @@ in the change that closes it.
 | The client ingest's own metrics are scraped from `:8888` (Docker labels), not pushed. | The published image serves Prometheus; its reference deployment scrapes it. | The image pushing its own metrics |
 | No client-logs or ingest-volume panel, and no ingest-volume alert. | The product has not opted into dashboards or alerts (skill §8); the panels #376 names join the product dashboard. | #422 |
 
+## 5. Migrations
+
+The `migrations` skill (baseline §10) is the contract (#615);
+`docs/project-deployment.md`, *Migrations*, is the operator's account.
+
+- **Everything a release changes outside its image runs in
+  `sovereign-config-server migrate`**, a one-shot `migrate` service from the
+  server's image, in this order: `schema` (the embedded SQL migrations,
+  tolerating unknown applied ones), `identity_claim` (the deployment's
+  identity provider), `reseal` (encrypting stored plaintext secrets; a key
+  that opens none aborts), `identity_provider` (with Authentik, the version
+  check and the environment's blueprint, compiled into the image). Each is
+  idempotent and a root span `sovereign_config.migrate.<step>`. A new kind of
+  outside state is a new step here, never a CI step and never server
+  startup.
+- **The server verifies, never applies.** At startup it refuses a pending or
+  diverged migration, an unclaimed deployment, a plaintext secret or the
+  wrong key, naming `migrate`. Do not add a write to server startup.
+- **A migration must work with release N-1.** `migrate` runs while the
+  previous release serves, and leaves it serving if it fails. Expand first;
+  contract (drop, rename, tighten) in a later release. Never edit a migration
+  that has been deployed to dev; add a new one.
+- **Credentials are files, never variables**, for every container:
+  `compose.yaml` mounts `/run/secrets/<name>` from host files the deploy
+  writes to `sovereign-config-<env>-secrets`, because Compose cannot write an
+  `environment:`-sourced secret into a read-only container.
+  `deployment_policy.rs` pins it. Only `migrate` gets the Authentik admin
+  token (`authentik_api_token`); it also gets the database URL, the value
+  encryption key and the manager token. The server keeps the database URL,
+  the key and the manager token.
+- **A deploy runs `migrate` alone, `docker wait`s for it, then replaces the
+  server.** Compose's own `depends_on` would replace the server first.
+  `pipeline_prod_gating.rs` pins the order.
+
 *Kanban workflow and automated test coverage follow the agent-shared baseline
 unchanged — see baseline §1 and §6. Start a card with the **`start-iteration`**
 skill (baseline §2). PR self-review + comment loop: run the **`pr-review-loop`**

@@ -138,7 +138,7 @@ fn manager_client_id(explicit: Option<&str>, audience: &str) -> Result<String> {
 /// reparses the same string: accepting a non-canonical issuer here would only
 /// surface as a failure after Authentik has already been mutated by a create
 /// or rotate.
-fn validate_issuer_url(raw: &str, url: &Url) -> Result<()> {
+pub(crate) fn validate_issuer_url(raw: &str, url: &Url) -> Result<()> {
     if url.scheme() != "https"
         || url.host_str().is_none()
         || !url.username().is_empty()

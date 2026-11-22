@@ -169,6 +169,30 @@ impl Config {
     }
 }
 
+/// What `sovereign-config-server migrate` needs, and no more: it never
+/// serves, so it reads none of the listeners, the verification rules or the
+/// connection manager's settings.
+pub(crate) struct MigrateConfig {
+    pub(crate) database_url: String,
+    /// The identity provider the deployment is claimed for.
+    pub(crate) identity_provider: &'static str,
+    /// What `migrate` configures in the provider itself.
+    pub(crate) external_setup: identity::ExternalSetup,
+    /// Seals the stored secrets still in plaintext.
+    pub(crate) value_cipher: ValueCipher,
+}
+
+impl MigrateConfig {
+    pub(crate) fn from_env() -> Result<Self> {
+        Ok(Self {
+            database_url: required_secret("SOVEREIGN_CONFIG_DATABASE_URL")?,
+            identity_provider: identity::selected_name(&ProcessEnvironment)?,
+            external_setup: identity::ExternalSetup::from_variables(&ProcessEnvironment)?,
+            value_cipher: value_cipher_from_env()?,
+        })
+    }
+}
+
 /// Builds the value cipher from the operator-supplied encryption key.
 ///
 /// The key is required unconditionally, exactly like the database URL and the

@@ -13,6 +13,8 @@
 //!   those calls, and Authentik's integer primary keys as opaque
 //!   [`sovereign_config_identity::AccountId`]s.
 //! - `password` — the replacement app passwords it generates.
+//! - `setup` — [`Setup`]: `migrate`'s Authentik step, which checks the
+//!   running Authentik and applies the environment's blueprint.
 //!
 //! - `tests/blueprints.rs` holds the setup files (`authentik/blueprint*.yaml`)
 //!   to the realm contract's terms.
@@ -27,7 +29,9 @@ mod config;
 mod password;
 mod provider;
 mod settings;
+mod setup;
 
 pub use config::AuthentikConfig;
 pub use provider::AuthentikProvider;
 pub use settings::{NAME, from_variables, verification_rules};
+pub use setup::Setup;

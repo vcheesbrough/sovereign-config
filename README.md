@@ -152,7 +152,7 @@ Every component is released together from one source tag under one version.
 
 The server takes its identity provider from `SOVEREIGN_CONFIG_IDENTITY_PROVIDER`, which defaults to `authentik`, the one provider it is built with. Each provider has a chapter that says how to set it up and which variables it reads; Authentik's is [Authentik](docs/authentik.md).
 
-Apply the matching Authentik blueprint (`authentik/blueprint.yaml` for production, `authentik/blueprint-dev.yaml` for development) to your Authentik instance, substituting its `${VARIABLE}` placeholders first. It creates the OIDC provider, the grant scope mapping, the admins group (the operator group), the connections group, and the restricted connection-manager service account and its API token, and binds the application to the admins and connections groups, so only their members can sign in. [Authentik](docs/authentik.md) lists every object it creates and the variables it needs.
+The server's `migrate` step applies the matching Authentik blueprint for you (`authentik/blueprint.yaml` for production, `authentik/blueprint-dev.yaml` for development, both built into the image) when you give it an Authentik API token allowed to manage blueprints (step 3) and name the blueprint (step 4). Before applying anything it checks that your Authentik is new enough. To apply the blueprint yourself instead, substitute its `${VARIABLE}` placeholders and import it, then leave `SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT` unset (`compose.yaml` as shipped requires it, so remove that line). It creates the OIDC provider, the grant scope mapping, the admins group (the operator group), the connections group, and the restricted connection-manager service account and its API token, and binds the application to the admins and connections groups, so only their members can sign in. [Authentik](docs/authentik.md) lists every object it creates and the variables it needs.
 
 > [!TIP]
 > Note the blueprint's **issuer URL**, its **client id** (the audience) and the **connection-manager API token**. The server needs all three.
@@ -173,11 +173,12 @@ Create the secret files in an operator-controlled directory, and never commit th
 | `DATABASE_URL_FILE` | The complete private-network URL, for example `postgresql://sovereign_config:<password>@postgres:5432/sovereign_config`. | `10001:10001`, `0400` |
 | `MANAGER_API_TOKEN_FILE` | Only the Authentik connection-manager API token from the blueprint. | `10001:10001`, `0400` |
 | `VALUE_ENCRYPTION_KEY_FILE` | Only the value encryption key: 32 random bytes in standard base64, from `openssl rand -base64 32`. | `10001:10001`, `0400` |
+| `AUTHENTIK_ADMIN_TOKEN_FILE` | Only an Authentik API token allowed to manage blueprints and read the version and schema. Only `migrate` is given it. | `10001:10001`, `0400` |
 
-The server runs as the fixed user `10001:10001`, with no capabilities and a read-only root filesystem, and Compose preserves host ownership for these file-backed secrets. Each server secret may instead be supplied directly through its environment variable: `SOVEREIGN_CONFIG_DATABASE_URL`, `SOVEREIGN_CONFIG_MANAGER_API_TOKEN` or `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY`. The variable takes precedence over the matching `_FILE`, which suits a secret manager that injects values into the environment. Startup fails with a redacted error when a required secret is absent through both routes.
+The server and `migrate` run as the fixed user `10001:10001`, with no capabilities and a read-only root filesystem, and Compose preserves host ownership for these file-backed secrets. `compose.yaml` delivers every credential as a file and never as an environment variable, because an exited container — `migrate`, after every deploy — keeps its environment in `docker inspect`. Outside Compose, the binary also takes each secret directly through its variable (`SOVEREIGN_CONFIG_DATABASE_URL`, `SOVEREIGN_CONFIG_MANAGER_API_TOKEN`, `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY`, `SOVEREIGN_CONFIG_AUTHENTIK_ADMIN_TOKEN`), which takes precedence over the matching `_FILE`. Startup fails with a redacted error when a required secret is absent through both routes.
 
 > [!WARNING]
-> **Back up the value encryption key, and keep that backup somewhere you would still have after losing the deployment.** It is the only thing that can decrypt the stored secrets; without it they are unrecoverable, no matter how good the database backups are. The server refuses to start if it finds a stored secret it cannot decrypt, rather than serving errors or sealing a second layer over intact data.
+> **Back up the value encryption key, and keep that backup somewhere you would still have after losing the deployment.** It is the only thing that can decrypt the stored secrets; without it they are unrecoverable, no matter how good the database backups are. Neither `migrate` nor the server runs with a key that opens none of the stored secrets, rather than serving errors or sealing a second layer over intact data.
 
 ### 4. Configure and start
 
@@ -191,15 +192,19 @@ export POSTGRES_PASSWORD_SECRET_FILE="$HOME/.config/sovereign-config/postgres-pa
 export DATABASE_URL_FILE="$HOME/.config/sovereign-config/database-url"
 export MANAGER_API_TOKEN_FILE="$HOME/.config/sovereign-config/manager-api-token"
 export VALUE_ENCRYPTION_KEY_FILE="$HOME/.config/sovereign-config/value-encryption-key"
+export AUTHENTIK_ADMIN_TOKEN_FILE="$HOME/.config/sovereign-config/authentik-admin-token"
+export SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT='production'
 export SOVEREIGN_CONFIG_OIDC_ISSUER='https://auth.example.com/application/o/sovereign-config/'
 export SOVEREIGN_CONFIG_OIDC_AUDIENCE='sovereign-config'
 export SOVEREIGN_CONFIG_PUBLIC_ORIGIN='https://config.example.com'
 export SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE='sovereign_config_prod_grants'
 export SOVEREIGN_CONFIG_MANAGER_GROUP='sovereign-config-connections'
-docker compose up -d --wait
+docker compose up -d migrate
+docker wait "$(docker compose ps -aq migrate)"   # prints 0 once migrate has finished
+docker compose up -d --no-deps --wait sovereign-config
 ```
 
-The service starts only after PostgreSQL reports healthy. It applies its forward-only database migrations before accepting requests.
+`migrate` is the same image run once, before the server: it applies the forward-only database migrations, records the identity provider, encrypts any secret still stored in plaintext, and applies the Authentik blueprint, then exits. The server never changes any of that. It checks it at startup, and refuses to start on a database `migrate` has not brought up to its release. Run `migrate` on its own first, as above, on every upgrade too: a plain `docker compose up` replaces the server before `migrate` has finished, so a failed `migrate` would leave no server running. Run that way, a failed `migrate` leaves the previous release serving, which every migration is written to allow.
 
 > [!IMPORTANT]
 > **`compose.yaml` currently depends on the author's own infrastructure.** It was written for the project's own deployment, and the reverse-proxy names below belong to that environment, not to Sovereign Config. The author intends to remove these dependencies, so that the stack runs as shipped with configuration alone (see [Roadmap](#roadmap)). Until then, adapt them to your environment.
@@ -210,6 +215,7 @@ The service starts only after PostgreSQL reports healthy. It applies its forward
 
 ### 5. Verify
 
+- [ ] `docker inspect -f '{{.State.ExitCode}}' <container name>-migrate` is `0`. An exited `migrate` is expected.
 - [ ] `https://<host>/` serves the web UI. Sign in with an Authentik user in the environment's admins group (`sovereign-config-admins` or `sovereign-config-dev-admins`).
 - [ ] `https://<host>/downloads` offers the CLI and MCP installers matched to this server.
 - [ ] `/readyz` on the internal listener (port `9090` inside the container) reports readiness, including the database.
@@ -225,8 +231,8 @@ The server is configured entirely through environment variables. `compose.yaml` 
 
 | Variable | Required | Purpose |
 | --- | :---: | --- |
-| `SOVEREIGN_CONFIG_DATABASE_URL` / `_FILE` | ✅ | The PostgreSQL connection URL. |
-| `SOVEREIGN_CONFIG_IDENTITY_PROVIDER` | — | The identity provider the server starts with. Unset means `authentik`, the only one it is built with; any other name fails startup. The provider's own variables follow: the `SOVEREIGN_CONFIG_OIDC_*` and `SOVEREIGN_CONFIG_MANAGER_*` rows below are Authentik's ([Authentik](docs/authentik.md#server-variables)). A deployment keeps the provider its first start recorded ([Authentication](docs/authentication.md#choosing-the-identity-provider)). |
+| `SOVEREIGN_CONFIG_DATABASE_URL` / `_FILE` | ✅ | The PostgreSQL connection URL. `migrate` takes it too. |
+| `SOVEREIGN_CONFIG_IDENTITY_PROVIDER` | — | The identity provider the server starts with. Unset means `authentik`, the only one it is built with; any other name fails startup. The provider's own variables follow: the `SOVEREIGN_CONFIG_OIDC_*` and `SOVEREIGN_CONFIG_MANAGER_*` rows below are Authentik's ([Authentik](docs/authentik.md#server-variables)). A deployment keeps the provider its first `migrate` recorded ([Authentication](docs/authentication.md#choosing-the-identity-provider)). |
 | `SOVEREIGN_CONFIG_OIDC_ISSUER` | ✅ | The Authentik provider's issuer URL. The Authentik administration origin is derived from it, so the API and issuer origins can never diverge. |
 | `SOVEREIGN_CONFIG_OIDC_AUDIENCE` | ✅ | The `aud` every access token must carry; tokens for any other audience are refused. With Authentik it is the application's client id. |
 | `SOVEREIGN_CONFIG_PUBLIC_ORIGIN` | ✅ | The exact canonical HTTPS origin embedded in generated access URLs. No userinfo, no path other than `/`, no query and no fragment. |
@@ -243,6 +249,24 @@ The server is configured entirely through environment variables. `compose.yaml` 
 | `SOVEREIGN_CONFIG_AUDIT_PAGE_SIZE` | — | The default and maximum number of events one audit query returns. Default `100`, maximum `1000`. |
 | `OTEL_*` | — | Telemetry export. See [Observability](docs/observability.md). |
 | `RUST_LOG` | — | Filters log output. |
+
+</details>
+
+<details>
+<summary><b><code>migrate</code> variables</b></summary>
+
+`sovereign-config-server migrate` reads only these, and `OTEL_*` and `RUST_LOG` as the server does.
+
+| Variable | Required | Purpose |
+| --- | :---: | --- |
+| `SOVEREIGN_CONFIG_DATABASE_URL` / `_FILE` | ✅ | The PostgreSQL connection URL. |
+| `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY` / `_FILE` | ✅ | The key that seals secret values. |
+| `SOVEREIGN_CONFIG_IDENTITY_PROVIDER` | — | As for the server: the provider the deployment is recorded for. |
+| `SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT` | — | `production` or `development`: the blueprint `migrate` applies. Unset, it applies none. The rest of this table is needed only when it is set ([Authentik](docs/authentik.md#applying-a-blueprint)). |
+| `SOVEREIGN_CONFIG_AUTHENTIK_ADMIN_TOKEN` / `_FILE` | — | An Authentik API token allowed to manage blueprints. |
+| `SOVEREIGN_CONFIG_OIDC_ISSUER` | — | The issuer, which must name the blueprint's application. Its host is the Authentik instance the blueprint is applied to. |
+| `SOVEREIGN_CONFIG_PUBLIC_ORIGIN` | — | The web UI's redirect URI is `<origin>/auth/callback`. |
+| `SOVEREIGN_CONFIG_MANAGER_API_TOKEN` / `_FILE` | — | The connection manager's token, which the blueprint sets as its key. |
 
 </details>
 
@@ -405,7 +429,7 @@ Metrics are pushed rather than scraped, and there is no `/metrics` endpoint. A c
 
 ## Upgrading
 
-Stop the server, back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new release, and run `docker compose up -d --pull always --wait`. Migrations are forward-only, so a downgrade means restoring the backup.
+Stop the server, back up the database, set `SOVEREIGN_CONFIG_IMAGE_TAG` to the new release, run `migrate` and wait for it to exit 0, then start the server ([Upgrading](docs/upgrading.md#procedure)). Migrations are forward-only, so a downgrade to a release before 3.62 means restoring the backup.
 
 > [!IMPORTANT]
 > Some releases need clients upgraded in a particular order. Read [Upgrading](docs/upgrading.md) for the procedure and the releases that need action.
