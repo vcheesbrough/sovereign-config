@@ -25,6 +25,7 @@ README; this file defines the repo-specific collaboration rules.
 | **Remote / `gh` repo** | `vcheesbrough/sovereign-config` |
 | **Trunk** | `main` |
 | **Kanban board** | `https://bored.desync.link/boards/sovereign-config` |
+| **Production version** | `System.GetVersion` on `https://sovereign-config.desync.link` (the `curl` in §1) |
 
 ### Bootstrap exception
 
@@ -64,19 +65,16 @@ Run the **`ci-watch`** skill (baseline §4) with `OWNER=vcheesbrough`,
   first deploy of a build writes its git tag, so a tag means "deployed".
   `release.yml` then gives the tag a GitHub Release that lists its images. A
   card's **Version** records the `major.minor`.
-- **Versions follow in sequence, and never track the iteration number.**
-  This overrides baseline §2, where minor = `N`; the iteration number names
-  the card and branch only.
-  - The next minor is the one **after the version production runs**. Read
-    prod's version first, every time: `curl -s --http1.1 -X POST -H
-    'content-type: application/json' -d '{"protocolVersion":"v6"}'
-    https://sovereign-config.desync.link/sovereign.config.v6.System/GetVersion`.
-    After 3.0.x comes 3.1.0, then 3.2.0. A new major starts at `X.0.0`.
-  - **While trunk's `major.minor` is newer than prod's, it is unreleased.**
-    Every card then stays on that line and changes no version. A tag or a
-    GitHub Release proves only a dev deploy, never a release.
-  - A version out of sequence is removed everywhere it reached: GHCR images,
-    `refs/builds/*`, git tags and GitHub Releases. It is never left behind.
+- **An iteration is the release line it ships in** (baseline §2): *Iteration
+  3.1* is everything released as `3.1.x`, and may bundle several cards.
+  Versions follow in sequence from the version production runs (after 3.0.x
+  comes 3.1, then 3.2), never from a card number or a count. Read it from
+  production itself before starting a card: `curl -s --http1.1 -X POST -H
+  'content-type: application/json' -d '{"protocolVersion":"v6"}'
+  https://sovereign-config.desync.link/sovereign.config.v6.System/GetVersion`
+  (`applicationVersion`). Cards before 3.1 carry the old `Iteration N`
+  headings (1–62), which are not versions; 3.60–3.63 were out of sequence and
+  were removed on 2026-11-22.
 - **A push never deploys** (#466). A push is green once the GitHub Actions
   build has published its images. Dev is deployed only by a Woodpecker Deploy
   targeting `dev` (any branch), started from that push's anchor pipeline. The
