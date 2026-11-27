@@ -288,7 +288,9 @@ The `migrations` skill (baseline §10) is the contract (#615);
   privileges, #616), `identity_claim` (the deployment's
   identity provider), `reseal` (encrypting stored plaintext secrets; a key
   that opens none aborts), `identity_provider` (with Authentik, the version
-  check and the environment's blueprint, compiled into the image). Each is
+  check and the environment's blueprint, compiled into the image),
+  `runtime_password` (an existing runtime login's password, last, so a
+  failed `migrate` leaves the running server's working). Each is
   idempotent and a root span `sovereign_config.migrate.<step>`. A new kind of
   outside state is a new step here, never a CI step and never server
   startup.

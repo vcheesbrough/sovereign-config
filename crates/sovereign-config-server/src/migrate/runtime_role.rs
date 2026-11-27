@@ -18,11 +18,13 @@
 //! back from `PUBLIC` there too), so it can create, alter, drop or truncate
 //! nothing.
 //!
-//! The step is idempotent: a second run on current state changes nothing,
-//! not even the password's salt. The password is sent as a SCRAM-SHA-256
-//! verifier, never as text, so it cannot reach the database's log. It is set
-//! whenever it no longer matches, which is how it is rotated: change the
-//! secret and redeploy.
+//! The step is idempotent: a second run on current state changes nothing.
+//! An existing role's password is changed only by [`set_password`],
+//! `migrate`'s last step (`runtime_password`), so a `migrate` that fails
+//! part-way leaves the running server's password working; it is set only
+//! when it no longer matches, which is how it is rotated: change the secret
+//! and redeploy. It is sent as a SCRAM-SHA-256 verifier, never as text, so it
+//! cannot reach the database's log.
 //!
 //! Release N-1 serves on the owner login while this runs, and is unaffected
 //! by it; a rollback to it simply goes on using the owner login.
@@ -84,11 +86,19 @@ impl RuntimeLogin {
     }
 }
 
-/// What the step found and did to the role itself.
+/// What the `runtime_role` step found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RoleChange {
+    /// Created, with the password `migrate` was given.
     Created,
-    PasswordSet,
+    /// Already there; its password is [`set_password`]'s, at the end.
+    Existing,
+}
+
+/// What [`set_password`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PasswordChange {
+    Set,
     Unchanged,
 }
 
@@ -96,19 +106,42 @@ impl RoleChange {
     fn as_str(self) -> &'static str {
         match self {
             Self::Created => "created",
-            Self::PasswordSet => "password_set",
+            Self::Existing => "existing",
+        }
+    }
+}
+
+impl PasswordChange {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Set => "set",
             Self::Unchanged => "unchanged",
         }
     }
 }
 
-/// Creates or updates the runtime role and its grants, in one transaction.
+/// Serialises two `migrate`s on the role, which would otherwise race on
+/// `CREATE ROLE`.
+async fn lock(transaction: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('sovereign-config:runtime-role', 0))",
+    )
+    .execute(&mut **transaction)
+    .await
+    .map_err(unavailable)?;
+    Ok(())
+}
+
+/// Creates the runtime role or restores its attributes, and makes its grants
+/// exact, in one transaction. An existing role's password is left as it is:
+/// the server still running from the previous release logs in with it, and
+/// [`set_password`] changes it only once every other step has succeeded.
 ///
 /// # Errors
 ///
 /// The database cannot be reached or refuses a statement (the owner is not a
 /// superuser), the runtime role is the owner itself, or the role is left able
-/// to create anything or to act as another role.
+/// to create anything, owns anything, or can act as another role.
 #[instrument(
     name = "ensure_runtime_role",
     skip_all,
@@ -116,13 +149,7 @@ impl RoleChange {
 )]
 pub(crate) async fn ensure(database: &PgPool, login: &RuntimeLogin) -> Result<RoleChange> {
     let mut transaction = database.begin().await.map_err(unavailable)?;
-    // Two `migrate`s at once would otherwise race on `CREATE ROLE`.
-    sqlx::query(
-        "SELECT pg_advisory_xact_lock(hashtextextended('sovereign-config:runtime-role', 0))",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(unavailable)?;
+    lock(&mut transaction).await?;
     let (owner, schema, database_name): (String, Option<String>, String) = sqlx::query_as(
         "SELECT current_user::TEXT, current_schema()::TEXT, current_database()::TEXT",
     )
@@ -160,57 +187,97 @@ pub(crate) async fn ensure(database: &PgPool, login: &RuntimeLogin) -> Result<Ro
     Ok(change)
 }
 
-/// The role, its attributes and its password.
-async fn role(
-    transaction: &mut Transaction<'_, Postgres>,
+/// Gives the runtime role the password `migrate` was given, unless it already
+/// has it: `migrate`'s last step, so that a `migrate` failing at any earlier
+/// one leaves the running server's password working (#616). A rotation is
+/// this step on a deploy with a new secret.
+///
+/// # Errors
+///
+/// The database cannot be reached or refuses the statement, or the role is
+/// missing ([`ensure`] did not run).
+#[instrument(
+    name = "set_runtime_password",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = Empty, error.type = Empty, db.system.name = "postgresql", db.operation.name = "set_runtime_password")
+)]
+pub(crate) async fn set_password(
+    database: &PgPool,
     login: &RuntimeLogin,
-) -> Result<RoleChange> {
+) -> Result<PasswordChange> {
+    let mut transaction = database.begin().await.map_err(unavailable)?;
+    lock(&mut transaction).await?;
     // Readable by a superuser only, which the owner is.
     let stored: Option<Option<String>> =
         sqlx::query_scalar("SELECT rolpassword FROM pg_catalog.pg_authid WHERE rolname = $1")
             .bind(&login.role)
-            .fetch_optional(&mut **transaction)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(unavailable)?;
+    let Some(stored) = stored else {
+        return Err(refused(
+            "runtime_role_missing",
+            "the runtime role does not exist",
+        ));
+    };
+    let change = if stored
+        .as_deref()
+        .is_some_and(|verifier| verifier_matches(verifier, &login.password))
+    {
+        PasswordChange::Unchanged
+    } else {
+        let verifier = scram_verifier(&login.password)?;
+        execute(
+            &mut transaction,
+            &format!(
+                "ALTER ROLE {} WITH PASSWORD {}",
+                quote_identifier(&login.role),
+                quote_literal(&verifier)
+            ),
+        )
+        .await?;
+        PasswordChange::Set
+    };
+    transaction.commit().await.map_err(unavailable)?;
+    info!(
+        runtime_role = login.role.as_str(),
+        change = change.as_str(),
+        "runtime role password is current"
+    );
+    Ok(change)
+}
+
+/// The role and its attributes, and a new role's password.
+async fn role(
+    transaction: &mut Transaction<'_, Postgres>,
+    login: &RuntimeLogin,
+) -> Result<RoleChange> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1)")
+            .bind(&login.role)
+            .fetch_one(&mut **transaction)
             .await
             .map_err(unavailable)?;
     let role = quote_identifier(&login.role);
     let attributes =
         "LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS";
-    let change = match &stored {
-        None => {
-            let verifier = scram_verifier(&login.password)?;
-            execute(
-                transaction,
-                &format!(
-                    "CREATE ROLE {role} WITH {attributes} PASSWORD {}",
-                    quote_literal(&verifier)
-                ),
-            )
-            .await?;
-            RoleChange::Created
-        }
-        Some(verifier) => {
-            // Resetting them is a no-op unless someone changed them.
-            execute(transaction, &format!("ALTER ROLE {role} WITH {attributes}")).await?;
-            if verifier
-                .as_deref()
-                .is_some_and(|verifier| verifier_matches(verifier, &login.password))
-            {
-                RoleChange::Unchanged
-            } else {
-                let verifier = scram_verifier(&login.password)?;
-                execute(
-                    transaction,
-                    &format!(
-                        "ALTER ROLE {role} WITH PASSWORD {}",
-                        quote_literal(&verifier)
-                    ),
-                )
-                .await?;
-                RoleChange::PasswordSet
-            }
-        }
-    };
-    Ok(change)
+    if exists {
+        // Resetting them is a no-op unless someone changed them.
+        execute(transaction, &format!("ALTER ROLE {role} WITH {attributes}")).await?;
+        return Ok(RoleChange::Existing);
+    }
+    // No running server logs in as a role that does not exist yet, so its
+    // first password can be set at once.
+    let verifier = scram_verifier(&login.password)?;
+    execute(
+        transaction,
+        &format!(
+            "CREATE ROLE {role} WITH {attributes} PASSWORD {}",
+            quote_literal(&verifier)
+        ),
+    )
+    .await?;
+    Ok(RoleChange::Created)
 }
 
 /// Exactly the grants the server needs, on what exists now and on what the
@@ -248,7 +315,15 @@ async fn grant(
         format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO {role}"),
         format!(
             "ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} \
+             REVOKE ALL ON TABLES FROM {role}"
+        ),
+        format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} \
              GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {role}"
+        ),
+        format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} \
+             REVOKE ALL ON SEQUENCES FROM {role}"
         ),
         format!(
             "ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} \
@@ -269,18 +344,26 @@ async fn grant(
 
 /// Refuses a runtime role that could still change the schema once the grants
 /// are in place: one that can create in the database (through `PUBLIC`,
-/// which this step leaves alone at the database level) or in the schema, or
-/// that belongs to another role it could act as.
+/// which this step leaves alone at the database level) or in the schema,
+/// that belongs to another role it could act as, or that owns anything.
 async fn confine(
     transaction: &mut Transaction<'_, Postgres>,
     role: &str,
     schema: &str,
 ) -> Result<()> {
-    let (creates, member): (bool, bool) = sqlx::query_as(
+    // An owner may drop, alter or truncate what it owns, whatever it was
+    // granted: anything here (or shared, such as a database) counts.
+    let (creates, member, owns): (bool, bool, bool) = sqlx::query_as(
         "SELECT has_schema_privilege($1, $2, 'CREATE') \
                 OR has_database_privilege($1, current_database(), 'CREATE'), \
                 EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members \
-                        WHERE member = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1))",
+                        WHERE member = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1)), \
+                EXISTS (SELECT 1 FROM pg_catalog.pg_shdepend \
+                        WHERE deptype = 'o' \
+                          AND refclassid = 'pg_catalog.pg_authid'::regclass \
+                          AND refobjid = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1) \
+                          AND dbid IN (0, (SELECT oid FROM pg_catalog.pg_database \
+                                           WHERE datname = current_database())))",
     )
     .bind(role)
     .bind(schema)
@@ -298,6 +381,12 @@ async fn confine(
         return Err(refused(
             "runtime_role_is_member",
             "the runtime role is a member of another role; revoke that membership",
+        ));
+    }
+    if owns {
+        return Err(refused(
+            "runtime_role_owns",
+            "the runtime role owns an object; give it back to the schema owner",
         ));
     }
     Ok(())

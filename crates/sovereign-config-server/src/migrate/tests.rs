@@ -6,7 +6,7 @@
 
 use sqlx::{Connection as _, PgConnection, PgPool};
 
-use super::runtime_role::{self, RoleChange, RuntimeLogin};
+use super::runtime_role::{self, PasswordChange, RoleChange, RuntimeLogin};
 use super::{MIGRATOR, apply_schema, connect, run, verify_schema};
 use crate::config::MigrateConfig;
 use crate::encryption::ValueCipher;
@@ -462,29 +462,36 @@ async fn the_runtime_password_is_kept_when_current_and_rotated_when_not() {
         .await
         .unwrap();
 
-    // PostgreSQL's own verifier, from a plaintext password.
+    // An existing role keeps its password through `ensure`: the running
+    // server may be using it.
     sqlx::raw_sql(&format!("ALTER ROLE {ROLE} PASSWORD 'set-by-postgres'"))
         .execute(&pool)
         .await
         .unwrap();
     assert_eq!(
-        runtime_role::ensure(&pool, &login("set-by-postgres"))
-            .await
-            .unwrap(),
-        RoleChange::Unchanged
-    );
-
-    assert_eq!(
         runtime_role::ensure(&pool, &login("rotated-password"))
             .await
             .unwrap(),
-        RoleChange::PasswordSet
+        RoleChange::Existing
     );
+    // PostgreSQL's own verifier, from a plaintext password, is recognised.
     assert_eq!(
-        runtime_role::ensure(&pool, &login("rotated-password"))
+        runtime_role::set_password(&pool, &login("set-by-postgres"))
             .await
             .unwrap(),
-        RoleChange::Unchanged
+        PasswordChange::Unchanged
+    );
+    assert_eq!(
+        runtime_role::set_password(&pool, &login("rotated-password"))
+            .await
+            .unwrap(),
+        PasswordChange::Set
+    );
+    assert_eq!(
+        runtime_role::set_password(&pool, &login("rotated-password"))
+            .await
+            .unwrap(),
+        PasswordChange::Unchanged
     );
     assert!(
         connect(&login_url(&url, ROLE, "set-by-postgres"))
@@ -501,8 +508,9 @@ async fn the_runtime_password_is_kept_when_current_and_rotated_when_not() {
 }
 
 /// Whatever was done to the runtime role by hand, the next `migrate` puts
-/// back: its attributes, its grants, and `CREATE` on the schema. A
-/// membership in another role it refuses rather than dismantles.
+/// back: its attributes, its grants, its default privileges, and `CREATE`
+/// on the schema. A membership in another role, or an object it owns, it
+/// refuses rather than dismantles.
 #[tokio::test]
 #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
 async fn migrate_restores_a_widened_runtime_role_and_refuses_what_it_cannot() {
@@ -519,6 +527,8 @@ async fn migrate_restores_a_widened_runtime_role_and_refuses_what_it_cannot() {
         format!("GRANT TRUNCATE, TRIGGER, REFERENCES ON ALL TABLES IN SCHEMA {SCHEMA} TO {ROLE}"),
         format!("GRANT INSERT, DELETE ON {SCHEMA}._sqlx_migrations TO {ROLE}"),
         format!("GRANT UPDATE ON ALL SEQUENCES IN SCHEMA {SCHEMA} TO {ROLE}"),
+        format!("ALTER DEFAULT PRIVILEGES IN SCHEMA {SCHEMA} GRANT ALL ON TABLES TO {ROLE}"),
+        format!("ALTER DEFAULT PRIVILEGES IN SCHEMA {SCHEMA} GRANT ALL ON SEQUENCES TO {ROLE}"),
     ] {
         sqlx::raw_sql(&widening).execute(&pool).await.unwrap();
     }
@@ -567,6 +577,23 @@ async fn migrate_restores_a_widened_runtime_role_and_refuses_what_it_cannot() {
         .unwrap();
     run(config_for(&url, 0x5A, ROLE)).await.unwrap();
 
+    // Nor is an object it owns, which it could drop whatever it was granted.
+    sqlx::raw_sql(&format!(
+        "CREATE TABLE {SCHEMA}.handed_over (id BIGINT); \
+         ALTER TABLE {SCHEMA}.handed_over OWNER TO {ROLE}"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let refused = run(config_for(&url, 0x5A, ROLE)).await.unwrap_err();
+    assert_eq!(classification(&refused), Some("runtime_role_owns"));
+    sqlx::raw_sql(&format!("DROP TABLE {SCHEMA}.handed_over"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    run(config_for(&url, 0x5A, ROLE)).await.unwrap();
+    assert_eq!(runtime_state(&pool, ROLE).await, current);
+
     // The owner itself is never made the runtime role.
     let owner: String = sqlx::query_scalar("SELECT current_user::TEXT")
         .fetch_one(&pool)
@@ -579,5 +606,49 @@ async fn migrate_restores_a_widened_runtime_role_and_refuses_what_it_cannot() {
     .await
     .unwrap_err();
     assert_eq!(classification(&refused), Some("runtime_role_is_owner"));
+    pool.close().await;
+}
+
+/// A `migrate` that fails after `runtime_role` leaves the running server's
+/// password working: a rotated one is set only by the last step, once
+/// everything before it has succeeded, so the previous release keeps
+/// opening connections.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+async fn a_failed_migrate_leaves_the_running_servers_password_working() {
+    const ROLE: &str = "sc_test_runtime_failed_rotation";
+    let Some((pool, url)) = empty_schema("migrate_runtime_failed_rotation").await else {
+        return;
+    };
+    let rotating = |seed: u8, password: &str| {
+        let mut config = config_for(&url, seed, ROLE);
+        config.runtime_login = RuntimeLogin::named(ROLE, password.to_owned()).unwrap();
+        config
+    };
+    apply_schema(&pool).await.unwrap();
+    seed_plaintext_secret(&pool, "/tests/migrate/rotation", "rotation-secret").await;
+    run(rotating(0x5A, "running-password")).await.unwrap();
+
+    // `reseal` refuses the wrong key, after `runtime_role` has run.
+    let refused = run(rotating(0x11, "rotated-password")).await.unwrap_err();
+    assert_eq!(classification(&refused), Some("wrong_key"));
+    connect(&login_url(&url, ROLE, "running-password"))
+        .await
+        .expect("the running server still logs in")
+        .close()
+        .await;
+    assert!(
+        connect(&login_url(&url, ROLE, "rotated-password"))
+            .await
+            .is_err(),
+        "the new password is not set yet"
+    );
+
+    run(rotating(0x5A, "rotated-password")).await.unwrap();
+    connect(&login_url(&url, ROLE, "rotated-password"))
+        .await
+        .expect("a successful migrate sets it")
+        .close()
+        .await;
     pool.close().await;
 }
