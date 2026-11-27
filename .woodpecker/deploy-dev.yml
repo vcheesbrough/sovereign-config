@@ -41,8 +41,9 @@ steps:
 
   # Deploys the build in two phases, so the running server keeps serving
   # unless the new release's state is in place (#615; docs/project-deployment.md,
-  # *Migrations*). First `migrate` runs alone: the schema, the identity claim,
-  # the stored secrets and the Authentik blueprint, from the image being
+  # *Migrations*). First `migrate` runs alone: the schema, the server's
+  # database login, the identity claim, the stored secrets and the Authentik
+  # blueprint, from the image being
   # deployed. Only once it has exited 0 is the server replaced. A plain
   # `up` would replace the server first and leave none running if `migrate`
   # failed, and `up --wait migrate` does not wait for a one-shot service to
@@ -53,7 +54,9 @@ steps:
   # inspect`. Compose reads each from this step's environment and writes it
   # into the containers given it (#617), so the stack needs nothing from
   # Woodpecker but these variables; only `migrate` is given the Authentik
-  # admin token.
+  # admin token and the database owner's URL. The server logs in as
+  # `sovereign_config_runtime`, which `migrate` creates with the runtime
+  # password and which owns nothing (#616).
   deploy-dev:
     depends_on:
       - resolve
@@ -66,6 +69,8 @@ steps:
     environment:
       POSTGRES_PASSWORD:
         from_secret: sovereign_config_dev_postgres_password
+      RUNTIME_DATABASE_PASSWORD:
+        from_secret: sovereign_config_dev_postgres_runtime_password
       MANAGER_API_TOKEN:
         from_secret: sovereign_config_dev_manager_api_token
       VALUE_ENCRYPTION_KEY:
@@ -92,12 +97,14 @@ steps:
         export OTEL_METRICS_EXPORTER=otlp
         printf 'telemetry: %s\n' "$$OTEL_RESOURCE_ATTRIBUTES"
         # The credentials Compose reads from this environment (compose.yaml,
-        # `secrets:`): the four Woodpecker secrets under their own names, and
-        # the database URL built from the password. Exported rather than
-        # prefixed, because several Compose runs read them.
+        # `secrets:`): the five Woodpecker secrets under their own names, and
+        # each login's database URL built from its password, so neither can
+        # drift from it. Exported rather than prefixed, because several
+        # Compose runs read them.
         ENCODED_PASSWORD=$$(printf '%s' "$$POSTGRES_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
-        export POSTGRES_PASSWORD MANAGER_API_TOKEN VALUE_ENCRYPTION_KEY AUTHENTIK_ADMIN_TOKEN DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config"
-        unset ENCODED_PASSWORD
+        ENCODED_RUNTIME_PASSWORD=$$(printf '%s' "$$RUNTIME_DATABASE_PASSWORD" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g')
+        export POSTGRES_PASSWORD RUNTIME_DATABASE_PASSWORD MANAGER_API_TOKEN VALUE_ENCRYPTION_KEY AUTHENTIK_ADMIN_TOKEN OWNER_DATABASE_URL="postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config" RUNTIME_DATABASE_URL="postgresql://sovereign_config_runtime:$$ENCODED_RUNTIME_PASSWORD@postgres:5432/sovereign_config"
+        unset ENCODED_PASSWORD ENCODED_RUNTIME_PASSWORD
         export SOVEREIGN_CONFIG_IMAGE_TAG=$$(cat .release-tag) SOVEREIGN_CONFIG_ENV=dev SOVEREIGN_CONFIG_HOST=sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CONTAINER_NAME=sovereign-config-dev POSTGRES_DATA_VOLUME=sovereign-config-dev-db SOVEREIGN_CONFIG_OIDC_ISSUER=https://auth.desync.link/application/o/sovereign-config-dev/ SOVEREIGN_CONFIG_OIDC_AUDIENCE=sovereign-config-dev SOVEREIGN_CONFIG_PUBLIC_ORIGIN=https://sovereign-config-dev.desync.link SOVEREIGN_CONFIG_CLIENT_TELEMETRY_ENDPOINT=https://sovereign-config-dev.desync.link SOVEREIGN_CONFIG_MANAGER_GRANTS_ATTRIBUTE=sovereign_config_dev_grants SOVEREIGN_CONFIG_MANAGER_GROUP=sovereign-config-dev-connections SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT=development
         # Phase 1: `migrate`, while the running server goes on serving.
         # Recreated every time: Compose writes a secret into a container when

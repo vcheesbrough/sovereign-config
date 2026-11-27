@@ -81,13 +81,17 @@ Everything a release changes outside its image runs in **`sovereign-config-serve
 | Step | What it does |
 | --- | --- |
 | `schema` | Applies the SQL migrations the binary embeds. Applied migrations it does not know are tolerated: that is a rollback to an older image. |
+| `runtime_role` | Creates the server's database login, `sovereign_config_runtime`, or puts it back to exactly its shape: it can log in, and has `SELECT, INSERT, UPDATE, DELETE` on the tables and `USAGE, SELECT` on the sequences, with default privileges carrying both to every table a later migration adds. It owns nothing, so it can create, alter, drop or truncate nothing; it may only read `_sqlx_migrations`. Its default privileges are made exact too. It takes `CREATE` on the schema back from `PUBLIC`, which a cluster first initialised before PostgreSQL 15 still grants, and refuses a role that could still create in the database, is a member of another role, or owns anything. A new role gets its password here; an existing one keeps it until `runtime_password` (#616). |
 | `identity_claim` | Records the deployment's identity provider the first time, and refuses any other afterwards. |
 | `reseal` | Encrypts any stored secret still in plaintext. A key that opens none of the sealed secrets aborts it, and nothing is changed. |
 | `identity_provider` | With Authentik: checks its version and API, then applies the environment's blueprint ([Authentik](authentik.md#applying-a-blueprint)). |
+| `runtime_password` | Gives `sovereign_config_runtime` the runtime password `migrate` is given, if it has another, sent as a SCRAM verifier. Last, so a `migrate` failing at any step before it leaves the running server's password working. |
 
 **The server never applies any of this.** At startup it checks that each step has run — every embedded migration applied, the provider claimed, no plaintext secret, a key that opens the sealed ones — and refuses to serve otherwise, naming `migrate`.
 
 **A deploy runs `migrate` on its own and waits for it** (`docker wait`), and replaces the server only once it has exited 0. If `migrate` fails part-way, the deploy fails and the previous release goes on serving, against whatever `migrate` changed. A plain `docker compose up` would not keep that promise: Compose replaces the server before the `depends_on` condition on `migrate` is met, and `up --wait migrate` reports a one-shot service ready before it has finished.
+
+**Two database logins** (#616). The owner is PostgreSQL's own user, `sovereign_config`, whose password initialises the database: it owns every table, and only `migrate` connects as it. The server connects as `sovereign_config_runtime`, which `migrate` creates. A compromised server can therefore read and write rows, but cannot change the schema or the migration record, nor create a role. Both URLs are built from their passwords by whatever runs Compose, so a URL cannot drift from its password. The runtime role's name is fixed in the binary; its URL must name it. Changing the runtime password is a redeploy with the new secret: `migrate`'s last step sets it, and the server is recreated with the new URL right after. A `migrate` that fails before that step leaves the old password in place, so the running server keeps opening connections; only the moments between `migrate` exiting and the new server starting run the old server on a password that no longer works for new connections. The release before 3.2 serves on the owner login while 3.2's `migrate` creates the role, and is unaffected by it, so a rollback to it is a deploy of the older image with its own `compose.yaml`.
 
 **Every migration must therefore work with the release before it.** The previous release serves against the new state during every deploy, and after a failed one. Expand in one release; contract (drop, rename, tighten) in a later one, once no running release reads the old shape. A rollback to 3.1 or later is a deploy of the older image, whose `migrate` tolerates migrations it does not know. An image from before 3.1 migrates in-process and refuses a database carrying a migration it does not know, so rolling back that far needs the backup restore in [Upgrading](upgrading.md#procedure) once a newer migration has been applied.
 
@@ -95,17 +99,29 @@ Everything a release changes outside its image runs in **`sovereign-config-serve
 
 | Credential | `migrate` | Server | PostgreSQL |
 | --- | :---: | :---: | :---: |
-| Database URL (`database_url`) | ✅ | ✅ | — |
+| Owner database URL (`owner_database_url`) | ✅ | — | — |
+| Runtime database password (`runtime_database_password`) | ✅ (it sets it) | — | — |
+| Runtime database URL (`runtime_database_url`) | — | ✅ | — |
 | Value encryption key (`value_encryption_key`) | ✅ | ✅ | — |
 | Connection-manager token (`manager_api_token`) | ✅ (the blueprint sets it) | ✅ | — |
 | Authentik admin token (`authentik_admin_token`) | ✅ | — | — |
-| PostgreSQL password (`postgres_password`) | — | — | ✅ |
+| PostgreSQL (owner) password (`postgres_password`) | — | — | ✅ |
 
-**Checking a deploy:** `docker inspect -f '{{.State.ExitCode}}' sovereign-config-dev-migrate` (or `sovereign-config-production-migrate`) is `0`, and its log says what each step changed. An exited `migrate` is expected: it is not a container that is down. Compose writes a secret into a container only when it creates it, so the deploy recreates `migrate` and the server every time (`--force-recreate`), and a redeploy is how a rotated credential reaches them.
+**Checking a deploy:** `docker inspect -f '{{.State.ExitCode}}' sovereign-config-dev-migrate` (or `sovereign-config-production-migrate`) is `0`, and its log says what each step changed (`runtime role is current`, with `change` `created` or `existing`, and `runtime role password is current`, with `change` `set` or `unchanged`). An exited `migrate` is expected: it is not a container that is down. Compose writes a secret into a container only when it creates it, so the deploy recreates `migrate` and the server every time (`--force-recreate`), and a redeploy is how a rotated credential reaches them.
 
 ### Production prerequisites
 
-Production's credentials (the PostgreSQL password, the connection-manager token, the value encryption key, and the Authentik admin token only `migrate` gets) live in mini-config's `secrets.env.enc`, with its `sovereign-config-stack`, along with the pre-created encrypted `sovereign-config-production-db` volume and DNS/Traefik for the production host. No pipeline here holds them. The promotion uses only the shared secret `github_token` (resolving the build, writing the tag, and the on-main check). The dev deploy also uses `authentik_api_token` (the Authentik admin token `migrate` applies the blueprint with). It holds no registry credential: the images are public. Every CI secret is served by the Sovereign Config Woodpecker secrets broker, which offers it to every event except pull requests, so moving a step between `push` and `deployment` needs no secret change.
+Production's credentials (the PostgreSQL password, the runtime database password, the connection-manager token, the value encryption key, and the Authentik admin token only `migrate` gets) live in mini-config's `secrets.env.enc`, with its `sovereign-config-stack`, along with the pre-created encrypted `sovereign-config-production-db` volume and DNS/Traefik for the production host. No pipeline here holds them. The promotion uses only the shared secret `github_token` (resolving the build, writing the tag, and the on-main check). The dev deploy also uses `authentik_api_token` (the Authentik admin token `migrate` applies the blueprint with). It holds no registry credential: the images are public. Every CI secret is served by the Sovereign Config Woodpecker secrets broker, which offers it to every event except pull requests, so moving a step between `push` and `deployment` needs no secret change.
+
+The dev deploy reads the runtime database password from `sovereign_config_dev_postgres_runtime_password`, beside `sovereign_config_dev_postgres_password`; production's is `SOVEREIGN_CONFIG_PROD_POSTGRES_RUNTIME_PASSWORD` in `secrets.env.enc`. A deploy without it fails before `migrate` runs and leaves the running server in place.
+
+### Restoring a database dump
+
+A `pg_dump` holds the grants to `sovereign_config_runtime` but not the role, which lives outside the database. Restore it with `--no-privileges`, so a fresh cluster without the role does not fail the restore, then deploy: the role and every grant come back from `migrate`'s `runtime_role` step, not from the dump.
+
+```sh
+docker compose exec -T postgres pg_restore -U sovereign_config -d sovereign_config --clean --if-exists --no-privileges --exit-on-error < backup.dump
+```
 
 ### Self-hosting exception
 

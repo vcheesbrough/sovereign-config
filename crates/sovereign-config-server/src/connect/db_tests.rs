@@ -293,3 +293,155 @@ async fn v6_over_connect_answers_as_v5_over_grpc() {
         .await;
     assert_eq!(over_connect.as_ref(), over_grpc.as_slice());
 }
+
+/// The server end to end on the login it is deployed with (#616): every
+/// storage RPC, values, secrets, aliases, managed connections and the audit
+/// trail, over a schema `migrate` brought up and the runtime login it
+/// created, which owns nothing there.
+#[tokio::test]
+#[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+#[allow(clippy::too_many_lines)]
+async fn the_server_serves_on_the_runtime_login() {
+    use sqlx::Connection as _;
+
+    use crate::config::MigrateConfig;
+    use crate::identity::ExternalSetup;
+    use crate::migrate::runtime_role::RuntimeLogin;
+
+    const SCHEMA: &str = "connect_runtime_login";
+    const ROLE: &str = "sc_test_connect_runtime";
+    const PASSWORD: &str = "connect-runtime-password";
+
+    let owner_url = database_url();
+    let mut connection = sqlx::PgConnection::connect(&owner_url).await.unwrap();
+    for statement in [
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA public".to_owned(),
+        format!("DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"),
+        format!("CREATE SCHEMA {SCHEMA}"),
+    ] {
+        sqlx::raw_sql(&statement)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+    }
+    connection.close().await.unwrap();
+    let separator = if owner_url.contains('?') { '&' } else { '?' };
+    let owner_url = format!("{owner_url}{separator}options=-c%20search_path%3D{SCHEMA}%2Cpublic");
+    crate::migrate::run(MigrateConfig {
+        database_url: owner_url.clone(),
+        runtime_login: RuntimeLogin::named(ROLE, PASSWORD.to_owned()).unwrap(),
+        identity_provider: "test-provider",
+        external_setup: ExternalSetup::None,
+        // The harness's key.
+        value_cipher: ValueCipher::new(&mut [0xA5; 32]),
+    })
+    .await
+    .unwrap();
+    let mut runtime_url = reqwest::Url::parse(&owner_url).unwrap();
+    runtime_url.set_username(ROLE).unwrap();
+    runtime_url.set_password(Some(PASSWORD)).unwrap();
+    let harness = Harness::over(runtime_url.as_str()).await;
+    let root = fresh_root("runtime-login");
+
+    let ok = |route: &str, (status, _, answer): (http::StatusCode, http::HeaderMap, Value)| {
+        assert!(
+            status.is_success(),
+            "{route} on the runtime login: {answer}"
+        );
+        answer
+    };
+    for body in [
+        json!({ "path": format!("{root}/plain"), "plainValue": "v" }),
+        json!({ "path": format!("{root}/plain"), "plainValue": "w" }),
+        json!({ "path": format!("{root}/secret"), "secretValue": "s3cr3t" }),
+    ] {
+        ok(PUT, harness.json(PUT, Some(WRITER), &body).await);
+    }
+    let revealed = ok(
+        REVEAL,
+        harness
+            .json(
+                REVEAL,
+                Some(READER),
+                &json!({ "path": format!("{root}/secret") }),
+            )
+            .await,
+    );
+    assert_eq!(revealed["value"], "s3cr3t", "{revealed}");
+    ok(
+        "AddValuePath",
+        harness
+            .json(
+                "/sovereign.config.v6.Configuration/AddValuePath",
+                Some(WRITER),
+                &json!({ "sourcePath": format!("{root}/plain"), "newPath": format!("{root}/alias") }),
+            )
+            .await,
+    );
+    let subtree = ok(
+        SUBTREE,
+        harness
+            .json(SUBTREE, Some(READER), &json!({ "path": root }))
+            .await,
+    );
+    assert_eq!(subtree["values"].as_array().unwrap().len(), 3, "{subtree}");
+    ok(
+        REPLACE,
+        harness
+            .json(
+                REPLACE,
+                Some(WRITER),
+                &json!({ "path": format!("{root}/tree"), "values": [
+                    { "path": format!("{root}/tree/a"), "plainValue": "1" },
+                ]}),
+            )
+            .await,
+    );
+    let created = ok(
+        "CreateManagedConnection",
+        harness
+            .json(
+                "/sovereign.config.v6.ManagedConnections/CreateManagedConnection",
+                Some(WRITER),
+                &json!({
+                    "displayName": "runtime login",
+                    "root": root,
+                    "permissions": ["MANAGED_PERMISSION_READ"],
+                }),
+            )
+            .await,
+    );
+    let connection_id = created["metadata"]["connectionId"].clone();
+    assert!(connection_id.is_string(), "{created}");
+    ok(
+        "RevokeManagedConnection",
+        harness
+            .json(
+                "/sovereign.config.v6.ManagedConnections/RevokeManagedConnection",
+                Some(WRITER),
+                &json!({ "connectionId": connection_id }),
+            )
+            .await,
+    );
+    let deleted = ok(
+        DELETE,
+        harness
+            .json(
+                DELETE,
+                Some(WRITER),
+                &json!({ "path": root, "recurse": true }),
+            )
+            .await,
+    );
+    assert!(deleted["deletedCount"].as_u64() > Some(0), "{deleted}");
+    let page = ok(
+        AUDIT,
+        harness
+            .json(AUDIT, Some(READER), &json!({ "pathFilter": root }))
+            .await,
+    );
+    assert!(
+        !page["events"].as_array().unwrap().is_empty(),
+        "the audit trail was written: {page}"
+    );
+}

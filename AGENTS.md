@@ -283,10 +283,14 @@ The `migrations` skill (baseline §10) is the contract (#615);
 - **Everything a release changes outside its image runs in
   `sovereign-config-server migrate`**, a one-shot `migrate` service from the
   server's image, in this order: `schema` (the embedded SQL migrations,
-  tolerating unknown applied ones), `identity_claim` (the deployment's
+  tolerating unknown applied ones), `runtime_role` (the server's own
+  login, `sovereign_config_runtime`, with exactly its grants and default
+  privileges, #616), `identity_claim` (the deployment's
   identity provider), `reseal` (encrypting stored plaintext secrets; a key
   that opens none aborts), `identity_provider` (with Authentik, the version
-  check and the environment's blueprint, compiled into the image). Each is
+  check and the environment's blueprint, compiled into the image),
+  `runtime_password` (an existing runtime login's password, last, so a
+  failed `migrate` leaves the running server's working). Each is
   idempotent and a root span `sovereign_config.migrate.<step>`. A new kind of
   outside state is a new step here, never a CI step and never server
   startup.
@@ -303,9 +307,15 @@ The `migrations` skill (baseline §10) is the contract (#615);
   Compose writes them into each container at `/run/secrets/<name>`, which is
   why the server and `migrate` have no `read_only` (a recorded exception)
   and are always `--force-recreate`d. `deployment_policy.rs` pins it. Only `migrate` gets the Authentik admin
-  token (`authentik_api_token`); it also gets the database URL, the value
-  encryption key and the manager token. The server keeps the database URL,
-  the key and the manager token.
+  token (`authentik_api_token`), the schema owner's database URL and the
+  runtime login's password; it also gets the value encryption key and the
+  manager token. The server gets the runtime login's URL, the key and the
+  manager token, and never the owner's password (#616).
+- **The server's login owns nothing.** It reads and writes rows; a new
+  table needs no grant (default privileges), but a migration that needs the
+  server to do anything else (a new schema, a function it must own) changes
+  the `runtime_role` step too. A dump is restored with `--no-privileges`:
+  the role comes back from `migrate`, not from the dump.
 - **A deploy runs `migrate` alone, `docker wait`s for it, then replaces the
   server.** Compose's own `depends_on` would replace the server first.
   `pipeline_prod_gating.rs` pins the order.

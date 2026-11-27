@@ -7,14 +7,20 @@
 //! 1. **`schema`** — the SQL migrations embedded in the binary. Applied
 //!    migrations this binary does not know are tolerated: that is a rollback
 //!    to an older image, and nothing is ever un-applied.
-//! 2. **`identity_claim`** — the deployment's identity provider is recorded
+//! 2. **`runtime_role`** — the login the server connects with is created,
+//!    or brought back to its exact attributes and grants (`runtime_role`,
+//!    #616). The owner login every step runs as stays with `migrate`.
+//! 3. **`identity_claim`** — the deployment's identity provider is recorded
 //!    the first time, and any other refused (`identity::claim_deployment`).
-//! 3. **`reseal`** — every stored secret is brought up to the current
+//! 4. **`reseal`** — every stored secret is brought up to the current
 //!    encrypted representation (`values::encrypt_stored_secrets`), and a key
 //!    that opens none of them aborts.
-//! 4. **`identity_provider`** — what the release configures in the identity
+//! 5. **`identity_provider`** — what the release configures in the identity
 //!    provider itself (`identity::ExternalSetup`), which the provider's crate
 //!    describes.
+//! 6. **`runtime_password`** — the runtime login gets the password
+//!    `migrate` was given, if it has another. Last, so a `migrate` failing
+//!    at any step above leaves the running server's password working.
 //!
 //! The server applies none of this. At startup it checks that each step has
 //! run ([`verify_schema`], `identity::verify_deployment`,
@@ -31,6 +37,8 @@ use tracing::info;
 use crate::config::MigrateConfig;
 use crate::spans::{classified, in_root_span};
 use crate::{identity, values};
+
+pub(crate) mod runtime_role;
 
 /// The migrations this binary carries.
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -62,6 +70,12 @@ pub(crate) async fn run(config: MigrateConfig) -> Result<()> {
     })
     .await
     .context("migrate step `schema` failed")?;
+    in_root_span(step_span!("runtime_role"), "runtime_role_failed", async {
+        runtime_role::ensure(&database, &config.runtime_login).await?;
+        Ok(())
+    })
+    .await
+    .context("migrate step `runtime_role` failed")?;
     in_root_span(
         step_span!("identity_claim"),
         "identity_claim_failed",
@@ -83,6 +97,18 @@ pub(crate) async fn run(config: MigrateConfig) -> Result<()> {
     )
     .await
     .context("migrate step `identity_provider` failed")?;
+    // Last, so a failure anywhere above leaves the running server's password
+    // working.
+    in_root_span(
+        step_span!("runtime_password"),
+        "runtime_password_failed",
+        async {
+            runtime_role::set_password(&database, &config.runtime_login).await?;
+            Ok(())
+        },
+    )
+    .await
+    .context("migrate step `runtime_password` failed")?;
     database.close().await;
     info!("migrations complete");
     Ok(())

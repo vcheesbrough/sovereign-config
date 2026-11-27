@@ -9,6 +9,8 @@ const SECRET: &str = "startup-redaction-sentinel-4d9a9fd8";
 const MANAGER_SECRET: &str = "manager-redaction-sentinel-e3b7c1f4";
 /// The Authentik admin token, which only `migrate` is given.
 const ADMIN_SECRET: &str = "admin-redaction-sentinel-9c2e4a71";
+/// The server's runtime login password, which `migrate` sets (#616).
+const RUNTIME_SECRET: &str = "runtime-redaction-sentinel-5f0b8e2d";
 // A real 32-byte key, base64-encoded, so the server gets past key validation
 // on the paths that are meant to fail somewhere else.
 const VALUE_ENCRYPTION_KEY: &str = "dmFsdWUtZW5jcnlwdGlvbi1zZW50aW5lbC1rZXktMDE=";
@@ -51,6 +53,10 @@ fn assert_secret_is_redacted(output: &Output) {
     assert!(
         !output.contains(ADMIN_SECRET),
         "startup output exposed the Authentik admin token: {output}"
+    );
+    assert!(
+        !output.contains(RUNTIME_SECRET),
+        "startup output exposed the runtime login's password: {output}"
     );
 }
 
@@ -370,6 +376,35 @@ fn no_startup_secret_reaches_an_exported_span_or_log_record() {
     assert_nothing_secret_is_exported(None, Vec::new(), "sovereign_config.startup.verify");
 }
 
+/// `migrate` refuses to run without the runtime login's password, or with
+/// one it cannot hand Postgres unchanged, naming the variable and never
+/// the value: without it, the server would have no login of its own (#616).
+#[test]
+fn migrate_needs_the_runtime_password_and_never_echoes_it() {
+    let mut environment = configured_environment("127.0.0.1:50051");
+    let missing = run_command(Some("migrate"), &environment);
+    assert_secret_is_redacted(&missing);
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("SOVEREIGN_CONFIG_RUNTIME_DATABASE_PASSWORD"),
+        "{stderr}"
+    );
+
+    environment.push((
+        "SOVEREIGN_CONFIG_RUNTIME_DATABASE_PASSWORD",
+        format!("{RUNTIME_SECRET} with spaces"),
+    ));
+    let unusable = run_command(Some("migrate"), &environment);
+    assert_secret_is_redacted(&unusable);
+    let stderr = String::from_utf8_lossy(&unusable.stderr);
+    assert!(
+        stderr.contains(
+            "SOVEREIGN_CONFIG_RUNTIME_DATABASE_PASSWORD must be printable ASCII, with no spaces"
+        ),
+        "{stderr}"
+    );
+}
+
 /// The same for `migrate`, which also holds the Authentik admin token: its
 /// first step fails on the unreachable database, before Authentik is called.
 #[test]
@@ -384,6 +419,10 @@ fn no_migrate_secret_reaches_an_exported_span_or_log_record() {
             (
                 "SOVEREIGN_CONFIG_AUTHENTIK_ADMIN_TOKEN",
                 ADMIN_SECRET.to_owned(),
+            ),
+            (
+                "SOVEREIGN_CONFIG_RUNTIME_DATABASE_PASSWORD",
+                RUNTIME_SECRET.to_owned(),
             ),
         ],
         "sovereign_config.migrate.schema",
@@ -442,7 +481,13 @@ fn assert_nothing_secret_is_exported(
     // Whatever metrics left before the failed start are searched too.
     let metrics = bodies("/v1/metrics");
     for body in traces.iter().chain(&logs).chain(&metrics) {
-        for secret in [SECRET, MANAGER_SECRET, VALUE_ENCRYPTION_KEY, ADMIN_SECRET] {
+        for secret in [
+            SECRET,
+            MANAGER_SECRET,
+            VALUE_ENCRYPTION_KEY,
+            ADMIN_SECRET,
+            RUNTIME_SECRET,
+        ] {
             assert!(
                 !contains(body, secret),
                 "an exported span or log record carries a startup secret"

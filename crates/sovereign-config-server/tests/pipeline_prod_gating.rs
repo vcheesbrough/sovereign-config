@@ -495,6 +495,10 @@ fn each_deploy_hands_compose_every_credential_as_a_variable() {
                 format!("sovereign_config_{environment_name}_postgres_password"),
             ),
             (
+                "RUNTIME_DATABASE_PASSWORD",
+                format!("sovereign_config_{environment_name}_postgres_runtime_password"),
+            ),
+            (
                 "MANAGER_API_TOKEN",
                 format!("sovereign_config_{environment_name}_manager_api_token"),
             ),
@@ -513,10 +517,18 @@ fn each_deploy_hands_compose_every_credential_as_a_variable() {
                 "{deploy} takes {variable} from {secret}"
             );
         }
+        // Two logins (#616): the owner's URL for `migrate`, and the runtime
+        // role's, which `migrate` creates under this name, for the server.
         assert!(command.contains(
-            "export POSTGRES_PASSWORD MANAGER_API_TOKEN VALUE_ENCRYPTION_KEY AUTHENTIK_ADMIN_TOKEN \
-             DATABASE_URL=\"postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config\""
+            "export POSTGRES_PASSWORD RUNTIME_DATABASE_PASSWORD MANAGER_API_TOKEN \
+             VALUE_ENCRYPTION_KEY AUTHENTIK_ADMIN_TOKEN \
+             OWNER_DATABASE_URL=\"postgresql://sovereign_config:$$ENCODED_PASSWORD@postgres:5432/sovereign_config\" \
+             RUNTIME_DATABASE_URL=\"postgresql://sovereign_config_runtime:$$ENCODED_RUNTIME_PASSWORD@postgres:5432/sovereign_config\""
         ));
+        assert!(
+            !command.contains(" DATABASE_URL="),
+            "{deploy} still hands Compose the one shared URL"
+        );
         let mounts = strings(deploy_step.get("volumes").expect("volumes"));
         assert_eq!(
             mounts,
