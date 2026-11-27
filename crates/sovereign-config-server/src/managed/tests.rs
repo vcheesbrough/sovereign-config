@@ -19,7 +19,12 @@ use reqwest::Url;
 use serde_json::{Value, json};
 use sovereign_config_core::{ConnectionUrl, ManagedPermission};
 use sqlx::postgres::PgPoolOptions;
-use tokio::{net::TcpListener, task::JoinHandle, time::sleep};
+use tokio::{
+    net::TcpListener,
+    sync::Notify,
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
 
 use sovereign_config_authentik::{AuthentikConfig, AuthentikProvider};
 use sovereign_config_core::Secret;
@@ -57,6 +62,8 @@ const TEST_GROUP_ID: &str = "11111111-1111-1111-1111-111111111111";
 /// Longer than the mock client timeout so an in-flight rotation is
 /// rejected, but short enough to exercise recovery without a long sleep.
 const ROTATION_LEASE: Duration = Duration::from_millis(800);
+/// The admin client's per-request timeout in the mock-backed service.
+const CLIENT_TIMEOUT: Duration = Duration::from_millis(400);
 
 /// One scripted outcome for a mocked Authentik route.
 #[derive(Clone)]
@@ -95,10 +102,41 @@ struct Script {
     /// Whether the configured connections group exists in the directory.
     group_exists: bool,
     set_credential_delay: Duration,
-    /// Delay applied before the account is registered in the mock,
-    /// modeling a create request that has not yet committed in
+    /// Parks the create call before the account is registered in the
+    /// mock, modeling a create request that has not yet committed in
     /// Authentik while the client is still waiting for a response.
-    create_account_delay: Duration,
+    create_account_gate: Option<Gate>,
+}
+
+/// Holds a mocked call until the test releases it, so a test can order
+/// work against an in-flight call without guessing how long it takes.
+#[derive(Clone, Default)]
+struct Gate {
+    arrived: Arc<Notify>,
+    released: Arc<Notify>,
+}
+
+impl Gate {
+    /// Called by the handler: announces the call, then waits for release.
+    async fn park(&self) {
+        self.arrived.notify_one();
+        self.released.notified().await;
+    }
+
+    /// Resolves once the call has reached the mock and is parked. The
+    /// deadline only turns a call that never arrives into a failure
+    /// rather than a hang; it plays no part in the ordering.
+    async fn wait_for_arrival(&self) {
+        timeout(Duration::from_secs(10), self.arrived.notified())
+            .await
+            .expect("the gated call must reach the mock");
+    }
+
+    /// Lets the parked call proceed. `Notify` keeps the permit if the call
+    /// has not parked yet, so a release is never lost.
+    fn release(&self) {
+        self.released.notify_one();
+    }
 }
 
 impl Default for Script {
@@ -116,7 +154,7 @@ impl Default for Script {
             credentials_visible: true,
             group_exists: true,
             set_credential_delay: Duration::ZERO,
-            create_account_delay: Duration::ZERO,
+            create_account_gate: None,
         }
     }
 }
@@ -206,8 +244,10 @@ async fn create_account(
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
     );
-    let delay = state.script.lock().unwrap().create_account_delay;
-    sleep(delay).await;
+    let gate = state.script.lock().unwrap().create_account_gate.clone();
+    if let Some(gate) = gate {
+        gate.park().await;
+    }
     if let Some(response) = apply(&behavior(&state, |script| script.create_account.clone())).await {
         return response;
     }
@@ -494,6 +534,14 @@ async fn service_with_metrics(
     mock: &MockAuthentik,
     metrics: Arc<ManagedConnectionMetrics>,
 ) -> Option<V3ManagedConnections> {
+    service_with_client_timeout(mock, metrics, CLIENT_TIMEOUT).await
+}
+
+async fn service_with_client_timeout(
+    mock: &MockAuthentik,
+    metrics: Arc<ManagedConnectionMetrics>,
+    client_timeout: Duration,
+) -> Option<V3ManagedConnections> {
     let database = fresh_database().await?;
     // The real Authentik implementation, against the mock: these tests prove
     // the service's behaviour through the identity-provider seam unchanged.
@@ -509,7 +557,7 @@ async fn service_with_metrics(
             "sovereign-config",
             GRANTS_ATTRIBUTE,
             MANAGED_GROUP,
-            Duration::from_millis(400),
+            client_timeout,
         )
         .expect("the mock Authentik configuration must validate"),
     )
@@ -1616,28 +1664,43 @@ async fn a_concurrent_revoke_is_not_undone_by_a_slow_rotation_write_back() {
 #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
 async fn a_revoke_racing_an_in_flight_create_does_not_orphan_the_account() {
     let mock = mock_authentik().await;
-    let service = service_or_skip!(&mock);
-    mock.script(|script| script.create_account_delay = Duration::from_millis(120));
+    // A generous client timeout: create's parked call must outlast the
+    // whole revoke however slow the machine is, or create would take the
+    // ambiguous-create path instead of the one this test exists for.
+    let Some(service) = service_with_client_timeout(
+        &mock,
+        Arc::new(ManagedConnectionMetrics::default()),
+        Duration::from_secs(30),
+    )
+    .await
+    else {
+        return;
+    };
+    let gate = Gate::default();
+    mock.script(|script| script.create_account_gate = Some(gate.clone()));
     let principal = operator("/");
 
     let create_future = create(&service, "Racing", "/apps/api", &principal);
 
     let revoke_future = async {
-        // The row is inserted before the delayed create call returns;
-        // give it time to land, then target it before create finishes.
-        sleep(Duration::from_millis(30)).await;
+        // Create commits its row before it calls Authentik, so once the
+        // call is parked the row is visible and create is in flight.
+        gate.wait_for_arrival().await;
         let connection_id = rows(&service)
             .await
             .into_iter()
             .find(|row| row.state == "provisioning")
-            .expect("the row must be visible before the delayed create call returns")
+            .expect("the row must be visible while the create call is parked")
             .connection_id;
-        service
+        let revoked = service
             .revoke_managed_connection(request(
                 RevokeManagedConnectionRequest { connection_id },
                 &principal,
             ))
-            .await
+            .await;
+        // Only now does Authentik commit the account create asked for.
+        gate.release();
+        revoked
     };
 
     let (created, revoked) = tokio::join!(create_future, revoke_future);
