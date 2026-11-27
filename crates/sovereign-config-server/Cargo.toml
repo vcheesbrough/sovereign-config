@@ -64,6 +64,8 @@ rustix.workspace = true
 serde_yaml.workspace = true
 tempfile = "3.27.0"
 tokio-stream = { version = "0.1.18", features = ["net"] }
+# `Notify`, for the mock identity provider's call gates (`managed/tests.rs`).
+tokio = { workspace = true, features = ["sync"] }
 # A second protobuf package, registered alongside v3 only in integration tests,
 # so concurrent protocol serving is proven before a real v4 relies on it. Never
 # reaches the release binary.
