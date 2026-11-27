@@ -282,8 +282,10 @@ async fn runtime_state(pool: &PgPool, role: &str) -> Vec<String> {
         SELECT format('%s %s', relname, relacl::TEXT) FROM pg_class
         WHERE relnamespace = current_schema()::regnamespace AND relkind IN ('r', 'S')
         UNION ALL
-        SELECT format('default %s %s', defaclobjtype, defaclacl::TEXT) FROM pg_default_acl
-        WHERE defaclnamespace = current_schema()::regnamespace
+        SELECT format('default %s %s %s', defaclnamespace = 0, defaclobjtype, defaclacl::TEXT)
+        FROM pg_default_acl
+        WHERE defaclrole = current_user::regrole
+          AND defaclnamespace IN (0, current_schema()::regnamespace)
         ORDER BY 1
         ",
     )
@@ -513,6 +515,7 @@ async fn the_runtime_password_is_kept_when_current_and_rotated_when_not() {
 /// refuses rather than dismantles.
 #[tokio::test]
 #[ignore = "requires SOVEREIGN_CONFIG_TEST_DATABASE_URL"]
+#[allow(clippy::too_many_lines)]
 async fn migrate_restores_a_widened_runtime_role_and_refuses_what_it_cannot() {
     const ROLE: &str = "sc_test_runtime_widened";
     const SCHEMA: &str = "migrate_runtime_widened";
@@ -529,12 +532,31 @@ async fn migrate_restores_a_widened_runtime_role_and_refuses_what_it_cannot() {
         format!("GRANT UPDATE ON ALL SEQUENCES IN SCHEMA {SCHEMA} TO {ROLE}"),
         format!("ALTER DEFAULT PRIVILEGES IN SCHEMA {SCHEMA} GRANT ALL ON TABLES TO {ROLE}"),
         format!("ALTER DEFAULT PRIVILEGES IN SCHEMA {SCHEMA} GRANT ALL ON SEQUENCES TO {ROLE}"),
+        // Global ones too, which apply in every schema.
+        format!("ALTER DEFAULT PRIVILEGES GRANT ALL ON TABLES TO {ROLE}"),
+        format!("ALTER DEFAULT PRIVILEGES GRANT ALL ON SEQUENCES TO {ROLE}"),
     ] {
         sqlx::raw_sql(&widening).execute(&pool).await.unwrap();
     }
     assert_ne!(runtime_state(&pool, ROLE).await, current);
     run(config_for(&url, 0x5A, ROLE)).await.unwrap();
     assert_eq!(runtime_state(&pool, ROLE).await, current);
+    // So a table a later migration adds grants exactly the four.
+    sqlx::raw_sql(&format!("CREATE TABLE {SCHEMA}.added_later (id BIGINT)"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let truncates: bool = sqlx::query_scalar("SELECT has_table_privilege($1, $2, 'TRUNCATE')")
+        .bind(ROLE)
+        .bind(format!("{SCHEMA}.added_later"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!truncates, "no widened default reaches a new table");
+    sqlx::raw_sql(&format!("DROP TABLE {SCHEMA}.added_later"))
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // `CREATE` on the schema through `PUBLIC`, as a cluster first
     // initialised before PostgreSQL 15 keeps it: taken back.

@@ -313,6 +313,10 @@ async fn grant(
         format!("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema} TO {role}"),
         format!("REVOKE ALL ON ALL SEQUENCES IN SCHEMA {schema} FROM {role}"),
         format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO {role}"),
+        // Global defaults (no schema) are added to the schema's, and a
+        // schema-scoped revoke cannot take them back.
+        format!("ALTER DEFAULT PRIVILEGES FOR ROLE {owner} REVOKE ALL ON TABLES FROM {role}"),
+        format!("ALTER DEFAULT PRIVILEGES FOR ROLE {owner} REVOKE ALL ON SEQUENCES FROM {role}"),
         format!(
             "ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} \
              REVOKE ALL ON TABLES FROM {role}"
