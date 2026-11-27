@@ -295,10 +295,27 @@ async fn isolated_database_url() -> String {
     format!("{database_url}{separator}options=-c%20search_path%3D{SCHEMA}%2Cpublic")
 }
 
+/// The runtime login's password `migrate` is given. The role is the one a
+/// deployment's server logs in as, so these tests share it; they run one at
+/// a time, as their shared schema already requires.
+const RUNTIME_PASSWORD: &str = "telemetry-startup-runtime-password";
+
+/// `database_url`, the owner's, logged in as the server's runtime role.
+fn runtime_url(database_url: &str) -> String {
+    let mut url = reqwest::Url::parse(database_url).expect("the test URL parses");
+    url.set_username("sovereign_config_runtime").unwrap();
+    url.set_password(Some(RUNTIME_PASSWORD)).unwrap();
+    url.to_string()
+}
+
 /// Runs the real binary's `migrate` on `database_url`, as a deploy runs it
 /// before the server, and returns its output.
 fn migrate(database_url: &str) -> Output {
-    let environment = server_environment(database_url, "unused", "unused");
+    let mut environment = server_environment(database_url, "unused", "unused");
+    environment.push((
+        "SOVEREIGN_CONFIG_RUNTIME_DATABASE_PASSWORD",
+        RUNTIME_PASSWORD.to_owned(),
+    ));
     Command::new(env!("CARGO_BIN_EXE_sovereign-config-server"))
         .arg("migrate")
         .env_clear()
@@ -307,8 +324,9 @@ fn migrate(database_url: &str) -> Output {
         .expect("migrate must start")
 }
 
-/// Starts the real server, waits until it serves, stops it with SIGTERM and
-/// returns its stdout and how long it took to exit.
+/// Runs `migrate` as the owner, then starts the real server on the runtime
+/// login it created, as a deployment does (#616), waits until it serves,
+/// stops it with SIGTERM and returns its stdout and how long it took to exit.
 fn serve_then_stop(
     database_url: &str,
     telemetry: Vec<(&'static str, String)>,
@@ -317,7 +335,7 @@ fn serve_then_stop(
     assert!(migrated.status.success(), "migrate: {:?}", text(&migrated));
     let metrics_port = unused_port();
     let mut environment = server_environment(
-        database_url,
+        &runtime_url(database_url),
         &format!("127.0.0.1:{}", unused_port()),
         &format!("127.0.0.1:{metrics_port}"),
     );

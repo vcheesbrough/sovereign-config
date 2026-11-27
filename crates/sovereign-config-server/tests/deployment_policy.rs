@@ -29,7 +29,11 @@ const CREDENTIALS: [(&str, &[(&str, &str)]); 3] = [
     (
         "migrate",
         &[
-            ("database_url", "SOVEREIGN_CONFIG_DATABASE_URL_FILE"),
+            ("owner_database_url", "SOVEREIGN_CONFIG_DATABASE_URL_FILE"),
+            (
+                "runtime_database_password",
+                "SOVEREIGN_CONFIG_RUNTIME_DATABASE_PASSWORD_FILE",
+            ),
             (
                 "authentik_admin_token",
                 "SOVEREIGN_CONFIG_AUTHENTIK_ADMIN_TOKEN_FILE",
@@ -47,7 +51,7 @@ const CREDENTIALS: [(&str, &[(&str, &str)]); 3] = [
     (
         "sovereign-config",
         &[
-            ("database_url", "SOVEREIGN_CONFIG_DATABASE_URL_FILE"),
+            ("runtime_database_url", "SOVEREIGN_CONFIG_DATABASE_URL_FILE"),
             (
                 "manager_api_token",
                 "SOVEREIGN_CONFIG_MANAGER_API_TOKEN_FILE",
@@ -135,7 +139,9 @@ fn compose_delivers_every_credential_from_the_environment_as_a_file() {
     let secrets = compose["secrets"].as_mapping().expect("secrets");
     for (secret, variable) in [
         ("postgres_password", "POSTGRES_PASSWORD"),
-        ("database_url", "DATABASE_URL"),
+        ("owner_database_url", "OWNER_DATABASE_URL"),
+        ("runtime_database_password", "RUNTIME_DATABASE_PASSWORD"),
+        ("runtime_database_url", "RUNTIME_DATABASE_URL"),
         ("manager_api_token", "MANAGER_API_TOKEN"),
         ("value_encryption_key", "VALUE_ENCRYPTION_KEY"),
         ("authentik_admin_token", "AUTHENTIK_ADMIN_TOKEN"),
@@ -146,7 +152,7 @@ fn compose_delivers_every_credential_from_the_environment_as_a_file() {
             "{secret} is read from {variable}, and from nowhere else"
         );
     }
-    assert_eq!(secrets.len(), 5, "a credential was added or removed");
+    assert_eq!(secrets.len(), 7, "a credential was added or removed");
 }
 
 /// Only `migrate` holds the Authentik admin token: the server that runs for
@@ -166,6 +172,54 @@ fn only_migrate_is_given_the_authentik_admin_token() {
             .contains("AUTHENTIK_ADMIN_TOKEN");
         assert_eq!(holds, name == "migrate", "{name}");
     }
+}
+
+/// The database owner's password reaches PostgreSQL and `migrate` alone: the
+/// server logs in as the runtime role `migrate` creates, which owns nothing,
+/// so a compromised server can read and write rows but create, alter, drop
+/// or truncate nothing (#616). Only `migrate` holds the runtime password it
+/// sets, and only the server the URL that carries it.
+#[test]
+fn the_server_holds_no_owner_password() {
+    let compose: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../../../compose.yaml")).expect("compose parses");
+    for (secret, holders) in [
+        ("postgres_password", &["postgres"][..]),
+        ("owner_database_url", &["migrate"][..]),
+        ("runtime_database_password", &["migrate"][..]),
+        ("runtime_database_url", &["sovereign-config"][..]),
+    ] {
+        let mut held: Vec<&str> = compose["services"]
+            .as_mapping()
+            .expect("services")
+            .iter()
+            .filter(|(_, service)| {
+                service.get("secrets").is_some_and(|_| {
+                    secret_grants(service.as_mapping().unwrap())
+                        .iter()
+                        .any(|(source, _)| source == secret)
+                })
+            })
+            .map(|(name, _)| name.as_str().unwrap())
+            .collect();
+        held.sort_unstable();
+        assert_eq!(held, holders, "who is given {secret}");
+    }
+    let server =
+        serde_yaml::to_string(&compose_service("sovereign-config")["environment"]).unwrap();
+    for owner in [
+        "POSTGRES_PASSWORD",
+        "OWNER_DATABASE_URL",
+        "owner_database_url",
+        "postgres_password",
+    ] {
+        assert!(!server.contains(owner), "the server names {owner}");
+    }
+    // The owner is PostgreSQL's own user, which `migrate`'s URL names.
+    assert_eq!(
+        environment(&compose_service("postgres"))["POSTGRES_USER"].as_str(),
+        Some("sovereign_config")
+    );
 }
 
 /// `migrate` is the same image as the server, run once per `up` and never
@@ -327,7 +381,7 @@ fn a_compose_change_is_carried_to_productions_mirror() {
         Sha256::digest(include_bytes!("../../../compose.yaml"))
     );
     assert_eq!(
-        digest, "0d0b916193865d8f8d95ee827c2f5b9f0e79b713cdb88624a33194e08d7937be",
+        digest, "da2a8073b0d02700982fd9709393f075b12aadbfd48e6963952ffe40c0eb70ea",
         "compose.yaml changed: carry the change into mini-config's \
          sovereign-config-stack/docker-compose.yml in the release's pin-bump PR, \
          then update this hash"

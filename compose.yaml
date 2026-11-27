@@ -51,13 +51,18 @@ services:
   # per deploy before the server is replaced (#615, docs/project-deployment.md,
   # *Migrations*). The same image; it exits when done, and the server waits
   # for it to exit 0. It is the only container given the Authentik admin
-  # token.
+  # token or the database owner's login, and it creates the server's own
+  # login, `sovereign_config_runtime`, which can read and write rows but owns
+  # nothing (#616).
   migrate:
     image: ghcr.io/vcheesbrough/sovereign-config:${SOVEREIGN_CONFIG_IMAGE_TAG:-local}
     container_name: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}-migrate
     command: ["migrate"]
     environment:
-      SOVEREIGN_CONFIG_DATABASE_URL_FILE: /run/secrets/database_url
+      # The schema owner: every step runs as it.
+      SOVEREIGN_CONFIG_DATABASE_URL_FILE: /run/secrets/owner_database_url
+      # The password `migrate` gives the server's login.
+      SOVEREIGN_CONFIG_RUNTIME_DATABASE_PASSWORD_FILE: /run/secrets/runtime_database_password
       SOVEREIGN_CONFIG_IDENTITY_PROVIDER: ${SOVEREIGN_CONFIG_IDENTITY_PROVIDER:-}
       SOVEREIGN_CONFIG_OIDC_ISSUER: ${SOVEREIGN_CONFIG_OIDC_ISSUER:?Set SOVEREIGN_CONFIG_OIDC_ISSUER}
       SOVEREIGN_CONFIG_PUBLIC_ORIGIN: ${SOVEREIGN_CONFIG_PUBLIC_ORIGIN:?Set SOVEREIGN_CONFIG_PUBLIC_ORIGIN}
@@ -80,7 +85,11 @@ services:
       OTEL_SDK_DISABLED:
     hostname: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}-migrate
     secrets:
-      - source: database_url
+      - source: owner_database_url
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: runtime_database_password
         uid: "10001"
         gid: "10001"
         mode: 0400
@@ -126,7 +135,9 @@ services:
     image: ghcr.io/vcheesbrough/sovereign-config:${SOVEREIGN_CONFIG_IMAGE_TAG:-local}
     container_name: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}
     environment:
-      SOVEREIGN_CONFIG_DATABASE_URL_FILE: /run/secrets/database_url
+      # The runtime login `migrate` created, never the owner's (#616): rows
+      # only, so a compromised server can change no table.
+      SOVEREIGN_CONFIG_DATABASE_URL_FILE: /run/secrets/runtime_database_url
       SOVEREIGN_CONFIG_GRPC_ADDR: 0.0.0.0:50051
       # The internal health listener (`/readyz`); the name predates metrics
       # moving to OTLP, and is kept rather than churn an operator variable.
@@ -167,7 +178,7 @@ services:
     # redeploy and the instance keeps one identity.
     hostname: ${SOVEREIGN_CONFIG_CONTAINER_NAME:?Set SOVEREIGN_CONFIG_CONTAINER_NAME}
     secrets:
-      - source: database_url
+      - source: runtime_database_url
         uid: "10001"
         gid: "10001"
         mode: 0400
@@ -296,11 +307,21 @@ services:
 # it, at /run/secrets/<name> (#617). The value never becomes one of the
 # container's own variables. Compose refuses to start a service whose secret's
 # variable is unset.
+#
+# Two database logins (#616): the owner, PostgreSQL's own user, whose
+# password is POSTGRES_PASSWORD and whose URL only `migrate` gets; and the
+# runtime login, `sovereign_config_runtime`, whose password `migrate` sets
+# and whose URL only the server gets. Build each URL from its password, so
+# the two cannot drift apart.
 secrets:
   postgres_password:
     environment: POSTGRES_PASSWORD
-  database_url:
-    environment: DATABASE_URL
+  owner_database_url:
+    environment: OWNER_DATABASE_URL
+  runtime_database_password:
+    environment: RUNTIME_DATABASE_PASSWORD
+  runtime_database_url:
+    environment: RUNTIME_DATABASE_URL
   manager_api_token:
     environment: MANAGER_API_TOKEN
   value_encryption_key:

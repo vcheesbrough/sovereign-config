@@ -169,13 +169,15 @@ The stack publishes no application, PostgreSQL, metrics, logging or tracing port
 
 | Variable | Contents |
 | --- | --- |
-| `POSTGRES_PASSWORD` | The PostgreSQL password. |
-| `DATABASE_URL` | The complete private-network URL, for example `postgresql://sovereign_config:<password>@postgres:5432/sovereign_config`, with the password percent-encoded. |
+| `POSTGRES_PASSWORD` | The PostgreSQL password: that of the schema owner, `sovereign_config`. |
+| `OWNER_DATABASE_URL` | The owner's complete private-network URL, `postgresql://sovereign_config:<password>@postgres:5432/sovereign_config`, with the password percent-encoded. Only `migrate` is given it. |
+| `RUNTIME_DATABASE_PASSWORD` | A second password, printable ASCII with no spaces (`openssl rand -hex 32`), for the server's own login, `sovereign_config_runtime`, which `migrate` creates and gives it. Only `migrate` is given it. |
+| `RUNTIME_DATABASE_URL` | The server's URL, `postgresql://sovereign_config_runtime:<runtime password>@postgres:5432/sovereign_config`, percent-encoded likewise. Only the server is given it: it can read and write rows, and change no table. |
 | `MANAGER_API_TOKEN` | The Authentik connection-manager API token from the blueprint. |
 | `VALUE_ENCRYPTION_KEY` | The value encryption key: 32 random bytes in standard base64, from `openssl rand -base64 32`. |
 | `AUTHENTIK_ADMIN_TOKEN` | An Authentik API token allowed to manage blueprints and read the version and schema. Only `migrate` is given it. |
 
-Compose writes each into the containers given it as a file at `/run/secrets/<name>`, mode `0400`, owned by the user that reads it. It never becomes one of a container's own variables, because an exited container — `migrate`, after every deploy — keeps those in `docker inspect`. The server and `migrate` run as the fixed user `10001:10001`, with no capabilities and `no-new-privileges`. Their root filesystem is writable, because Compose writes these files into the container, which it refuses to do for a read-only one. The files live in each container's own layer until it is recreated: an exited `migrate` holds the Authentik admin token until the next deploy. Outside Compose, the binary also takes each secret directly through its variable (`SOVEREIGN_CONFIG_DATABASE_URL`, `SOVEREIGN_CONFIG_MANAGER_API_TOKEN`, `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY`, `SOVEREIGN_CONFIG_AUTHENTIK_ADMIN_TOKEN`), which takes precedence over the matching `_FILE`. Startup fails with a redacted error when a required secret is absent through both routes.
+Compose writes each into the containers given it as a file at `/run/secrets/<name>`, mode `0400`, owned by the user that reads it. It never becomes one of a container's own variables, because an exited container — `migrate`, after every deploy — keeps those in `docker inspect`. The server and `migrate` run as the fixed user `10001:10001`, with no capabilities and `no-new-privileges`. Their root filesystem is writable, because Compose writes these files into the container, which it refuses to do for a read-only one. The files live in each container's own layer until it is recreated: an exited `migrate` holds the Authentik admin token until the next deploy. Outside Compose, the binary also takes each secret directly through its variable (`SOVEREIGN_CONFIG_DATABASE_URL`, `SOVEREIGN_CONFIG_RUNTIME_DATABASE_PASSWORD`, `SOVEREIGN_CONFIG_MANAGER_API_TOKEN`, `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY`, `SOVEREIGN_CONFIG_AUTHENTIK_ADMIN_TOKEN`), which takes precedence over the matching `_FILE`. Startup fails with a redacted error when a required secret is absent through both routes.
 
 > [!WARNING]
 > **Back up the value encryption key, and keep that backup somewhere you would still have after losing the deployment.** It is the only thing that can decrypt the stored secrets; without it they are unrecoverable, no matter how good the database backups are. Neither `migrate` nor the server runs with a key that opens none of the stored secrets, rather than serving errors or sealing a second layer over intact data.
@@ -188,7 +190,7 @@ export SOVEREIGN_CONFIG_ENV='prod'
 export SOVEREIGN_CONFIG_HOST='config.example.com'
 export SOVEREIGN_CONFIG_CONTAINER_NAME='sovereign-config-production'
 export POSTGRES_DATA_VOLUME='sovereign-config-production-db'
-# and the five secrets from step 3
+# and the seven secrets from step 3
 export SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT='production'
 export SOVEREIGN_CONFIG_OIDC_ISSUER='https://auth.example.com/application/o/sovereign-config/'
 export SOVEREIGN_CONFIG_OIDC_AUDIENCE='sovereign-config'
@@ -200,7 +202,7 @@ docker wait "$(docker compose ps -aq migrate)"   # prints 0 once migrate has fin
 docker compose up -d --no-deps --force-recreate --wait sovereign-config
 ```
 
-`migrate` is the same image run once, before the server: it applies the forward-only database migrations, records the identity provider, encrypts any secret still stored in plaintext, and applies the Authentik blueprint, then exits. The server never changes any of that. It checks it at startup, and refuses to start on a database `migrate` has not brought up to its release. Run `migrate` on its own first, as above, on every upgrade too: a plain `docker compose up` replaces the server before `migrate` has finished, so a failed `migrate` would leave no server running. Run that way, a failed `migrate` leaves the previous release serving, which every migration is written to allow.
+`migrate` is the same image run once, before the server: it applies the forward-only database migrations, creates the server's database login, records the identity provider, encrypts any secret still stored in plaintext, and applies the Authentik blueprint, then exits. The server never changes any of that. It checks it at startup, and refuses to start on a database `migrate` has not brought up to its release. Run `migrate` on its own first, as above, on every upgrade too: a plain `docker compose up` replaces the server before `migrate` has finished, so a failed `migrate` would leave no server running. Run that way, a failed `migrate` leaves the previous release serving, which every migration is written to allow.
 
 > [!IMPORTANT]
 > **`compose.yaml` currently depends on the author's own infrastructure.** It was written for the project's own deployment, and the reverse-proxy names below belong to that environment, not to Sovereign Config. The author intends to remove these dependencies, so that the stack runs as shipped with configuration alone (see [Roadmap](#roadmap)). Until then, adapt them to your environment.
@@ -227,7 +229,7 @@ The server is configured entirely through environment variables. `compose.yaml` 
 
 | Variable | Required | Purpose |
 | --- | :---: | --- |
-| `SOVEREIGN_CONFIG_DATABASE_URL` / `_FILE` | ✅ | The PostgreSQL connection URL. `migrate` takes it too. |
+| `SOVEREIGN_CONFIG_DATABASE_URL` / `_FILE` | ✅ | The PostgreSQL connection URL, logged in as `sovereign_config_runtime`, the role `migrate` creates. `migrate` takes the owner's. |
 | `SOVEREIGN_CONFIG_IDENTITY_PROVIDER` | — | The identity provider the server starts with. Unset means `authentik`, the only one it is built with; any other name fails startup. The provider's own variables follow: the `SOVEREIGN_CONFIG_OIDC_*` and `SOVEREIGN_CONFIG_MANAGER_*` rows below are Authentik's ([Authentik](docs/authentik.md#server-variables)). A deployment keeps the provider its first `migrate` recorded ([Authentication](docs/authentication.md#choosing-the-identity-provider)). |
 | `SOVEREIGN_CONFIG_OIDC_ISSUER` | ✅ | The Authentik provider's issuer URL. The Authentik administration origin is derived from it, so the API and issuer origins can never diverge. |
 | `SOVEREIGN_CONFIG_OIDC_AUDIENCE` | ✅ | The `aud` every access token must carry; tokens for any other audience are refused. With Authentik it is the application's client id. |
@@ -255,7 +257,8 @@ The server is configured entirely through environment variables. `compose.yaml` 
 
 | Variable | Required | Purpose |
 | --- | :---: | --- |
-| `SOVEREIGN_CONFIG_DATABASE_URL` / `_FILE` | ✅ | The PostgreSQL connection URL. |
+| `SOVEREIGN_CONFIG_DATABASE_URL` / `_FILE` | ✅ | The PostgreSQL connection URL, logged in as the schema owner. |
+| `SOVEREIGN_CONFIG_RUNTIME_DATABASE_PASSWORD` / `_FILE` | ✅ | The password `migrate` sets on `sovereign_config_runtime`, the server's login: printable ASCII, no spaces. |
 | `SOVEREIGN_CONFIG_VALUE_ENCRYPTION_KEY` / `_FILE` | ✅ | The key that seals secret values. |
 | `SOVEREIGN_CONFIG_IDENTITY_PROVIDER` | — | As for the server: the provider the deployment is recorded for. |
 | `SOVEREIGN_CONFIG_AUTHENTIK_BLUEPRINT` | — | `production` or `development`: the blueprint `migrate` applies. Unset, it applies none. The rest of this table is needed only when it is set ([Authentik](docs/authentik.md#applying-a-blueprint)). |

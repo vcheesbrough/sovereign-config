@@ -8,6 +8,7 @@ use sovereign_config_identity::{
 
 use crate::encryption::{ValueCipher, decode_key};
 use crate::identity;
+use crate::migrate::runtime_role::{self, RuntimeLogin};
 
 /// For one fetch of an issuer's signing keys (docs/authentication.md, "Request authentication").
 const JWKS_TIMEOUT: Duration = Duration::from_secs(3);
@@ -173,7 +174,10 @@ impl Config {
 /// serves, so it reads none of the listeners, the verification rules or the
 /// connection manager's settings.
 pub(crate) struct MigrateConfig {
+    /// The schema owner's URL: the login every step runs as.
     pub(crate) database_url: String,
+    /// The login the server connects with, which `migrate` creates (#616).
+    pub(crate) runtime_login: RuntimeLogin,
     /// The identity provider the deployment is claimed for.
     pub(crate) identity_provider: &'static str,
     /// What `migrate` configures in the provider itself.
@@ -186,6 +190,7 @@ impl MigrateConfig {
     pub(crate) fn from_env() -> Result<Self> {
         Ok(Self {
             database_url: required_secret("SOVEREIGN_CONFIG_DATABASE_URL")?,
+            runtime_login: RuntimeLogin::new(required_secret(runtime_role::PASSWORD_VARIABLE)?)?,
             identity_provider: identity::selected_name(&ProcessEnvironment)?,
             external_setup: identity::ExternalSetup::from_variables(&ProcessEnvironment)?,
             value_cipher: value_cipher_from_env()?,

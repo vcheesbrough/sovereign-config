@@ -32,15 +32,25 @@ docker compose down
 docker volume create sovereign-config-rollback-db
 export POSTGRES_DATA_VOLUME=sovereign-config-rollback-db SOVEREIGN_CONFIG_IMAGE_TAG=<older version>
 docker compose up -d --wait postgres
-docker compose exec -T postgres pg_restore -U sovereign_config -d sovereign_config < sovereign-config-backup.dump
+docker compose exec -T postgres pg_restore -U sovereign_config -d sovereign_config --no-privileges < sovereign-config-backup.dump
 docker compose up -d --wait
 ```
+
+`--no-privileges` leaves out the dump's grants to the server's database login, a role the new volume does not have. From 3.2, `migrate` grants them again ([Project deployment](project-deployment.md#restoring-a-database-dump)); before 3.2 there were none.
 
 **Clients.** Upgrading the server alone is safe for clients on a protocol version it still serves. The notes below say when clients must move before or after the server.
 
 ## Releases that need action
 
 Newest first. A release not listed needs nothing beyond the procedure.
+
+### 3.2: the server gets a database login of its own
+
+- **`migrate` creates the login the server connects with**, `sovereign_config_runtime`. It can read and write rows and nothing else: it owns no table, so it cannot create, alter, drop or truncate one. The existing login, PostgreSQL's own user, stays the schema owner, and only `migrate` uses it ([Project deployment](project-deployment.md#migrations)).
+- **Three credentials replace `DATABASE_URL`** ([README](../README.md#3-set-the-secrets)): `OWNER_DATABASE_URL` is what `DATABASE_URL` was, the owner's URL, and only `migrate` is given it. `RUNTIME_DATABASE_PASSWORD` is a new password of printable ASCII with no spaces (`openssl rand -hex 32`), which `migrate` sets on the runtime login. `RUNTIME_DATABASE_URL` is that login's URL, `postgresql://sovereign_config_runtime:<password>@postgres:5432/sovereign_config` with the password percent-encoded, and only the server is given it. `compose.yaml` refuses to start without them, and `migrate` refuses to run without the password. Either way the previous release goes on serving.
+- **Outside Compose**, give `migrate` the password as `SOVEREIGN_CONFIG_RUNTIME_DATABASE_PASSWORD` (or `_FILE`), and the server the runtime URL as `SOVEREIGN_CONFIG_DATABASE_URL`.
+- **Restoring a dump** needs `pg_restore --no-privileges` from now on, as the [procedure](#procedure) shows: the role is not in the dump, and `migrate` grants it again.
+- **Rolling back to 3.1** is a deploy of the 3.1 image with 3.1's `compose.yaml`, whose server uses the owner login. The runtime role it leaves behind is harmless.
 
 ### 3.1: migrations run in `migrate`, and credentials come from the environment
 
