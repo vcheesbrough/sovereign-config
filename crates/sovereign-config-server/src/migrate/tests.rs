@@ -444,7 +444,7 @@ async fn a_table_a_later_migration_adds_needs_no_grant() {
     pool.close().await;
 }
 
-/// A password set by PostgreSQL itself is recognised, so `migrate` leaves it
+/// A password set by Postgres itself is recognised, so `migrate` leaves it
 /// alone; a new one replaces it, and only the new one logs in. That is how
 /// the runtime password is rotated: change the secret and redeploy.
 #[tokio::test]

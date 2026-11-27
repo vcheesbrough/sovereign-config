@@ -174,7 +174,7 @@ fn only_migrate_is_given_the_authentik_admin_token() {
     }
 }
 
-/// The database owner's password reaches PostgreSQL and `migrate` alone: the
+/// The database owner's password reaches Postgres and `migrate` alone: the
 /// server logs in as the runtime role `migrate` creates, which owns nothing,
 /// so a compromised server can read and write rows but create, alter, drop
 /// or truncate nothing (#616). Only `migrate` holds the runtime password it

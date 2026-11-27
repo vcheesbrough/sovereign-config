@@ -377,7 +377,7 @@ fn no_startup_secret_reaches_an_exported_span_or_log_record() {
 }
 
 /// `migrate` refuses to run without the runtime login's password, or with
-/// one it cannot hand PostgreSQL unchanged, naming the variable and never
+/// one it cannot hand Postgres unchanged, naming the variable and never
 /// the value: without it, the server would have no login of its own (#616).
 #[test]
 fn migrate_needs_the_runtime_password_and_never_echoes_it() {

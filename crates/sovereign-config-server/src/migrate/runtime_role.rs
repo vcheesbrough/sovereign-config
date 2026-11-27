@@ -43,7 +43,7 @@ use crate::spans::{self, classified};
 /// The role the server logs in as. A deployment's server URL names it.
 pub(crate) const RUNTIME_ROLE: &str = "sovereign_config_runtime";
 
-/// PostgreSQL's own default (`scram_iterations`).
+/// Postgres's own default (`scram_iterations`).
 const ITERATIONS: NonZeroU32 = NonZeroU32::new(4096).unwrap();
 
 /// The variable `migrate` reads the runtime password from (or its `_FILE`).
@@ -406,7 +406,7 @@ async fn execute(transaction: &mut Transaction<'_, Postgres>, statement: &str) -
 }
 
 /// A SCRAM-SHA-256 verifier for `password` under a fresh salt, in the form
-/// PostgreSQL stores (`SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`).
+/// Postgres stores (`SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`).
 /// Handed to `PASSWORD`, it is stored as it is, so the password itself never
 /// reaches the server.
 fn scram_verifier(password: &str) -> Result<String> {
@@ -443,7 +443,7 @@ fn keys(password: &str, salt: &[u8], iterations: NonZeroU32) -> (Vec<u8>, Vec<u8
     (stored_key.as_ref().to_vec(), server_key.as_ref().to_vec())
 }
 
-/// Whether `stored`, a verifier PostgreSQL holds, is one for `password`.
+/// Whether `stored`, a verifier Postgres holds, is one for `password`.
 /// Anything not a SCRAM-SHA-256 verifier (an MD5 hash, say) is not.
 fn verifier_matches(stored: &str, password: &str) -> bool {
     let parse = || {
@@ -490,7 +490,7 @@ mod tests {
     use super::{RuntimeLogin, verifier, verifier_matches};
 
     /// A verifier made here is one this module recognises for the same
-    /// password only; PostgreSQL's own are checked against the database in
+    /// password only; Postgres's own are checked against the database in
     /// `migrate/tests.rs`.
     #[test]
     fn a_verifier_matches_its_own_password_only() {
